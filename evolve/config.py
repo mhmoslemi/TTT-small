@@ -99,13 +99,13 @@ class ModelConfig:
     lora_rank: int = 32
     lora_alpha: int = 32
     lora_dropout: float = 0.0
-    # Qwen3-family chat templates accept enable_thinking and default it to True,
-    # so the model opens a <think> block and can spend the entire token budget
-    # in it without ever emitting an answer. The reference implementation passes
-    # False, and so do we: the prompt already asks for a bounded <strategy>
-    # block, and two layers of reasoning is what exhausts the budget. Ignored by
-    # templates that do not accept the argument.
-    enable_thinking: bool = False
+    # Native <think> reasoning. ON: the reasoning is worth having, and it is
+    # what the model is actually good at. The budget is controlled by
+    # generation.think_budget instead of by switching thinking off, and the
+    # prompt asks for no second reasoning block -- having both a native <think>
+    # AND a <strategy> section is what produced two of everything.
+    # Set False to suppress it entirely (force_no_think then makes that stick).
+    enable_thinking: bool = True
     # apply_chat_template forwards unknown kwargs into the Jinja context instead
     # of raising, so enable_thinking=False is silently ignored by any template
     # that does not reference it -- and the model opens <think> anyway. When
@@ -135,13 +135,15 @@ class GenerationConfig:
     # one call. On OOM the batch is halved and retried, so this is a hint.
     batch_size: int = 0
     # --- thinking budget -------------------------------------------------
-    # A reasoning model will happily spend the entire budget inside its think
-    # block and never emit an answer, which scores zero however good the
-    # reasoning was. With think_budget > 0 generation runs in two phases:
-    # think for at most this many tokens, then force the block closed and spend
-    # what is left writing the answer. Reasoning is capped, not removed.
-    # 0 disables it. A good starting point is ~60% of max_new_tokens.
-    think_budget: int = 0
+    # How much of the budget may be spent inside <think>. Generation runs in
+    # two phases: reason for at most this much, then force the block closed and
+    # spend the rest writing the answer. Reasoning is capped, not removed --
+    # uncapped, a reasoning model reliably spends everything on thinking and
+    # emits no program at all.
+    #   < 1  a fraction of max_new_tokens (0.6 = 60%)
+    #   >= 1 an absolute token count
+    #   0    uncapped
+    think_budget: float = 0.6
     think_close_tag: str = "</think>"
     # Stop a sequence as soon as it has produced a complete ```python block.
     # Without it a model that finishes the program keeps going -- reopening
@@ -149,6 +151,13 @@ class GenerationConfig:
     # budget. Costs one decode per check, hence stop_check_every.
     stop_on_code_block: bool = True
     stop_check_every: int = 16
+    # End the thinking phase as soon as a code fence appears inside <think>.
+    # Drafting a full program in the reasoning and then rewriting it is the
+    # single biggest waste of budget: it doubles the output and the draft is
+    # thrown away. Asking the model not to do it works only sometimes; this
+    # makes it structural -- start writing code and the block closes, so the
+    # program you are writing becomes the real one.
+    close_think_on_code: bool = True
     # Injected when the budget runs out, to hand the model a running start on
     # the answer rather than dropping it at the closing tag.
     think_force_text: str = (
@@ -319,7 +328,7 @@ _CLI_SPEC: List[Tuple[str, str, Any, str]] = [
     ("--num-gpus",          "generation.num_gpus",     int,      "generation workers (1 = in-process)"),
     ("--gpu-ids",           "generation.gpu_ids",      str,      "e.g. '6,7'"),
     ("--gen-batch-size",    "generation.batch_size",   int,      "rollouts per generate() call; 0 = all of B_t"),
-    ("--think-budget",      "generation.think_budget", int,      "cap tokens spent inside <think>; 0 = uncapped"),
+    ("--think-budget",      "generation.think_budget", float,    "<1 = fraction of max_new_tokens, >=1 = tokens, 0 = uncapped"),
     ("--enable-thinking",   "model.enable_thinking",   _optbool, "Qwen-style native <think> mode"),
     ("--stop-on-code",      "generation.stop_on_code_block", _optbool, "stop once a complete ```python block exists"),
     # -- D-PUCT (§2.1) --

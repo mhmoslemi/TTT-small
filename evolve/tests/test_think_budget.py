@@ -93,16 +93,30 @@ def test_eos_is_detectable_even_when_pad_equals_eos():
     assert filtered == [11, 12, 2]
 
 def test_budget_is_skipped_when_it_would_not_bind():
-    """think_budget >= max_new_tokens leaves nothing for the answer, so the
+    """A budget >= max_new_tokens leaves nothing for the answer, so the
     two-phase path must not engage."""
-    cfg = Config().generation
-    cfg.max_new_tokens, cfg.think_budget = 100, 100
-    assert not (0 < cfg.think_budget < cfg.max_new_tokens)
-    cfg.think_budget = 60
-    assert 0 < cfg.think_budget < cfg.max_new_tokens
+    from llm.backbone import resolve_think_budget
+    assert not (0 < resolve_think_budget(100, 100) < 100)
+    assert 0 < resolve_think_budget(60, 100) < 100
 
-def test_budget_defaults_to_off():
-    assert Config().generation.think_budget == 0
+def test_thinking_is_on_by_default_but_bounded():
+    """The reasoning is worth keeping; only its share of the budget is capped."""
+    cfg = Config()
+    assert cfg.model.enable_thinking is True
+    assert 0 < cfg.generation.think_budget < 1
+
+def test_a_fraction_resolves_against_max_new_tokens():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(0.6, 8000) == 4800
+    assert resolve_think_budget(0.25, 4000) == 1000
+
+def test_a_value_of_one_or_more_is_an_absolute_token_count():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(1500, 8000) == 1500
+
+def test_zero_means_uncapped():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(0, 8000) == 0
 
 def test_budget_flows_from_config_to_the_generator(tmp_path):
     """The knob has to reach sample_batch, not sit unread in the config."""
@@ -122,3 +136,37 @@ def test_budget_flows_from_config_to_the_generator(tmp_path):
         [(0, [{"role": "user", "content": "hi"}], 2)])
     assert seen["think_budget"] == 60
     assert seen["think_close_tag"] == "</think>"
+
+
+# ---------------- no full draft program inside the reasoning ----------------
+def test_draft_guard_is_on_by_default():
+    """Writing a program in <think> and then rewriting it doubles the output
+    and throws the first away -- the single biggest waste of budget."""
+    assert Config().generation.close_think_on_code is True
+
+def test_draft_guard_reaches_the_backbone():
+    from llm.generation import InProcessGenerator
+
+    seen = {}
+
+    class Spy:
+        def render(self, m): return m[0]["content"]
+        def sample_batch(self, texts, **kw):
+            seen.update(kw)
+            return [("x", [1]) for _ in texts]
+
+    cfg = Config().generation
+    InProcessGenerator(Spy(), cfg, progress=False).generate(
+        [(0, [{"role": "user", "content": "hi"}], 1)])
+    assert seen["close_think_on_code"] is True
+
+
+def test_the_prompt_no_longer_asks_for_a_second_reasoning_block():
+    """A native <think> AND a <strategy> section is two of everything."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "<strategy>" not in text
+    assert "Do NOT draft the program in your reasoning" in text
+    assert "exactly one" in text

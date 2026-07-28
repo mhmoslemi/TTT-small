@@ -37,6 +37,7 @@ class _HonouringTok(_Tok):
 
 def _backbone(tok, **over):
     cfg = Config().model
+    cfg.enable_thinking = False      # these tests are about suppressing it
     for k, v in over.items():
         setattr(cfg, k, v)
 
