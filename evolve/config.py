@@ -129,9 +129,16 @@ class SearchConfig:
     # so c does not transfer across problems. Rescaling W_m by the archive
     # spread makes c problem-independent. Set false for the literal Eq. 6.
     normalize_exploitation: bool = True
-    # Selection descends from a chosen internal child until it reaches a leaf
-    # or a virtual action (the paper defines only those two outcomes).
-    descend_internal_nodes: bool = True
+    # "node": one generation target per node -- a leaf expands into k children,
+    #   a node that already has children offers its virtual action for 1 child.
+    #   This is the literal "select top-n nodes by Eq. 6", and an internal node
+    #   is never itself a target, which removes the paper's undefined case.
+    # "action_descend": score (parent, action) pairs and walk down through a
+    #   chosen internal child until reaching a leaf or a virtual action.
+    selection_mode: str = "node"          # node | action_descend
+    # V(p, s-hat) for the virtual action. The paper leaves it undefined and says
+    # the score is "driven by the prior and the exploration bonus" -> zero.
+    virtual_value_mode: str = "zero"      # zero | parent_mean
     max_archive_size: int = 1000          # cap on |D|; 0 = unbounded
     num_seed_nodes: int = 1               # root(s) at step 0
 
@@ -146,9 +153,13 @@ class EloConfig:
     # The paper writes 10^(E_j - E_i), i.e. scale = 1.0. Classic Elo is 400.0.
     # Kept configurable because it changes K's meaning by ~400x.
     scale: float = 400.0
-    pairing_mode: str = "round_robin"     # round_robin | random | top_k
+    # round_robin: every pair among the candidates
+    # random:      up to num_matches distinct pairs
+    # neighbors:   sort candidates by W_m and compare adjacent pairs (k-1 matches)
+    pairing_mode: str = "round_robin"
     num_matches: int = 60                 # cap for pairing_mode=random
     candidate_top_k: int = 16             # only rate the top-k nodes of D
+    rounds_per_step: int = 1              # repeat the pairing schedule this often
     allow_ties: bool = True
     judge_max_tokens: int = 1024
     judge_temperature: float = 0.7
@@ -183,9 +194,17 @@ class RLConfig:
     grad_clip: float = 1.0
     updates_per_step: int = 1             # paper: one update per evolution step
     microbatch_size: int = 1
-    # Eq. 9 needs a second forward pass per failed rollout. Disable to train on
-    # the group-relative reward signal alone.
+    # Eq. 9 needs two extra forward passes per failed rollout. Disable to train
+    # on the group-relative reward signal alone.
     use_feedback_signal: bool = True
+    # Guard rail, not part of the paper: A_fb is a log-prob difference and is
+    # unbounded below, so one token the feedback-conditioned teacher considers
+    # near-impossible can dominate the batch. 0 disables the clamp.
+    advantage_clip: float = 10.0
+    # Skip the update when every response in the batch scored identically --
+    # Eq. 8 yields all-zero advantages there, so the step would be a no-op that
+    # still costs a full backward pass.
+    skip_degenerate_batches: bool = True
 
 
 @dataclass
