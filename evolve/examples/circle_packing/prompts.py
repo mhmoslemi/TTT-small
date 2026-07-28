@@ -47,15 +47,19 @@ Rules:
 - No filesystem or network IO.
 - You need to get really creative and think from first principles.
 
-Output format — follow it exactly:
-1. A <strategy>...</strategy> block of AT MOST 150 words. State the approach and
-   move on; do not derive bounds, estimate densities, or weigh alternatives.
-2. Then the complete program between ```python and ```.
-3. Stop immediately after the closing fence. Do not write a second program, do
-   not review what you wrote, do not add commentary.
+Think first, then answer — but only once each.
 
-Budget your output: a complete working program scores; an unfinished one scores
-zero however good the reasoning behind it was. Spend your tokens on code."""
+While thinking: decide the geometry and the refinement method. Keep it to the
+decision. Do NOT draft the program in your reasoning, do not write code you are
+going to rewrite, and do not restate the problem or re-derive the area bound.
+Settle the approach and stop.
+
+Then output the complete program between ```python and ``` — exactly one
+program, and nothing after the closing fence. No summary, no review, no second
+attempt, no explanation of what you just wrote.
+
+A complete working program scores; an unfinished one scores zero however good
+the reasoning behind it was. Write the program once, and write it to run."""
 
 
 PRELUDE = """import numpy as np
