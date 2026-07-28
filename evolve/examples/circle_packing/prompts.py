@@ -25,6 +25,18 @@ INSTRUCTION = """Reason about how you could further improve this packing. Consid
 - Are there gaps that could be filled with repositioned or resized circles?
 - Could optimization parameters or methods be improved?
 
+HARD TIME LIMIT: {entrypoint}() is killed after {timeout:.0f} seconds and scores
+ZERO. This is the constraint that most often costs points. Budget for it:
+- A global optimizer over all 3n variables (differential_evolution, basinhopping,
+  dual_annealing) will NOT finish in time at n={n}. Do not use one.
+- A rejection-sampling objective that returns a large constant for any invalid
+  configuration gives the optimizer nothing to descend and wastes the budget.
+- What fits: a constructive layout, then a bounded local refinement -- a fixed
+  iteration count of SLSQP, or a few thousand hill-climbing steps. Vectorize the
+  pairwise distances with numpy; a Python double loop over pairs is too slow to
+  iterate usefully.
+- Leave margin. Aim to return in well under {timeout:.0f}s.
+
 Rules:
 - You must define the {entrypoint} function: def {entrypoint}() -> tuple[np.ndarray, np.ndarray, float]
 - Returns (centers, radii, sum_radii) where centers has shape ({n}, 2) and radii has shape ({n},).

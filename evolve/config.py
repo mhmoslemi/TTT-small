@@ -106,6 +106,14 @@ class ModelConfig:
     # block, and two layers of reasoning is what exhausts the budget. Ignored by
     # templates that do not accept the argument.
     enable_thinking: bool = False
+    # apply_chat_template forwards unknown kwargs into the Jinja context instead
+    # of raising, so enable_thinking=False is silently ignored by any template
+    # that does not reference it -- and the model opens <think> anyway. When
+    # this is set, the rendered prompt is checked and, if the template did not
+    # already close a think block, one is prefilled so generation starts outside
+    # it. Independent of template support.
+    force_no_think: bool = True
+    no_think_prefill: str = "<think>\n\n</think>\n\n"
     target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
