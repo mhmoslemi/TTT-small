@@ -145,19 +145,12 @@ class GenerationConfig:
     #   0    uncapped
     think_budget: float = 0.6
     think_close_tag: str = "</think>"
-    # Stop a sequence as soon as it has produced a complete ```python block.
-    # Without it a model that finishes the program keeps going -- reopening
-    # <strategy>, writing a second worse program, and burning the rest of the
-    # budget. Costs one decode per check, hence stop_check_every.
+    # Stop a sequence once it has produced a complete ```python block, so the
+    # remaining budget is not spent writing a second program after the answer.
+    # Reasoning is unaffected: a fence inside an unclosed <think> does not
+    # count. Costs one decode per check, hence stop_check_every.
     stop_on_code_block: bool = True
     stop_check_every: int = 16
-    # End the thinking phase as soon as a code fence appears inside <think>.
-    # Drafting a full program in the reasoning and then rewriting it is the
-    # single biggest waste of budget: it doubles the output and the draft is
-    # thrown away. Asking the model not to do it works only sometimes; this
-    # makes it structural -- start writing code and the block closes, so the
-    # program you are writing becomes the real one.
-    close_think_on_code: bool = True
     # Injected when the budget runs out, to hand the model a running start on
     # the answer rather than dropping it at the closing tag.
     think_force_text: str = (

@@ -97,15 +97,11 @@ def _example(timeout=100.0):
     return build(cfg)
 
 
-def test_instruction_states_the_real_timeout():
-    assert "100 seconds" in _example(100.0).instruction()
-    assert "45 seconds" in _example(45.0).instruction()
-
-def test_instruction_warns_off_global_optimizers():
-    """The observed failure: differential_evolution over 78 dims, killed at 100s."""
-    text = _example().instruction()
-    assert "differential_evolution" in text
-    assert "will NOT finish in time" in text
+def test_the_prompt_says_nothing_about_the_timeout():
+    """Kept out of the prompt to stay faithful to the reference wording. The
+    guidance lives in the verifier FEEDBACK instead, where it only appears
+    once a timeout has actually happened."""
+    assert "seconds" not in _example(100.0).instruction()
 
 def test_timeout_feedback_says_what_to_do_differently():
     example = _example(timeout=2.0)          # must actually exceed the limit
