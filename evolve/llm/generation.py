@@ -129,7 +129,6 @@ class InProcessGenerator:
                                          "\n</think>\n\n"),
                 stop_on_code=getattr(self.cfg, "stop_on_code_block", True),
                 stop_check_every=getattr(self.cfg, "stop_check_every", 16),
-                close_think_on_code=getattr(self.cfg, "close_think_on_code", True),
             )
         except Exception as e:
             if not _is_oom(e) or len(texts) == 1:

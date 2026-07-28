@@ -148,49 +148,6 @@ class Backbone:
 
         return _Tick()
 
-    def _draft_in_think_criteria(self, prompt_len: int, check_every: int):
-        """
-        End the thinking phase the moment a code fence appears inside <think>.
-
-        A reasoning model will otherwise write a full program in its reasoning,
-        reject it, and write another one after -- doubling the output and
-        throwing the first away. The instruction not to do it holds only
-        sometimes; this makes it structural. Once the block closes, the program
-        being written IS the answer, so nothing is wasted.
-        """
-        import torch
-        from transformers import StoppingCriteria
-
-        tokenizer = self.tokenizer
-
-        class _StopOnDraft(StoppingCriteria):
-            def __init__(self):
-                self.step = 0
-                self.done = None
-
-            def __call__(self, input_ids, scores, **kwargs):
-                rows = input_ids.shape[0]
-                if self.done is None:
-                    self.done = torch.zeros(rows, dtype=torch.bool,
-                                            device=input_ids.device)
-                self.step += 1
-                if self.step % max(1, check_every):
-                    return self.done
-                for row in range(rows):
-                    if self.done[row]:
-                        continue
-                    text = tokenizer.decode(input_ids[row, prompt_len:],
-                                            skip_special_tokens=False)
-                    # Only while still reasoning: a fence after </think> is the
-                    # real answer being written, which must not be cut off.
-                    if "</think>" in text:
-                        self.done[row] = True      # nothing left to guard
-                    elif "```" in text:
-                        self.done[row] = True
-                return self.done
-
-        return _StopOnDraft()
-
     def _code_block_criteria(self, prompt_len: int, check_every: int):
         """
         Stop a sequence once it has emitted a complete ```python block.
@@ -263,8 +220,7 @@ class Backbone:
 
     def _generate_budgeted(self, prompt_texts, max_new_tokens, temperature,
                            top_p, think_budget, close_tag, force_text, on_step,
-                           stop_on_code=False, stop_check_every=16,
-                           close_think_on_code=True):
+                           stop_on_code=False, stop_check_every=16):
         """
         Budget forcing: think for at most `think_budget` tokens, then close the
         block and spend the rest of the budget answering.
@@ -287,16 +243,10 @@ class Backbone:
         ids, mask = self._encode_left_padded(prompt_rows)
         input_len = ids.shape[1]
 
-        # Phase 1 is the thinking phase: guard against drafting a program in
-        # it, rather than against finishing one.
+        # Phase 1 is the thinking phase; reasoning is free-form, so nothing
+        # guards its contents. Only the token budget bounds it.
         extra = self._stopping_criteria(on_step, input_len, False,
                                         stop_check_every)
-        if close_think_on_code:
-            from transformers import StoppingCriteriaList
-            criteria = list(extra.get("stopping_criteria", []))
-            criteria.append(self._draft_in_think_criteria(input_len,
-                                                          stop_check_every))
-            extra = {"stopping_criteria": StoppingCriteriaList(criteria)}
 
         common = dict(
             do_sample=temperature is not None and temperature > 0,
@@ -356,7 +306,6 @@ class Backbone:
                   think_close_tag: str = "</think>",
                   think_force_text: str = "\n</think>\n\n",
                   stop_on_code: bool = False, stop_check_every: int = 16,
-                  close_think_on_code: bool = True,
                   ) -> List[List[Tuple[str, List[int]]]]:
         import torch
 
@@ -367,8 +316,7 @@ class Backbone:
             return self._generate_budgeted(
                 prompt_texts, max_new_tokens, temperature, top_p, budget,
                 think_close_tag, think_force_text, on_step,
-                stop_on_code=stop_on_code, stop_check_every=stop_check_every,
-                close_think_on_code=close_think_on_code)
+                stop_on_code=stop_on_code, stop_check_every=stop_check_every)
 
         tok = self.tokenizer
         self.set_inference_mode()
@@ -422,7 +370,6 @@ class Backbone:
                      think_budget: int = 0, think_close_tag: str = "</think>",
                      think_force_text: str = "\n</think>\n\n",
                      stop_on_code: bool = False, stop_check_every: int = 16,
-                     close_think_on_code: bool = True,
                      ) -> List[Tuple[str, List[int]]]:
         """
         One sample per prompt, all in a single generate() call.
@@ -437,8 +384,7 @@ class Backbone:
                                  think_close_tag=think_close_tag,
                                  think_force_text=think_force_text,
                                  stop_on_code=stop_on_code,
-                                 stop_check_every=stop_check_every,
-                                 close_think_on_code=close_think_on_code)
+                                 stop_check_every=stop_check_every)
         return [g[0] if g else ("", []) for g in grouped]
 
     def chat(self, messages: Sequence[dict], max_new_tokens: int = 1024,

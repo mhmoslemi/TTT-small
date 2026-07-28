@@ -138,35 +138,35 @@ def test_budget_flows_from_config_to_the_generator(tmp_path):
     assert seen["think_close_tag"] == "</think>"
 
 
-# ---------------- no full draft program inside the reasoning ----------------
-def test_draft_guard_is_on_by_default():
-    """Writing a program in <think> and then rewriting it doubles the output
-    and throws the first away -- the single biggest waste of budget."""
-    assert Config().generation.close_think_on_code is True
+# ---------------- the prompt follows TTT-Discover ----------------
+def test_prompt_matches_the_reference_wording():
+    """Kept verbatim so results stay comparable with the reference runs."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "Reason about how you could further improve this packing" in text
+    assert "You need to get really creative and think from first principles" in text
+    assert "Make sure to think step by step" in text
 
-def test_draft_guard_reaches_the_backbone():
-    from llm.generation import InProcessGenerator
-
-    seen = {}
-
-    class Spy:
-        def render(self, m): return m[0]["content"]
-        def sample_batch(self, texts, **kw):
-            seen.update(kw)
-            return [("x", [1]) for _ in texts]
-
-    cfg = Config().generation
-    InProcessGenerator(Spy(), cfg, progress=False).generate(
-        [(0, [{"role": "user", "content": "hi"}], 1)])
-    assert seen["close_think_on_code"] is True
-
-
-def test_the_prompt_no_longer_asks_for_a_second_reasoning_block():
-    """A native <think> AND a <strategy> section is two of everything."""
+def test_the_strategy_block_is_gone():
+    """Native <think> is on, so <strategy> was a second pass over the same
+    ground -- in the reference it WAS the reasoning, because thinking was off."""
     from examples.circle_packing.env import build
     cfg = Config()
     cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
     text = build(cfg).instruction()
     assert "<strategy>" not in text
-    assert "Do NOT draft the program in your reasoning" in text
-    assert "exactly one" in text
+    assert "/think" not in text          # Qwen soft switch, no longer needed
+
+def test_the_prompt_does_not_constrain_what_goes_in_the_reasoning():
+    """Thinking is free-form; only the token budget bounds it."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "Do NOT draft" not in text
+    assert "HARD TIME LIMIT" not in text
+
+def test_no_draft_enforcement_remains():
+    assert not hasattr(Config().generation, "close_think_on_code")
