@@ -98,6 +98,25 @@ class MockBackbone:
             out.append((text, [self.rng.randrange(1000) for _ in range(12)]))
         return out
 
+    def sample_batch(self, prompt_texts, max_new_tokens: int = 0,
+                     temperature: float = 1.0, top_p: float = 1.0, on_step=None
+                     ) -> List[Tuple[str, List[int]]]:
+        self.calls["sample_batch"] = self.calls.get("sample_batch", 0) + 1
+        if on_step is not None:
+            for _ in range(min(int(max_new_tokens or 0), 8)):
+                on_step()
+
+        out = []
+        for prompt in prompt_texts:
+            match = re.search(r"pack (\d+) circles", prompt)
+            n = match.group(1) if match else "1"
+            if self.responses:
+                text = self.responses[self.rng.randrange(len(self.responses))]
+            else:
+                text = self._canned_program().replace("N_CIRCLES", n)
+            out.append((text, [self.rng.randrange(1000) for _ in range(12)]))
+        return out
+
     def chat_batch(self, batch, max_new_tokens: int = 1024,
                    temperature: float = 0.7, top_p: float = 1.0,
                    batch_size: int = 4) -> List[str]:

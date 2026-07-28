@@ -144,6 +144,20 @@ class Backbone:
         return self._generate([self.render(messages)], k, max_new_tokens,
                               temperature, top_p, on_step=on_step)[0]
 
+    def sample_batch(self, prompt_texts: Sequence[str], max_new_tokens: int,
+                     temperature: float, top_p: float, on_step=None,
+                     ) -> List[Tuple[str, List[int]]]:
+        """
+        One sample per prompt, all in a single generate() call.
+
+        Lets a whole step's rollouts share one call even though targets ask for
+        different counts: the caller repeats a prompt `count` times rather than
+        using num_return_sequences, which can only apply one count to the batch.
+        """
+        grouped = self._generate(list(prompt_texts), 1, max_new_tokens,
+                                 temperature, top_p, on_step=on_step)
+        return [g[0] if g else ("", []) for g in grouped]
+
     def chat(self, messages: Sequence[dict], max_new_tokens: int = 1024,
              temperature: float = 0.7, top_p: float = 1.0) -> str:
         return self.chat_batch([messages], max_new_tokens, temperature, top_p)[0]
