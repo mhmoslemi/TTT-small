@@ -107,10 +107,16 @@ class TestTimeTrainer:
             return stats
 
         # ---- per-rollout tensors -------------------------------------
+        from runio.progress import make_bar
+
         self.backbone.set_training_mode()
         device = self.backbone.device
         prepared = []
         total_tokens = 0
+
+        show = getattr(self.cfg.run, "progress", True)
+        prep_bar = make_bar(len(usable), "rl: score rollouts", unit="rollout",
+                            enabled=show)
 
         for i, (rollout, verdict) in enumerate(usable):
             response_ids = list(rollout.token_ids)
@@ -146,6 +152,8 @@ class TestTimeTrainer:
                 "logp_ref": logp_ref,
             })
             total_tokens += len(response_ids)
+            prep_bar.update(1)
+        prep_bar.close()
 
         if total_tokens == 0:
             stats["reason"] = "no response tokens"
@@ -156,9 +164,11 @@ class TestTimeTrainer:
         micro = max(1, int(self.rl.microbatch_size))
         policy_sum = kl_total = 0.0
 
-        for _ in range(max(1, int(self.rl.updates_per_step))):
+        for update in range(max(1, int(self.rl.updates_per_step))):
             optimizer.zero_grad(set_to_none=True)
             policy_sum = kl_total = 0.0
+            step_bar = make_bar(len(prepared), f"rl: backward {update + 1}",
+                                unit="rollout", enabled=show)
 
             for start in range(0, len(prepared), micro):
                 for item in prepared[start:start + micro]:
@@ -174,6 +184,8 @@ class TestTimeTrainer:
                     loss.backward()
                     policy_sum += parts["policy_loss_sum"]
                     kl_total += parts["kl_sum"]
+                    step_bar.update(1)
+            step_bar.close()
 
             if self.rl.grad_clip:
                 torch.nn.utils.clip_grad_norm_(

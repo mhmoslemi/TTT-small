@@ -78,9 +78,13 @@ class MockBackbone:
         )
 
     def sample_group(self, messages, k: int, max_new_tokens: int = 0,
-                     temperature: float = 1.0, top_p: float = 1.0
+                     temperature: float = 1.0, top_p: float = 1.0, on_step=None
                      ) -> List[Tuple[str, List[int]]]:
         self.calls["sample_group"] += 1
+        if on_step is not None:
+            # Pretend to decode, so the progress path is exercised in tests.
+            for _ in range(min(int(max_new_tokens or 0), 8)):
+                on_step()
         prompt = self.render(messages)
         match = re.search(r"pack (\d+) circles", prompt)
         n = match.group(1) if match else "1"

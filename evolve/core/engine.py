@@ -93,7 +93,8 @@ class Engine:
     def _build_generator(self):
         from llm.generation import InProcessGenerator, build_generator
         if (self.cfg.model.backend or "").lower() == "mock":
-            return InProcessGenerator(self.backbone, self.cfg.generation)
+            return InProcessGenerator(self.backbone, self.cfg.generation,
+                                      progress=self.cfg.run.progress)
         return build_generator(self.cfg, self.backbone)
 
     # ------------------------------------------------------------------
@@ -157,6 +158,13 @@ class Engine:
         if not targets:
             return {"step": step, "error": "no expandable targets"}
 
+        if self.cfg.run.progress:
+            planned = sum(t.num_children for t in targets)
+            leaves = sum(1 for t in targets if t.kind == LEAF_EXPAND)
+            print(f"[step {step:02d}] {len(targets)} targets "
+                  f"({leaves} leaf / {len(targets) - leaves} virtual) "
+                  f"-> B_t = {planned} rollouts", flush=True)
+
         # ---- build the prompts of Fig. 1 -----------------------------
         jobs = []
         prompts = {}
@@ -188,17 +196,35 @@ class Engine:
                 ))
 
         # ---- verify --------------------------------------------------
+        # Serial subprocesses, each up to verifier.timeout_s, so this is the
+        # second place a step can sit silent for a long time.
+        from runio.progress import make_bar
+
         results = []
-        for rollout in rollouts:
-            parent = self.tree.get(rollout.parent_id)
-            try:
-                results.append(self.example.verify(rollout.response_text, parent))
-            except Exception as e:
-                from core.types import VerifyResult
-                results.append(VerifyResult(
-                    reward=self.cfg.verifier.fail_reward, valid=False,
-                    msg=f"verifier_crashed: {e}",
-                    feedback=f"The verifier itself raised:\n{traceback.format_exc()}"))
+        bar = make_bar(len(rollouts), "verify", unit="rollout",
+                       enabled=self.cfg.run.progress)
+        num_valid = 0
+        try:
+            for rollout in rollouts:
+                parent = self.tree.get(rollout.parent_id)
+                try:
+                    result = self.example.verify(rollout.response_text, parent)
+                except Exception as e:
+                    from core.types import VerifyResult
+                    result = VerifyResult(
+                        reward=self.cfg.verifier.fail_reward, valid=False,
+                        msg=f"verifier_crashed: {e}",
+                        feedback=f"The verifier itself raised:\n{traceback.format_exc()}")
+                results.append(result)
+                num_valid += bool(result.valid)
+                best_so_far = max((r.reward for r in results), default=0.0)
+                # Postfix before update: update() is what draws, and a throttled
+                # redraw would otherwise pair the new count with stale text.
+                bar.set_postfix_str(
+                    f"valid={num_valid}/{len(results)} best={best_so_far:.4f}")
+                bar.update(1)
+        finally:
+            bar.close()
 
         # ---- insert into the tree ------------------------------------
         for idx, (rollout, result) in enumerate(zip(rollouts, results)):
@@ -223,7 +249,13 @@ class Engine:
         self.tree.prune()
 
         # ---- memory (Sec. 2.2) ---------------------------------------
-        memory_stats = self.update_memory(results, step)
+        from runio.progress import PhaseTimer
+        show = self.cfg.run.progress
+        if self.memory is not None:
+            with PhaseTimer("extract lessons", show):
+                memory_stats = self.update_memory(results, step)
+        else:
+            memory_stats = self.update_memory(results, step)
 
         # ---- test-time RL (Sec. 2.3) ---------------------------------
         rl_stats = {"updated": False, "reason": "rl disabled"}
