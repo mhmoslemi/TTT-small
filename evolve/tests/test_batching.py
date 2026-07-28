@@ -16,7 +16,7 @@ class RecordingBackbone:
         return messages if isinstance(messages, str) else messages[0]["content"]
 
     def sample_batch(self, prompt_texts, max_new_tokens=0, temperature=1.0,
-                     top_p=1.0, on_step=None):
+                     top_p=1.0, on_step=None, **kwargs):
         texts = list(prompt_texts)
         if self.fail_above is not None and len(texts) > self.fail_above:
             raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")

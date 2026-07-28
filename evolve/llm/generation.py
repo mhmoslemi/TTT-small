@@ -123,6 +123,10 @@ class InProcessGenerator:
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
                 on_step=lambda: bar.update(1),
+                think_budget=getattr(self.cfg, "think_budget", 0),
+                think_close_tag=getattr(self.cfg, "think_close_tag", "</think>"),
+                think_force_text=getattr(self.cfg, "think_force_text",
+                                         "\n</think>\n\n"),
             )
         except Exception as e:
             if not _is_oom(e) or len(texts) == 1:

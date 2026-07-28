@@ -89,10 +89,116 @@ class Backbone:
 
         return _Tick()
 
+    def _encode_left_padded(self, texts: Sequence[List[int]]):
+        """Left-pad ragged token-id rows into a batch, with an attention mask."""
+        import torch
+
+        pad_id = self.tokenizer.pad_token_id
+        width = max(len(row) for row in texts)
+        ids, mask = [], []
+        for row in texts:
+            padding = width - len(row)
+            ids.append([pad_id] * padding + list(row))
+            mask.append([0] * padding + [1] * len(row))
+        device = self.model.device
+        return (torch.tensor(ids, device=device),
+                torch.tensor(mask, device=device))
+
+    def _generate_budgeted(self, prompt_texts, max_new_tokens, temperature,
+                           top_p, think_budget, close_tag, force_text, on_step):
+        """
+        Budget forcing: think for at most `think_budget` tokens, then close the
+        block and spend the rest of the budget answering.
+
+        A reasoning model left uncapped will spend the whole allowance inside
+        <think> and emit no answer at all, which scores zero no matter how good
+        the reasoning was. Phase 1 lets it reason; phase 2 injects the closing
+        tag for whichever sequences are still thinking and lets every unfinished
+        sequence continue. Sequences that closed the block on their own are
+        continued untouched, so nothing is truncated that would have finished.
+        """
+        import torch
+
+        tok = self.tokenizer
+        self.set_inference_mode()
+
+        prompt_rows = [tok(text=t, add_special_tokens=False,
+                           truncation=True, max_length=self.cfg.max_seq_length
+                           )["input_ids"] for t in prompt_texts]
+        ids, mask = self._encode_left_padded(prompt_rows)
+        input_len = ids.shape[1]
+
+        extra = {}
+        if on_step is not None:
+            from transformers import StoppingCriteriaList
+            extra["stopping_criteria"] = StoppingCriteriaList(
+                [self._tick_criteria(on_step)])
+
+        common = dict(
+            do_sample=temperature is not None and temperature > 0,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            num_return_sequences=1,
+            pad_token_id=tok.pad_token_id,
+        )
+
+        with torch.no_grad():
+            phase1 = self.model.generate(
+                input_ids=ids, attention_mask=mask,
+                max_new_tokens=int(think_budget), **common, **extra)
+
+        eos_id = tok.eos_token_id
+        close_ids = tok(text=force_text, add_special_tokens=False)["input_ids"]
+
+        produced, pending = [], []
+        for row in range(phase1.shape[0]):
+            raw = [int(t) for t in phase1[row, input_len:]]
+            # pad_token is normally set to eos_token, so completion has to be
+            # decided from the raw row -- filtering pads would delete the EOS
+            # that proves the sequence finished on its own.
+            finished = eos_id is not None and eos_id in raw
+            # </think> is an added token on some checkpoints; skipping specials
+            # would hide it and make every sequence look like it is still
+            # thinking, injecting a second closing tag into a closed block.
+            closed = close_tag in tok.decode(raw, skip_special_tokens=False)
+
+            new_ids = [t for t in raw if t != tok.pad_token_id]
+            injected = [] if (closed or finished) else list(close_ids)
+            produced.append(new_ids + injected)
+            if not finished:
+                pending.append(row)
+
+        remaining = int(max_new_tokens) - int(think_budget)
+        if pending and remaining > 0:
+            rows = [list(prompt_rows[r]) + produced[r] for r in pending]
+            ids2, mask2 = self._encode_left_padded(rows)
+            with torch.no_grad():
+                phase2 = self.model.generate(
+                    input_ids=ids2, attention_mask=mask2,
+                    max_new_tokens=remaining, **common, **extra)
+            for offset, row in enumerate(pending):
+                tail = [int(t) for t in phase2[offset, ids2.shape[1]:]
+                        if int(t) != tok.pad_token_id]
+                produced[row] = produced[row] + tail
+
+        return [[(tok.decode(ids_, skip_special_tokens=True), ids_)]
+                for ids_ in produced]
+
     def _generate(self, prompt_texts: Sequence[str], num_return_sequences: int,
                   max_new_tokens: int, temperature: float, top_p: float,
-                  on_step=None) -> List[List[Tuple[str, List[int]]]]:
+                  on_step=None, think_budget: int = 0,
+                  think_close_tag: str = "</think>",
+                  think_force_text: str = "\n</think>\n\n",
+                  ) -> List[List[Tuple[str, List[int]]]]:
         import torch
+
+        # Budget forcing only applies one sample per prompt; with
+        # num_return_sequences > 1 the rows do not map back 1:1 to prompts.
+        budget = int(think_budget or 0)
+        if 0 < budget < int(max_new_tokens) and int(num_return_sequences) == 1:
+            return self._generate_budgeted(
+                prompt_texts, max_new_tokens, temperature, top_p, budget,
+                think_close_tag, think_force_text, on_step)
 
         tok = self.tokenizer
         self.set_inference_mode()
@@ -146,6 +252,8 @@ class Backbone:
 
     def sample_batch(self, prompt_texts: Sequence[str], max_new_tokens: int,
                      temperature: float, top_p: float, on_step=None,
+                     think_budget: int = 0, think_close_tag: str = "</think>",
+                     think_force_text: str = "\n</think>\n\n",
                      ) -> List[Tuple[str, List[int]]]:
         """
         One sample per prompt, all in a single generate() call.
@@ -155,7 +263,10 @@ class Backbone:
         using num_return_sequences, which can only apply one count to the batch.
         """
         grouped = self._generate(list(prompt_texts), 1, max_new_tokens,
-                                 temperature, top_p, on_step=on_step)
+                                 temperature, top_p, on_step=on_step,
+                                 think_budget=think_budget,
+                                 think_close_tag=think_close_tag,
+                                 think_force_text=think_force_text)
         return [g[0] if g else ("", []) for g in grouped]
 
     def chat(self, messages: Sequence[dict], max_new_tokens: int = 1024,
