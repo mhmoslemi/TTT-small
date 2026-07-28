@@ -226,6 +226,10 @@ class RunConfig:
     save_rollouts: bool = True
     print_responses: int = 0              # how many rollouts to echo per step
     resume_from: str = ""
+    # Per-phase progress bars. A step is otherwise silent through one blocking
+    # generate() per target and a serial loop of sandbox subprocesses, which
+    # looks identical to being hung.
+    progress: bool = True
 
 
 @dataclass
@@ -309,6 +313,7 @@ _CLI_SPEC: List[Tuple[str, str, Any, str]] = [
     ("--output-root",       "run.output_root",         str,      "root directory for runs/"),
     ("--run-name",          "run.run_name",            str,      "explicit run directory name"),
     ("--print-responses",   "run.print_responses",     int,      "rollouts to echo per step"),
+    ("--progress",          "run.progress",            _optbool, "per-phase progress bars"),
     ("--resume-from",       "run.resume_from",         str,      "run directory to resume"),
 ]
 

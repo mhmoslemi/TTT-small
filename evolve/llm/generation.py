@@ -52,21 +52,39 @@ def split_jobs(jobs: Sequence[Job], num_workers: int) -> List[List[Job]]:
 class InProcessGenerator:
     name = "in_process"
 
-    def __init__(self, backbone, gen_cfg):
+    def __init__(self, backbone, gen_cfg, progress: bool = True):
         self.backbone = backbone
         self.cfg = gen_cfg
+        self.progress = progress
 
     def generate(self, jobs: Sequence[Job], adapter_path: Optional[str] = None
                  ) -> dict:
         """Returns {group_id: [(text, token_ids), ...]}."""
+        from runio.progress import make_bar
+
         out: dict = {}
-        for group_id, messages, count in jobs:
-            samples = self.backbone.sample_group(
-                messages, count,
-                max_new_tokens=self.cfg.max_new_tokens,
-                temperature=self.cfg.temperature,
-                top_p=self.cfg.top_p,
-            )
+        total_samples = sum(count for _, _, count in jobs)
+        done = 0
+
+        for index, (group_id, messages, count) in enumerate(jobs, 1):
+            # One blocking generate() per target. Tick per decoding step, which
+            # is the only visibility into it -- all `count` sequences in the
+            # batch advance together, so steps (not tokens) is the honest unit.
+            bar = make_bar(
+                int(self.cfg.max_new_tokens),
+                f"generate {index}/{len(jobs)} (x{count}, {done}/{total_samples} done)",
+                unit="tok", enabled=self.progress)
+            try:
+                samples = self.backbone.sample_group(
+                    messages, count,
+                    max_new_tokens=self.cfg.max_new_tokens,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    on_step=lambda: bar.update(1),
+                )
+            finally:
+                bar.close()
+            done += count
             out.setdefault(group_id, []).extend(samples)
         return out
 
@@ -148,10 +166,11 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 class PoolGenerator:
     name = "pool"
 
-    def __init__(self, model_cfg, gen_cfg, render_fn=None):
+    def __init__(self, model_cfg, gen_cfg, render_fn=None, progress: bool = True):
         import torch.multiprocessing as mp
 
         self.cfg = gen_cfg
+        self.progress = progress
         # Jobs carry chat messages; workers need flat text. Rendering happens
         # here so every worker sees byte-identical prompts from one tokenizer.
         self.render_fn = render_fn or (lambda m: m if isinstance(m, str) else str(m))
@@ -204,12 +223,22 @@ class PoolGenerator:
             self.task_queues[rank].put(
                 (adapter_path, buckets[rank], gen_kwargs))
 
+        # Workers are separate processes, so the finest granularity available
+        # here is a completed job, not a token.
+        from runio.progress import make_bar
+        bar = make_bar(expected, f"generate on {self.num_workers} GPUs",
+                       unit="rollout", enabled=self.progress)
+
         out: dict = {}
         collected = 0
-        while collected < expected:
-            _, group_id, batch = self.result_queue.get()
-            out.setdefault(group_id, []).extend(batch)
-            collected += len(batch)
+        try:
+            while collected < expected:
+                _, group_id, batch = self.result_queue.get()
+                out.setdefault(group_id, []).extend(batch)
+                collected += len(batch)
+                bar.update(len(batch))
+        finally:
+            bar.close()
         return out
 
     def shutdown(self):
@@ -227,5 +256,7 @@ class PoolGenerator:
 def build_generator(cfg, backbone):
     """cfg is the full Config."""
     if int(cfg.generation.num_gpus) > 1:
-        return PoolGenerator(cfg.model, cfg.generation, render_fn=backbone.render)
-    return InProcessGenerator(backbone, cfg.generation)
+        return PoolGenerator(cfg.model, cfg.generation,
+                             render_fn=backbone.render,
+                             progress=cfg.run.progress)
+    return InProcessGenerator(backbone, cfg.generation, progress=cfg.run.progress)
