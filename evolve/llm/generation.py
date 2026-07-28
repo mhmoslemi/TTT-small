@@ -127,6 +127,8 @@ class InProcessGenerator:
                 think_close_tag=getattr(self.cfg, "think_close_tag", "</think>"),
                 think_force_text=getattr(self.cfg, "think_force_text",
                                          "\n</think>\n\n"),
+                stop_on_code=getattr(self.cfg, "stop_on_code_block", True),
+                stop_check_every=getattr(self.cfg, "stop_check_every", 16),
             )
         except Exception as e:
             if not _is_oom(e) or len(texts) == 1:

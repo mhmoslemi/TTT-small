@@ -17,21 +17,83 @@ from typing import Any, Dict, List, Optional
 from core.types import Node, VerifyResult
 from envs.sandbox import run_code
 
-_CODE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_OPEN_THINK = re.compile(r"<think>", re.IGNORECASE)
+_CLOSE_THINK = re.compile(r"</think>", re.IGNORECASE)
+
+
+def strip_reasoning(response: str) -> Optional[str]:
+    """
+    Remove <think>...</think> so only the answer is considered.
+
+    Returns None when a block was opened and never closed: the model was still
+    reasoning when it ran out of budget, and any fenced code inside a think
+    block is a draft it was arguing with, not the program it chose to submit.
+    """
+    if not response:
+        return None
+    cleaned = _THINK_BLOCK.sub("", response)
+    if _OPEN_THINK.search(cleaned) and not _CLOSE_THINK.search(cleaned):
+        return None
+    # A forced close can leave a stray closing tag with no opener.
+    return _CLOSE_THINK.sub("", cleaned)
 
 
 def extract_python_code(response: str) -> Optional[str]:
-    """Last fenced block wins: models often show a draft before the final answer."""
-    if not response:
+    """
+    Pull the submitted program out of a response, in four passes.
+
+    Ported from the reference implementation, whose ordering matters:
+
+      1. a well-formed ```python ... ``` block
+      2. an unterminated ```python ... <end of output>, i.e. the model ran out
+         of budget mid-program -- still worth running, it often parses
+      3. a generic ``` ... ``` block with no language tag
+      4. the raw response, when it is plainly a program
+
+    Reasoning is stripped first. Without that, a draft the model wrote inside
+    <think> and then rejected can be picked up as the answer.
+    """
+    cleaned = strip_reasoning(response)
+    if not cleaned:
         return None
-    blocks = _CODE_FENCE.findall(response)
-    if blocks:
-        return blocks[-1].strip()
-    # Unfenced fallback: accept a response that is plainly a program.
-    stripped = response.strip()
-    if stripped.startswith(("import ", "from ", "def ")):
+
+    # 1) Well-formed block. Last one wins: the prompt asks for the final
+    #    program last, and earlier blocks are usually partial sketches.
+    blocks = re.findall(r"```(?:python|py)?\s*\n?(.*?)```", cleaned,
+                        re.DOTALL | re.IGNORECASE)
+    for code in reversed(blocks):
+        if code.strip():
+            return code.strip()
+
+    # 2) Opened a block and ran out of budget before closing it.
+    match = re.search(r"```(?:python|py)?\s*\n?(.*)$", cleaned,
+                      re.DOTALL | re.IGNORECASE)
+    if match:
+        code = re.sub(r"\n?```\s*$", "", match.group(1)).strip()
+        if code:
+            return code
+
+    # 3) Any fenced block at all.
+    blocks = re.findall(r"```\s*\n?(.*?)```", cleaned, re.DOTALL)
+    for code in reversed(blocks):
+        if code.strip():
+            return code.strip()
+
+    # 4) Unfenced, but it smells like a program.
+    stripped = cleaned.strip()
+    if stripped.startswith(("import ", "from ", "def ", "class ", "#")):
         return stripped
     return None
+
+
+def has_complete_code_block(response: str) -> bool:
+    """True once a closed ```python block exists outside any reasoning block."""
+    cleaned = strip_reasoning(response)
+    if not cleaned:
+        return False
+    return bool(re.search(r"```(?:python|py)?\s*\n.*?\n?```", cleaned,
+                          re.DOTALL | re.IGNORECASE))
 
 
 class Example(ABC):
