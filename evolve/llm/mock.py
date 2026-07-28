@@ -99,8 +99,8 @@ class MockBackbone:
         return out
 
     def sample_batch(self, prompt_texts, max_new_tokens: int = 0,
-                     temperature: float = 1.0, top_p: float = 1.0, on_step=None
-                     ) -> List[Tuple[str, List[int]]]:
+                     temperature: float = 1.0, top_p: float = 1.0, on_step=None,
+                     **kwargs) -> List[Tuple[str, List[int]]]:
         self.calls["sample_batch"] = self.calls.get("sample_batch", 0) + 1
         if on_step is not None:
             for _ in range(min(int(max_new_tokens or 0), 8)):

@@ -215,6 +215,7 @@ class Engine:
                         reward=self.cfg.verifier.fail_reward, valid=False,
                         msg=f"verifier_crashed: {e}",
                         feedback=f"The verifier itself raised:\n{traceback.format_exc()}")
+                self._mark_if_truncated(rollout, result)
                 results.append(result)
                 num_valid += bool(result.valid)
                 best_so_far = max((r.reward for r in results), default=0.0)
@@ -279,6 +280,8 @@ class Engine:
             "virtual_targets": sum(1 for t in targets if t.kind == VIRTUAL_EXPAND),
             "num_valid": len(valid),
             "valid_rate": len(valid) / max(1, len(results)),
+            "num_truncated": sum(1 for r in results
+                                 if r.msg == "truncated_before_code"),
             "mean_reward": sum(rewards) / max(1, len(rewards)),
             "max_reward": max(rewards) if rewards else 0.0,
             "best_so_far": best.reward if best else 0.0,
@@ -291,6 +294,28 @@ class Engine:
         self.io.save_step_summary(step, summary)
         self.history.append(summary)
         return summary
+
+    # ------------------------------------------------------------------
+    def _mark_if_truncated(self, rollout, result) -> None:
+        """
+        Distinguish "ran out of budget" from "wrote no code".
+
+        Both surface as no_code_block, but they need different fixes and the
+        model can only act on the difference if the feedback says which it was.
+        Naming it here also routes it into the negative lessons and into Eq. 9,
+        so over-thinking becomes something the run can learn its way out of.
+        """
+        if result.valid or result.msg != "no_code_block":
+            return
+        budget = int(self.cfg.generation.max_new_tokens)
+        if not rollout.token_ids or len(rollout.token_ids) < budget:
+            return
+        result.msg = "truncated_before_code"
+        result.feedback = (
+            f"The response hit the {budget}-token limit while still reasoning "
+            f"and never produced a ```python block, so it scored zero. Reason "
+            f"far more briefly and start writing the program much sooner: a "
+            f"complete average program beats an unfinished excellent one.")
 
     # ------------------------------------------------------------------
     def update_memory(self, results, step: int) -> dict:
@@ -350,12 +375,25 @@ class Engine:
     def _print_step(s: dict) -> None:
         rl = s.get("rl", {})
         rl_note = "rl+" if rl.get("updated") else f"rl-({rl.get('reason', '')[:40]})"
-        print(f"[step {s['step']:02d}] "
-              f"B={s['batch_size']:3d} "
-              f"({s['leaf_targets']}L/{s['virtual_targets']}V) "
-              f"valid={s['valid_rate']:.0%} "
-              f"max={s['max_reward']:.4f} best={s['best_so_far']:.4f} "
-              f"|D|={s['archive_size']:4d} "
-              f"mem={s.get('memory', {}).get('total', 0):3d} "
-              f"elo={s.get('elo', {}).get('matches', 0):3d} "
-              f"{rl_note} {s['seconds']:.1f}s")
+        cut = s.get("num_truncated", 0)
+        # cut = rollouts that hit the token limit still reasoning, so they never
+        # emitted a program. Shown only when nonzero, since it means the budget
+        # is the bottleneck rather than the search.
+        parts = [
+            f"[step {s['step']:02d}]",
+            f"B={s['batch_size']:3d}",
+            f"({s['leaf_targets']}L/{s['virtual_targets']}V)",
+            f"valid={s['valid_rate']:.0%}",
+        ]
+        if cut:
+            parts.append(f"cut={cut}")
+        parts += [
+            f"max={s['max_reward']:.4f}",
+            f"best={s['best_so_far']:.4f}",
+            f"|D|={s['archive_size']:4d}",
+            f"mem={s.get('memory', {}).get('total', 0):3d}",
+            f"elo={s.get('elo', {}).get('matches', 0):3d}",
+            rl_note,
+            f"{s['seconds']:.1f}s",
+        ]
+        print(" ".join(parts))
