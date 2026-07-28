@@ -67,7 +67,7 @@ def test_phase_timer_still_reports_when_the_body_raises(capsys):
     assert "done in" in capsys.readouterr().err
 
 
-def test_generation_drives_a_token_bar(capsys, tmp_path):
+def test_generation_drives_a_step_bar(capsys, tmp_path):
     """The tick callback must reach the backbone, not be silently dropped."""
     from config import Config
     from llm.generation import InProcessGenerator
@@ -78,7 +78,9 @@ def test_generation_drives_a_token_bar(capsys, tmp_path):
     gen = InProcessGenerator(MockBackbone(seed=0), cfg, progress=True)
     out = gen.generate([(0, [{"role": "user", "content": "pack 4 circles"}], 3)])
     assert len(out[0]) == 3
-    assert "generate 1/1" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "generate 3 rollouts" in err
+    assert "step/s" in err        # decoding steps, not tokens: k advance together
 
 def test_progress_can_be_turned_off_end_to_end(capsys, tmp_path):
     from config import load_config
