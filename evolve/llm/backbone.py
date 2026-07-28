@@ -59,27 +59,64 @@ class Backbone:
     # Prompt formatting
     # ------------------------------------------------------------------
     def render(self, messages: Sequence[dict]) -> str:
+        enable_thinking = bool(getattr(self.cfg, "enable_thinking", False))
+        rendered = None
+
         # Some multimodal checkpoints carry the chat template on the processor
         # rather than on the tokenizer, so try both before giving up.
-        enable_thinking = bool(getattr(self.cfg, "enable_thinking", False))
         for holder in (self.tokenizer, self.processor):
             if holder is None or not getattr(holder, "chat_template", None):
                 continue
             try:
-                # Qwen3-family templates accept this and default it to True.
-                # Left on, the model opens <think> and can spend the whole
-                # budget there while the prompt's own <strategy> block asks it
-                # to reason a second time.
-                return holder.apply_chat_template(
+                rendered = holder.apply_chat_template(
                     list(messages), tokenize=False, add_generation_prompt=True,
                     enable_thinking=enable_thinking)
             except TypeError:
-                # Template does not take the argument; nothing to switch off.
-                return holder.apply_chat_template(
+                rendered = holder.apply_chat_template(
                     list(messages), tokenize=False, add_generation_prompt=True)
-        parts = [f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-                 for m in messages]
-        return "\n\n".join(parts) + "\n\nASSISTANT:"
+            break
+
+        if rendered is None:
+            parts = [f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+                     for m in messages]
+            rendered = "\n\n".join(parts) + "\n\nASSISTANT:"
+
+        return self._suppress_thinking(rendered, enable_thinking)
+
+    def _suppress_thinking(self, rendered: str, enable_thinking: bool) -> str:
+        """
+        Make enable_thinking=False actually stick.
+
+        apply_chat_template forwards unknown kwargs into the Jinja context
+        rather than raising, so a template that never references
+        enable_thinking ignores it in silence and the model opens <think>
+        regardless. Templates that DO honour it emit a closed empty block at
+        the start of the assistant turn; when that is missing, prefill one so
+        generation begins outside the block either way.
+        """
+        if enable_thinking or not getattr(self.cfg, "force_no_think", True):
+            return rendered
+
+        prefill = getattr(self.cfg, "no_think_prefill", "<think>\n\n</think>\n\n")
+        if not prefill:
+            return rendered
+
+        # The template handled it if the assistant turn already closes a block.
+        if "</think>" in rendered[-len(prefill) - 64:]:
+            self._log_thinking_mode("template honoured enable_thinking=False")
+            return rendered
+
+        self._log_thinking_mode(
+            "template ignored enable_thinking=False; prefilling a closed "
+            "<think> block so generation starts outside it")
+        return rendered + prefill
+
+    def _log_thinking_mode(self, message: str) -> None:
+        """Say once what happened; silence here is how the bug hid last time."""
+        if getattr(self, "_thinking_logged", False):
+            return
+        self._thinking_logged = True
+        print(f"[backbone] {message}", flush=True)
 
     # ------------------------------------------------------------------
     # Generation

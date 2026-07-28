@@ -52,8 +52,13 @@ class CirclePacking(Example):
         )
 
     def instruction(self) -> str:
+        # The sandbox timeout is a first-class constraint, not a detail: the
+        # most common way a well-reasoned program scores zero is by being
+        # killed before it returns. Take it from the config so the number the
+        # model is told is the number that will actually be enforced.
         return prompts.INSTRUCTION.format(n=self.num_circles,
-                                          entrypoint=self.entrypoint)
+                                          entrypoint=self.entrypoint,
+                                          timeout=self.timeout_s)
 
     # ------------------------------------------------------------------
     # Transition T_d

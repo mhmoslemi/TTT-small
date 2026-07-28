@@ -183,6 +183,19 @@ class Example(ABC):
             error = out.get("error", "unknown error")
             traceback_text = out.get("traceback", "") or ""
             feedback = f"Execution failed: {error}"
+            if "Timeout" in error:
+                # A timeout has no traceback, so without this the model is told
+                # only that it was too slow -- not that the fix is to compute
+                # less. This is the text the negative-lesson extractor sees.
+                feedback += (
+                    f"\n\nThe program was killed before returning, so it scored "
+                    f"zero. The search space is too large for a global optimizer "
+                    f"here: use a constructive layout plus a BOUNDED local "
+                    f"refinement with a fixed iteration count, vectorize the "
+                    f"pairwise distance checks with numpy instead of Python "
+                    f"loops, and return well inside {self.timeout_s:.0f}s. A "
+                    f"quick valid answer beats a thorough one that never "
+                    f"returns.")
             if traceback_text:
                 feedback += f"\n\nTraceback:\n{traceback_text}"
             return VerifyResult(
