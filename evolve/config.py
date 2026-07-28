@@ -119,6 +119,19 @@ class GenerationConfig:
     # throughput until the KV cache fills the card. 0 = the whole step's B_t in
     # one call. On OOM the batch is halved and retried, so this is a hint.
     batch_size: int = 0
+    # --- thinking budget -------------------------------------------------
+    # A reasoning model will happily spend the entire budget inside its think
+    # block and never emit an answer, which scores zero however good the
+    # reasoning was. With think_budget > 0 generation runs in two phases:
+    # think for at most this many tokens, then force the block closed and spend
+    # what is left writing the answer. Reasoning is capped, not removed.
+    # 0 disables it. A good starting point is ~60% of max_new_tokens.
+    think_budget: int = 0
+    think_close_tag: str = "</think>"
+    # Injected when the budget runs out, to hand the model a running start on
+    # the answer rather than dropping it at the closing tag.
+    think_force_text: str = (
+        "\n</think>\n\nI have analysed enough. Final program:\n")
 
 
 @dataclass
@@ -285,6 +298,7 @@ _CLI_SPEC: List[Tuple[str, str, Any, str]] = [
     ("--num-gpus",          "generation.num_gpus",     int,      "generation workers (1 = in-process)"),
     ("--gpu-ids",           "generation.gpu_ids",      str,      "e.g. '6,7'"),
     ("--gen-batch-size",    "generation.batch_size",   int,      "rollouts per generate() call; 0 = all of B_t"),
+    ("--think-budget",      "generation.think_budget", int,      "cap tokens spent inside <think>; 0 = uncapped"),
     # -- D-PUCT (§2.1) --
     ("--n-select",          "search.n_select",         int,      "n: top-n actions per step"),
     ("--k-children",        "search.k_children",       int,      "k: children per leaf expansion"),
