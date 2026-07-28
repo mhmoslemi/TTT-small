@@ -114,6 +114,11 @@ class GenerationConfig:
     # Multi-GPU generation pool. 1 -> in-process generation, no workers.
     num_gpus: int = 1
     gpu_ids: str = ""                     # "" -> 0..num_gpus-1
+    # Rollouts per generate() call. Decoding re-reads the whole weight matrix
+    # each step regardless of batch size, so a larger batch is close to free
+    # throughput until the KV cache fills the card. 0 = the whole step's B_t in
+    # one call. On OOM the batch is halved and retried, so this is a hint.
+    batch_size: int = 0
 
 
 @dataclass
@@ -279,6 +284,7 @@ _CLI_SPEC: List[Tuple[str, str, Any, str]] = [
     ("--top-p",             "generation.top_p",        float,    "nucleus sampling"),
     ("--num-gpus",          "generation.num_gpus",     int,      "generation workers (1 = in-process)"),
     ("--gpu-ids",           "generation.gpu_ids",      str,      "e.g. '6,7'"),
+    ("--gen-batch-size",    "generation.batch_size",   int,      "rollouts per generate() call; 0 = all of B_t"),
     # -- D-PUCT (§2.1) --
     ("--n-select",          "search.n_select",         int,      "n: top-n actions per step"),
     ("--k-children",        "search.k_children",       int,      "k: children per leaf expansion"),
