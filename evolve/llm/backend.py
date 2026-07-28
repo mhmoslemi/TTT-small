@@ -9,10 +9,34 @@ that these read a ModelConfig rather than a flat namespace.
 """
 
 
-def _ensure_pad_token(tokenizer):
+def as_tokenizer(obj):
+    """
+    Unwrap a Processor to the text tokenizer inside it.
+
+    Multimodal checkpoints (Qwen*-VL and friends) load with a Processor rather
+    than a tokenizer, and a Processor's FIRST POSITIONAL argument is `images`,
+    not `text`. Passing a prompt positionally therefore sends it into the image
+    pipeline, which fails deep inside base64 decoding with a message that says
+    nothing about tokenization. This framework is text-only, so reach through to
+    the tokenizer and always call it with text= as a keyword.
+    """
+    inner = getattr(obj, "tokenizer", None)
+    if inner is not None and hasattr(inner, "convert_tokens_to_ids"):
+        return inner
+    return obj
+
+
+def _ensure_pad_token(obj):
+    """Set the pad token on the tokenizer, and on the processor wrapping it."""
+    tokenizer = as_tokenizer(obj)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+    if obj is not tokenizer and getattr(obj, "pad_token_id", None) is None:
+        try:
+            obj.pad_token = tokenizer.pad_token
+        except AttributeError:
+            pass          # not all processors expose it; the tokenizer is what we use
+    return obj
 
 
 class UnslothBackend:
