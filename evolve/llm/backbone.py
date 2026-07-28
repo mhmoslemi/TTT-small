@@ -61,8 +61,20 @@ class Backbone:
     def render(self, messages: Sequence[dict]) -> str:
         # Some multimodal checkpoints carry the chat template on the processor
         # rather than on the tokenizer, so try both before giving up.
+        enable_thinking = bool(getattr(self.cfg, "enable_thinking", False))
         for holder in (self.tokenizer, self.processor):
-            if holder is not None and getattr(holder, "chat_template", None):
+            if holder is None or not getattr(holder, "chat_template", None):
+                continue
+            try:
+                # Qwen3-family templates accept this and default it to True.
+                # Left on, the model opens <think> and can spend the whole
+                # budget there while the prompt's own <strategy> block asks it
+                # to reason a second time.
+                return holder.apply_chat_template(
+                    list(messages), tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking)
+            except TypeError:
+                # Template does not take the argument; nothing to switch off.
                 return holder.apply_chat_template(
                     list(messages), tokenize=False, add_generation_prompt=True)
         parts = [f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
@@ -89,6 +101,61 @@ class Backbone:
 
         return _Tick()
 
+    def _code_block_criteria(self, prompt_len: int, check_every: int):
+        """
+        Stop a sequence once it has emitted a complete ```python block.
+
+        Left to run, a model that finished the program keeps going: it reopens
+        <strategy>, writes a second, worse program, and burns the remaining
+        budget -- and the extractor then has to choose between them. Stopping at
+        the first complete program removes both problems.
+
+        Returns per-row flags, so finished sequences stop while the rest of the
+        batch continues. Checked every `check_every` steps because it costs a
+        decode per row.
+        """
+        import torch
+        from transformers import StoppingCriteria
+
+        from envs.base import has_complete_code_block
+
+        tokenizer = self.tokenizer
+
+        class _StopOnCode(StoppingCriteria):
+            def __init__(self):
+                self.step = 0
+                self.done = None
+
+            def __call__(self, input_ids, scores, **kwargs):
+                rows = input_ids.shape[0]
+                if self.done is None:
+                    self.done = torch.zeros(rows, dtype=torch.bool,
+                                            device=input_ids.device)
+                self.step += 1
+                if self.step % max(1, check_every):
+                    return self.done
+                for row in range(rows):
+                    if self.done[row]:
+                        continue
+                    text = tokenizer.decode(input_ids[row, prompt_len:],
+                                            skip_special_tokens=True)
+                    if has_complete_code_block(text):
+                        self.done[row] = True
+                return self.done
+
+        return _StopOnCode()
+
+    def _stopping_criteria(self, on_step, prompt_len: int, stop_on_code: bool,
+                           check_every: int):
+        from transformers import StoppingCriteriaList
+
+        criteria = []
+        if on_step is not None:
+            criteria.append(self._tick_criteria(on_step))
+        if stop_on_code:
+            criteria.append(self._code_block_criteria(prompt_len, check_every))
+        return {"stopping_criteria": StoppingCriteriaList(criteria)} if criteria else {}
+
     def _encode_left_padded(self, texts: Sequence[List[int]]):
         """Left-pad ragged token-id rows into a batch, with an attention mask."""
         import torch
@@ -105,7 +172,8 @@ class Backbone:
                 torch.tensor(mask, device=device))
 
     def _generate_budgeted(self, prompt_texts, max_new_tokens, temperature,
-                           top_p, think_budget, close_tag, force_text, on_step):
+                           top_p, think_budget, close_tag, force_text, on_step,
+                           stop_on_code=False, stop_check_every=16):
         """
         Budget forcing: think for at most `think_budget` tokens, then close the
         block and spend the rest of the budget answering.
@@ -128,11 +196,8 @@ class Backbone:
         ids, mask = self._encode_left_padded(prompt_rows)
         input_len = ids.shape[1]
 
-        extra = {}
-        if on_step is not None:
-            from transformers import StoppingCriteriaList
-            extra["stopping_criteria"] = StoppingCriteriaList(
-                [self._tick_criteria(on_step)])
+        extra = self._stopping_criteria(on_step, input_len, stop_on_code,
+                                        stop_check_every)
 
         common = dict(
             do_sample=temperature is not None and temperature > 0,
@@ -172,10 +237,12 @@ class Backbone:
         if pending and remaining > 0:
             rows = [list(prompt_rows[r]) + produced[r] for r in pending]
             ids2, mask2 = self._encode_left_padded(rows)
+            extra2 = self._stopping_criteria(on_step, ids2.shape[1],
+                                             stop_on_code, stop_check_every)
             with torch.no_grad():
                 phase2 = self.model.generate(
                     input_ids=ids2, attention_mask=mask2,
-                    max_new_tokens=remaining, **common, **extra)
+                    max_new_tokens=remaining, **common, **extra2)
             for offset, row in enumerate(pending):
                 tail = [int(t) for t in phase2[offset, ids2.shape[1]:]
                         if int(t) != tok.pad_token_id]
@@ -189,6 +256,7 @@ class Backbone:
                   on_step=None, think_budget: int = 0,
                   think_close_tag: str = "</think>",
                   think_force_text: str = "\n</think>\n\n",
+                  stop_on_code: bool = False, stop_check_every: int = 16,
                   ) -> List[List[Tuple[str, List[int]]]]:
         import torch
 
@@ -198,7 +266,8 @@ class Backbone:
         if 0 < budget < int(max_new_tokens) and int(num_return_sequences) == 1:
             return self._generate_budgeted(
                 prompt_texts, max_new_tokens, temperature, top_p, budget,
-                think_close_tag, think_force_text, on_step)
+                think_close_tag, think_force_text, on_step,
+                stop_on_code=stop_on_code, stop_check_every=stop_check_every)
 
         tok = self.tokenizer
         self.set_inference_mode()
@@ -213,11 +282,8 @@ class Backbone:
                       add_special_tokens=False).to(self.model.device)
             input_len = enc["input_ids"].shape[1]
 
-            extra = {}
-            if on_step is not None:
-                from transformers import StoppingCriteriaList
-                extra["stopping_criteria"] = StoppingCriteriaList(
-                    [self._tick_criteria(on_step)])
+            extra = self._stopping_criteria(on_step, input_len, stop_on_code,
+                                            stop_check_every)
 
             with torch.no_grad():
                 out = self.model.generate(
@@ -254,6 +320,7 @@ class Backbone:
                      temperature: float, top_p: float, on_step=None,
                      think_budget: int = 0, think_close_tag: str = "</think>",
                      think_force_text: str = "\n</think>\n\n",
+                     stop_on_code: bool = False, stop_check_every: int = 16,
                      ) -> List[Tuple[str, List[int]]]:
         """
         One sample per prompt, all in a single generate() call.
@@ -266,7 +333,9 @@ class Backbone:
                                  temperature, top_p, on_step=on_step,
                                  think_budget=think_budget,
                                  think_close_tag=think_close_tag,
-                                 think_force_text=think_force_text)
+                                 think_force_text=think_force_text,
+                                 stop_on_code=stop_on_code,
+                                 stop_check_every=stop_check_every)
         return [g[0] if g else ("", []) for g in grouped]
 
     def chat(self, messages: Sequence[dict], max_new_tokens: int = 1024,
