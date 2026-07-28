@@ -47,7 +47,7 @@ class TestTimeTrainer:
     # ------------------------------------------------------------------
     def _encode_prompt(self, text: str):
         tok = self.backbone.tokenizer
-        ids = tok(text, add_special_tokens=False,
+        ids = tok(text=text, add_special_tokens=False,
                   truncation=True, max_length=self.cfg.model.max_seq_length)
         return list(ids["input_ids"])
 

@@ -83,7 +83,10 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    from llm.backend import as_tokenizer
+
+    tokenizer = as_tokenizer(
+        AutoTokenizer.from_pretrained(model_name, trust_remote_code=True))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -123,7 +126,7 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         for group_id, prompt_text, count in jobs:
             try:
                 tokenizer.padding_side = "left"
-                enc = tokenizer([prompt_text], return_tensors="pt",
+                enc = tokenizer(text=[prompt_text], return_tensors="pt",
                                 truncation=True, max_length=max_seq_length,
                                 add_special_tokens=False).to(model.device)
                 input_len = enc["input_ids"].shape[1]

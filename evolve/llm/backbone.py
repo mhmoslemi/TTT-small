@@ -15,7 +15,7 @@ requires.
 from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
 
-from llm.backend import load_backend
+from llm.backend import as_tokenizer, load_backend
 
 
 class Backbone:
@@ -24,13 +24,20 @@ class Backbone:
         self.cfg = cfg
         self.backend = backend or load_backend(cfg)
         self.model = None
-        self.tokenizer = None
+        self.tokenizer = None      # always the TEXT tokenizer
+        self.processor = None      # the multimodal wrapper, when there is one
         self._loaded = False
 
     # ------------------------------------------------------------------
     def load(self):
         if not self._loaded:
-            self.model, self.tokenizer = self.backend.load()
+            self.model, loaded = self.backend.load()
+            # A multimodal checkpoint loads a Processor; we only ever do text.
+            self.processor = loaded
+            self.tokenizer = as_tokenizer(loaded)
+            if self.tokenizer is not loaded:
+                print(f"[backbone] {type(loaded).__name__} detected; using its "
+                      f"{type(self.tokenizer).__name__} for text")
             self._loaded = True
         return self
 
@@ -52,11 +59,12 @@ class Backbone:
     # Prompt formatting
     # ------------------------------------------------------------------
     def render(self, messages: Sequence[dict]) -> str:
-        tok = self.tokenizer
-        if getattr(tok, "chat_template", None):
-            return tok.apply_chat_template(list(messages), tokenize=False,
-                                           add_generation_prompt=True)
-        # No chat template: fall back to a plain transcript.
+        # Some multimodal checkpoints carry the chat template on the processor
+        # rather than on the tokenizer, so try both before giving up.
+        for holder in (self.tokenizer, self.processor):
+            if holder is not None and getattr(holder, "chat_template", None):
+                return holder.apply_chat_template(
+                    list(messages), tokenize=False, add_generation_prompt=True)
         parts = [f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
                  for m in messages]
         return "\n\n".join(parts) + "\n\nASSISTANT:"
@@ -76,7 +84,8 @@ class Backbone:
         previous_side = tok.padding_side
         tok.padding_side = "left"
         try:
-            enc = tok(list(prompt_texts), return_tensors="pt", padding=True,
+            # text= as a keyword: a Processor's first positional is `images`.
+            enc = tok(text=list(prompt_texts), return_tensors="pt", padding=True,
                       truncation=True, max_length=self.cfg.max_seq_length,
                       add_special_tokens=False).to(self.model.device)
             input_len = enc["input_ids"].shape[1]
