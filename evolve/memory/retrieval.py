@@ -82,7 +82,7 @@ class BackboneEmbedder:
         rows = []
         with torch.no_grad():
             for text in texts:
-                enc = tok(text or "", return_tensors="pt", truncation=True,
+                enc = tok(text=text or "", return_tensors="pt", truncation=True,
                           max_length=self.max_tokens).to(model.device)
                 out = model(**enc, output_hidden_states=True)
                 hidden = out.hidden_states[-1][0]                  # (T, H)
