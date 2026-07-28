@@ -99,6 +99,13 @@ class ModelConfig:
     lora_rank: int = 32
     lora_alpha: int = 32
     lora_dropout: float = 0.0
+    # Qwen3-family chat templates accept enable_thinking and default it to True,
+    # so the model opens a <think> block and can spend the entire token budget
+    # in it without ever emitting an answer. The reference implementation passes
+    # False, and so do we: the prompt already asks for a bounded <strategy>
+    # block, and two layers of reasoning is what exhausts the budget. Ignored by
+    # templates that do not accept the argument.
+    enable_thinking: bool = False
     target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -128,6 +135,12 @@ class GenerationConfig:
     # 0 disables it. A good starting point is ~60% of max_new_tokens.
     think_budget: int = 0
     think_close_tag: str = "</think>"
+    # Stop a sequence as soon as it has produced a complete ```python block.
+    # Without it a model that finishes the program keeps going -- reopening
+    # <strategy>, writing a second worse program, and burning the rest of the
+    # budget. Costs one decode per check, hence stop_check_every.
+    stop_on_code_block: bool = True
+    stop_check_every: int = 16
     # Injected when the budget runs out, to hand the model a running start on
     # the answer rather than dropping it at the closing tag.
     think_force_text: str = (
@@ -299,6 +312,8 @@ _CLI_SPEC: List[Tuple[str, str, Any, str]] = [
     ("--gpu-ids",           "generation.gpu_ids",      str,      "e.g. '6,7'"),
     ("--gen-batch-size",    "generation.batch_size",   int,      "rollouts per generate() call; 0 = all of B_t"),
     ("--think-budget",      "generation.think_budget", int,      "cap tokens spent inside <think>; 0 = uncapped"),
+    ("--enable-thinking",   "model.enable_thinking",   _optbool, "Qwen-style native <think> mode"),
+    ("--stop-on-code",      "generation.stop_on_code_block", _optbool, "stop once a complete ```python block exists"),
     # -- D-PUCT (§2.1) --
     ("--n-select",          "search.n_select",         int,      "n: top-n actions per step"),
     ("--k-children",        "search.k_children",       int,      "k: children per leaf expansion"),

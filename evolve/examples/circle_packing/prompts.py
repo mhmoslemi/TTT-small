@@ -35,7 +35,15 @@ Rules:
 - No filesystem or network IO.
 - You need to get really creative and think from first principles.
 
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```."""
+Output format — follow it exactly:
+1. A <strategy>...</strategy> block of AT MOST 150 words. State the approach and
+   move on; do not derive bounds, estimate densities, or weigh alternatives.
+2. Then the complete program between ```python and ```.
+3. Stop immediately after the closing fence. Do not write a second program, do
+   not review what you wrote, do not add commentary.
+
+Budget your output: a complete working program scores; an unfinished one scores
+zero however good the reasoning behind it was. Spend your tokens on code."""
 
 
 PRELUDE = """import numpy as np
