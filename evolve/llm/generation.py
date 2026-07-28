@@ -59,36 +59,103 @@ class InProcessGenerator:
 
     def generate(self, jobs: Sequence[Job], adapter_path: Optional[str] = None
                  ) -> dict:
-        """Returns {group_id: [(text, token_ids), ...]}."""
+        """
+        Returns {group_id: [(text, token_ids), ...]}.
+
+        The whole step's B_t rollouts go through as few generate() calls as the
+        KV cache allows, rather than one call per target. Decoding re-reads the
+        full weight matrix on every step whatever the batch size, so a target
+        generating alone at batch 4 wastes most of the card's bandwidth; folding
+        n targets into one call costs almost nothing extra per step.
+
+        Targets ask for different counts (leaf -> k, virtual -> 1), and
+        num_return_sequences can only apply a single count to a whole batch, so
+        a prompt is simply repeated `count` times instead.
+        """
         from runio.progress import make_bar
 
-        out: dict = {}
-        total_samples = sum(count for _, _, count in jobs)
-        done = 0
+        flat: List[Tuple[int, str]] = []
+        for group_id, messages, count in jobs:
+            text = self.backbone.render(messages)
+            flat.extend((group_id, text) for _ in range(count))
+        if not flat:
+            return {}
 
-        for index, (group_id, messages, count) in enumerate(jobs, 1):
-            # One blocking generate() per target. Tick per decoding step, which
-            # is the only visibility into it -- all `count` sequences in the
-            # batch advance together, so steps (not tokens) is the honest unit.
-            bar = make_bar(
-                int(self.cfg.max_new_tokens),
-                f"generate {index}/{len(jobs)} (x{count}, {done}/{total_samples} done)",
-                unit="tok", enabled=self.progress)
-            try:
-                samples = self.backbone.sample_group(
-                    messages, count,
-                    max_new_tokens=self.cfg.max_new_tokens,
-                    temperature=self.cfg.temperature,
-                    top_p=self.cfg.top_p,
-                    on_step=lambda: bar.update(1),
-                )
-            finally:
-                bar.close()
-            done += count
-            out.setdefault(group_id, []).extend(samples)
+        # Sort by length so each padded batch is as uniform as possible; padding
+        # is decoded at full cost, so mixing a short prompt with a long one
+        # wastes the difference on every step.
+        flat.sort(key=lambda item: len(item[1]))
+
+        cap = int(getattr(self.cfg, "batch_size", 0) or 0) or len(flat)
+        chunks = [flat[i:i + cap] for i in range(0, len(flat), cap)]
+
+        bar = make_bar(len(chunks) * int(self.cfg.max_new_tokens),
+                       f"generate {len(flat)} rollouts "
+                       f"in {len(chunks)} batch(es) of <={cap}",
+                       unit="step", enabled=self.progress)
+
+        out: dict = {}
+        done = 0
+        try:
+            for chunk in chunks:
+                samples = self._generate_chunk([t for _, t in chunk], bar)
+                for (group_id, _), sample in zip(chunk, samples):
+                    out.setdefault(group_id, []).append(sample)
+                done += len(chunk)
+                bar.set_postfix_str(f"{done}/{len(flat)} rollouts")
+        finally:
+            bar.close()
         return out
 
+    def _generate_chunk(self, texts: List[str], bar) -> List[Tuple[str, List[int]]]:
+        """
+        One generate() call, halving the batch and retrying on OOM.
+
+        generation.batch_size is a hint rather than a guarantee: KV cache use
+        depends on prompt length, which grows as parent programs accumulate, so
+        a batch that fit at step 0 can fail at step 20. Backing off beats losing
+        a run that has been going for hours.
+        """
+        try:
+            return self.backbone.sample_batch(
+                texts,
+                max_new_tokens=self.cfg.max_new_tokens,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                on_step=lambda: bar.update(1),
+            )
+        except Exception as e:
+            if not _is_oom(e) or len(texts) == 1:
+                raise
+            half = len(texts) // 2
+            print(f"\n[generation] OOM at batch {len(texts)}; retrying as "
+                  f"{half} + {len(texts) - half}", flush=True)
+            _free_cuda_cache()
+            return (self._generate_chunk(texts[:half], bar)
+                    + self._generate_chunk(texts[half:], bar))
+
     def shutdown(self):
+        pass
+
+
+def _is_oom(exc: BaseException) -> bool:
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    return "out of memory" in str(exc).lower()
+
+
+def _free_cuda_cache() -> None:
+    try:
+        import gc
+
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
         pass
 
 
