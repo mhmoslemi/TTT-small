@@ -139,8 +139,7 @@ exec python main.py "${ARGS[@]}" "$@"
 # ======================================================================
 #
 # n=26, single GPU, short smoke test:
-#   STEPS=3 N_SELECT=2 K_CHILDREN=2 MAX_NEW_TOKENS=1500 \
-#   MODEL_NAME=LiquidAI/LFM2.5-350M bash run.sh
+# STEPS=3 N_SELECT=2 K_CHILDREN=2 MAX_NEW_TOKENS=1500 MODEL_NAME=LiquidAI/LFM2.5-350M bash run.sh
 #
 # n=32 instead of the example's n=26 (open namespace, no schema change):
 #   NUM_CIRCLES=32 TARGET=2.940 bash run.sh

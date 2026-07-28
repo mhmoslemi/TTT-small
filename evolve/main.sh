@@ -1,0 +1,7 @@
+
+
+
+MODEL_NAME=Qwen/Qwen3.5-4B \
+    STEPS=10 N_SELECT=8 K_CHILDREN=8 MAX_NEW_TOKENS=24000 \
+    ELO_ENABLED=false ALPHA=1.0 \
+    NUM_CIRCLES=26 bash run.sh
