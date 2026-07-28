@@ -72,9 +72,26 @@ class Backbone:
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
+    def _tick_criteria(self, on_step):
+        """
+        A StoppingCriteria that never stops -- it exists only to fire a callback
+        once per decoding step, which is the only hook into an otherwise opaque
+        blocking generate() call.
+        """
+        import torch
+        from transformers import StoppingCriteria
+
+        class _Tick(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                on_step()
+                return torch.zeros(input_ids.shape[0], dtype=torch.bool,
+                                   device=input_ids.device)
+
+        return _Tick()
+
     def _generate(self, prompt_texts: Sequence[str], num_return_sequences: int,
-                  max_new_tokens: int, temperature: float, top_p: float
-                  ) -> List[List[Tuple[str, List[int]]]]:
+                  max_new_tokens: int, temperature: float, top_p: float,
+                  on_step=None) -> List[List[Tuple[str, List[int]]]]:
         import torch
 
         tok = self.tokenizer
@@ -90,6 +107,12 @@ class Backbone:
                       add_special_tokens=False).to(self.model.device)
             input_len = enc["input_ids"].shape[1]
 
+            extra = {}
+            if on_step is not None:
+                from transformers import StoppingCriteriaList
+                extra["stopping_criteria"] = StoppingCriteriaList(
+                    [self._tick_criteria(on_step)])
+
             with torch.no_grad():
                 out = self.model.generate(
                     **enc,
@@ -99,6 +122,7 @@ class Backbone:
                     top_p=float(top_p),
                     num_return_sequences=int(num_return_sequences),
                     pad_token_id=tok.pad_token_id,
+                    **extra,
                 )
         finally:
             tok.padding_side = previous_side
@@ -114,11 +138,11 @@ class Backbone:
         return results
 
     def sample_group(self, messages: Sequence[dict], k: int, max_new_tokens: int,
-                     temperature: float, top_p: float,
+                     temperature: float, top_p: float, on_step=None,
                      ) -> List[Tuple[str, List[int]]]:
         """k samples from one prompt -- the group g_p of Sec. 2.3."""
         return self._generate([self.render(messages)], k, max_new_tokens,
-                              temperature, top_p)[0]
+                              temperature, top_p, on_step=on_step)[0]
 
     def chat(self, messages: Sequence[dict], max_new_tokens: int = 1024,
              temperature: float = 0.7, top_p: float = 1.0) -> str:
