@@ -91,6 +91,47 @@ virtual  72703c9c      1    2.0674    0.0000   0.431    2.0674
 leaf     f1015a50      6    1.9905    1.0000   0.597    0.9905
 ```
 
+## Drawing the tree
+
+Seeing the tree is how you tell whether `c_puct` is doing what you think.
+
+```python
+tree.show()                                    # text, no dependencies
+tree.show(targets=policy.select(tree))         # mark what was just selected
+tree.show(max_depth=3, max_children=2)         # trim a big tree
+tree.draw(max_depth=6)                         # matplotlib
+```
+
+```
+@ Q=0 W=9 m=9
+|-- o Q=0.1 W=9 m=6
+|   |-- * Q=9 W=9 m=1
+|   |-- o Q=0 W=0 m=1
+|   `-- ... 3 weaker sibling(s)
+`-- o Q=1 W=1.1 m=2
+    `-- o Q=1.1 W=1.1 m=1
+@ root   * best   > selected   o node
+```
+
+Each node shows the three numbers selection is computed from: `Q` (own value),
+`W` (subtree max), `m` (subtree size). `Q=0.1 W=9` on that branch is the library
+in one line — its own value is 0.1, but the best thing beneath it is a 9. A mean
+backup would have shown you 0.9 and moved on.
+
+| renderer | needs | good for |
+|---|---|---|
+| `render_text` / `tree.show()` | nothing | terminals, logs, quick checks |
+| `to_mermaid` | nothing | GitHub markdown, notebook viewers |
+| `to_dot` | nothing (graphviz to rasterize) | publication figures |
+| `draw` / `tree.draw()` | matplotlib | exploring a big tree |
+
+Trimming keeps the **best** children, not the first ones, and truncation is
+always reported rather than silently hiding nodes. `path_to_best(tree)` returns
+the winning lineage, useful as a `highlight` set.
+
+Reading the matplotlib plot: a single deep spike with no fan means `c_puct` is
+too low; a wide bush that never descends means it is too high.
+
 ## Configuration
 
 | parameter | symbol | what it does |
@@ -155,10 +196,11 @@ dpuct/
 │   ├── signals.py   rank signal, standardization, softmax
 │   ├── elo.py       optional pairwise-comparison ratings
 │   ├── policy.py    the selection rule
+│   ├── viz.py       text / mermaid / graphviz / matplotlib drawing
 │   └── loop.py      optional driver: SearchLoop / search()
 ├── examples/rastrigin.py       a runnable non-LLM search
 ├── notebooks/tutorial.ipynb    start here
-└── tests/test_dpuct.py         39 tests
+└── tests/                      60 tests
 ```
 
 ```bash
