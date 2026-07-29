@@ -51,6 +51,8 @@ from .policy import DPUCT, ParentPrior, Target
 from .signals import (average_ranks, blend, minmax, rank_signal, softmax,
                       standardize)
 from .tree import Node, Tree
+from .viz import (draw, layout, path_to_best, render_text, to_dot,
+                  to_mermaid)
 
 __version__ = "0.1.0"
 
@@ -61,6 +63,8 @@ __all__ = [
     "search", "SearchLoop", "SearchResult", "RoundStats",
     # optional comparison signal
     "EloRatings", "build_pairings",
+    # drawing
+    "render_text", "draw", "to_dot", "to_mermaid", "path_to_best", "layout",
     # signal primitives, exposed for inspection and custom priors
     "rank_signal", "standardize", "average_ranks", "blend", "minmax", "softmax",
     # constants

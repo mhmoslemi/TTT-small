@@ -199,6 +199,23 @@ class Tree:
             stack.extend(self._children.get(cur, ()))
 
     # ------------------------------------------------------------------
+    # Drawing (lazy imports: viz is optional and matplotlib doubly so)
+    # ------------------------------------------------------------------
+    def render(self, **kwargs) -> str:
+        """Text drawing of the tree. See dpuct.viz.render_text for options."""
+        from .viz import render_text
+        return render_text(self, **kwargs)
+
+    def show(self, **kwargs) -> None:
+        """print(self.render(...))."""
+        print(self.render(**kwargs))
+
+    def draw(self, **kwargs):
+        """Matplotlib drawing. See dpuct.viz.draw for options."""
+        from .viz import draw
+        return draw(self, **kwargs)
+
+    # ------------------------------------------------------------------
     def summary(self) -> dict:
         best = self.best()
         return {
