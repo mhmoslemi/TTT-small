@@ -93,16 +93,30 @@ def test_eos_is_detectable_even_when_pad_equals_eos():
     assert filtered == [11, 12, 2]
 
 def test_budget_is_skipped_when_it_would_not_bind():
-    """think_budget >= max_new_tokens leaves nothing for the answer, so the
+    """A budget >= max_new_tokens leaves nothing for the answer, so the
     two-phase path must not engage."""
-    cfg = Config().generation
-    cfg.max_new_tokens, cfg.think_budget = 100, 100
-    assert not (0 < cfg.think_budget < cfg.max_new_tokens)
-    cfg.think_budget = 60
-    assert 0 < cfg.think_budget < cfg.max_new_tokens
+    from llm.backbone import resolve_think_budget
+    assert not (0 < resolve_think_budget(100, 100) < 100)
+    assert 0 < resolve_think_budget(60, 100) < 100
 
-def test_budget_defaults_to_off():
-    assert Config().generation.think_budget == 0
+def test_thinking_is_on_by_default_but_bounded():
+    """The reasoning is worth keeping; only its share of the budget is capped."""
+    cfg = Config()
+    assert cfg.model.enable_thinking is True
+    assert 0 < cfg.generation.think_budget < 1
+
+def test_a_fraction_resolves_against_max_new_tokens():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(0.6, 8000) == 4800
+    assert resolve_think_budget(0.25, 4000) == 1000
+
+def test_a_value_of_one_or_more_is_an_absolute_token_count():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(1500, 8000) == 1500
+
+def test_zero_means_uncapped():
+    from llm.backbone import resolve_think_budget
+    assert resolve_think_budget(0, 8000) == 0
 
 def test_budget_flows_from_config_to_the_generator(tmp_path):
     """The knob has to reach sample_batch, not sit unread in the config."""
@@ -122,3 +136,37 @@ def test_budget_flows_from_config_to_the_generator(tmp_path):
         [(0, [{"role": "user", "content": "hi"}], 2)])
     assert seen["think_budget"] == 60
     assert seen["think_close_tag"] == "</think>"
+
+
+# ---------------- the prompt follows TTT-Discover ----------------
+def test_prompt_matches_the_reference_wording():
+    """Kept verbatim so results stay comparable with the reference runs."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "Reason about how you could further improve this packing" in text
+    assert "You need to get really creative and think from first principles" in text
+    assert "Make sure to think step by step" in text
+
+def test_the_strategy_block_is_gone():
+    """Native <think> is on, so <strategy> was a second pass over the same
+    ground -- in the reference it WAS the reasoning, because thinking was off."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "<strategy>" not in text
+    assert "/think" not in text          # Qwen soft switch, no longer needed
+
+def test_the_prompt_does_not_constrain_what_goes_in_the_reasoning():
+    """Thinking is free-form; only the token budget bounds it."""
+    from examples.circle_packing.env import build
+    cfg = Config()
+    cfg.example.params = {"num_circles": 26, "entrypoint": "run_packing"}
+    text = build(cfg).instruction()
+    assert "Do NOT draft" not in text
+    assert "HARD TIME LIMIT" not in text
+
+def test_no_draft_enforcement_remains():
+    assert not hasattr(Config().generation, "close_think_on_code")

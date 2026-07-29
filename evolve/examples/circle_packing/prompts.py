@@ -1,10 +1,15 @@
 """
 Circle-packing prompt text.
 
-Split into the two halves Fig. 1 distinguishes: META is the problem description
-d, stable for the whole run and identical in every prompt; INSTRUCTION is what
-to do this turn. Keeping them apart is what lets the builder slot the parent
-node and the retrieved lessons between them.
+The wording is the reference TTT-Discover prompt, kept verbatim so results stay
+comparable, with one change: the <strategy> block is gone. In the reference the
+model had native thinking switched off, so <strategy> WAS its reasoning. Here
+native <think> is on, which made <strategy> a second reasoning pass over the
+same ground. The reasoning happens in the think block now, free-form.
+
+META is the problem description d, stable for the whole run and identical in
+every prompt; INSTRUCTION is what to do this turn. Keeping them apart is what
+lets the builder slot the parent node and the retrieved lessons between them.
 """
 
 META = """You are an expert mathematician specializing in circle packing problems and computational geometry.
@@ -35,15 +40,7 @@ Rules:
 - No filesystem or network IO.
 - You need to get really creative and think from first principles.
 
-Output format — follow it exactly:
-1. A <strategy>...</strategy> block of AT MOST 150 words. State the approach and
-   move on; do not derive bounds, estimate densities, or weigh alternatives.
-2. Then the complete program between ```python and ```.
-3. Stop immediately after the closing fence. Do not write a second program, do
-   not review what you wrote, do not add commentary.
-
-Budget your output: a complete working program scores; an unfinished one scores
-zero however good the reasoning behind it was. Spend your tokens on code."""
+Make sure to think step by step, then finally return the final program between ```python and ```."""
 
 
 PRELUDE = """import numpy as np

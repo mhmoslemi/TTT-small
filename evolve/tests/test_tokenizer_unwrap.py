@@ -105,7 +105,8 @@ def test_render_falls_back_to_the_processor_chat_template():
             return object(), ProcessorWithTemplate()
 
     backbone = Backbone(Config().model, backend=StubBackend()).load()
-    assert backbone.render([{"role": "user", "content": "hi"}]) == "FROM_PROCESSOR"
+    # startswith, not ==: force_no_think appends a closed <think> block.
+    assert backbone.render([{"role": "user", "content": "hi"}]).startswith("FROM_PROCESSOR")
 
 def test_render_prefers_the_tokenizer_template_when_it_has_one():
     from config import Config
@@ -117,4 +118,4 @@ def test_render_prefers_the_tokenizer_template_when_it_has_one():
             return object(), FakeProcessor()
 
     backbone = Backbone(Config().model, backend=StubBackend()).load()
-    assert backbone.render([{"role": "user", "content": "hi"}]) == "RENDERED"
+    assert backbone.render([{"role": "user", "content": "hi"}]).startswith("RENDERED")
