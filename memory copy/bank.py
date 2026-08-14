@@ -28,8 +28,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from memory_v1.embedding import Embedder, cosine_scores
-from memory_v1.types import FAILURE, SUCCESS, Lesson
+from memory.embedding import Embedder, cosine_scores
+from memory.types import FAILURE, SUCCESS, Lesson
 
 
 class MemoryBank:

@@ -28,9 +28,9 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Sequence
 
-from memory_v1.prompts import (build_negative_messages, build_positive_messages,
+from memory.prompts import (build_negative_messages, build_positive_messages,
                             parse_lessons)
-from memory_v1.types import FAILURE, SUCCESS, Lesson, RolloutRecord
+from memory.types import FAILURE, SUCCESS, Lesson, RolloutRecord
 
 
 class LessonExtractor:

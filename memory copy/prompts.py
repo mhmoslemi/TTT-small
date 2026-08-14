@@ -31,7 +31,7 @@ import json
 import re
 from typing import Dict, List, Sequence
 
-from memory_v1.types import FAILURE, SUCCESS, Lesson, RolloutRecord
+from memory.types import FAILURE, SUCCESS, Lesson, RolloutRecord
 
 # ----------------------------------------------------------------------
 # Extraction
