@@ -28,14 +28,14 @@ Typical wiring in a trainer:
         memory.save()
 """
 
-from memory_v1.bank import MemoryBank
-from memory_v1.config import MemoryConfig
-from memory_v1.embedding import Embedder
-from memory_v1.extractor import LessonExtractor, build_meta_description
-from memory_v1.llm import make_memory_llm
-from memory_v1.prompts import (inject_memories, parent_query_text,
+from memory.bank import MemoryBank
+from memory.config import MemoryConfig
+from memory.embedding import Embedder
+from memory.extractor import LessonExtractor, build_meta_description
+from memory.llm import make_memory_llm
+from memory.prompts import (inject_memories, parent_query_text,
                             render_memory_block)
-from memory_v1.types import FAILURE, SUCCESS, Lesson, RolloutRecord
+from memory.types import FAILURE, SUCCESS, Lesson, RolloutRecord
 
 __all__ = [
     "MemoryBank", "MemoryConfig", "Embedder", "LessonExtractor",

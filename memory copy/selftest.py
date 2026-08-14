@@ -17,12 +17,12 @@ import json
 import tempfile
 from pathlib import Path
 
-from memory_v1.bank import MemoryBank
-from memory_v1.config import MemoryConfig
-from memory_v1.embedding import Embedder
-from memory_v1.extractor import LessonExtractor
-from memory_v1.prompts import inject_memories, parse_lessons
-from memory_v1.types import FAILURE, SUCCESS, RolloutRecord
+from memory.bank import MemoryBank
+from memory.config import MemoryConfig
+from memory.embedding import Embedder
+from memory.extractor import LessonExtractor
+from memory.prompts import inject_memories, parse_lessons
+from memory.types import FAILURE, SUCCESS, RolloutRecord
 
 FAILS = []
 
