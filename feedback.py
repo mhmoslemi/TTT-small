@@ -1,0 +1,311 @@
+"""
+Feedback-based failure signal (Sec. 2.3, Eq. 9).
+
+A scalar reward says a rollout failed. It does not say which tokens caused the
+failure. Eq. 9 recovers that by reusing the rollout policy as a
+feedback-conditioned self-teacher:
+
+    A^fb_{i,l} = log q_thetabar(y_{i,l} | x_p, f_i, y_{i,<l})
+               - log pi_thetabar(y_{i,l} | x_p,      y_{i,<l})
+
+Same weights on both sides. The only difference is whether the verifier's
+complaint is in the context. Where the token becomes more likely once the model
+can see the error message, the feedback endorses it; where it becomes less
+likely, the feedback blames it. Detached, so it shapes the advantage and is
+never differentiated through.
+
+Combined per Sec. 2.3:
+
+    A_{i,l} = A^rew_i + lambda_f * d_i * A^fb_{i,l}
+
+with d_i the failure indicator, so successful rollouts are untouched.
+
+ONE FORWARD PASS, NOT TWO. The second term above is log pi_thetabar, the
+rollout policy. The trainer accumulates gradients over every example and calls
+optimizer.step() once at the end, so throughout that loop theta == thetabar and
+`cur_lp.detach()` from the existing forward IS log pi_thetabar. Only the
+feedback-conditioned forward is new, and it runs under no_grad.
+
+Cost: one extra prompt+response forward per FAILED rollout. In your runs
+failures are 50-70% of 512, so expect the train phase to grow by roughly half
+unless you cap it with feedback_max_per_step.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields
+from typing import Any, Dict, List, Optional, Sequence
+
+PREFIX = "feedback_"
+_MISSING = object()
+
+
+# ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
+@dataclass
+class FeedbackConfig:
+    enabled: bool = False
+
+    lambda_f: float = 0.2         # lambda_f in Sec. 2.3. UNVALIDATED, see note below.
+    clip: float = 5.0             # clamp |A^fb| per token; 0 disables (paper has no clip)
+    chars: int = 1200             # verifier text budget in the reprompt
+    max_per_step: int = 0         # 0 = every failed rollout; >0 caps the extra forwards
+    include_constant_groups: bool = True
+    inject_mode: str = "append"   # append | user_turn
+    normalize: bool = False       # standardize A^fb within a response
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any], verbose: bool = True) -> "FeedbackConfig":
+        d = dict(d or {})
+        enabled = bool(d.get("feedback", False))
+
+        if not enabled:
+            defaults = cls()
+            ignored = sorted(
+                k for k, v in d.items()
+                if k.startswith(PREFIX) and v is not None
+                and getattr(defaults, _name(k), _MISSING) != v
+            )
+            if verbose and ignored:
+                print(f"[feedback] disabled (--feedback not set); ignoring "
+                      f"{len(ignored)} feedback_* key(s): {', '.join(ignored)}")
+            return cls(enabled=False)
+
+        kwargs: Dict[str, Any] = {"enabled": True}
+        known = {f.name: f for f in fields(cls)}
+        unknown = []
+        for key, value in d.items():
+            if not key.startswith(PREFIX) or value is None:
+                continue
+            name = _name(key)
+            if name not in known or name == "enabled":
+                unknown.append(key)
+                continue
+            target = known[name].type
+            try:
+                if target is bool or target == "bool":
+                    value = _as_bool(value)
+                elif target is int or target == "int":
+                    value = int(value)
+                elif target is float or target == "float":
+                    value = float(value)
+                else:
+                    value = str(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"[feedback] bad value for {key}: {value!r}")
+            kwargs[name] = value
+
+        if verbose and unknown:
+            print(f"[feedback] unknown feedback_* key(s) ignored: "
+                  f"{', '.join(sorted(unknown))}")
+
+        cfg = cls(**kwargs)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        if self.lambda_f < 0:
+            raise ValueError("feedback_lambda must be >= 0")
+        if self.inject_mode not in ("append", "user_turn"):
+            raise ValueError("feedback_inject_mode must be append|user_turn")
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "feedback signal OFF"
+        return (f"feedback signal ON  lambda_f={self.lambda_f}  "
+                f"clip={self.clip or 'none'}  "
+                f"constant_groups={'in' if self.include_constant_groups else 'out'}  "
+                f"cap={self.max_per_step or 'all'}")
+
+
+def _name(key: str) -> str:
+    """feedback_lambda maps to the field lambda_f; the rest strip the prefix."""
+    name = key[len(PREFIX):]
+    return "lambda_f" if name == "lambda" else name
+
+
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# ----------------------------------------------------------------------
+# reprompt(x_p, f_i)
+# ----------------------------------------------------------------------
+_HEADER = "## Verifier output for the attempt below"
+
+_PREAMBLE = (
+    "The program produced in response to the instructions above was executed "
+    "and rejected. The verifier reported the following. Treat it as ground "
+    "truth about what went wrong."
+)
+
+_CLOSER = (
+    "Write the program again, correcting the cause of this failure while "
+    "keeping everything that was already right."
+)
+
+
+def format_feedback(msg: str, stdout: str, limit: int = 1200) -> str:
+    """
+    f_i. The verifier's tag plus the tail of stdout, which is where the
+    traceback lives; the head is usually progress noise.
+    """
+    parts = []
+    if msg:
+        parts.append(f"verifier: {msg}")
+    else:
+        parts.append("verifier: invalid (no message)")
+    tail = (stdout or "").strip()
+    if tail:
+        parts.append("stdout tail:\n" + tail[-limit:])
+    return "\n".join(parts)
+
+
+def build_reprompt(messages: List[Dict], feedback_text: str,
+                   mode: str = "append") -> List[Dict]:
+    """
+    x_p augmented with f_i, per Sec. 2.3. Returns a NEW list.
+
+    Two modes, and the difference matters more than it looks:
+
+      append     the feedback is folded into the same user message. The teacher
+                 sees one instruction that happens to mention a past failure.
+
+      user_turn  the feedback arrives as a separate later user turn. The
+                 teacher sees a conversation where its work was rejected.
+
+    `append` is the default because the response y_i was itself generated from
+    a single-user-message prompt, so the teacher's context stays closer to the
+    rollout's context and log q - log pi isolates the feedback rather than also
+    picking up a change in conversational shape.
+    """
+    block = f"{_HEADER}\n\n{_PREAMBLE}\n\n{feedback_text}\n\n{_CLOSER}"
+    out = [dict(m) for m in messages]
+    if not feedback_text:
+        return out
+
+    if mode == "user_turn":
+        return out + [{"role": "user", "content": block}]
+
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            out[i]["content"] = out[i]["content"] + "\n\n" + block
+            return out
+
+    out.append({"role": "user", "content": block})
+    return out
+
+
+def render_chat(tokenizer, messages: List[Dict]) -> str:
+    """Same call and fallback the trainer uses for the rollout prompt."""
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+
+def is_failure(res, fail_score: float = 0.0) -> bool:
+    """
+    d_i = 1{r_i = 0 or the attempt failed}. `valid` is checked as well as the
+    reward so a problem with a negative fail_score cannot mislabel an invalid
+    rollout as a success.
+    """
+    return not (bool(getattr(res, "valid", False))
+                and float(getattr(res, "reward", 0.0)) > float(fail_score))
+
+
+def select_capped(indices: Sequence[int], cap: int) -> List[int]:
+    """
+    Even stride rather than a prefix. Taking the first `cap` failures would draw
+    them all from the first group or two, and a cap is supposed to reduce cost
+    without changing which part of the batch the signal comes from.
+    """
+    idx = list(indices)
+    if cap <= 0 or len(idx) <= cap:
+        return idx
+    step = len(idx) / float(cap)
+    return [idx[int(i * step)] for i in range(cap)]
+
+
+# ----------------------------------------------------------------------
+# A^fb (Eq. 9)
+# ----------------------------------------------------------------------
+def feedback_advantage(compute_token_logprobs, model, tokenizer,
+                       reprompt_text: str, response_ids, rollout_logprobs,
+                       cfg: FeedbackConfig):
+    """
+    Returns the detached per-token A^fb aligned 1:1 with response_ids, already
+    multiplied by lambda_f, or None if it could not be computed.
+
+    `rollout_logprobs` must be log pi_thetabar for this response, detached. In
+    the trainer that is cur_lp.detach(), which is exact as long as no optimizer
+    step has happened since the rollouts were sampled.
+    """
+    import torch
+
+    try:
+        rp_ids = tokenizer(reprompt_text, return_tensors="pt").input_ids.to(model.device)
+        with torch.no_grad():
+            q_lp = compute_token_logprobs(model, rp_ids, response_ids, with_grad=False)
+    except Exception as e:
+        print(f"[feedback] teacher forward failed ({e!r}); skipping this rollout")
+        return None
+
+    if q_lp.shape[0] != rollout_logprobs.shape[0]:
+        # Cannot align, so it cannot be attributed to tokens. Drop it rather
+        # than silently applying a shifted credit assignment.
+        return None
+
+    adv = (q_lp - rollout_logprobs).detach()
+
+    if cfg.normalize:
+        std = adv.std()
+        if float(std) > 1e-6:
+            adv = (adv - adv.mean()) / std
+
+    if cfg.clip and cfg.clip > 0:
+        # Not in the paper. A single token can hit a log-ratio of 10 or more
+        # when the feedback names an identifier verbatim, and unclipped that one
+        # token dominates a whole response's update. clip=0 restores Eq. 9 as
+        # written.
+        adv = adv.clamp(-float(cfg.clip), float(cfg.clip))
+
+    return float(cfg.lambda_f) * adv
+
+
+class FeedbackStats:
+    """Per-step diagnostics, printed by the trainer."""
+
+    def __init__(self):
+        self.n = 0
+        self.skipped = 0
+        self.sum_abs = 0.0
+        self.sum_pos = 0.0
+        self.max_abs = 0.0
+
+    def add(self, adv) -> None:
+        self.n += 1
+        a = adv.abs()
+        self.sum_abs += float(a.mean().item())
+        self.sum_pos += float((adv > 0).float().mean().item())
+        self.max_abs = max(self.max_abs, float(a.max().item()))
+
+    def line(self, step_idx: int, lam: float) -> str:
+        if self.n == 0:
+            return (f"[step {step_idx}] feedback: no failed rollouts scored"
+                    + (f" ({self.skipped} skipped)" if self.skipped else ""))
+        return (f"[step {step_idx}] feedback: {self.n} failed rollouts scored"
+                + (f" ({self.skipped} skipped)" if self.skipped else "")
+                + f"  mean|lambda*A^fb|={self.sum_abs / self.n:.4f}"
+                f"  max={self.max_abs:.3f}"
+                f"  endorsed={100 * self.sum_pos / self.n:.0f}% of tokens")
