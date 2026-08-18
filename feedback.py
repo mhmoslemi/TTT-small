@@ -47,7 +47,15 @@ _MISSING = object()
 class FeedbackConfig:
     enabled: bool = False
 
-    lambda_f: float = 0.2         # lambda_f in Sec. 2.3. UNVALIDATED, see note below.
+    lambda_f: float = 0.2         # lambda_f at step 0
+    # Annealing. anneal_steps=0 keeps lambda_f constant (Sec. 2.3 as written).
+    # anneal_steps=10 with lambda_final=0 means the feedback term is fully off
+    # from step 10 onward, and the teacher forward is skipped entirely once the
+    # coefficient reaches zero, so the late steps cost exactly what a no-feedback
+    # run costs.
+    anneal_steps: int = 0
+    anneal_shape: str = "linear"  # linear | cosine
+    lambda_final: float = 0.0
     clip: float = 5.0             # clamp |A^fb| per token; 0 disables (paper has no clip)
     chars: int = 1200             # verifier text budget in the reprompt
     max_per_step: int = 0         # 0 = every failed rollout; >0 caps the extra forwards
@@ -107,13 +115,49 @@ class FeedbackConfig:
     def validate(self) -> None:
         if self.lambda_f < 0:
             raise ValueError("feedback_lambda must be >= 0")
+        if self.lambda_final < 0:
+            raise ValueError("feedback_lambda_final must be >= 0")
+        if self.anneal_steps < 0:
+            raise ValueError("feedback_anneal_steps must be >= 0")
+        if self.anneal_shape not in ("linear", "cosine"):
+            raise ValueError("feedback_anneal_shape must be linear|cosine")
         if self.inject_mode not in ("append", "user_turn"):
             raise ValueError("feedback_inject_mode must be append|user_turn")
+
+    def lambda_at(self, step: int) -> float:
+        """
+        The coefficient in force at this step.
+
+        Keyed on the absolute step rather than advanced by a counter, so a step
+        is reproducible on its own and a restart cannot land on a different
+        point of the schedule than a fresh run would.
+        """
+        n = int(self.anneal_steps or 0)
+        if n <= 0:
+            return float(self.lambda_f)
+        if step >= n:
+            return float(self.lambda_final)
+        frac = float(step) / float(n)
+        if self.anneal_shape == "cosine":
+            import math
+            w = 0.5 * (1.0 + math.cos(math.pi * frac))
+        else:
+            w = 1.0 - frac
+        return float(self.lambda_final + (self.lambda_f - self.lambda_final) * w)
+
+    def schedule_preview(self, n: int = 12) -> str:
+        if self.anneal_steps <= 0:
+            return f"constant {self.lambda_f}"
+        pts = [f"{s}:{self.lambda_at(s):.3f}" for s in range(0, min(n, self.anneal_steps + 2))]
+        return "  ".join(pts)
 
     def describe(self) -> str:
         if not self.enabled:
             return "feedback signal OFF"
-        return (f"feedback signal ON  lambda_f={self.lambda_f}  "
+        sched = (f"lambda_f={self.lambda_f}" if self.anneal_steps <= 0
+                 else f"lambda_f {self.lambda_f}->{self.lambda_final} over "
+                      f"{self.anneal_steps} steps ({self.anneal_shape})")
+        return (f"feedback signal ON  {sched}  "
                 f"clip={self.clip or 'none'}  "
                 f"constant_groups={'in' if self.include_constant_groups else 'out'}  "
                 f"cap={self.max_per_step or 'all'}")
@@ -242,10 +286,12 @@ def select_capped(indices: Sequence[int], cap: int) -> List[int]:
 # ----------------------------------------------------------------------
 def feedback_advantage(compute_token_logprobs, model, tokenizer,
                        reprompt_text: str, response_ids, rollout_logprobs,
-                       cfg: FeedbackConfig):
+                       cfg: FeedbackConfig, lam: Optional[float] = None):
     """
     Returns the detached per-token A^fb aligned 1:1 with response_ids, already
-    multiplied by lambda_f, or None if it could not be computed.
+    multiplied by the coefficient in force, or None if it could not be computed.
+    Pass `lam` from cfg.lambda_at(step) when annealing; it defaults to the
+    unannealed lambda_f.
 
     `rollout_logprobs` must be log pi_thetabar for this response, detached. In
     the trainer that is cur_lp.detach(), which is exact as long as no optimizer
@@ -280,7 +326,8 @@ def feedback_advantage(compute_token_logprobs, model, tokenizer,
         # written.
         adv = adv.clamp(-float(cfg.clip), float(cfg.clip))
 
-    return float(cfg.lambda_f) * adv
+    lam = float(cfg.lambda_f if lam is None else lam)
+    return lam * adv
 
 
 class FeedbackStats:
@@ -302,10 +349,12 @@ class FeedbackStats:
 
     def line(self, step_idx: int, lam: float) -> str:
         if self.n == 0:
-            return (f"[step {step_idx}] feedback: no failed rollouts scored"
-                    + (f" ({self.skipped} skipped)" if self.skipped else ""))
+            return (f"[step {step_idx}] feedback: no failed rollouts scored "
+                    f"(lambda={lam:.3f})"
+                    + (f", {self.skipped} skipped" if self.skipped else ""))
         return (f"[step {step_idx}] feedback: {self.n} failed rollouts scored"
                 + (f" ({self.skipped} skipped)" if self.skipped else "")
-                + f"  mean|lambda*A^fb|={self.sum_abs / self.n:.4f}"
+                + f"  lambda={lam:.3f}"
+                f"  mean|lambda*A^fb|={self.sum_abs / self.n:.4f}"
                 f"  max={self.max_abs:.3f}"
                 f"  endorsed={100 * self.sum_pos / self.n:.0f}% of tokens")

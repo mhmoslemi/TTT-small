@@ -87,7 +87,16 @@ class Problem(ABC):
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
-    def build_prompt(self, parent: ParentContext) -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
+        """
+        Build the chat messages for one parent.
+
+        `memory` is a pre-rendered block of retrieved lessons, or "" when memory
+        is off or nothing was selected. A problem that accepts it should place it
+        between the parent state and the instruction, and adapt the instruction
+        to it; a problem that ignores it still works, and the trainer falls back
+        to appending the block itself.
+        """
         ...
 
     @abstractmethod

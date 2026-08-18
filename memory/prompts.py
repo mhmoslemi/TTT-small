@@ -1,28 +1,29 @@
 """
-Memory-maker prompts, the parser for what they return, and the injection of
-retrieved lessons into a generation prompt.
+Prompts for the four things the module asks the model to do: extract lessons,
+curate the bank, choose which lessons to use, and read the chosen lessons back.
 
-Four things this file is responsible for:
+Three design borrowings, each tied to a measured failure:
 
-1. The extraction prompts process a whole group in ONE call. Sec. 2.2 is
-   specific: "the extracted lessons summarize patterns across the entire group;
-   they are not separate notes for individual responses."
+1. CONTRASTIVE EXTRACTION (ReasoningBank, self-contrast). One call sees the
+   successes AND the failures of the step and is asked why some worked and
+   others did not. The split prompt+/prompt- design asks "what makes these good"
+   at steps where the median within-group reward spread is exactly 0.000000, so
+   it restates the current construction. A contrast between the batch's two
+   halves exists even when the successes are indistinguishable from each other.
 
-2. Every extraction prompt carries the CURRENT BANK as a catalog of id, title
-   and summary. The maker is told to write only what is new relative to that
-   list, and to reinforce an existing id instead of restating it. Without this
-   the maker is blind to what it already wrote and re-derives the same lesson
-   every step, which embedding dedup then silently discards.
+2. GENERALIZATION BY PROHIBITION, not by request. ReasoningBank forbids naming
+   specific websites, queries, and string contents. The analogue for program
+   search is to forbid coordinates, numeric constants tied to the instance size,
+   and whole layouts. v1 asked for generality and stored a coordinate formula
+   that reached 99% of programs. Naming what may not appear is enforceable;
+   asking for generality is not.
 
-3. Titles are human-facing, lesson bodies are not. The schema says so
-   explicitly: the body is read back by a model, so shorthand, symbols and
-   parameter names are preferred over readable prose.
+3. CURATION, not accumulation (Dynamic Cheatsheet). See curator.py. Additive
+   banks accumulate paraphrases; a periodic rewrite where anything not carried
+   forward is dropped forces the model to decide what is worth keeping.
 
-4. Injection is budgeted. build_injection renders the block, measures it with
-   the real tokenizer, and drops the lowest-ranked lessons until it fits
-   token_budget. The trainer adds that same budget to max_seq_length at
-   startup, so the block is granted context on top rather than taking it from
-   the response.
+Reflection precedes summary in both extraction prompts, again from
+ReasoningBank: state why before stating what.
 """
 
 from __future__ import annotations
@@ -32,93 +33,174 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from memory.types import (FAILURE, SUCCESS, IMPORTANCE_DEFAULT, Lesson,
-                          RolloutRecord, clamp_importance)
+from memory.types import (FAILURE, GLOBAL, IMPORTANCE_DEFAULT, LOCAL, SUCCESS,
+                          Lesson, RolloutRecord, clamp_importance)
 
 # ----------------------------------------------------------------------
-# Extraction prompts
+# Rules shared by every extraction prompt
 # ----------------------------------------------------------------------
-_SCHEMA = """Return ONLY a JSON object, with no prose before or after it and no
-markdown fences. Shape:
+GENERALIZATION_RULES = """## What a lesson may and may not contain
+
+A lesson is an insight that transfers to the next attempt. It is NOT a record of
+what these programs did.
+
+NEVER include, at any scope:
+- coordinates, positions, or any expression that computes them
+- numeric constants tied to this instance size, lattice constants, or magic numbers
+- a complete arrangement, layout, seed configuration, or initialization scheme
+- more than {max_code} lines of code, in any form, fenced or unfenced
+- the specific score any program reached
+
+The test: if a future attempt could paste your lesson into its program and
+thereby have its structure decided for it, the lesson is too specific. Rewrite it
+as the idea a reader would need in order to derive that structure themselves.
+
+Declare a "scope" for each lesson:
+  "local"   an operation, repair, check, or diagnostic that drops into any
+            candidate without deciding its overall approach. May carry a few
+            lines of code.
+  "global"  anything determining the overall structure: which family of method
+            to search in, which formulation to hand the optimizer, what to treat
+            as the decision variables. MUST contain no code at all.
+
+The asymmetry is measured, not stylistic. A global rule written as code stops
+being a lesson and becomes the answer: every later program copies it, the search
+stops exploring the space that rule fixes, and the run plateaus."""
+
+_SCHEMA = """## Output format
+
+Return ONLY a JSON object, no prose around it and no markdown fences:
 
 {{
-  "reinforce": ["<id of an already-recorded lesson this batch confirmed>", ...],
+  "reflection": "<2-4 sentences: why did the successes succeed and the failures
+                 fail? Write this FIRST and reason in it, then derive the items
+                 below from it.>",
+  "reinforce": ["<id from the index that this batch re-confirmed>", ...],
   "lessons": [
     {{
       "title":      "<human-readable, plain English, under 10 words>",
       "summary":    "<one plain sentence a human can read>",
-      "lesson":     "<the actual content, written for a language model>",
-      "importance": <integer 1-5>
+      "scope":      "local" | "global",
+      "kind":       "operation" | "heuristic" | "diagnostic" | "pitfall",
+      "lesson":     "<the content, written for a language model to reuse>",
+      "importance": <integer 1-5>,
+      "closest_existing": "<id from the index this most resembles, or none>",
+      "new_because": "<one clause: what this adds that the closest one lacks>"
     }}
   ]
 }}
 
-At most {n} objects in "lessons". "reinforce" may be empty.
+At most {n} lessons IN TOTAL. Returning fewer, or none, is correct when this
+batch produced nothing that generalizes. An empty list is a valid answer and is
+better than a restatement.
 
-Field rules:
-- "title" and "summary" are read by a person auditing the run. Plain English,
-  no shorthand, no symbols, no invented abbreviations.
-- "lesson" is NOT read by a person. It is fed back to a language model in a
-  later prompt. Write it for that reader: compress it, use symbols, parameter
-  names, arrow notation, fragments, whatever encodes the finding most densely.
-  It does not need to be grammatical or comprehensible to a human. It must be
-  self-contained, because it will appear without any of this context.
-- "importance" is how strongly the evidence supports acting on this lesson.
-  5 = seen across nearly every attempt in the batch and directly tied to the
-  reward difference. 1 = one attempt, plausible but unconfirmed.
-"""
-
-_QUALITY_BAR = """Rules for every lesson:
-- It must be NEW relative to the already-recorded list above. If this batch
-  merely confirms a lesson that is already recorded, put its id in "reinforce"
-  and do not write it again.
-- It must generalize past the specific attempts shown. A lesson that only
-  describes one attempt is useless later.
-- It must be specific enough to act on. "be more careful" is not a lesson;
-  a named technique, parameter range, or structural choice is.
-- Do not restate the problem statement or the scoring rule.
-- Do not include code blocks. Name techniques instead.
-{fill_rule}"""
-
-_FILL_STRICT = ("- Return exactly {n} lessons. If the evidence does not support "
-                "{n} distinct ones, make the weaker ones narrower rather than "
-                "vaguer.")
-_FILL_LOOSE = ("- Return FEWER than {n} lessons, or none at all, if this batch "
-               "produced nothing genuinely new. Padding the list with restated "
-               "or vague entries is worse than returning one good lesson.")
+- "title"/"summary" are read by a person auditing the run: plain English.
+- "lesson" is not read by a person. It is fed back to a language model later.
+  Compress it, but keep it self-contained.
+- "importance": 5 = held across nearly every attempt here and tied to the
+  outcome difference. 1 = one attempt, plausible, unconfirmed.
+- "closest_existing" and "new_because" are mandatory. Look up the nearest entry
+  in the index before writing. If you cannot say what yours adds, it is not new:
+  put that id in "reinforce" and drop it from "lessons"."""
 
 
-def _catalog_section(catalog: Sequence[str]) -> str:
+def _index_section(catalog: Sequence[str]) -> str:
     if not catalog:
         return ("## Lessons already recorded\n"
                 "(none yet, this is the first extraction)\n")
     return ("## Lessons already recorded\n"
-            "Each line is: [id] (outcome, importance) title :: summary\n\n"
+            "id  [scope/outcome, importance, step, times used]  title :: summary\n\n"
             + "\n".join(catalog) + "\n")
 
 
-def build_positive_messages(meta_description: str,
-                            records: Sequence[RolloutRecord],
+def _delta_note(records: Sequence[RolloutRecord]) -> str:
+    deltas = [r.delta() for r in records if r.delta() is not None]
+    if not deltas:
+        return ""
+    best, worst = max(deltas), min(deltas)
+    if abs(best) < 1e-12 and abs(worst) < 1e-12:
+        return ("\n**Nothing here improved on its parent.** Every attempt scored "
+                "exactly what it started from. Do not describe what these "
+                "programs do, because that is already recorded and is not "
+                "working. Either name the specific thing blocking progress, at "
+                "`global` scope and without code, or return no lessons at all.\n")
+    return (f"\nEach attempt's change relative to its parent is shown, ranging "
+            f"from {worst:+.6f} to {best:+.6f}. What matters is what CHANGED.\n")
+
+
+# ----------------------------------------------------------------------
+# Contrastive extraction (default): successes and failures in one call
+# ----------------------------------------------------------------------
+def build_contrast_messages(meta_description: str,
+                            successes: Sequence[RolloutRecord],
+                            failures: Sequence[RolloutRecord],
                             num_lessons: int,
                             max_chars_per_example: int,
+                            feedback_chars: int,
                             catalog: Sequence[str] = (),
-                            require_full: bool = False) -> List[Dict]:
-    """prompt+ over S_t: strategies shared by the successful attempts."""
-    blocks = [f"### Successful attempt {i}\n" + r.render_success(max_chars_per_example)
-              for i, r in enumerate(records, 1)]
-    fill = (_FILL_STRICT if require_full else _FILL_LOOSE).format(n=num_lessons)
+                            max_code: int = 4) -> List[Dict]:
+    """
+    One call over both halves of the batch.
+
+    The instruction to compare rather than to summarize is the whole point: on a
+    plateau the accepted programs are indistinguishable from each other, but they
+    are still distinguishable from the rejected ones.
+    """
+    blocks = []
+    for i, r in enumerate(successes, 1):
+        blocks.append(f"### ACCEPTED attempt {i}\n" + r.render_success(max_chars_per_example))
+    for i, r in enumerate(failures, 1):
+        blocks.append(f"### REJECTED attempt {i}\n"
+                      + r.render_failure(max_chars_per_example, feedback_chars))
+
     user = (
         "You maintain the lesson memory for an automated program-search run. "
-        "Below is a batch of SUCCESSFUL attempts at one task. Record what made "
-        "them work, without duplicating what is already recorded.\n\n"
+        "Below is one batch of attempts at a single task. Some were accepted by "
+        "the verifier and some were rejected.\n\n"
         f"## Task\n{meta_description}\n\n"
-        + _catalog_section(catalog) + "\n"
-        f"## This batch ({len(records)} attempts, all valid)\n\n"
+        + _index_section(catalog) + "\n"
+        f"## This batch ({len(successes)} accepted, {len(failures)} rejected)\n\n"
         + "\n\n".join(blocks)
         + "\n\n## What to produce\n"
-        "Identify the strategies these attempts have in common, and the choices "
-        "that separate the higher-reward ones from the lower-reward ones.\n\n"
-        + _QUALITY_BAR.format(fill_rule=fill) + "\n\n"
+        "Compare and contrast these attempts. Think first: why did some succeed "
+        "while others failed, and what separates the higher-scoring accepted ones "
+        "from the lower-scoring ones?\n"
+        "- Identify strategies that consistently led to a better outcome.\n"
+        "- Identify mistakes or inefficiencies in the rejected attempts, and "
+        "state the preventative measure for each.\n"
+        "- Prefer insights that hold beyond this particular batch.\n"
+        + _delta_note(list(successes) + list(failures))
+        + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
+        + _SCHEMA.format(n=num_lessons)
+    )
+    return [{"role": "user", "content": user}]
+
+
+# ----------------------------------------------------------------------
+# Split extraction (prompt+ / prompt-), kept for the ablation
+# ----------------------------------------------------------------------
+def build_positive_messages(meta_description: str,
+                            records: Sequence[RolloutRecord],
+                            num_lessons: int, max_chars_per_example: int,
+                            catalog: Sequence[str] = (),
+                            require_full: bool = False,
+                            max_code: int = 4) -> List[Dict]:
+    blocks = [f"### Attempt {i}\n" + r.render_success(max_chars_per_example)
+              for i, r in enumerate(records, 1)]
+    user = (
+        "You maintain the lesson memory for an automated program-search run. "
+        "Below is a batch of attempts the verifier ACCEPTED.\n\n"
+        f"## Task\n{meta_description}\n\n"
+        + _index_section(catalog) + "\n"
+        f"## This batch ({len(records)} accepted attempts)\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n## What to produce\n"
+        "Think first about WHY these succeeded, then derive what separates the "
+        "higher-scoring ones from the lower-scoring ones and what each changed "
+        "relative to its parent."
+        + _delta_note(records)
+        + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
+        + ("Return exactly {n} lessons.\n\n".format(n=num_lessons) if require_full else "")
         + _SCHEMA.format(n=num_lessons)
     )
     return [{"role": "user", "content": user}]
@@ -126,43 +208,47 @@ def build_positive_messages(meta_description: str,
 
 def build_negative_messages(meta_description: str,
                             records: Sequence[RolloutRecord],
-                            num_lessons: int,
-                            max_chars_per_example: int,
-                            feedback_chars: int,
-                            catalog: Sequence[str] = (),
-                            require_full: bool = False) -> List[Dict]:
-    """prompt- over F_t: common failure modes and how to prevent them."""
-    blocks = [f"### Failed attempt {i}\n"
+                            num_lessons: int, max_chars_per_example: int,
+                            feedback_chars: int, catalog: Sequence[str] = (),
+                            require_full: bool = False,
+                            max_code: int = 4) -> List[Dict]:
+    blocks = [f"### Attempt {i}\n"
               + r.render_failure(max_chars_per_example, feedback_chars)
               for i, r in enumerate(records, 1)]
-    fill = (_FILL_STRICT if require_full else _FILL_LOOSE).format(n=num_lessons)
     user = (
         "You maintain the lesson memory for an automated program-search run. "
-        "Below is a batch of FAILED attempts at one task. Record how to avoid "
-        "repeating them, without duplicating what is already recorded.\n\n"
+        "Below is a batch of attempts the verifier REJECTED.\n\n"
         f"## Task\n{meta_description}\n\n"
-        + _catalog_section(catalog) + "\n"
-        f"## This batch ({len(records)} attempts, all invalid or crashed)\n\n"
+        + _index_section(catalog) + "\n"
+        f"## This batch ({len(records)} rejected attempts)\n\n"
         + "\n\n".join(blocks)
         + "\n\n## What to produce\n"
-        "Identify the failure modes that RECUR across these attempts, not the "
-        "one-off accidents. For each, state the preventative measure: what a "
-        "future attempt should do differently so the same verifier message does "
-        "not come back.\n\n"
-        + _QUALITY_BAR.format(fill_rule=fill) + "\n\n"
+        "Reflect first on WHY these failed, then state the lessons or "
+        "preventative strategies. Identify the failure modes that RECUR here, "
+        "not the one-off accidents.\n\n"
+        "A caution specific to this channel: 'catch the error and return a safe "
+        "default' is almost never the right lesson. A program that detects its "
+        "own failure and returns a degenerate answer has not solved anything, and "
+        "a memory full of defensive coding produces valid, worthless output. "
+        "State what would make the computation correct, not how to survive it "
+        "being wrong.\n"
+        + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
+        + ("Return exactly {n} lessons.\n\n".format(n=num_lessons) if require_full else "")
         + _SCHEMA.format(n=num_lessons)
     )
     return [{"role": "user", "content": user}]
 
 
 # ----------------------------------------------------------------------
-# Parsing
+# Parsing extraction
 # ----------------------------------------------------------------------
 @dataclass
 class ExtractionResult:
     lessons: List[Lesson] = field(default_factory=list)
     reinforce: List[str] = field(default_factory=list)
+    reflection: str = ""
     raw: str = ""
+    rejected: List[Tuple[str, str]] = field(default_factory=list)
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -171,24 +257,35 @@ _ID_RE = re.compile(r"^[0-9a-f]{6,16}$")
 
 
 def _candidate_spans(text: str) -> List[str]:
-    """Ordered guesses at where the JSON is, most likely first."""
     out = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
     for op, cl in (("{", "}"), ("[", "]")):
-        start, end = text.find(op), text.rfind(cl)
-        if start != -1 and end > start:
-            out.append(text[start:end + 1])
+        a, b = text.find(op), text.rfind(cl)
+        if a != -1 and b > a:
+            out.append(text[a:b + 1])
     out.append(text.strip())
+    return out
+
+
+def _clean_ids(raw) -> List[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    if isinstance(raw, list):
+        for r in raw:
+            rid = str(r).strip().strip("[]").lower()
+            if _ID_RE.match(rid):
+                out.append(rid)
     return out
 
 
 def parse_extraction(response_text: str, outcome: str, step: int,
                      expected: int) -> ExtractionResult:
     """
-    Turn one memory-maker response into lessons plus reinforce ids.
+    Never raises: a malformed reply costs one step's lessons, not the run.
 
-    A model that ignores the schema should cost a step's lessons, not the run,
-    so every failure path returns what it could recover instead of raising.
-    Both the object form and a bare array (older schema) are accepted.
+    `outcome` is the default label. In contrastive mode a lesson may declare
+    "kind": "pitfall", which routes it to the failure side, since that is what
+    the outcome tag is for downstream.
     """
     text = _THINK_RE.sub("", response_text or "").strip()
     if not text:
@@ -198,126 +295,155 @@ def parse_extraction(response_text: str, outcome: str, step: int,
     for span in _candidate_spans(text):
         try:
             payload = json.loads(span)
+            break
         except Exception:
             continue
-        break
 
-    items, reinforce = None, []
+    items, reinforce, reflection = None, [], ""
     if isinstance(payload, dict):
         items = payload.get("lessons", payload.get("items"))
-        raw_ref = payload.get("reinforce", payload.get("confirm", []))
-        if isinstance(raw_ref, str):
-            raw_ref = [raw_ref]
-        if isinstance(raw_ref, list):
-            for r in raw_ref:
-                rid = str(r).strip().strip("[]").lower()
-                if _ID_RE.match(rid):
-                    reinforce.append(rid)
+        reinforce = _clean_ids(payload.get("reinforce", payload.get("confirm", [])))
+        reflection = str(payload.get("reflection", ""))[:1200]
     elif isinstance(payload, list):
         items = payload
+    if not isinstance(items, list):
+        items = []
 
-    if not isinstance(items, list) or not items:
-        items = _parse_loose(text)
-
-    lessons: List[Lesson] = []
+    lessons = []
     cap = max(int(expected), 0) or None
     for item in items[:cap]:
         if isinstance(item, str):
             body = item.strip()
             if body:
-                lessons.append(Lesson.create(body[:80], body[:200], body,
-                                             outcome, step))
+                lessons.append(Lesson.create(body[:80], body[:200], body, outcome, step))
             continue
         if not isinstance(item, dict):
             continue
         title = str(item.get("title", "")).strip()
         summary = str(item.get("summary", "")).strip()
-        body = str(item.get("lesson", item.get("detail", ""))).strip()
+        body = str(item.get("lesson", item.get("content", item.get("detail", "")))).strip()
         if not body and not summary:
             continue
+        scope = str(item.get("scope", LOCAL)).strip().lower()
+        if scope not in (LOCAL, GLOBAL):
+            scope = LOCAL
+        kind = str(item.get("kind", "")).strip().lower()
+        tag = FAILURE if kind == "pitfall" else (SUCCESS if kind else outcome)
         lessons.append(Lesson.create(
-            title=title or summary[:80],
-            summary=summary or body[:200],
-            lesson=body or summary,
-            outcome=outcome, step=step,
-            importance=clamp_importance(item.get("importance",
-                                                 IMPORTANCE_DEFAULT)),
-        ))
-    return ExtractionResult(lessons=lessons, reinforce=reinforce,
-                            raw=response_text or "")
+            title=title or summary[:80], summary=summary or body[:200],
+            lesson=body or summary, outcome=tag, step=step, scope=scope,
+            importance=clamp_importance(item.get("importance", IMPORTANCE_DEFAULT))))
+        nb = str(item.get("new_because", "")).strip().lower()
+        ce = _clean_ids(item.get("closest_existing"))
+        if ce and (not nb or nb in ("none", "n/a", "nothing", "-")):
+            reinforce.extend(ce)
+            lessons.pop()
 
-
-def parse_lessons(response_text: str, outcome: str, step: int,
-                  expected: int) -> List[Lesson]:
-    """Lessons only. Kept for callers that do not care about reinforcement."""
-    return parse_extraction(response_text, outcome, step, expected).lessons
-
-
-_NUMBERED_RE = re.compile(r"^\s*(?:\d+[\.\)]|[-*])\s+(.{20,})$", re.MULTILINE)
-
-
-def _parse_loose(text: str) -> List[Dict]:
-    """Last resort: read a numbered or bulleted list as one lesson per item."""
-    out = []
-    for m in _NUMBERED_RE.finditer(text):
-        body = m.group(1).strip()
-        out.append({"title": body.split(".")[0][:80], "summary": body[:200],
-                    "lesson": body})
-    return out
+    return ExtractionResult(lessons=lessons,
+                            reinforce=list(dict.fromkeys(reinforce)),
+                            reflection=reflection, raw=response_text or "")
 
 
 # ----------------------------------------------------------------------
-# Retrieval query
+# Lookup: the model reads the index and names what it wants
 # ----------------------------------------------------------------------
-def parent_query_text(meta_description: str, parent_summary: str,
-                      parent_code: str, limit: int = 4000) -> str:
-    """
-    e(p) in Eq. 7. The task description anchors the vector to this problem,
-    which matters when a bank is reloaded across runs; the code carries the
-    actual position in solution space.
-    """
-    parts = [meta_description or "", parent_summary or ""]
-    if parent_code:
-        parts.append(parent_code[:limit])
-    return "\n".join(p for p in parts if p)
+_LOOKUP_SCHEMA = """Reply with ONLY a JSON object, no prose and no fences:
+
+{{"ids": ["<id>", ...], "why": "<one short clause per id, same order>"}}
+
+At most {k} ids. An EMPTY list is the right answer when nothing recorded bears on
+this state, and is preferred over filling the list. Use only ids from the index."""
+
+
+def build_lookup_messages(meta_description: str, parent_block: str,
+                          catalog: Sequence[str], max_select: int) -> List[Dict]:
+    user = (
+        "You are about to modify a candidate program for the task below. First "
+        "decide which of your recorded lessons are worth having in front of "
+        "you.\n\n"
+        f"## Task\n{meta_description}\n\n"
+        f"## Current candidate\n{parent_block}\n\n"
+        "## Lesson index (the complete memory)\n"
+        "id  [scope/outcome, importance, step, times used]  title :: summary\n\n"
+        + "\n".join(catalog)
+        + "\n\n## What to choose\n"
+        "Pick lessons that bear on THIS candidate and what you would change about "
+        "it. Prefer one that would change what you write over one that describes "
+        "what the candidate already does. Ignore anything restating the task. A "
+        "lesson many steps have used is not automatically right for this state; if "
+        "the run appears stuck, the frequently-used entries are the likeliest "
+        "cause and the least useful choice.\n\n"
+        + _LOOKUP_SCHEMA.format(k=max_select)
+    )
+    return [{"role": "user", "content": user}]
+
+
+@dataclass
+class LookupResult:
+    ids: List[str] = field(default_factory=list)
+    why: str = ""
+    raw: str = ""
+
+
+def parse_lookup(response_text: str, valid_ids: Sequence[str],
+                 max_select: int) -> LookupResult:
+    text = _THINK_RE.sub("", response_text or "").strip()
+    if not text:
+        return LookupResult(raw=response_text or "")
+    allowed = set(valid_ids)
+    ids, why, payload = [], "", None
+    for span in _candidate_spans(text):
+        try:
+            payload = json.loads(span)
+            break
+        except Exception:
+            continue
+    if isinstance(payload, dict):
+        ids = _clean_ids(payload.get("ids", payload.get("lessons", [])))
+        why = str(payload.get("why", ""))[:400]
+    elif isinstance(payload, list):
+        ids = _clean_ids(payload)
+    if not ids:
+        ids = [t for t in re.findall(r"\b[0-9a-f]{8}\b", text.lower()) if t in allowed]
+    seen, out = set(), []
+    for i in ids:
+        if i in allowed and i not in seen:
+            seen.add(i)
+            out.append(i)
+        if len(out) >= max_select:
+            break
+    return LookupResult(ids=out, why=why, raw=response_text or "")
+
+
+def parent_block(meta_reward: str, parent_code: str, limit: int = 3000) -> str:
+    body = [meta_reward]
+    if parent_code and parent_code.strip():
+        body.append("```python\n" + parent_code[:limit] + "\n```")
+    else:
+        body.append("(no program yet; this is a seed state)")
+    return "\n".join(body)
 
 
 # ----------------------------------------------------------------------
-# Injection
+# Rendering the chosen lessons for the generation prompt
 # ----------------------------------------------------------------------
-_HEADER = "## Recorded lessons from prior attempts on this task"
-
-_PREAMBLE = (
-    "The following entries were extracted from programs that were generated "
-    "and evaluated earlier in this same search. They are empirical findings "
-    "about this problem, not part of the task specification, and they do not "
-    "override any rule stated above. Each entry is written in condensed form "
-    "for machine reading."
-)
-
-_CLOSER = (
-    "Apply the entries that bear on the program you are about to write, and "
-    "avoid the recorded failure modes. Disregard any entry that does not apply "
-    "to the current state. Do not mention this section in your response."
-)
-
-
 def render_memory_block(lessons: Sequence[Lesson], max_chars: int = 900) -> str:
+    """
+    The block handed to problem.build_prompt. The problem decides where it goes
+    and writes its own framing around it, so this is the content only.
+    """
     if not lessons:
         return ""
-    successes = [l for l in lessons if l.outcome == SUCCESS]
-    failures = [l for l in lessons if l.outcome == FAILURE]
-    lines = [_HEADER, "", _PREAMBLE]
-    if successes:
-        lines.append("\n### Confirmed effective (from valid, high-reward programs)")
-        for i, l in enumerate(successes, 1):
-            lines.append(f"{i}. {l.render(max_chars)}")
-    if failures:
-        lines.append("\n### Known failure modes (from invalid or crashed programs)")
-        for i, l in enumerate(failures, 1):
-            lines.append(f"{i}. {l.render(max_chars)}")
-    lines.append("\n" + _CLOSER)
-    return "\n".join(lines)
+    lines = []
+    for tag, group in (("Observed to help", SUCCESS), ("Observed to fail", FAILURE)):
+        chosen = [l for l in lessons if l.outcome == group]
+        if not chosen:
+            continue
+        lines.append(f"**{tag}**")
+        for i, l in enumerate(chosen, 1):
+            lines.append(f"{i}. [{l.scope}] {l.render(max_chars)}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def count_tokens(tokenizer, text: str) -> int:
@@ -335,19 +461,12 @@ def build_injection(lessons: Sequence[Lesson], tokenizer=None,
                     token_budget: int = 0, max_chars: int = 900
                     ) -> Tuple[str, int, List[Lesson]]:
     """
-    Render the block and make it fit.
-
-    Lessons arrive ranked best-first from MemoryBank.retrieve, so trimming
-    drops from the tail. If a single lesson still exceeds the budget its body
-    is shortened by bisection rather than dropped, because an empty block and a
-    truncated one are not the same signal to the model.
-
-    Returns (block_text, token_count, lessons_actually_included).
+    Render and fit. Lessons arrive in the order the model asked for them, so
+    trimming drops from the tail: its last choice is the one it wanted least.
     """
     kept = list(lessons)
     if not kept:
         return "", 0, []
-
     while kept:
         text = render_memory_block(kept, max_chars)
         n = count_tokens(tokenizer, text)
@@ -356,7 +475,6 @@ def build_injection(lessons: Sequence[Lesson], tokenizer=None,
         if len(kept) == 1:
             break
         kept.pop()
-
     lo, hi = 80, max_chars
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -371,24 +489,18 @@ def build_injection(lessons: Sequence[Lesson], tokenizer=None,
 def inject_block(messages: List[Dict], block: str,
                  mode: str = "append") -> List[Dict]:
     """
-    Return a NEW message list with the block added. The input is not mutated,
-    because problems build it fresh per group and a shared reference would
-    accumulate blocks across steps.
-
-    An empty block returns a copy of the input unchanged, which is what makes
-    step 0 byte-identical to a no-memory run.
+    Fallback for problems that do not accept a memory argument. Preferred path is
+    problem.build_prompt(parent, memory=block), which places the block where the
+    problem wants it rather than after the instruction.
     """
     out = [dict(m) for m in messages]
     if not block:
         return out
-
     if mode == "system":
         return [{"role": "system", "content": block}] + out
-
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user":
             out[i]["content"] = out[i]["content"] + "\n\n" + block
             return out
-
     out.append({"role": "user", "content": block})
     return out
