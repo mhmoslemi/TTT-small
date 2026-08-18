@@ -95,12 +95,6 @@ class Config:
     memory_inject_mode: str = "append"      # append | system
     memory_token_budget: int = 1200
     memory_grant_context: bool = True
-    memory_extract_mode: str = "contrast"   # contrast | split
-    memory_extract_from: str = "both"       # both | failure | success (split only)
-    memory_curate_every: int = 0            # 0 = never; N = every N steps
-    memory_curate_min_bank: int = 20
-    memory_curate_max_items: int = 60
-    memory_curate_min_keep_frac: float = 0.25
     memory_lessons_per_call: int = 3        # L, a ceiling
     memory_require_full_lessons: bool = False
     memory_max_examples_per_call: int = 8
@@ -122,10 +116,7 @@ class Config:
     # `feedback` is the master switch, same rule as `memory`: when it is False
     # every feedback_* field below is ignored.
     feedback: bool = False
-    feedback_lambda: float = 0.2           # lambda_f at step 0
-    feedback_anneal_steps: int = 0         # 0 = constant; 10 = off from step 10
-    feedback_anneal_shape: str = "linear"  # linear | cosine
-    feedback_lambda_final: float = 0.0
+    feedback_lambda: float = 0.2           # lambda_f. Unvalidated starting point.
     feedback_clip: float = 5.0             # clamp |A^fb| per token; 0 = Eq. 9 as written
     feedback_chars: int = 1200             # verifier text budget in the reprompt
     feedback_max_per_step: int = 0         # 0 = every failed rollout
@@ -200,21 +191,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    choices=["none", "recent", "importance"], default=None)
     p.add_argument("--memory-catalog-max-lessons", type=int, default=None)
     p.add_argument("--memory-token-budget", type=int, default=None)
-    p.add_argument("--memory-extract-mode",
-                   choices=["contrast", "split"], default=None,
-                   help="contrast = one call over successes and failures "
-                        "together, asked why some worked and others did not.")
-    p.add_argument("--memory-curate-every", type=int, default=None,
-                   help="Rewrite the whole bank every N steps. 0 disables.")
-    p.add_argument("--memory-curate-max-items", type=int, default=None)
-    p.add_argument("--memory-extract-from",
-                   choices=["both", "failure", "success"], default=None,
-                   help="Which side of the batch produces lessons. 'failure' "
-                        "skips the positive call entirely: one extraction call "
-                        "per step instead of two.")
-    p.add_argument("--memory-failures-only", dest="memory_extract_from",
-                   action="store_const", const="failure", default=None,
-                   help="Shorthand for --memory-extract-from failure.")
     p.add_argument("--memory-lessons-per-call", type=int, default=None)
     p.add_argument("--memory-require-full-lessons", action="store_const",
                    const=True, default=None)
@@ -240,13 +216,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    const=False,
                    help="Force the feedback signal off, overriding the YAML.")
     p.add_argument("--feedback-lambda", type=float, default=None)
-    p.add_argument("--feedback-anneal-steps", type=int, default=None,
-                   help="Anneal lambda_f to feedback_lambda_final over this many "
-                        "steps. 0 keeps it constant. Once the coefficient hits "
-                        "zero the teacher forward is skipped entirely.")
-    p.add_argument("--feedback-anneal-shape",
-                   choices=["linear", "cosine"], default=None)
-    p.add_argument("--feedback-lambda-final", type=float, default=None)
     p.add_argument("--feedback-clip", type=float, default=None)
     p.add_argument("--feedback-chars", type=int, default=None)
     p.add_argument("--feedback-max-per-step", type=int, default=None)
@@ -460,7 +429,7 @@ def _save_adapter(model, exp_dir, step_idx):
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg: Config, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
-               curator=None, fb_cfg=None):
+               fb_cfg=None):
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -486,17 +455,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"Q={info['Q']:.4f}  P={info['P']:.4f}  bonus={info['bonus']:.4f}  "
               f"score={info['score']:.4f}")
 
-    # The coefficient in force this step. When it reaches zero the whole
-    # feedback path is skipped: no reprompts built, no teacher forwards, so the
-    # annealed tail costs exactly what a no-feedback run costs.
-    import inspect as _inspect
-    memory_aware_prompt = "memory" in _inspect.signature(
-        problem.build_prompt).parameters
-
-    fb_lambda = fb_cfg.lambda_at(step_idx) if fb_cfg is not None else 0.0
-    fb_on = bool(fb_cfg is not None and fb_cfg.enabled and fb_lambda > 0.0)
-    if (fb_cfg is not None and fb_cfg.enabled and not fb_on):
-        print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
+    fb_on = bool(fb_cfg is not None and fb_cfg.enabled)
     fail_score = float(getattr(problem, "fail_score", 0.0))
     reprompt_by_key = {}        # (group, rollout) -> reprompt text for a failure
 
@@ -553,16 +512,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 chosen, tokenizer, getattr(mem_cfg, "token_budget", 0))
             retrieved_by_group[g] = [l.id for l in kept]
             mem_tokens_by_group[g] = n_tok
-            # Preferred path: the problem places the block itself, between the
-            # parent state and the instruction, and adapts its instruction to
-            # it. Problems that predate the `memory` argument fall back to the
-            # trainer appending the block after the instruction.
-            if memory_aware_prompt:
-                messages = problem.build_prompt(pc, memory=block)
-            else:
-                messages = inject_block(
-                    messages, block,
-                    mode=getattr(mem_cfg, "inject_mode", "append"))
+            messages = inject_block(
+                messages, block,
+                mode=getattr(mem_cfg, "inject_mode", "append"))
         elif memory is not None:
             retrieved_by_group[g] = []
             mem_tokens_by_group[g] = 0
@@ -812,9 +764,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # inserts whatever is genuinely new, printing its own summary line.
     if memory is not None and extractor is not None:
         extractor.update(mem_records, step_idx, adapter_path=adapter_path)
-        # Curation runs after insertion, so it sees this step's lessons too.
-        if curator is not None and curator.due(step_idx):
-            curator.run(step_idx, adapter_path=adapter_path)
         memory.save()
 
     if not all_examples:
@@ -868,8 +817,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if fb_on and ex.get("reprompt_text"):
             fb_adv = feedback_advantage(
                 compute_token_logprobs, model, tokenizer,
-                ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
-                lam=fb_lambda)
+                ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg)
             if fb_adv is None:
                 fb_stats.skipped += 1
             else:
@@ -912,7 +860,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
           f"avg loss: {total_loss / n_examples:.4f}  "
           f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.4f}{is_msg}")
     if fb_on:
-        print(fb_stats.line(step_idx, fb_lambda))
+        print(fb_stats.line(step_idx, fb_cfg.lambda_f))
 
     best = sampler.best_state()
     if best is not None:
@@ -1039,7 +987,7 @@ def main():
 
     # ---- memory (Sec. 2.2) ----
     from memory import setup_memory
-    mem_cfg, memory, extractor, lookup, curator = setup_memory(
+    mem_cfg, memory, extractor, lookup = setup_memory(
         merged, problem, cfg, mem_cfg=mem_cfg,
         backend=backend, model=model, tokenizer=tokenizer,
         gen_pool=gen_pool, exp_dir=exp_dir, seed=cfg.seed,
@@ -1049,8 +997,6 @@ def main():
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
     print(f"[init] {fb_cfg.describe()}")
-    if fb_cfg.enabled and fb_cfg.anneal_steps > 0:
-        print(f"[init] lambda schedule: {fb_cfg.schedule_preview()}")
 
     # ---- Elo re-ranker (optional, background thread) ----
     reranker = None
@@ -1091,7 +1037,7 @@ def main():
             train_step(backend, model, tokenizer, sampler, optimizer, step,
                        cfg, exp_dir, problem, gen_pool,
                        memory=memory, extractor=extractor, mem_cfg=mem_cfg,
-                       lookup=lookup, curator=curator, fb_cfg=fb_cfg)
+                       lookup=lookup, fb_cfg=fb_cfg)
     finally:
         if reranker is not None:
             print("[shutdown] stopping Elo re-ranker ...")
