@@ -482,9 +482,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
-        print(f"  parent {i} [{tag}]  value={info['value']:.4f}  n={info['n']}  "
-              f"Q={info['Q']:.4f}  P={info['P']:.4f}  bonus={info['bonus']:.4f}  "
-              f"score={info['score']:.4f}")
+        print(f"  parent {i} [{tag}]  value={info['value']:.8f}  n={info['n']}  "
+              f"Q={info['Q']:.8f}  P={info['P']:.8f}  bonus={info['bonus']:.8f}  "
+              f"score={info['score']:.8f}")
 
     # The coefficient in force this step. When it reaches zero the whole
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
@@ -684,9 +684,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         rewards_np = np.array(rewards, dtype=np.float64)
         advantages, beta = entropic_adaptive_advantages(rewards_np)
-        print(f"  group {g}: rewards min={rewards_np.min():.4f} "
-              f"mean={rewards_np.mean():.4f} max={rewards_np.max():.4f}  "
-              f"valid={sum(valids)}/{len(valids)}  beta={beta:.4f}")
+        print(f"  group {g}: rewards min={rewards_np.min():.8f} "
+              f"mean={rewards_np.mean():.8f} max={rewards_np.max():.8f}  "
+              f"valid={sum(valids)}/{len(valids)}  beta={beta:.8f}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, (text, token_ids) in enumerate(responses):
@@ -906,11 +906,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     train_time = time.time() - train_t0
     is_msg = ""
     if is_ratio_count > 0:
-        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.4f} "
+        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.8f} "
                   f"max={is_ratio_max:.3f}")
     print(f"[step {step_idx}] train time: {train_time:.1f}s  "
-          f"avg loss: {total_loss / n_examples:.4f}  "
-          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.4f}{is_msg}")
+          f"avg loss: {total_loss / n_examples:.8f}  "
+          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.8f}{is_msg}")
     if fb_on:
         print(fb_stats.line(step_idx, fb_lambda))
 

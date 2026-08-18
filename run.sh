@@ -49,9 +49,12 @@
 
 
 # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python train_multy.py --num-circles 26 \
-CUDA_VISIBLE_DEVICES=0,1,2,3 python train_multy.py --num-circles 26 \
-                --num-steps 50 --groups-per-step 8 --group-size 64 \
-                --model-name /mnt/storage/mohammad/models/Qwen3-8B
+# CUDA_VISIBLE_DEVICES=0,1 python train_multy.py --num-circles 26 \
+python train_multy.py --num-circles 26 \
+                --num-steps 50 --groups-per-step 4 --group-size 12 
+               #  --num-steps 50 --groups-per-step 8 --group-size 64 \
+               #  --model-name Qwen/Qwen3-8B
+               #  --model-name /mnt/storage/mohammad/models/Qwen3-8B
 
 
 # reinforce
