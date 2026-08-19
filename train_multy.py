@@ -72,6 +72,11 @@ class Config:
     # Misc
     seed: int = 42
     print_responses: int = 0           # how many rollouts to print per step
+    # Threads used to evaluate rollouts. 0 = auto (cpu_count - num_gpus), which
+    # is right for a subprocess sandbox and WRONG for anything that benchmarks
+    # on the GPU: concurrent timing runs contend and the reward IS the timing.
+    # Set 1 for gpu_mode.
+    reward_workers: int = 0
 
     # Multi-GPU generation
     num_gpus: int = 4
@@ -140,9 +145,11 @@ class Config:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TTT-Discover multi-problem runner")
     # Problem selection
-    p.add_argument("--problem", default="circle_packing",
-                   help="Problem name. Loads configs/<problem>.yaml unless --config is given. "
-                        "One of: circle_packing, erdos, ac1, ac2, denoising, gpu_mode.")
+    p.add_argument("--problem", default=None,
+                   help="Problem name. Loads configs/<problem>.yaml unless --config "
+                        "is given. Defaults to Config.problem, so changing that one "
+                        "field is enough to switch problems. One of: circle_packing, "
+                        "erdos, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
                    help="Explicit path to a YAML config (overrides the --problem lookup).")
     p.add_argument("--problem-type", default=None,
@@ -174,6 +181,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--print-responses", type=int, default=None)
+    p.add_argument("--reward-workers", type=int, default=None,
+                   help="Threads for reward evaluation. 0 = auto. Use 1 for any "
+                        "problem whose reward is a measured runtime.")
     p.add_argument("--num-gpus", type=int, default=None,
                    help="Number of GPUs for parallel generation. 1 = single-process "
                         "in-line generation (no worker pool). >1 spawns that many "
@@ -277,8 +287,14 @@ def load_config():
     # 1) defaults from the dataclass
     merged = {f.name: getattr(Config(), f.name) for f in fields(Config)}
 
+    # The problem name comes from Config.problem unless --problem overrides it,
+    # so editing that one field switches problems: it picks the YAML, and the
+    # YAML then supplies everything else. Previously --problem carried its own
+    # hardcoded default, which silently won over the dataclass.
+    problem_name = args.problem if args.problem is not None else merged["problem"]
+
     # 2) YAML overlay
-    cfg_path = args.config or os.path.join("configs", f"{args.problem}.yaml")
+    cfg_path = args.config or os.path.join("configs", f"{problem_name}.yaml")
     ydict = {}
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -288,12 +304,14 @@ def load_config():
     elif args.config is not None:
         raise FileNotFoundError(f"--config path not found: {cfg_path}")
     else:
-        print(f"[config] no YAML at {cfg_path}; using Config() defaults + CLI")
+        print(f"[config] no YAML at {cfg_path}; using Config() defaults + CLI. "
+              f"This is usually a mistake: the problem's own knobs "
+              f"(task paths, batch sizes, reward_workers) live in that file.")
 
     # The registry routing key is the YAML's `problem` field when present
     # (this lets e.g. configs/gpu_mode_trimul.yaml declare `problem: gpu_mode`
     # while --problem just selects the file). With no YAML, --problem is the key.
-    merged["problem"] = ydict.get("problem", args.problem)
+    merged["problem"] = ydict.get("problem", problem_name)
 
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type"}

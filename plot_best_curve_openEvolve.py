@@ -14,6 +14,7 @@ Usage:
     python plot_best_curve.py --no-openevolve                  # just TTT vs Elo
 """
 
+
 import argparse
 import glob
 import json
