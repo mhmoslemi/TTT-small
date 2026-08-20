@@ -87,9 +87,15 @@ class HFBackend:
         print(f"[backend=hf] loading {self.cfg.model_name} ...")
         tokenizer = AutoTokenizer.from_pretrained(self.cfg.model_name, trust_remote_code=True)
 
+        # Pinned to one device, NOT "auto". With two visible GPUs, "auto" shards
+        # the model across both and puts training weights on the card that
+        # kernel_gpu_id reserves for benchmarking, so the measured runtime
+        # reflects contention with the backward pass instead of the kernel.
+        # Index is into CUDA_VISIBLE_DEVICES, i.e. the first device this process
+        # can see; the benchmark child re-sets CUDA_VISIBLE_DEVICES itself.
         model_kwargs = dict(
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": 0},
             trust_remote_code=True,
         )
         if self.cfg.load_in_4bit:
