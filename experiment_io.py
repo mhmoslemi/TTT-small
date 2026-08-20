@@ -71,9 +71,10 @@ def save_rollout(
     rollout: int,
     response_text: str,
     meta: dict,
+    prompt_text: str = "",
 ):
     """
-    Save one rollout as a .txt + .meta.json pair.
+    Save one rollout as a .txt + .meta.json pair (+ .prompt.txt if given).
 
     meta should include at least: reward, valid, parsed, ran, msg.
     Anything JSON-serializable is fine.
@@ -82,6 +83,8 @@ def save_rollout(
     step_dir.mkdir(exist_ok=True)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
     (step_dir / f"{base}.txt").write_text(response_text, errors="replace")
+    if prompt_text:
+        (step_dir / f"{base}.prompt.txt").write_text(prompt_text, errors="replace")
 
     # Make sure we can dump everything (numpy floats, bools, etc.)
     def _coerce(v):

@@ -9,8 +9,9 @@ Eq. 9, so a log that keeps only the successes hides half the training signal.
       config.json                        full resolved config
       provenance.txt                     which layer set each key
       step00/
-        step00_target00_rollout000.txt        raw response
-        step00_target00_rollout000.meta.json  reward, valid, feedback, advantage
+        step00_target00_rollout000.txt          raw response
+        step00_target00_rollout000.prompt.txt   full rendered prompt
+        step00_target00_rollout000.meta.json    reward, valid, feedback, advantage
         step00.summary.json                   per-step stats
         step00_elo/                           judge prompts, replies, standings
       memory.json                         the lesson bank
@@ -71,7 +72,8 @@ class ExperimentIO:
         return path
 
     def save_rollout(self, step: int, target_idx: int, rollout_idx: int,
-                     response_text: str, meta: dict) -> None:
+                     response_text: str, meta: dict,
+                     prompt_text: str = "") -> None:
         if not self.enabled:
             return
         base = f"step{step:02d}_target{target_idx:02d}_rollout{rollout_idx:03d}"
@@ -79,6 +81,9 @@ class ExperimentIO:
         (directory / f"{base}.txt").write_text(response_text or "", errors="replace")
         (directory / f"{base}.meta.json").write_text(
             json.dumps({k: _coerce(v) for k, v in meta.items()}, indent=2))
+        if prompt_text:
+            (directory / f"{base}.prompt.txt").write_text(prompt_text,
+                                                          errors="replace")
 
     def save_step_summary(self, step: int, summary: dict) -> None:
         (self.step_dir(step) / f"step{step:02d}.summary.json").write_text(

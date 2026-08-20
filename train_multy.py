@@ -738,7 +738,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "memory_ids": retrieved_by_group.get(g, []),
                 "memory_tokens": mem_tokens_by_group.get(g, 0),
             }
-            save_rollout(exp_dir, step_idx, g, r_idx, text, meta)
+            save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
+                         prompt_text=prompt_text)
             if memory is not None:
                 mem_records.append(RolloutRecord(
                     step=step_idx, group=g, rollout=r_idx,
