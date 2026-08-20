@@ -32,7 +32,7 @@
 
 
 
-# CUDA_VISIBLE_DEVICES=6 python train_ppo.py --num-circles 26 \
+# CUDA_VISIBLE_DEVICES=6 python train_ppo.py --num-circles 26 \cd ../
 #                 --num-steps 20 --groups-per-step 4 --group-size 24
 
 
@@ -61,10 +61,17 @@
 
 
 
-python train_multy.py --problem gpu_mode --problem-type trimul \
-    --num-steps 30 --groups-per-step 4 --group-size 12
+python train_multy.py --problem gpu_mode --problem-type trimul --config configs/gpu_mode_trimul.yaml \
+    --num-steps 30 --groups-per-step 4 --group-size 12 --gpu-type L40S
+
+# python train_multy.py --problem gpu_mode --problem-type trimul \
+#     --num-steps 30 --groups-per-step 4 --group-size 12 --gpu-type L40S
+
 
 # reinforce
 
 # gpu 6 : lr 0 
 # gpu 7 : lr 1
+
+
+# srun --jobid=4918491 --overlap watch -n 0.1 nvidia-smi

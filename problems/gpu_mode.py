@@ -45,6 +45,27 @@ from examples.gpu_mode.prompt import (
     MLA_DECODE_INITIAL_VALUE,
 )
 
+# Runtime scaling relative to H100, from memory bandwidth, because trimul and
+# mla_decode are both bandwidth-bound. ESTIMATES: they set the reward scale, not
+# correctness, and the right move is to benchmark one kernel and pin `target`
+# and `score_scale` in the YAML. Until you do, this at least keeps reward
+# magnitudes in the same range across hardware instead of silently 4x off.
+#   H100 3.35 TB/s | H200 4.8 | A100 2.0 | L40S 0.864 | L4 0.3 | RTX4090 1.01
+_ARCH_RUNTIME_FACTOR = {
+    "h100": 1.0,
+    "h200": 0.70,
+    "a100": 1.68,
+    "l40s": 3.88,
+    "l4": 11.2,
+    "rtx4090": 3.32,
+    "a6000": 4.30,
+}
+
+
+def arch_factor(gpu_type: str) -> float:
+    return _ARCH_RUNTIME_FACTOR.get((gpu_type or "").strip().lower(), 1.0)
+
+
 _DEFAULTS = {
     "trimul": {
         "score_scale": 1500.0,
@@ -65,6 +86,67 @@ _MEMORY_HEADER = """## Lessons from earlier kernels in this search
 Extracted from kernels already generated and benchmarked here. Empirical
 findings, not part of the specification above, and they do not override any rule
 stated in it."""
+
+_ARCH_NOTES = {
+    "l40s": """Target hardware: NVIDIA L40S (Ada Lovelace, sm_89, 48 GB GDDR6, no NVLink).
+Ada is not Hopper. The following do NOT exist on this device and will fail to
+compile or silently fall back:
+- TMA / `tl.make_tensor_descriptor` and descriptor-based async copies
+- warpgroup MMA (`wgmma`), and anything assuming a 128-thread warpgroup
+- thread-block clusters and distributed shared memory
+- the 228 KB shared-memory-per-SM budget; Ada gives you 100 KB per SM
+What Ada does have and is worth using: 142 SMs' worth of 4th-gen tensor cores
+(bf16 and fp8), `cp.async` style pipelining, and a large 96 MB L2. Memory
+bandwidth is 864 GB/s, roughly a quarter of an H100's, so this part is far more
+bandwidth-bound than the same kernel on Hopper: favour fewer passes over the
+data, fusion, and reuse through L2 over strategies that assume you can stream.""",
+    "a100": """Target hardware: NVIDIA A100 (Ampere, sm_80). No TMA, no wgmma, no
+thread-block clusters. 164 KB shared memory per SM, 1.5-2.0 TB/s HBM.""",
+    "h100": """Target hardware: NVIDIA H100 (Hopper, sm_90). TMA, wgmma, and
+thread-block clusters are available. 228 KB shared memory per SM, ~3.3 TB/s HBM.""",
+    "h200": """Target hardware: NVIDIA H200 (Hopper, sm_90). As H100 but with 141 GB
+HBM3e at ~4.8 TB/s.""",
+}
+
+
+def arch_notes(gpu_type: str) -> str:
+    return _ARCH_NOTES.get((gpu_type or "").strip().lower(), "")
+
+
+_LAUNCH_NOTE = """## Triton launch convention
+
+Every failure mode below has appeared in this search. Read this before writing.
+
+A `@triton.jit` function is NOT a Python function. It is launched with a grid
+subscript, and its `tl.constexpr` parameters exist only inside it:
+
+```python
+@triton.jit
+def my_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=m, other=0.0), mask=m)
+
+def custom_kernel(data):
+    ...
+    BLOCK = 128                                   # a host variable YOU define
+    grid = (triton.cdiv(n, BLOCK),)               # host-side, use triton.cdiv
+    my_kernel[grid](x, y, n, BLOCK=BLOCK)         # note the [grid] subscript
+```
+
+- `my_kernel(...)` without `[grid]` raises "Cannot call @triton.jit'd outside
+  the scope of a kernel".
+- `BLOCK`, `BLOCK_M`, `BLOCK_N` are not defined on the host unless you define
+  them there. Referencing one you only declared as a `tl.constexpr` parameter
+  raises NameError.
+- `tl.cdiv` is device-side. On the host use `triton.cdiv`.
+- Define the kernel at module top level, never nested inside `custom_kernel`.
+
+You do not have to move everything into Triton. A correct submission that keeps
+most of the computation in PyTorch and moves one hot region into a kernel scores;
+one that fails to launch scores zero."""
+
 
 _ANALYSIS_WITH_MEMORY = """## Analysis
 
@@ -116,6 +198,43 @@ def collect_logs(result, limit: int = 4000) -> str:
     return "\n\n".join(p for p in parts if p.strip())[: limit * 2]
 
 
+def ensure_python3_on_path() -> Optional[str]:
+    """
+    libkernelbot runs the submission with subprocess.run(["python3", ...]).
+
+    That name is hardcoded, so it must resolve to the SAME interpreter the run
+    is using: a venv whose bin is not on PATH, a conda env exposing only
+    `python`, or a container without /usr/bin/python3 all produce a bare
+    FileNotFoundError from subprocess with no indication of what was missing.
+    Worse, if some other python3 resolves first, the submission runs against a
+    different torch than the one you installed.
+
+    So: put the directory of sys.executable first on PATH, and if that still
+    does not give a `python3`, symlink one into a temp dir and prepend that.
+    Returns the resolved path, or None if it could not be arranged.
+    """
+    import shutil
+    import tempfile
+
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    os.environ["PATH"] = exe_dir + os.pathsep + os.environ.get("PATH", "")
+
+    found = shutil.which("python3")
+    if found and os.path.realpath(found) == os.path.realpath(sys.executable):
+        return found
+    if os.path.exists(os.path.join(exe_dir, "python3")):
+        return os.path.join(exe_dir, "python3")
+
+    try:
+        shim = tempfile.mkdtemp(prefix="ttt-py3-")
+        link = os.path.join(shim, "python3")
+        os.symlink(os.path.abspath(sys.executable), link)
+        os.environ["PATH"] = shim + os.pathsep + os.environ["PATH"]
+        return link
+    except Exception:
+        return found        # whatever was there, possibly the wrong interpreter
+
+
 def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 problem_type: str, log_chars: int,
                 gpu_id: Optional[int] = None) -> None:
@@ -132,6 +251,7 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
     out = {"ok": False, "msg": "unknown", "logs": "", "score_us": None}
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    py3 = ensure_python3_on_path()
     try:
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
@@ -160,8 +280,17 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 out["score_us"] = float(score_seconds) * 1_000_000.0
                 out["ok"] = True
                 out["msg"] = f"runtime_us={out['score_us']}"
+    except FileNotFoundError as e:
+        # subprocess raises this with the executable in .filename and nothing
+        # in the repr, which is how this arrived as an unreadable
+        # "FileNotFoundError(2, 'No such file or directory')".
+        missing = getattr(e, "filename", None) or "(unknown)"
+        out["msg"] = (f"Local kernel run failed: could not find {missing!r}. "
+                      f"python3 resolved to {py3!r}, sys.executable is "
+                      f"{sys.executable!r}, cwd is {os.getcwd()!r}.")
     except Exception as e:
-        out["msg"] = f"Local kernel run failed: {e!r}"
+        out["msg"] = (f"Local kernel run failed: {type(e).__name__}: {e} "
+                      f"(cwd={os.getcwd()!r})")
     try:
         conn.send(out)
     except Exception:
@@ -225,15 +354,44 @@ class GpuMode(Problem):
             raise ValueError(f"problem_type must be one of {list(_DEFAULTS)}, "
                              f"got {self.problem_type}")
         d = _DEFAULTS[self.problem_type]
-        self.score_scale = float(cfg.get("score_scale", d["score_scale"]))
         self.gpu_type = str(cfg.get("gpu_type", d["gpu_type"]))
+        self.triton_version = str(cfg.get("triton_version", "3.3.1"))
+
+        # target and score_scale default to the H100 numbers scaled to this
+        # device, so setting gpu_type is enough. An explicit value in the YAML
+        # or on the CLI still wins.
+        f = arch_factor(self.gpu_type)
+        self._arch_factor = f
+        self.score_scale = float(cfg.get("score_scale", d["score_scale"] * f))
         self.task_yaml = str(cfg.get("task_yaml", d["task_yaml"]))
         self.lib_dir = str(cfg.get("kernel_lib_dir",
                                    cfg.get("lib_dir", "examples/gpu_mode/lib")))
         if self.target is None:
-            self.target = d["target"]
+            self.target = float(d["target"]) * f
+        if abs(f - 1.0) > 1e-9 and ("target" not in cfg or "score_scale" not in cfg):
+            print(f"[gpu_mode] {self.gpu_type}: scaled H100 defaults by {f:.2f}x "
+                  f"-> target={self.target:.0f}us, score_scale={self.score_scale:.0f} "
+                  f"(reward {self.score_scale / self.target:.2f} at target). "
+                  f"ESTIMATE from memory bandwidth; benchmark one kernel and pin "
+                  f"both in the YAML.")
+        missing = self.missing_task_files()
+        if missing:
+            raise FileNotFoundError(
+                "gpu_mode cannot start: task.yml references files that are not "
+                "present:\n  " + "\n  ".join(missing)
+                + "\nFetch them from github.com/gpu-mode/reference-kernels "
+                  "(problems/bioml/trimul and problems/amd/mla-decode) into the "
+                  "directory holding task.yml.")
+
         self.log_chars = int(cfg.get("kernel_log_chars", 4000))
         # 0 falls back to sandbox_timeout_s; set explicitly to override it.
+        self.show_launch_note = bool(cfg.get("show_launch_note", True))
+        # Seed the tree with the task's reference submission instead of empty
+        # code. With code="" the model writes a kernel from nothing at step 0,
+        # and the whole batch fails on launch syntax rather than on anything
+        # about the kernel. The reference is correct, complete, and slow, which
+        # is exactly what a search wants as a starting point.
+        self.seed_from_reference = bool(cfg.get("seed_from_reference", True))
         self.kernel_timeout_s = float(cfg.get("kernel_timeout_s", 0.0))
         # Physical device the benchmark runs on. None inherits the parent's,
         # which is the training GPU: correct only if nothing else is on it.
@@ -253,9 +411,13 @@ class GpuMode(Problem):
             memory_section = f"\n{_MEMORY_HEADER}\n\n{memory.strip()}\n"
             analysis = f"\n{_ANALYSIS_WITH_MEMORY}\n"
 
+        notes = arch_notes(self.gpu_type)
+        arch_section = f"\n{notes}\n" if notes else ""
+        launch_section = f"\n{_LAUNCH_NOTE}\n" if self.show_launch_note else ""
+
         if self.problem_type == "trimul":
             user = f"""{TRIMUL_PROMPT}
-
+{arch_section}{launch_section}
 {state_ctx}
 {memory_section}{analysis}
 Rules:
@@ -263,7 +425,7 @@ Rules:
 - Define all of your code in one final ```python ``` block.
 - We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
 - You are allowed to use mixed precision computations, but make sure your final output is in float32.
-- You must use trition 3.3.1 and these kernels will be run on an H100.
+- You must use triton {self.triton_version} and these kernels will be run on an {self.gpu_type}.
 - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 - Do not wrap the kernel in a try/except that falls back to a slow reference path.
@@ -272,7 +434,7 @@ Rules:
 """
         else:
             user = f"""{MLA_DECODE_PROMPT}
-
+{arch_section}{launch_section}
 {state_ctx}
 {memory_section}{analysis}
 {MLA_DECODE_PROMPT_END}
@@ -284,6 +446,38 @@ Rules:
 
     def score(self, output: Any, stdout: str) -> RewardResult:
         return RewardResult(reward=self.fail_score, msg="unused")
+
+    def missing_task_files(self) -> List[str]:
+        """
+        task.yml lists source files by relative path and libkernelbot reads them
+        with (root / source).read_text(), so an absent one surfaces as a bare
+        FileNotFoundError from deep inside the runner, once per rollout. Check
+        up front and say what is missing.
+        """
+        import yaml as _yaml
+        from pathlib import Path
+        p = Path(self.task_yaml)
+        if not p.exists():
+            return [f"{self.task_yaml} (task.yml itself; run from the repo root)"]
+        try:
+            raw = _yaml.safe_load(p.read_text())
+        except Exception as e:
+            return [f"{self.task_yaml} (unparsable: {e})"]
+        out = []
+        # `files:` are the sources copied into the run directory.
+        for spec in raw.get("files", []):
+            src = spec.get("source")
+            if not src or src == "@SUBMISSION@":
+                continue
+            if not (p.parent / src).exists():
+                out.append(str(p.parent / src))
+        # `templates:` are read too, by make_task_definition, and are easy to
+        # miss because the same filename also appears in `files:` as the
+        # @SUBMISSION@ placeholder. Different thing, still has to exist.
+        for src in (raw.get("templates", {}) or {}).values():
+            if src and not (p.parent / src).exists():
+                out.append(f"{p.parent / src} (templates:)")
+        return out
 
     # ------------------------------------------------------------------
     def _fail(self, msg: str, logs: str = "") -> RewardResult:
@@ -304,9 +498,14 @@ Rules:
         if self.problem_type == "trimul" and "identity" in code:
             return self._fail("Identity kernel is not allowed.")
 
-        if not os.path.exists(self.task_yaml):
-            return self._fail(f"task_yaml not found: {self.task_yaml} "
-                              f"(run from the repo root)")
+        missing = self.missing_task_files()
+        if missing:
+            return self._fail(
+                f"task files missing: {', '.join(missing)}. task.yml lists them "
+                f"but they are not in the repo. Fetch them from "
+                f"github.com/gpu-mode/reference-kernels "
+                f"(problems/bioml/trimul, problems/amd/mla-decode) into the "
+                f"same directory as task.yml.")
 
         timeout = float(self.kernel_timeout_s or 0.0) or float(timeout_s or 0.0)
         if timeout > 0:
@@ -346,10 +545,38 @@ Rules:
     # ------------------------------------------------------------------
     def seed_states(self) -> List[SeedState]:
         if self.problem_type == "mla_decode_nvidia":
+            # MLA_DECODE_INITIAL_VALUE is a measured H200 runtime. On other
+            # hardware it is simply wrong, and it seeds the whole tree with a
+            # reward the search can never reproduce.
+            if self.gpu_type.strip().lower() not in ("h200",):
+                seed_us = self.cfg.get("mla_seed_runtime_us")
+                if seed_us is None:
+                    raise ValueError(
+                        f"problem_type=mla_decode_nvidia seeds the tree with an "
+                        f"H200 runtime ({abs(float(MLA_DECODE_INITIAL_VALUE))} us) "
+                        f"but gpu_type={self.gpu_type}. Benchmark the initial "
+                        f"state on your hardware and set mla_seed_runtime_us, or "
+                        f"use problem_type=trimul, which seeds from empty code.")
+                us = abs(float(seed_us))
+                reward = float(self.score_scale / us) if us > 0 else 0.0
+                return [SeedState(code=MLA_DECODE_INITIAL_STATE, value=reward,
+                                  raw_score=us, construction=[])
+                        for _ in range(self.num_seed_states)]
             us = abs(float(MLA_DECODE_INITIAL_VALUE))
             reward = float(self.score_scale / us) if us > 0 else 0.0
             return [SeedState(code=MLA_DECODE_INITIAL_STATE, value=reward,
                               raw_score=us, construction=[])
                     for _ in range(self.num_seed_states)]
-        return [SeedState(code="", value=0.0, raw_score=None, construction=[])
+        code = ""
+        if self.seed_from_reference:
+            from pathlib import Path
+            ref = Path(self.task_yaml).parent / "submission.py"
+            if ref.exists():
+                code = ref.read_text()
+            else:
+                print(f"[gpu_mode] seed_from_reference set but {ref} is missing; "
+                      f"seeding with empty code")
+        # value stays 0: the reference has not been benchmarked here, and a made
+        # up number would seed the tree with a reward nothing can reproduce.
+        return [SeedState(code=code, value=0.0, raw_score=None, construction=[])
                 for _ in range(self.num_seed_states)]

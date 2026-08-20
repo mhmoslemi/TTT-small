@@ -13,7 +13,7 @@ import argparse
 import random
 import time
 from dataclasses import dataclass, field, fields
-from typing import Tuple
+from typing import Optional, Tuple
 import numpy as np
 import yaml
 
@@ -45,7 +45,10 @@ class Config:
     )
 
     num_circles: int = 26
-    target: float = 2.635983
+    # None means "let the problem decide". A concrete default here leaks circle
+    # packing's target into every other problem, because Problem.__init__ only
+    # applies its own when this is None.
+    target: Optional[float] = None
     sandbox_timeout_s: float = 30.0
 
     # RL hyperparameters
@@ -152,6 +155,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "erdos, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
                    help="Explicit path to a YAML config (overrides the --problem lookup).")
+    p.add_argument("--gpu-type", default=None,
+                   help="Target hardware for a kernel problem: L40S, A100, H100, "
+                        "H200, ... Sets the prompt's arch notes and rules line, "
+                        "and scales target/score_scale from the H100 defaults.")
+    p.add_argument("--kernel-gpu-id", type=int, default=None,
+                   help="Physical device the kernel benchmark owns, exclusively.")
+    p.add_argument("--kernel-timeout-s", type=float, default=None)
     p.add_argument("--problem-type", default=None,
                    help="Sub-type for multi-mode problems (ac1/ac2, trimul/mla_decode_nvidia).")
 
@@ -500,9 +510,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
-        print(f"  parent {i} [{tag}]  value={info['value']:.8f}  n={info['n']}  "
-              f"Q={info['Q']:.8f}  P={info['P']:.8f}  bonus={info['bonus']:.8f}  "
-              f"score={info['score']:.8f}")
+        print(f"  parent {i} [{tag}]  value={info['value']:.4f}  n={info['n']}  "
+              f"Q={info['Q']:.4f}  P={info['P']:.4f}  bonus={info['bonus']:.4f}  "
+              f"score={info['score']:.4f}")
 
     # The coefficient in force this step. When it reaches zero the whole
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
@@ -702,9 +712,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         rewards_np = np.array(rewards, dtype=np.float64)
         advantages, beta = entropic_adaptive_advantages(rewards_np)
-        print(f"  group {g}: rewards min={rewards_np.min():.8f} "
-              f"mean={rewards_np.mean():.8f} max={rewards_np.max():.8f}  "
-              f"valid={sum(valids)}/{len(valids)}  beta={beta:.8f}")
+        print(f"  group {g}: rewards min={rewards_np.min():.4f} "
+              f"mean={rewards_np.mean():.4f} max={rewards_np.max():.4f}  "
+              f"valid={sum(valids)}/{len(valids)}  beta={beta:.4f}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, (text, token_ids) in enumerate(responses):
@@ -924,11 +934,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     train_time = time.time() - train_t0
     is_msg = ""
     if is_ratio_count > 0:
-        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.8f} "
+        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.4f} "
                   f"max={is_ratio_max:.3f}")
     print(f"[step {step_idx}] train time: {train_time:.1f}s  "
-          f"avg loss: {total_loss / n_examples:.8f}  "
-          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.8f}{is_msg}")
+          f"avg loss: {total_loss / n_examples:.4f}  "
+          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.4f}{is_msg}")
     if fb_on:
         print(fb_stats.line(step_idx, fb_lambda))
 
