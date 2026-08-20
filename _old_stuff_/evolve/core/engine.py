@@ -245,7 +245,7 @@ class Engine:
                                      "valid": result.valid, "msg": result.msg,
                                      "feedback": result.feedback[:2000],
                                      "stdout": result.stdout[:2000],
-                                 })
+                                 }, prompt_text=rollout.prompt_text)
         self.tree.recompute()
         self.tree.prune()
 

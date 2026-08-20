@@ -62,7 +62,7 @@
 
 
 python train_multy.py --problem gpu_mode --problem-type trimul --config configs/gpu_mode_trimul.yaml \
-    --num-steps 30 --groups-per-step 4 --group-size 12 --gpu-type L40S
+    --num-steps 30 --groups-per-step 2 --group-size 4 --gpu-type L40S
 
 # python train_multy.py --problem gpu_mode --problem-type trimul \
 #     --num-steps 30 --groups-per-step 4 --group-size 12 --gpu-type L40S
