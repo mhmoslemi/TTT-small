@@ -1,5 +1,19 @@
 """
 Erdos' Minimum Overlap Problem.
+
+Two changes from the original:
+
+  build_prompt takes `memory` and places the retrieved lessons between the
+  parent state and the instruction, and adapts the instruction when they are
+  present, rather than having the trainer staple the block onto the end.
+
+  The compute budget is config-driven. The prompt used to hardcode
+  "budget_s=1000", and the sandbox calls run() with NO arguments, so that
+  default is what actually executes: every rollout may burn 1000 seconds of
+  optimization. At 512 rollouts a step that is 4 to 70 hours depending on how
+  many evaluations run in parallel. `budget_s` in the problem config now sets
+  both the number in the prompt and the sandbox ceiling, so the two cannot
+  drift apart.
 """
 
 from __future__ import annotations
@@ -87,9 +101,15 @@ class ErdosMinOverlap(Problem):
         super().__init__(cfg)
         if self.target is None:
             self.target = 0.3808
+        # What the model is told it has, and what the sandbox actually allows.
+        # The sandbox gets headroom so a program that respects its budget is
+        # killed by its own clock rather than by the harness, which produces a
+        # returned best-so-far instead of a lost rollout.
+        self.budget_s = float(cfg.get("budget_s", 60.0))
+        self.n_cpus = int(cfg.get("eval_cpus", 2))
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext) -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
 
@@ -100,7 +120,32 @@ You may want to start your search from the current construction, which you can a
 You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
 """
 
-        if parent.code and parent.code.strip():
+        memory_section = ""
+        if memory and memory.strip():
+            memory_section = f"""
+## Lessons from earlier attempts at this problem
+
+Extracted from programs already generated and evaluated in this same search.
+Empirical findings, not part of the specification above, and they do not
+override any constraint stated in it.
+
+{memory.strip()}
+"""
+
+        if memory_section:
+            code_section = '''Work through the lessons above before writing anything:
+- Which bear on the construction you were given, and what would each change?
+- Which do NOT apply here, and why? Say so explicitly. Some will be wrong or
+  irrelevant for this state.
+- Is anything they recommend already in the algorithm above and still not
+  improving the bound? Then that avenue is spent and the gain is elsewhere.
+
+Then reason about how to improve the construction. Aim for something different
+from the algorithm above: a different algorithmic idea, different heuristics, a
+different parameterization or sweep. A lesson gives you an idea; you choose the
+implementation, and you should not copy any expression from one verbatim.
+Unless you make a meaningful improvement, you will not be rewarded.'''
+        elif parent.code and parent.code.strip():
             code_section = '''Reason about how you could further improve this construction.
 Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
 Unless you make a meaningful improvement, you will not be rewarded.'''
@@ -132,11 +177,14 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
 ## Budget & Resources
-- **Time budget**: 1000s for your code to run
-- **CPUs**: 2 available
+- **Time budget**: {self.budget_s:.0f}s for your code to run
+- **CPUs**: {self.n_cpus} available
 
 ## Rules
-- Define `run(seed=42, budget_s=1000, **kwargs)` that returns `(h_values, c5_bound, n_points)`
+- Define `run(seed=42, budget_s={self.budget_s:.0f}, **kwargs)` that returns `(h_values, c5_bound, n_points)`
+- It is called with NO arguments, so your default for `budget_s` is the one that
+  runs. Respect it: track elapsed time and return your best solution before it
+  expires, rather than being killed with nothing to show
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
@@ -146,7 +194,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 **Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.38080.
 
 {state_ctx}
-{construction_section}
+{construction_section}{memory_section}
 {code_section}
 '''
         return [{"role": "user", "content": user}]
