@@ -53,9 +53,23 @@ class Config:
 
     # RL hyperparameters
     num_steps: int = 50
-    groups_per_step: int = 8
-    group_size: int = 64
+    groups_per_step: int = 8       # START value; ratchets up toward the max below
+    group_size: int = 64           # START value; ratchets up toward the max below
     num_seed_states: int = 16
+
+    # ---- adaptive batch growth ----
+    # groups_per_step / group_size are the STARTING (G, K). Each step, if the
+    # best group's valid fraction and the count of distinct improved children
+    # both clear their thresholds, (G, K) are multiplied by growth_factor and
+    # clamped to (max_groups_per_step, max_group_size). Growth is monotonic: it
+    # never shrinks. At step >= growth_force_step, (G, K) are pinned to the max
+    # no matter what the signals say.
+    max_groups_per_step: int = 8
+    max_group_size: int = 64
+    growth_force_step: int = 10    # from this step on, run at max unconditionally
+    growth_valid_yield: float = 0.7   # best group's valid fraction must reach this
+    growth_distinct_min: int = 4      # this many distinct improved children needed
+    growth_factor: float = 2.0        # multiply G and K by this when both clear
     learning_rate: float = 4e-5
     kl_penalty_coef: float = 0.1
     max_new_tokens: int = 4200
@@ -74,6 +88,7 @@ class Config:
 
     # Misc
     seed: int = 42
+    deterministic: bool = False        # master switch for reproducible sampling
     print_responses: int = 0           # how many rollouts to print per step
     # Cap on the construction length written into each rollout's meta. Erdos
     # carries 40-100 floats; circle packing and gpu_mode carry none. 0 disables.
@@ -186,6 +201,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--group-size", type=int, default=None,
                    help="Rollouts per parent per step (paper: 64)")
     p.add_argument("--num-seed-states", type=int, default=None)
+    # ---- adaptive batch growth (groups-per-step / group-size are the START) --
+    p.add_argument("--max-groups-per-step", type=int, default=None,
+                   help="Cap that G (groups per step) ratchets up to.")
+    p.add_argument("--max-group-size", type=int, default=None,
+                   help="Cap that K (rollouts per group) ratchets up to.")
+    p.add_argument("--growth-force-step", type=int, default=None,
+                   help="From this step on, run at (max G, max K) no matter what.")
+    p.add_argument("--growth-valid-yield", type=float, default=None,
+                   help="Best group's valid fraction must reach this to grow.")
+    p.add_argument("--growth-distinct-min", type=int, default=None,
+                   help="Distinct improved children needed to grow.")
+    p.add_argument("--growth-factor", type=float, default=None,
+                   help="Multiply G and K by this when both signals clear.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--kl-penalty-coef", type=float, default=None)
@@ -193,6 +221,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--deterministic", dest="deterministic",
+                   action="store_const", const=True, default=None,
+                   help="Seed every generation stream from --seed so runs are "
+                        "reproducible. Off by default.")
+    p.add_argument("--no-deterministic", dest="deterministic",
+                   action="store_const", const=False,
+                   help="Force determinism off, overriding the YAML.")
     p.add_argument("--print-responses", type=int, default=None)
     p.add_argument("--max-saved-construction", type=int, default=None,
                    help="Max construction length stored per rollout meta. "
@@ -535,9 +570,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
-        print(f"  parent {i} [{tag}]  value={info['value']:.6f}  n={info['n']}  "
-              f"Q={info['Q']:.6f}  P={info['P']:.6f}  bonus={info['bonus']:.6f}  "
-              f"score={info['score']:.6f}")
+        print(f"  parent {i} [{tag}]  value={info['value']:.9f}  n={info['n']}  "
+              f"Q={info['Q']:.9f}  P={info['P']:.9f}  bonus={info['bonus']:.9f}  "
+              f"score={info['score']:.9f}")
 
     # The coefficient in force this step. When it reaches zero the whole
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
@@ -690,12 +725,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # Single-GPU: generate group by group; submit each group's rewards
             # right after it's generated so eval overlaps the next group's gen.
             backend.set_inference_mode()
-            if getattr(cfg, "seed", None) is not None:
-                # Same keying as the pool workers: step t is reproducible on
-                # its own, so the memory maker's in-process calls cannot shift
-                # the rollout stream of later steps.
+            if cfg.deterministic:
                 torch.manual_seed((int(cfg.seed) * 1_000_003
-                                   + step_idx * 1009 + 13) % (2 ** 31 - 1))
+                                   + step_idx * 1009 + 13) % (2**31 - 1))
             gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
             try:
                 for g, prompt_text in enumerate(prompts_by_group):
@@ -721,6 +753,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         reward_pool.shutdown(wait=True)
 
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
+    # ---- signals for adaptive batch growth ----
+    # best_valid_yield: the single best group's valid fraction this step.
+    # distinct_good: how many UNIQUE valid children beat their parent, deduped
+    # by code so a collapsed group (same program N times) counts once.
+    best_valid_yield = 0.0
+    distinct_good_hashes = set()
+
     for g, parent in enumerate(parents):
         prompt_text = prompts_by_group[g]
         responses = group_responses[g]          # list of (text, token_ids)
@@ -740,9 +779,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         rewards_np = np.array(rewards, dtype=np.float64)
         advantages, beta = entropic_adaptive_advantages(rewards_np)
-        print(f"  group {g}: rewards min={rewards_np.min():.6f} "
-              f"mean={rewards_np.mean():.6f} max={rewards_np.max():.6f}  "
-              f"valid={sum(valids)}/{len(valids)}  beta={beta:.6f}")
+
+        # growth signals for this group
+        if len(valids):
+            best_valid_yield = max(best_valid_yield, sum(valids) / len(valids))
+        parent_val = float(parent.value) if parent.value is not None else 0.0
+        for r_idx in range(len(responses)):
+            if valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val:
+                distinct_good_hashes.add(hash(codes[r_idx].strip()))
+
+        print(f"  group {g}: rewards min={rewards_np.min():.9f} "
+              f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
+              f"valid={sum(valids)}/{len(valids)}  beta={beta:.9f}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, (text, token_ids) in enumerate(responses):
@@ -780,7 +828,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
-            save_rollout(exp_dir, step_idx, g, r_idx, text, meta)
+            save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
+                         prompt_text=prompt_text)
             if memory is not None:
                 mem_records.append(RolloutRecord(
                     step=step_idx, group=g, rollout=r_idx,
@@ -887,9 +936,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             curator.run(step_idx, adapter_path=adapter_path)
         memory.save()
 
+    step_stats = {"best_valid_yield": float(best_valid_yield),
+                  "distinct_good": int(len(distinct_good_hashes))}
+
     if not all_examples:
         print(f"[step {step_idx}] no training signal (all groups had constant reward)")
-        return
+        return step_stats
 
     # ----- TRAIN STEP -----
     backend.set_training_mode()
@@ -976,11 +1028,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     train_time = time.time() - train_t0
     is_msg = ""
     if is_ratio_count > 0:
-        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.6f} "
+        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.9f} "
                   f"max={is_ratio_max:.3f}")
     print(f"[step {step_idx}] train time: {train_time:.1f}s  "
-          f"avg loss: {total_loss / n_examples:.6f}  "
-          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.6f}{is_msg}")
+          f"avg loss: {total_loss / n_examples:.9f}  "
+          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.9f}{is_msg}")
     if fb_on:
         print(fb_stats.line(step_idx, fb_lambda))
 
@@ -990,12 +1042,43 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
               f"(step total {time.time() - step_t0:.1f}s, archive={sampler.archive_size()})")
 
+    return step_stats
+
+
+# ======================================================================
+# Batch-size growth controller
+# ======================================================================
+def grow_batch(cur_g, cur_k, stats, cfg):
+    """
+    Monotonic ratchet. Grow (G, K) toward (max_groups_per_step, max_group_size)
+    only when BOTH signals from the step just finished clear their thresholds:
+      - best_valid_yield: the best group's valid fraction, and
+      - distinct_good: the count of unique children that beat their parent.
+    Otherwise hold. Never shrinks. The step >= growth_force_step override lives
+    in the caller, not here.
+    """
+    g_max = int(cfg.max_groups_per_step)
+    k_max = int(cfg.max_group_size)
+    stats = stats or {}
+    grow = (float(stats.get("best_valid_yield", 0.0)) >= cfg.growth_valid_yield
+            and int(stats.get("distinct_good", 0)) >= cfg.growth_distinct_min)
+    if grow:
+        cur_g = min(g_max, int(round(cur_g * cfg.growth_factor)))
+        cur_k = min(k_max, int(round(cur_k * cfg.growth_factor)))
+    return cur_g, cur_k
+
 
 # ======================================================================
 # Main
 # ======================================================================
 def main():
     cfg, merged = load_config()
+
+    # One effective seed for every generation stream. None => not seeded, which
+    # is the original behaviour. Set once here and threaded through unchanged.
+    run_seed = cfg.seed if cfg.deterministic else None
+    print(f"[init] deterministic = {cfg.deterministic}"
+          + (f" (seed {cfg.seed})" if cfg.deterministic else ""))
 
     # ---- memory context top-up (must happen before the model loads) ----
     # The injected block is granted context ON TOP of the no-memory setting,
@@ -1058,9 +1141,13 @@ def main():
     model, tokenizer = backend.load()
 
     import torch  # safe to import now
+    import random
     random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
+    if run_seed is not None:
+        random.seed(run_seed)
+        torch.manual_seed(run_seed)
+        np.random.seed(run_seed)
+
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -1101,7 +1188,7 @@ def main():
             gpu_ids=gpu_ids,
             max_seq_length=cfg.max_seq_length,
             load_in_4bit=cfg.load_in_4bit,
-            seed=cfg.seed,
+            seed=run_seed,
         )
         print("[init] generation pool ready")
     else:
@@ -1112,9 +1199,8 @@ def main():
     mem_cfg, memory, extractor, lookup, curator = setup_memory(
         merged, problem, cfg, mem_cfg=mem_cfg,
         backend=backend, model=model, tokenizer=tokenizer,
-        gen_pool=gen_pool, exp_dir=exp_dir, seed=cfg.seed,
+        gen_pool=gen_pool, exp_dir=exp_dir,  seed=run_seed,
     )
-
     # ---- feedback-based failure signal (Sec. 2.3) ----
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
@@ -1155,13 +1241,36 @@ def main():
               f"continuing with rank-based prior")
         reranker = None
 
+    # ---- adaptive batch growth: start from the configured (G, K) ----
+    cur_g = int(cfg.groups_per_step)
+    cur_k = int(cfg.group_size)
+    print(f"[init] batch growth: start G={cur_g} K={cur_k} -> "
+          f"max G={cfg.max_groups_per_step} K={cfg.max_group_size}; "
+          f"grow when best-valid-yield>={cfg.growth_valid_yield} and "
+          f"distinct-good>={cfg.growth_distinct_min} (x{cfg.growth_factor}); "
+          f"forced to max at step {cfg.growth_force_step}")
+
     # ---- main loop ----
     try:
         for step in range(cfg.num_steps):
-            train_step(backend, model, tokenizer, sampler, optimizer, step,
-                       cfg, exp_dir, problem, gen_pool,
-                       memory=memory, extractor=extractor, mem_cfg=mem_cfg,
-                       lookup=lookup, curator=curator, fb_cfg=fb_cfg)
+            # Hard convergence: from growth_force_step on, run at the cap no
+            # matter what the signals say.
+            if step >= cfg.growth_force_step:
+                cur_g, cur_k = int(cfg.max_groups_per_step), int(cfg.max_group_size)
+            cfg.groups_per_step = cur_g
+            cfg.group_size = cur_k
+            print(f"[step {step}] batch: G={cur_g} K={cur_k} "
+                  f"({cur_g * cur_k} rollouts)")
+
+            stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
+                               cfg, exp_dir, problem, gen_pool,
+                               memory=memory, extractor=extractor, mem_cfg=mem_cfg,
+                               lookup=lookup, curator=curator, fb_cfg=fb_cfg)
+
+            # Ratchet up for the next step (skipped once we are in the forced
+            # region, since we are already pinned to the max there).
+            if step < cfg.growth_force_step:
+                cur_g, cur_k = grow_batch(cur_g, cur_k, stats, cfg)
     finally:
         if reranker is not None:
             print("[shutdown] stopping Elo re-ranker ...")
