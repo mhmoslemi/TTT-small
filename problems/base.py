@@ -78,6 +78,14 @@ class Problem(ABC):
     metric_name: str = "score"
     maximize: bool = True
 
+    # Whether RewardResult.construction is the actual solution object and
+    # therefore worth writing into every rollout's meta. True only where the
+    # construction cannot be recovered by re-running the program: Erdos returns
+    # an h array produced by a stochastic, wall-clock-bounded optimizer, so a
+    # replay does not reproduce it. Circle packing and gpu_mode carry no
+    # construction at all, and their programs are the artifact.
+    saves_construction: bool = False
+
     def __init__(self, cfg: dict):
         self.cfg = dict(cfg or {})
         self.target = self.cfg.get("target")
