@@ -71,10 +71,9 @@ def save_rollout(
     rollout: int,
     response_text: str,
     meta: dict,
-    prompt_text: str = "",
 ):
     """
-    Save one rollout as a .txt + .meta.json pair (+ .prompt.txt if given).
+    Save one rollout as a .txt + .meta.json pair.
 
     meta should include at least: reward, valid, parsed, ran, msg.
     Anything JSON-serializable is fine.
@@ -83,8 +82,6 @@ def save_rollout(
     step_dir.mkdir(exist_ok=True)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
     (step_dir / f"{base}.txt").write_text(response_text, errors="replace")
-    if prompt_text:
-        (step_dir / f"{base}.prompt.txt").write_text(prompt_text, errors="replace")
 
     # Make sure we can dump everything (numpy floats, bools, etc.)
     def _coerce(v):
@@ -115,16 +112,30 @@ def save_step_summary(exp_dir: Path, step: int, summary: dict):
     )
 
 
-def save_final_summary(exp_dir: Path, best_value, best_code, best_step):
-    """Write the end-of-run summary."""
+def save_final_summary(exp_dir: Path, best_value, best_code, best_step,
+                       best_construction=None, best_raw_score=None):
+    """
+    Write the end-of-run summary.
+
+    best_construction is the actual solution object (for Erdos, the h array).
+    Written both into the summary and to its own file, because a plot or a
+    verification wants the array on its own and should never have to re-run the
+    program to get it.
+    """
     out = {
         "best_value": float(best_value) if best_value is not None else None,
+        "best_raw_score": (float(best_raw_score)
+                           if best_raw_score is not None else None),
         "best_step": int(best_step) if best_step is not None else None,
         "best_code": best_code or "",
+        "best_construction": best_construction,
     }
     (exp_dir / "final.summary.json").write_text(json.dumps(out, indent=2))
     if best_code:
         (exp_dir / "best_code.py").write_text(best_code)
+    if best_construction:
+        (exp_dir / "best_construction.json").write_text(
+            json.dumps(best_construction))
 
 
 
@@ -185,6 +196,3 @@ if __name__ == "__main__":
     print("Saved demo rollout. Contents:")
     for f in sorted(p.iterdir()):
         print(" ", f.name)
-
-
-

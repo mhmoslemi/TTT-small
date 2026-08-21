@@ -3,6 +3,12 @@ Erdos' Minimum Overlap Problem.
 
 Two changes from the original:
 
+  The prompt now specifies an output format. It previously ended with "Write
+  code to optimize this construction." and said nothing about structure, so the
+  model had no block to fill and no fence to reach and simply ran toward
+  max_new_tokens, and extract_python_code (which looks for ```python fences)
+  had nothing reliable to find.
+
   build_prompt takes `memory` and places the retrieved lessons between the
   parent state and the instruction, and adapts the instruction when they are
   present, rather than having the trainer staple the block onto the end.
@@ -96,6 +102,10 @@ class ErdosMinOverlap(Problem):
     entrypoint = "run"
     metric_name = "C\u2085 bound"
     maximize = False
+    # The h array is the solution and cannot be recovered by replay: the
+    # optimizer is stochastic and budget-bounded, and a mid-run rollout's parent
+    # array is not otherwise stored either. Save both.
+    saves_construction = True
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
@@ -196,7 +206,19 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 {state_ctx}
 {construction_section}{memory_section}
 {code_section}
+
+## Output format
+
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
+
+
+- Exactly ONE ```python block, containing the complete program. It is extracted
+  verbatim and executed as written.
+- No prose, notes, explanation, or example usage after the closing fence.
+- No second code block. No partial snippets earlier in the response.
+- The block must define `run` at top level and be runnable on its own.
 '''
+# Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------

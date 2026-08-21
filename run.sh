@@ -68,8 +68,9 @@
 #     --num-steps 30 --groups-per-step 4 --group-size 12 --gpu-type L40S
 
 
-python train_multy.py --problem erdos --num-steps 30 --groups-per-step 4 --group-size 15 --config configs/erdos.yaml
+python train_multy.py --problem erdos --num-steps 30 --groups-per-step 5 --group-size 15 --config configs/erdos.yaml
 
+# problem
 # reinforce
 
 # gpu 6 : lr 0 

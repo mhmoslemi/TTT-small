@@ -75,6 +75,9 @@ class Config:
     # Misc
     seed: int = 42
     print_responses: int = 0           # how many rollouts to print per step
+    # Cap on the construction length written into each rollout's meta. Erdos
+    # carries 40-100 floats; circle packing and gpu_mode carry none. 0 disables.
+    max_saved_construction: int = 4096
     # Threads used to evaluate rollouts. 0 = auto (cpu_count - num_gpus), which
     # is right for a subprocess sandbox and WRONG for anything that benchmarks
     # on the GPU: concurrent timing runs contend and the reward IS the timing.
@@ -191,6 +194,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--print-responses", type=int, default=None)
+    p.add_argument("--max-saved-construction", type=int, default=None,
+                   help="Max construction length stored per rollout meta. "
+                        "0 disables saving it.")
     p.add_argument("--reward-workers", type=int, default=None,
                    help="Threads for reward evaluation. 0 = auto. Use 1 for any "
                         "problem whose reward is a measured runtime.")
@@ -441,6 +447,25 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool):
 # ======================================================================
 # LoRA adapter sync (main process -> generation workers)
 # ======================================================================
+def _as_float_list(seq, max_len: int = 4096):
+    """
+    Coerce a construction to a plain list of floats for the rollout meta.
+
+    Returns None when absent, and refuses anything longer than max_len so a
+    problem with a huge construction cannot bloat every meta file. 0 disables
+    saving entirely.
+    """
+    if seq is None or max_len == 0:
+        return None
+    try:
+        out = [float(x) for x in seq]
+    except (TypeError, ValueError):
+        return None
+    if not out or (max_len > 0 and len(out) > max_len):
+        return None
+    return out
+
+
 def _adapter_dir(exp_dir, step_idx):
     from pathlib import Path
     return str(Path(exp_dir) / f"adapter_step{step_idx:03d}")
@@ -510,9 +535,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
-        print(f"  parent {i} [{tag}]  value={info['value']:.4f}  n={info['n']}  "
-              f"Q={info['Q']:.4f}  P={info['P']:.4f}  bonus={info['bonus']:.4f}  "
-              f"score={info['score']:.4f}")
+        print(f"  parent {i} [{tag}]  value={info['value']:.6f}  n={info['n']}  "
+              f"Q={info['Q']:.6f}  P={info['P']:.6f}  bonus={info['bonus']:.6f}  "
+              f"score={info['score']:.6f}")
 
     # The coefficient in force this step. When it reaches zero the whole
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
@@ -520,6 +545,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     import inspect as _inspect
     memory_aware_prompt = "memory" in _inspect.signature(
         problem.build_prompt).parameters
+    # Only problems that declare it get their construction written to disk.
+    save_ctor = (bool(getattr(problem, "saves_construction", False))
+                 and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
     fb_lambda = fb_cfg.lambda_at(step_idx) if fb_cfg is not None else 0.0
     fb_on = bool(fb_cfg is not None and fb_cfg.enabled and fb_lambda > 0.0)
@@ -712,9 +740,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         rewards_np = np.array(rewards, dtype=np.float64)
         advantages, beta = entropic_adaptive_advantages(rewards_np)
-        print(f"  group {g}: rewards min={rewards_np.min():.4f} "
-              f"mean={rewards_np.mean():.4f} max={rewards_np.max():.4f}  "
-              f"valid={sum(valids)}/{len(valids)}  beta={beta:.4f}")
+        print(f"  group {g}: rewards min={rewards_np.min():.6f} "
+              f"mean={rewards_np.mean():.6f} max={rewards_np.max():.6f}  "
+              f"valid={sum(valids)}/{len(valids)}  beta={beta:.6f}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, (text, token_ids) in enumerate(responses):
@@ -737,15 +765,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "parent_is_seed": parent.id in sampler._seed_ids,
                 "memory_ids": retrieved_by_group.get(g, []),
                 "memory_tokens": mem_tokens_by_group.get(g, 0),
+                # The solution itself, and the one it started from. Neither is
+                # recoverable afterwards: `construction` lives only in the
+                # in-memory sampler State, and a mid-run rollout's parent array
+                # is gone by the time anyone wants to plot it. Saving the result
+                # means reproducing a figure needs no re-execution at all, which
+                # also sidesteps programs that are stochastic or wall-clock
+                # bounded and therefore cannot replay identically.
+                "construction": (_as_float_list(getattr(res, "construction", None),
+                                                cfg.max_saved_construction)
+                                 if save_ctor else None),
+                "parent_construction": (_as_float_list(
+                    getattr(parent, "construction", None),
+                    cfg.max_saved_construction) if save_ctor else None),
+                "seed": int(cfg.seed),
             }
-            save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
-                         prompt_text=prompt_text)
+            save_rollout(exp_dir, step_idx, g, r_idx, text, meta)
             if memory is not None:
                 mem_records.append(RolloutRecord(
                     step=step_idx, group=g, rollout=r_idx,
                     parent_summary=(
                         f"parent reward="
-                        f"{(parent.value if parent.value is not None else 0.0):.6f}"),
+                        f"{(parent.value if parent.value is not None else 0.0):.9f}"),
                     parent_code=parent.code or "",
                     parent_reward=(float(parent.value)
                                    if parent.value is not None else None),
@@ -935,18 +976,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     train_time = time.time() - train_t0
     is_msg = ""
     if is_ratio_count > 0:
-        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.4f} "
+        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.6f} "
                   f"max={is_ratio_max:.3f}")
     print(f"[step {step_idx}] train time: {train_time:.1f}s  "
-          f"avg loss: {total_loss / n_examples:.4f}  "
-          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.4f}{is_msg}")
+          f"avg loss: {total_loss / n_examples:.6f}  "
+          f"avg logpi_theta - logpi_base: {total_logp_delta / n_examples:.6f}{is_msg}")
     if fb_on:
         print(fb_stats.line(step_idx, fb_lambda))
 
     best = sampler.best_state()
     if best is not None:
-        raw = f" raw={best.raw_score:.6f}" if best.raw_score is not None else ""
-        print(f"[step {step_idx}] best so far: value={best.value:.6f}{raw}  "
+        raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
+        print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
               f"(step total {time.time() - step_t0:.1f}s, archive={sampler.archive_size()})")
 
 
@@ -1135,12 +1176,19 @@ def main():
     print("=" * 70)
     best = sampler.best_state()
     if best is not None:
-        raw = f"  (raw {getattr(problem, 'metric_name', 'metric')} = {best.raw_score:.6f})" \
+        raw = f"  (raw {getattr(problem, 'metric_name', 'metric')} = {best.raw_score:.9f})" \
             if best.raw_score is not None else ""
-        print(f"Best reward (higher=better): {best.value:.6f}{raw}")
+        print(f"Best reward (higher=better): {best.value:.9f}{raw}")
         print(f"Found at step:     {best.timestep}")
         print(f"\n--- best code ---\n{best.code}\n--- end ---")
-        save_final_summary(exp_dir, best.value, best.code, best.timestep)
+        save_final_summary(exp_dir, best.value, best.code, best.timestep,
+                           best_construction=(_as_float_list(
+                               getattr(best, "construction", None),
+                               cfg.max_saved_construction)
+                               if getattr(problem, "saves_construction", False)
+                               else None),
+                           best_raw_score=(float(best.raw_score)
+                                           if best.raw_score is not None else None))
     else:
         print("No valid solution was ever produced.")
         save_final_summary(exp_dir, None, None, None)
