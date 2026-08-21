@@ -155,6 +155,28 @@ def run_program(code: str, initial_h, budget_note=""):
 
 
 # ----------------------------------------------------------------------
+# Orientation
+# ----------------------------------------------------------------------
+def canonical_orientation(h_values):
+    """
+    Put h in the paper's orientation (mass centered, tapering to ~0 at both
+    ends). C5 is invariant under h -> 1-h and under reflection x -> 2-x, and
+    both preserve sum(h) = n/2, so all four forms are equally valid solutions.
+    The raw rollout is often the complement ("valley") or a mirror of the
+    paper's "mountain"; pick the form with the least mass sitting at the ends.
+    """
+    h = np.asarray(h_values, dtype=np.float64).ravel()
+    n = h.shape[0]
+    edge = max(1, n // 10)
+
+    def edge_mass(a):
+        return float(a[:edge].mean() + a[-edge:].mean())
+
+    candidates = (h, 1.0 - h, h[::-1], 1.0 - h[::-1])
+    return min(candidates, key=edge_mass)
+
+
+# ----------------------------------------------------------------------
 # Plot
 # ----------------------------------------------------------------------
 def plot_step_function(h_values, c5_val, n_points, title, save_path):
@@ -180,7 +202,7 @@ def plot_step_function(h_values, c5_val, n_points, title, save_path):
     ax.set_yticks([])
     ax.set_title(title, fontsize=10, pad=8, color="#111111")
     ax.text(0.03, 0.92,
-            f"{n_points}-piece function\n$c \\leq {c5_val:.6f}$",
+            f"{n_points}-piece function\n$c \\leq {c5_val:.9f}$",
             transform=ax.transAxes, fontsize=8.5, verticalalignment="top",
             color="#222222",
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
@@ -250,13 +272,13 @@ def main():
             if parent_h is not None:
                 initial = parent_h
                 print(f"initial_h_values = the SAVED parent construction "
-                      f"(n={len(initial)}, C5={c5_of(initial)[1]:.6f})")
+                      f"(n={len(initial)}, C5={c5_of(initial)[1]:.9f})")
             elif args.no_initial:
                 initial = None
             else:
                 initial = seed_construction(args.seed, args.seed_index)
                 print(f"initial_h_values = seed {args.seed_index} "
-                      f"(n={len(initial)}, C5={c5_of(initial)[1]:.6f})")
+                      f"(n={len(initial)}, C5={c5_of(initial)[1]:.9f})")
                 if m.get("parent_is_seed") is False:
                     print("  NOTE: the real parent was an evolved state and this "
                           "run did not save it, so the replay cannot be exact.")
@@ -265,7 +287,7 @@ def main():
                 raise SystemExit(f"run() returned {type(result).__name__}, "
                                  f"expected a 3-tuple")
             h_raw, reported, n_rep = result
-            print(f"program reported C5 = {float(reported):.6f}  n_points = {n_rep}")
+            print(f"program reported C5 = {float(reported):.9f}  n_points = {n_rep}")
 
     # --- route 2: h supplied directly ---
     elif args.h_json:
@@ -279,23 +301,24 @@ def main():
                                                                  args.seed_index)
         if initial is not None:
             print(f"initial_h_values = seed {args.seed_index} "
-                  f"(n={len(initial)}, C5={c5_of(initial)[1]:.6f})")
+                  f"(n={len(initial)}, C5={c5_of(initial)[1]:.9f})")
         result = run_program(code, initial)
         if not (isinstance(result, tuple) and len(result) == 3):
             raise SystemExit(f"run() returned {type(result).__name__}, expected a "
                              f"3-tuple (h_values, c5_bound, n_points)")
         h_raw, reported, n_rep = result
-        print(f"program reported C5 = {float(reported):.6f}  n_points = {n_rep}")
+        print(f"program reported C5 = {float(reported):.9f}  n_points = {n_rep}")
 
     h, computed = c5_of(h_raw)
+    h = canonical_orientation(h)
     n = len(h)
-    print(f"verifier computes  C5 = {computed:.6f}  over {n} points")
+    print(f"verifier computes  C5 = {computed:.9f}  over {n} points")
     if h.min() < -1e-12 or h.max() > 1 + 1e-12:
         print(f"  WARNING: after normalization h is outside [0,1] "
               f"({h.min():.4f}..{h.max():.4f}). The real verifier REJECTS this.")
     if recorded is not None:
         d = abs(computed - float(recorded))
-        print(f"recorded raw_score = {float(recorded):.6f}   |diff| = {d:.2e}"
+        print(f"recorded raw_score = {float(recorded):.9f}   |diff| = {d:.2e}"
               + ("   (replay reproduced it)" if d < 1e-6 else
                  "   (replay DIVERGED: the program is stochastic, or it used a "
                  "parent construction this script could not supply)"))

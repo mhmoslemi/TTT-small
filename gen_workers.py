@@ -192,16 +192,31 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             break
         step, adapter_path, jobs, gen_kwargs = task
 
+        # if seed is not None:
+        #     # Keyed on (seed, step, rank) rather than advanced sequentially, so
+        #     # step t is reproducible on its own and does not depend on how many
+        #     # generations happened before it.
+        #     s = worker_seed(seed, step, rank)
+        #     random.seed(s)
+        #     np.random.seed(s % (2 ** 32 - 1))
+        #     torch.manual_seed(s)
+        #     if torch.cuda.is_available():
+        #         torch.cuda.manual_seed_all(s)
+
+
         if seed is not None:
-            # Keyed on (seed, step, rank) rather than advanced sequentially, so
-            # step t is reproducible on its own and does not depend on how many
-            # generations happened before it.
-            s = worker_seed(seed, step, rank)
+            # Keyed on (seed, step, rank), not advanced sequentially, so step t
+            # is reproducible on its own and does not depend on how many
+            # generations happened before it. No-op when seed is None (the
+            # non-deterministic default).
+            import random
+            import numpy as _np
+            s = (int(seed) * 1_000_003 + int(step) * 1009
+                 + rank * 7 + 13) % (2**31 - 1)
             random.seed(s)
-            np.random.seed(s % (2 ** 32 - 1))
+            _np.random.seed(s % (2**32 - 1))
             torch.manual_seed(s)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(s)
+            torch.cuda.manual_seed_all(s) 
 
         gen_model = ensure_adapter(adapter_path)
 
@@ -259,7 +274,7 @@ class GenerationPool:
                 target=_worker_loop,
                 args=(r, self.gpu_ids[r], model_name, max_seq_length,
                       load_in_4bit, self.task_queues[r], self.result_queue,
-                      ready_queue, seed),
+                      ready_queue, self.seed),
                 daemon=True,
             )
             p.start()
