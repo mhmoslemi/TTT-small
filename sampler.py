@@ -38,7 +38,7 @@ plus the buffer-mutating section of update(), are guarded by self._prior_lock
 import threading
 import uuid
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -392,6 +392,72 @@ class PUCTSampler:
 
     def archive_size(self):
         return len(self._states)
+
+    def state_dict(self):
+        """Return all search state required to continue in another process."""
+        with self._prior_lock:
+            return {
+                "version": 1,
+                "states": [asdict(s) for s in self._states],
+                "seed_ids": sorted(self._seed_ids),
+                "n": dict(self._n),
+                "m": dict(self._m),
+                "T": int(self._T),
+                "current_step": int(self._current_step),
+                "external_prior": dict(self._external_prior),
+                "external_prior_alpha": float(self._external_prior_alpha),
+            }
+
+    def load_state_dict(self, payload):
+        """Restore a snapshot produced by :meth:`state_dict`."""
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("unsupported or invalid sampler checkpoint")
+        states = payload.get("states")
+        if not isinstance(states, list) or not states:
+            raise ValueError("sampler checkpoint contains no states")
+
+        restored = [State(**item) for item in states]
+        restored_ids = {s.id for s in restored}
+        seed_ids = set(payload.get("seed_ids", ()))
+        if not seed_ids.issubset(restored_ids):
+            raise ValueError("sampler checkpoint references missing seed states")
+
+        with self._prior_lock:
+            self._states = restored
+            self._seed_ids = seed_ids
+            self._n = {str(k): int(v) for k, v in payload.get("n", {}).items()}
+            self._m = {str(k): float(v) for k, v in payload.get("m", {}).items()}
+            self._T = int(payload.get("T", 0))
+            self._current_step = int(payload.get("current_step", 0))
+            self._external_prior = {
+                str(k): float(v)
+                for k, v in payload.get("external_prior", {}).items()
+            }
+            self._external_prior_alpha = float(
+                payload.get("external_prior_alpha", 1.0)
+            )
+            self.last_picks_info = []
+
+    def import_legacy_states(self, states, total_expansions: int = 0):
+        """Best-effort archive import for runs created before checkpoints."""
+        with self._prior_lock:
+            existing_codes = {s.code for s in self._states if s.code}
+            for state in states:
+                if state.code and state.code in existing_codes:
+                    continue
+                state.parents = []
+                self._states.append(state)
+                if state.code:
+                    existing_codes.add(state.code)
+            if len(self._states) > self.max_buffer_size:
+                seeds = [s for s in self._states if s.id in self._seed_ids]
+                others = [s for s in self._states if s.id not in self._seed_ids]
+                others.sort(
+                    key=lambda s: s.value if s.value is not None else -np.inf,
+                    reverse=True,
+                )
+                self._states = seeds + others[:self.max_buffer_size - len(seeds)]
+            self._T = max(self._T, int(total_expansions))
 
     def set_current_step(self, step: int):
         self._current_step = int(step)

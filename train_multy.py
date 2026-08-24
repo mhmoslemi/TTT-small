@@ -10,9 +10,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 import os
 import argparse
+import json
 import random
 import time
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 from typing import Optional, Tuple
 import numpy as np
 import yaml
@@ -188,6 +190,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "erdos, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
                    help="Explicit path to a YAML config (overrides the --problem lookup).")
+    p.add_argument("--resume", "--resume-from", dest="resume", default=None,
+                   metavar="RUN_DIR",
+                   help="Continue an existing run directory from its latest "
+                        "completed checkpoint.")
     p.add_argument("--gpu-type", default=None,
                    help="Target hardware for a kernel problem: L40S, A100, H100, "
                         "H200, ... Sets the prompt's arch notes and rules line, "
@@ -351,7 +357,7 @@ _CLI_TO_CFG = {"lr": "learning_rate"}
 
 def load_config():
     """
-    Merge Config() defaults < YAML(configs/<problem>.yaml or --config) < CLI flags.
+    Merge Config() defaults < YAML < resumed config.json < CLI flags.
 
     Returns (cfg, merged) where:
       cfg    is a Config built from the engine-level fields, and
@@ -361,6 +367,22 @@ def load_config():
     """
     args = _build_arg_parser().parse_args()
 
+    # Read the saved run identity early enough to select its YAML. New runs
+    # persist the complete merged config; older ones at least contain the
+    # dataclass fields and can recover standard problem YAMLs by name.
+    resume_dir = None
+    saved = {}
+    if args.resume is not None:
+        resume_dir = Path(args.resume).expanduser().resolve()
+        if not resume_dir.is_dir():
+            raise FileNotFoundError(f"--resume directory not found: {resume_dir}")
+        saved_config_path = resume_dir / "config.json"
+        if not saved_config_path.is_file():
+            raise FileNotFoundError(
+                f"--resume directory has no config.json: {resume_dir}"
+            )
+        saved = json.loads(saved_config_path.read_text())
+
     # 1) defaults from the dataclass
     merged = {f.name: getattr(Config(), f.name) for f in fields(Config)}
 
@@ -368,10 +390,19 @@ def load_config():
     # so editing that one field switches problems: it picks the YAML, and the
     # YAML then supplies everything else. Previously --problem carried its own
     # hardcoded default, which silently won over the dataclass.
-    problem_name = args.problem if args.problem is not None else merged["problem"]
+    problem_name = (saved.get("problem") if saved
+                    else (args.problem if args.problem is not None
+                          else merged["problem"]))
 
     # 2) YAML overlay
-    cfg_path = args.config or os.path.join("configs", f"{problem_name}.yaml")
+    cfg_path = args.config
+    if cfg_path is None and saved.get("problem_type"):
+        typed = os.path.join(
+            "configs", f"{problem_name}_{saved['problem_type']}.yaml"
+        )
+        if os.path.exists(typed):
+            cfg_path = typed
+    cfg_path = cfg_path or os.path.join("configs", f"{problem_name}.yaml")
     ydict = {}
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -390,8 +421,24 @@ def load_config():
     # while --problem just selects the file). With no YAML, --problem is the key.
     merged["problem"] = ydict.get("problem", problem_name)
 
-    # 3) CLI overlay (only explicitly-provided values)
-    skip = {"problem", "config", "problem_type"}
+    # 3) Saved config overlay. Older code wrote max_seq_length after adding the
+    # memory allowance; undo that convention before main() adds it again.
+    if saved:
+        marker = saved.pop("_max_seq_length_includes_memory_topup", None)
+        if (marker is None and saved.get("memory")
+                and saved.get("memory_grant_context", True)
+                and saved.get("memory_token_budget", 0)):
+            saved["max_seq_length"] = max(
+                1,
+                int(saved.get("max_seq_length", 0))
+                - int(saved.get("memory_token_budget", 0)),
+            )
+        merged.update(saved)
+        print(f"[config] resuming original configuration from "
+              f"{resume_dir / 'config.json'}")
+
+    # 4) CLI overlay (only explicitly-provided values)
+    skip = {"problem", "config", "problem_type", "resume"}
     for arg_name, value in vars(args).items():
         if arg_name in skip or value is None:
             continue
@@ -400,10 +447,11 @@ def load_config():
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
-    # 4) build the Config from the fields it knows; leave the rest in `merged`
+    # 5) build the Config from the fields it knows; leave the rest in `merged`
     known = {f.name for f in fields(Config)}
     cfg_kwargs = {k: v for k, v in merged.items() if k in known}
     cfg = Config(**cfg_kwargs)
+    merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 
 
@@ -567,25 +615,152 @@ def _adapter_exists(exp_dir):
 def _save_adapter(model, exp_dir, step_idx):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
-    Returns the directory path. Cleans up the previous step's adapter to
-    avoid filling the disk (we only ever need the latest).
+    Adapters are retained because completed checkpoints refer to their matching
+    step directory; an interrupted write can therefore never invalidate the
+    previous resumable checkpoint.
     """
-    import shutil
-    from pathlib import Path
-
     out_dir = _adapter_dir(exp_dir, step_idx)
     # PEFT/Unsloth models support save_pretrained, which writes just the adapter
     model.save_pretrained(out_dir)
-
-    # Remove older adapter dirs (keep only the current one)
-    for old in Path(exp_dir).glob("adapter_step*"):
-        if str(old) != out_dir:
-            try:
-                shutil.rmtree(old)
-            except Exception:
-                pass
-
     return out_dir
+
+
+def _load_adapter(model, adapter_dir):
+    """Load saved LoRA weights into the already-created trainable adapter."""
+    import torch
+    from peft import set_peft_model_state_dict
+
+    adapter_dir = Path(adapter_dir)
+    if not adapter_dir.is_dir():
+        raise FileNotFoundError(f"checkpoint adapter not found: {adapter_dir}")
+
+    try:
+        from peft.utils.save_and_load import load_peft_weights
+        weights = load_peft_weights(
+            str(adapter_dir), device=str(next(model.parameters()).device)
+        )
+    except (ImportError, TypeError):
+        safe_path = adapter_dir / "adapter_model.safetensors"
+        bin_path = adapter_dir / "adapter_model.bin"
+        if safe_path.is_file():
+            from safetensors.torch import load_file
+            weights = load_file(
+                str(safe_path), device=str(next(model.parameters()).device)
+            )
+        elif bin_path.is_file():
+            try:
+                weights = torch.load(
+                    str(bin_path), map_location="cpu", weights_only=True
+                )
+            except TypeError:
+                weights = torch.load(str(bin_path), map_location="cpu")
+        else:
+            raise FileNotFoundError(f"no adapter weights found under {adapter_dir}")
+
+    set_peft_model_state_dict(model, weights)
+    print(f"[resume] loaded LoRA adapter from {adapter_dir}")
+
+
+def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
+                              optimizer, next_g, next_k, memory_path=None):
+    """Atomically save the state required for an exact next-step resume."""
+    import torch
+
+    target = Path(exp_dir) / "training_state.pt"
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = {
+        "version": 1,
+        "next_step": int(next_step),
+        "adapter_dir": Path(adapter_path).name,
+        "sampler": sampler.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "next_groups_per_step": int(next_g),
+        "next_group_size": int(next_k),
+        "memory_file": Path(memory_path).name if memory_path is not None else None,
+    }
+    torch.save(payload, tmp)
+    tmp.replace(target)
+    return target
+
+
+def _load_training_checkpoint(exp_dir):
+    import torch
+
+    path = Path(exp_dir) / "training_state.pt"
+    if not path.is_file():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError(f"unsupported training checkpoint: {path}")
+    required = ("next_step", "adapter_dir", "sampler", "optimizer",
+                "next_groups_per_step", "next_group_size")
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"training checkpoint is missing {key!r}: {path}")
+    return payload
+
+
+def _legacy_resume_info(exp_dir):
+    """Locate the safe restart point for a pre-checkpoint run directory."""
+    matches = []
+    for path in Path(exp_dir).glob("adapter_step*"):
+        try:
+            matches.append((int(path.name.removeprefix("adapter_step")), path))
+        except ValueError:
+            continue
+    if not matches:
+        raise FileNotFoundError(
+            "this older run has no training_state.pt and no adapter_step* "
+            "directory; the trained policy cannot be resumed"
+        )
+    # Legacy adapters were written immediately before their numbered step.
+    return max(matches, key=lambda item: item[0])
+
+
+def _restore_legacy_archive(sampler, exp_dir, before_step):
+    """Recover valid candidates from rollout files that predate checkpoints."""
+    from reward import extract_python_code
+    from sampler import State
+
+    states = []
+    total_rollouts = 0
+    pattern = "step*/step*_group*_rollout*.meta.json"
+    for meta_path in sorted(Path(exp_dir).glob(pattern)):
+        try:
+            meta = json.loads(meta_path.read_text())
+            step = int(meta.get("step", -1))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if step < 0 or step >= before_step:
+            continue
+        total_rollouts += 1
+        if not meta.get("valid"):
+            continue
+        text_path = meta_path.with_name(
+            meta_path.name.removesuffix(".meta.json") + ".txt"
+        )
+        try:
+            code = extract_python_code(text_path.read_text(errors="replace"))
+        except OSError:
+            code = None
+        if not code:
+            continue
+        try:
+            reward = float(meta.get("reward", 0.0))
+            raw = meta.get("raw_score")
+            raw = float(raw) if raw is not None else None
+            construction = meta.get("construction")
+        except (TypeError, ValueError):
+            continue
+        states.append(State.make(
+            timestep=step, value=reward, code=code, raw_score=raw,
+            construction=construction,
+        ))
+    sampler.import_legacy_states(states, total_expansions=total_rollouts)
+    return len(states), total_rollouts
 
 
 # ======================================================================
@@ -1130,6 +1305,15 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 def main():
     cfg, merged = load_config()
 
+    # Select the run directory before runtime-only context adjustments so a
+    # fresh config.json stores the reusable base configuration.
+    from experiment_io import (make_experiment_dir, save_final_summary,
+                               save_step_summary)
+    resume_dir = merged.pop("_resume_dir", None)
+    exp_dir = make_experiment_dir(
+        cfg, resume_dir=resume_dir, config_dict=merged
+    )
+
     # One effective seed for every generation stream. None => not seeded, which
     # is the original behaviour. Set once here and threaded through unchanged.
     run_seed = cfg.seed if cfg.deterministic else None
@@ -1183,9 +1367,8 @@ def main():
     print("=" * 70)
 
     # ---- experiment dir ----
-    from experiment_io import make_experiment_dir, save_final_summary
-    exp_dir = make_experiment_dir(cfg)
-    print(f"[init] writing all rollouts to: {exp_dir}")
+    action = "resuming in" if resume_dir else "writing all rollouts to"
+    print(f"[init] {action}: {exp_dir}")
 
     # ---- seed states (problem-defined) ----
     seeds = problem.seed_states()
@@ -1205,6 +1388,28 @@ def main():
         torch.manual_seed(run_seed)
         np.random.seed(run_seed)
 
+    # Load policy weights before constructing the optimizer, so both describe
+    # the same completed step.
+    resume_payload = None
+    legacy_resume = None
+    start_step = 0
+    if resume_dir:
+        resume_payload = _load_training_checkpoint(exp_dir)
+        if resume_payload is not None:
+            start_step = int(resume_payload["next_step"])
+            adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
+            _load_adapter(model, adapter_path)
+            print(f"[resume] exact checkpoint found; next step is {start_step}")
+        else:
+            legacy_resume = _legacy_resume_info(exp_dir)
+            start_step, adapter_path = legacy_resume
+            _load_adapter(model, adapter_path)
+            print(
+                f"[resume] legacy run (no training_state.pt): restarting step "
+                f"{start_step} from {adapter_path.name}. The archive will be "
+                "reconstructed, but old PUCT/optimizer/growth statistics are "
+                "unavailable."
+            )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -1213,6 +1418,9 @@ def main():
         eps=1e-8,
         weight_decay=0.0
     )
+    if resume_payload is not None:
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        print("[resume] restored optimizer state")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"[init] trainable params: {trainable:,} / total {total:,} "
@@ -1228,6 +1436,15 @@ def main():
         seed_value=0.0,
         seed_states=seeds,
     )
+    if resume_payload is not None:
+        sampler.load_state_dict(resume_payload["sampler"])
+        print("[resume] restored exact PUCT archive and visit statistics")
+    elif legacy_resume is not None:
+        n_states, n_rollouts = _restore_legacy_archive(
+            sampler, exp_dir, before_step=start_step
+        )
+        print(f"[resume] reconstructed {n_states} valid archived candidates "
+              f"from {n_rollouts} earlier rollouts")
     print(f"[init] sampler archive size = {sampler.archive_size()}")
 
     # ---- generation pool (multi-GPU) ----
@@ -1263,6 +1480,21 @@ def main():
         backend=backend, model=model, tokenizer=tokenizer,
         gen_pool=gen_pool, exp_dir=exp_dir,  seed=run_seed,
     )
+    if resume_payload is not None and memory is not None:
+        memory_file = resume_payload.get("memory_file")
+        if memory_file:
+            memory_path = Path(exp_dir) / memory_file
+            if not memory_path.is_file():
+                raise FileNotFoundError(
+                    f"checkpoint memory snapshot not found: {memory_path}"
+                )
+            n_lessons = memory.load(memory_path)
+            memory.save()  # undo a partially completed later step, if present
+            print(f"[resume] restored {n_lessons} memory lessons from "
+                  f"{memory_path.name}")
+    elif legacy_resume is not None and memory is not None:
+        print("[resume] warning: legacy memory.json cannot be rolled back to the "
+              "restarted step; it will be reused as-is")
     # ---- feedback-based failure signal (Sec. 2.3) ----
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
@@ -1304,8 +1536,12 @@ def main():
         reranker = None
 
     # ---- adaptive batch growth: start from the configured (G, K) ----
-    cur_g = int(cfg.groups_per_step)
-    cur_k = int(cfg.group_size)
+    if resume_payload is not None:
+        cur_g = int(resume_payload["next_groups_per_step"])
+        cur_k = int(resume_payload["next_group_size"])
+    else:
+        cur_g = int(cfg.groups_per_step)
+        cur_k = int(cfg.group_size)
     print(f"[init] batch growth: start G={cur_g} K={cur_k} -> "
           f"max G={cfg.max_groups_per_step} K={cfg.max_group_size}; "
           f"grow when best-valid-yield>={cfg.growth_valid_yield} and "
@@ -1314,7 +1550,9 @@ def main():
 
     # ---- main loop ----
     try:
-        for step in range(cfg.num_steps):
+        if start_step >= cfg.num_steps:
+            print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
+        for step in range(start_step, cfg.num_steps):
             # Hard convergence: from growth_force_step on, run at the cap no
             # matter what the signals say.
             if step >= cfg.growth_force_step:
@@ -1333,6 +1571,31 @@ def main():
             # region, since we are already pinned to the max there).
             if step < cfg.growth_force_step:
                 cur_g, cur_k = grow_batch(cur_g, cur_k, stats, cfg)
+
+            # Version the memory and adapter first, then atomically advance the
+            # state pointer. A crash during any write leaves the previous
+            # adapter/checkpoint pair valid.
+            memory_path = None
+            if memory is not None:
+                memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
+                memory.save(memory_path)
+            adapter_path = _save_adapter(model, exp_dir, step)
+            checkpoint_path = _save_training_checkpoint(
+                exp_dir, step + 1, adapter_path, sampler, optimizer,
+                next_g=cur_g, next_k=cur_k, memory_path=memory_path,
+            )
+            save_step_summary(exp_dir, step, {
+                "step": step,
+                "completed": True,
+                "next_step": step + 1,
+                "adapter_dir": Path(adapter_path).name,
+                "checkpoint": Path(checkpoint_path).name,
+                "archive_size": sampler.archive_size(),
+                "next_groups_per_step": cur_g,
+                "next_group_size": cur_k,
+                **(stats or {}),
+            })
+            print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
     finally:
         if reranker is not None:
             print("[shutdown] stopping Elo re-ranker ...")

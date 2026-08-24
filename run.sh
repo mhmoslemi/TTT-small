@@ -114,12 +114,30 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # # --deterministic --seed 42
 # # --no-deterministic
-CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
-    --num-steps 100 \
-    --groups-per-step 8 --group-size 64 \
-    --max-groups-per-step 8 --max-group-size 64 \
-    --growth-force-step 5 --num-gpus 3 --gpu-ids 4,5,6 \
-    --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --model-name /mnt/storage/mohammad/models/Qwen3-8B
+# Fresh run:
+#   sh run.sh
+# Resume in-place from the next incomplete step:
+#   sh run.sh --resume /path/to/runs/erdos_Qwen3-8B_0824-1000
+# On resume, config.json supplies the original defaults. Extra CLI flags still
+# win, e.g. `sh run.sh --resume RUN_DIR --num-steps 150`.
+resume_run=0
+for arg in "$@"; do
+    case "$arg" in
+        --resume|--resume-from|--resume=*|--resume-from=*) resume_run=1 ;;
+    esac
+done
+
+if [ "$resume_run" -eq 1 ]; then
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py "$@"
+else
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
+        --num-steps 100 \
+        --groups-per-step 8 --group-size 64 \
+        --max-groups-per-step 8 --max-group-size 64 \
+        --growth-force-step 5 --num-gpus 3 --gpu-ids 4,5,6 \
+        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 \
+        --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
+fi
  
 
 

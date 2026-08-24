@@ -33,11 +33,22 @@ def _model_short(model_name: str) -> str:
     return _slugify(model_name.split("/")[-1])
 
 
-def make_experiment_dir(cfg, root: str = "runs") -> Path:
+def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
+                        config_dict=None) -> Path:
     """
     Build a directory whose name encodes the key identifiers of this run.
     Full hyperparameters are always in config.json inside the directory.
+
+    When ``resume_dir`` is provided, reuse it without rewriting the original
+    configuration. ``config_dict`` lets callers persist problem-specific YAML
+    keys in addition to the Config dataclass fields.
     """
+    if resume_dir is not None:
+        path = Path(resume_dir).expanduser().resolve()
+        if not path.is_dir():
+            raise NotADirectoryError(f"resume directory not found: {path}")
+        return path
+
     problem = _slugify(getattr(cfg, "problem", "run"))
     name_parts = [problem]
 
@@ -54,12 +65,18 @@ def make_experiment_dir(cfg, root: str = "runs") -> Path:
     path = Path(root) / name
     path.mkdir(parents=True, exist_ok=True)
 
-    try:
-        cfg_dict = asdict(cfg)
-    except TypeError:
-
-        cfg_dict = {k: getattr(cfg, k) for k in dir(cfg)
-                    if not k.startswith("_") and not callable(getattr(cfg, k))}
+    if config_dict is not None:
+        cfg_dict = dict(config_dict)
+    else:
+        try:
+            cfg_dict = asdict(cfg)
+        except TypeError:
+            cfg_dict = {k: getattr(cfg, k) for k in dir(cfg)
+                        if not k.startswith("_")
+                        and not callable(getattr(cfg, k))}
+    # New configs store the base context length, before the runtime memory
+    # allowance is added. The marker lets resume read older configs too.
+    cfg_dict["_max_seq_length_includes_memory_topup"] = False
     (path / "config.json").write_text(json.dumps(cfg_dict, indent=2, default=str))
     return path
 
