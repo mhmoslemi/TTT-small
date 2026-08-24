@@ -42,6 +42,8 @@ Wiring in a trainer:
 """
 
 from memory.bank import MemoryBank
+from memory.bandit import (MemoryArm, allocate_memory_arms,
+                           credit_memory_arms, expected_subsample_max)
 from memory.curator import MemoryCurator
 from memory.config import MemoryConfig
 from memory.extractor import LessonExtractor, build_meta_description
@@ -63,6 +65,8 @@ __all__ = [
     "inject_block", "count_tokens", "parent_block", "parse_extraction",
     "parse_lookup", "render_memory_block", "Lesson", "RolloutRecord",
     "SUCCESS", "FAILURE", "LOCAL", "GLOBAL", "setup_memory",
+    "MemoryArm", "allocate_memory_arms", "credit_memory_arms",
+    "expected_subsample_max",
 ]
 
 

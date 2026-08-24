@@ -90,7 +90,8 @@ def make_progress_bar(total, desc="progress"):
     return _PrintBar(total, desc=desc)
 
 
-def distribute_jobs(prompts_by_group, group_size, num_workers):
+def distribute_jobs(prompts_by_group, group_size, num_workers,
+                    counts_by_group=None):
     """
     prompts_by_group: list of prompt strings, one per group (index = group_idx)
 
@@ -100,13 +101,19 @@ def distribute_jobs(prompts_by_group, group_size, num_workers):
     every worker participates in every group (max GPU utilization).
     """
     worker_jobs = [[] for _ in range(num_workers)]
-    for g, prompt in enumerate(prompts_by_group):
-        base = group_size // num_workers
-        rem = group_size % num_workers
+    counts = ([int(group_size)] * len(prompts_by_group)
+              if counts_by_group is None else [int(x) for x in counts_by_group])
+    if len(counts) != len(prompts_by_group):
+        raise ValueError("counts_by_group must align with prompts_by_group")
+    for g, (prompt, count) in enumerate(zip(prompts_by_group, counts)):
+        if count < 0:
+            raise ValueError("generation counts must be non-negative")
+        base = count // num_workers
+        rem = count % num_workers
         for w in range(num_workers):
-            count = base + (1 if w < rem else 0)
-            if count > 0:
-                worker_jobs[w].append((g, prompt, count))
+            worker_count = base + (1 if w < rem else 0)
+            if worker_count > 0:
+                worker_jobs[w].append((g, prompt, worker_count))
     return worker_jobs
 
 
@@ -346,7 +353,7 @@ class GenerationPool:
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        show_progress=True):
+                        show_progress=True, counts_by_group=None):
         """
         Stream generation results as each (worker, group) job completes.
 
@@ -366,7 +373,9 @@ class GenerationPool:
         placeholders for its dropped rollouts, so the count still reaches
         total_expected instead of hanging here.
         """
-        worker_jobs = distribute_jobs(prompts_by_group, group_size, self.num_workers)
+        worker_jobs = distribute_jobs(
+            prompts_by_group, group_size, self.num_workers,
+            counts_by_group=counts_by_group)
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
@@ -393,7 +402,8 @@ class GenerationPool:
                 bar.close()
 
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
-                        max_new_tokens, temperature, top_p, step_idx=0):
+                        max_new_tokens, temperature, top_p, step_idx=0,
+                        counts_by_group=None):
         """
         Backward-compatible blocking variant. Returns:
           dict group_idx -> list of (text, token_ids, None)
@@ -404,7 +414,8 @@ class GenerationPool:
         by_group = {g: [] for g in range(num_groups)}
         for group_idx, job_results in self.iter_group_jobs(
                 prompts_by_group, group_size, adapter_path,
-                max_new_tokens, temperature, top_p, step_idx=step_idx):
+                max_new_tokens, temperature, top_p, step_idx=step_idx,
+                counts_by_group=counts_by_group):
             for (text, token_ids) in job_results:
                 by_group[group_idx].append((text, token_ids, None))
         return by_group

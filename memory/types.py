@@ -100,6 +100,8 @@ class RolloutRecord:
     ran: bool = False
     msg: str = ""
     stdout: str = ""
+    memory_arm: str = "no_memory"
+    memory_ids: Optional[List[str]] = None
 
     def is_success(self, fail_score: float = 0.0) -> bool:
         """
@@ -172,6 +174,18 @@ class Lesson:
     importance: float = IMPORTANCE_DEFAULT
     uses: int = 0                 # times the model CHOSE this lesson
     confirmations: int = 0        # times a later step reinforced it
+    # Outcome evidence from randomized memory arms. `tail_uplift` compares the
+    # expected best of equal-size subsamples against the same parent's null arm.
+    # These fields are deliberately separate from `uses`/`confirmations`: being
+    # selected or paraphrased is not evidence that a lesson helped discovery.
+    arm_trials: int = 0
+    arm_rollouts: int = 0
+    arm_valid: int = 0
+    arm_parent_improvements: int = 0
+    arm_tail_wins: int = 0
+    tail_uplift_sum: float = 0.0
+    tail_uplift_best: float = 0.0
+    last_outcome_step: int = -1
 
     @staticmethod
     def make_id(title: str, lesson: str, outcome: str) -> str:
@@ -199,6 +213,12 @@ class Lesson:
     def render(self, max_chars: int = 900) -> str:
         return f"{self.title}\n   {_clip(self.lesson or self.summary, max_chars)}"
 
+    def mean_tail_uplift(self) -> float:
+        """Matched max-seeking evidence; zero is the neutral untested prior."""
+        if self.arm_trials <= 0:
+            return 0.0
+        return float(self.tail_uplift_sum) / int(self.arm_trials)
+
     def catalog_line(self, chars: int = 200) -> str:
         """
         One line of the index the model reads when choosing. Carries enough to
@@ -206,8 +226,13 @@ class Lesson:
         """
         tag = "worked" if self.outcome == SUCCESS else "failed"
         text = (self.summary or self.lesson or "").replace("\n", " ")
+        evidence = ""
+        if self.arm_trials:
+            evidence = (f", tail {self.mean_tail_uplift():+.3g}/"
+                        f"{self.arm_trials} trials, "
+                        f"wins {self.arm_tail_wins}")
         return (f"{self.id}  [{self.scope}/{tag}, imp {self.importance:.1f}, "
-                f"step {self.step}, used {self.uses}x]  {self.title}"
+                f"step {self.step}, used {self.uses}x{evidence}]  {self.title}"
                 f" :: {text[:chars]}")
 
     def to_dict(self) -> Dict:
@@ -215,7 +240,15 @@ class Lesson:
                 "lesson": self.lesson, "scope": self.scope,
                 "outcome": self.outcome, "step": self.step,
                 "importance": float(self.importance), "uses": self.uses,
-                "confirmations": self.confirmations}
+                "confirmations": self.confirmations,
+                "arm_trials": self.arm_trials,
+                "arm_rollouts": self.arm_rollouts,
+                "arm_valid": self.arm_valid,
+                "arm_parent_improvements": self.arm_parent_improvements,
+                "arm_tail_wins": self.arm_tail_wins,
+                "tail_uplift_sum": float(self.tail_uplift_sum),
+                "tail_uplift_best": float(self.tail_uplift_best),
+                "last_outcome_step": self.last_outcome_step}
 
     @classmethod
     def from_dict(cls, d: Dict) -> "Lesson":
@@ -225,7 +258,16 @@ class Lesson:
                    outcome=d.get("outcome", SUCCESS), step=int(d.get("step", 0)),
                    importance=clamp_importance(d.get("importance", IMPORTANCE_DEFAULT)),
                    uses=int(d.get("uses", 0)),
-                   confirmations=int(d.get("confirmations", 0)))
+                   confirmations=int(d.get("confirmations", 0)),
+                   arm_trials=int(d.get("arm_trials", 0)),
+                   arm_rollouts=int(d.get("arm_rollouts", 0)),
+                   arm_valid=int(d.get("arm_valid", 0)),
+                   arm_parent_improvements=int(
+                       d.get("arm_parent_improvements", 0)),
+                   arm_tail_wins=int(d.get("arm_tail_wins", 0)),
+                   tail_uplift_sum=float(d.get("tail_uplift_sum", 0.0)),
+                   tail_uplift_best=float(d.get("tail_uplift_best", 0.0)),
+                   last_outcome_step=int(d.get("last_outcome_step", -1)))
 
 
 def clamp_importance(v) -> float:

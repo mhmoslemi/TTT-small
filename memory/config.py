@@ -56,6 +56,18 @@ class MemoryConfig:
     token_budget: int = 1200         # cap on the injected block
     grant_context: bool = True       # add that budget to max_seq_length
 
+    # --- budget-neutral causal arms ---
+    # Split the EXISTING K rollouts for a parent across prompt variants. No
+    # extra programs are generated or evaluated. A permanent null arm makes it
+    # possible to measure whether memory helps the reward tail instead of only
+    # observing that the model chose/repeated a lesson.
+    arm_control_fraction: float = 0.0   # no-memory share; 0 keeps legacy behavior
+    arm_explore_fraction: float = 0.0   # under-tested lesson share
+    arm_max_lessons: int = 1            # causal credit is cleanest at one/arm
+    arm_exploration_c: float = 0.5       # UCB uncertainty bonus
+    outcome_credit: bool = False         # update lessons from matched best@K uplift
+    text_reinforce: bool = True          # legacy LLM "confirmations"
+
     # --- extraction (Sec. 2.2) ---
     # Which side of the batch produces lessons.
     #   both     : one call over S_t and one over F_t (the paper's 2L per step)
@@ -180,6 +192,28 @@ class MemoryConfig:
             raise ValueError("memory_inject_mode must be append|system")
         if self.lookup_max_select < 0:
             raise ValueError("memory_lookup_max_select must be >= 0")
+        if not 0.0 <= self.arm_control_fraction <= 1.0:
+            raise ValueError("memory_arm_control_fraction must be in [0, 1]")
+        if not 0.0 <= self.arm_explore_fraction <= 1.0:
+            raise ValueError("memory_arm_explore_fraction must be in [0, 1]")
+        if self.arm_control_fraction + self.arm_explore_fraction > 1.0:
+            raise ValueError("memory arm fractions must sum to <= 1")
+        if self.arm_max_lessons < 1:
+            raise ValueError("memory_arm_max_lessons must be >= 1")
+        if self.arm_exploration_c < 0:
+            raise ValueError("memory_arm_exploration_c must be >= 0")
+        if self.outcome_credit and self.arm_control_fraction <= 0:
+            raise ValueError(
+                "memory_outcome_credit requires memory_arm_control_fraction > 0")
+        if self.outcome_credit and self.arm_max_lessons != 1:
+            raise ValueError(
+                "memory_outcome_credit requires memory_arm_max_lessons == 1 "
+                "for identifiable lesson credit")
+        if self.outcome_credit and (
+                self.lookup_mode != "select" or self.lookup_max_select != 1):
+            raise ValueError(
+                "memory_outcome_credit requires memory_lookup_mode=select and "
+                "memory_lookup_max_select=1")
 
     def describe(self) -> str:
         if not self.enabled:
@@ -187,12 +221,16 @@ class MemoryConfig:
         src = ("" if self.extract_from == "both"
                else f"-{self.extract_from}-only")
         cur = "" if self.curate_every <= 0 else f"  curate/{self.curate_every}"
+        arms = ""
+        if self.arm_control_fraction > 0 or self.arm_explore_fraction > 0:
+            arms = (f"  arms=null:{self.arm_control_fraction:.0%}/"
+                    f"explore:{self.arm_explore_fraction:.0%}")
         return (f"memory ON  extract={self.extract_mode}{src}{cur}  "
                 f"lookup={self.lookup_mode}"
                 f"(<={self.lookup_max_select})  L<={self.lessons_per_call}  "
                 f"cap={self.max_lessons}  budget={self.token_budget}tok  "
                 f"constructions={'forbidden' if self.forbid_constructions else 'allowed'}  "
-                f"inject={self.inject_mode}")
+                f"inject={self.inject_mode}{arms}")
 
 
 def _as_bool(v: Any) -> bool:

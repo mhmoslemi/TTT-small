@@ -50,7 +50,10 @@ def build_curation_messages(meta_description: str, entries: Sequence[str],
         "## What to do\n"
         "**Selective retention.** Keep only entries that would change what a "
         "future attempt writes. Discard anything redundant, trivial, or so "
-        "specific to one program that it does not generalize.\n\n"
+        "specific to one program that it does not generalize. Matched tail-uplift "
+        "trials are the strongest evidence: protect relevant positive entries, "
+        "be skeptical of repeatedly negative ones, and do not mistake an "
+        "under-tested entry for a disproven one.\n\n"
         "**Merge duplicates.** Several entries here state the same idea in "
         "different words. Merge each such group into ONE entry, written better "
         "than any of its inputs, and sum their usage counts.\n\n"
@@ -93,8 +96,11 @@ def curation_entries(bank, body_chars: int = 400) -> List[str]:
     out = []
     for l in sorted(bank.lessons, key=lambda x: (-x.importance, x.step)):
         body = (l.lesson or l.summary).replace("\n", " ")[:body_chars]
+        tail = l.mean_tail_uplift()
         out.append(f"[{l.id}] ({l.scope}/{l.outcome}, imp {l.importance:.1f}, "
-                   f"step {l.step}, used {l.uses}x, confirmed {l.confirmations}x)\n"
+                   f"step {l.step}, used {l.uses}x, confirmed {l.confirmations}x, "
+                   f"matched tail {tail:+.6g} over {l.arm_trials} trials, "
+                   f"wins {l.arm_tail_wins})\n"
                    f"  {l.title}\n  {body}")
     return out
 
@@ -124,12 +130,19 @@ def parse_curation(response_text: str, step: int) -> List[Lesson]:
             continue
         scope = str(item.get("scope", LOCAL)).strip().lower()
         outcome = str(item.get("outcome", SUCCESS)).strip().lower()
-        out.append(Lesson.create(
+        lesson = Lesson.create(
             title=str(item.get("title", "")).strip() or summary[:80],
             summary=summary or body[:200], lesson=body or summary,
             outcome=outcome if outcome in (SUCCESS, FAILURE) else SUCCESS,
             step=step, scope=scope if scope in (LOCAL, GLOBAL) else LOCAL,
-            importance=clamp_importance(item.get("importance", 3.0))))
+            importance=clamp_importance(item.get("importance", 3.0)))
+        # Kept only until _carry_counters runs. Exact provenance is safer than
+        # guessing from text when the curator merged several old entries.
+        merged_from = item.get("merged_from", [])
+        if isinstance(merged_from, list):
+            lesson._merged_from_ids = [str(x).strip().lower()
+                                       for x in merged_from if str(x).strip()]
+        out.append(lesson)
     return out
 
 
@@ -215,16 +228,39 @@ class MemoryCurator:
         have been worth choosing.
         """
         old = [(l, l.tokens()) for l in self.bank.lessons]
+        old_by_id = {l.id: l for l in self.bank.lessons}
+        claimed = set()
         carried = 0
         for new in new_lessons:
-            toks = new.tokens()
-            best, best_j = None, 0.0
-            for cand, ctoks in old:
-                j = jaccard(toks, ctoks)
-                if j > best_j:
-                    best, best_j = cand, j
-            if best is not None and best_j >= 0.4:
-                new.uses = max(new.uses, best.uses)
-                new.confirmations = max(new.confirmations, best.confirmations)
-                carried += 1
+            sources = [old_by_id[x] for x in getattr(
+                new, "_merged_from_ids", []) if x in old_by_id and x not in claimed]
+            if not sources:
+                toks = new.tokens()
+                best, best_j = None, 0.0
+                for cand, ctoks in old:
+                    if cand.id in claimed:
+                        continue
+                    j = jaccard(toks, ctoks)
+                    if j > best_j:
+                        best, best_j = cand, j
+                if best is not None and best_j >= 0.4:
+                    sources = [best]
+            if not sources:
+                continue
+
+            claimed.update(l.id for l in sources)
+            new.uses = sum(l.uses for l in sources)
+            new.confirmations = sum(l.confirmations for l in sources)
+            new.arm_trials = sum(l.arm_trials for l in sources)
+            new.arm_rollouts = sum(l.arm_rollouts for l in sources)
+            new.arm_valid = sum(l.arm_valid for l in sources)
+            new.arm_parent_improvements = sum(
+                l.arm_parent_improvements for l in sources)
+            new.arm_tail_wins = sum(l.arm_tail_wins for l in sources)
+            new.tail_uplift_sum = sum(l.tail_uplift_sum for l in sources)
+            tested = [l for l in sources if l.arm_trials > 0]
+            if tested:
+                new.tail_uplift_best = max(l.tail_uplift_best for l in tested)
+                new.last_outcome_step = max(l.last_outcome_step for l in tested)
+            carried += len(sources)
         return carried

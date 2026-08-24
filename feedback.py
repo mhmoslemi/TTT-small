@@ -63,6 +63,21 @@ class FeedbackConfig:
     inject_mode: str = "append"   # append | user_turn
     normalize: bool = False       # standardize A^fb within a response
 
+    # --- adaptive repair budget ---
+    # A fixed time schedule cannot tell whether failures are still the
+    # bottleneck. When enabled, the scheduled coefficient is multiplied by a
+    # validity-deficit controller: full below `validity_floor`, zero at/above
+    # `validity_target`, linear between them.
+    adaptive: bool = False
+    validity_floor: float = 0.5
+    validity_target: float = 0.9
+    # Bound mean |feedback advantage| relative to the scalar reward advantage.
+    # This is a cheap trust-region proxy: feedback may repair the proposal, but
+    # cannot silently become the main scientific objective.
+    max_reward_ratio: float = 0.0  # 0 disables the bound (legacy)
+    reward_scale_floor: float = 0.25
+    max_per_signature: int = 0     # cap repeated copies of one failure class
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any], verbose: bool = True) -> "FeedbackConfig":
         d = dict(d or {})
@@ -117,12 +132,31 @@ class FeedbackConfig:
             raise ValueError("feedback_lambda must be >= 0")
         if self.lambda_final < 0:
             raise ValueError("feedback_lambda_final must be >= 0")
+        if self.clip < 0:
+            raise ValueError("feedback_clip must be >= 0")
+        if self.chars < 0:
+            raise ValueError("feedback_chars must be >= 0")
+        if self.max_per_step < 0:
+            raise ValueError("feedback_max_per_step must be >= 0")
         if self.anneal_steps < 0:
             raise ValueError("feedback_anneal_steps must be >= 0")
         if self.anneal_shape not in ("linear", "cosine"):
             raise ValueError("feedback_anneal_shape must be linear|cosine")
         if self.inject_mode not in ("append", "user_turn"):
             raise ValueError("feedback_inject_mode must be append|user_turn")
+        if not 0.0 <= self.validity_floor <= 1.0:
+            raise ValueError("feedback_validity_floor must be in [0, 1]")
+        if not 0.0 <= self.validity_target <= 1.0:
+            raise ValueError("feedback_validity_target must be in [0, 1]")
+        if self.validity_target <= self.validity_floor:
+            raise ValueError(
+                "feedback_validity_target must exceed feedback_validity_floor")
+        if self.max_reward_ratio < 0:
+            raise ValueError("feedback_max_reward_ratio must be >= 0")
+        if self.reward_scale_floor < 0:
+            raise ValueError("feedback_reward_scale_floor must be >= 0")
+        if self.max_per_signature < 0:
+            raise ValueError("feedback_max_per_signature must be >= 0")
 
     def lambda_at(self, step: int) -> float:
         """
@@ -151,6 +185,20 @@ class FeedbackConfig:
         pts = [f"{s}:{self.lambda_at(s):.3f}" for s in range(0, min(n, self.anneal_steps + 2))]
         return "  ".join(pts)
 
+    def effective_lambda(self, step: int, valid_fraction: float) -> float:
+        """Scheduled coefficient, optionally gated by the observed validity."""
+        base = self.lambda_at(step)
+        if not self.adaptive:
+            return base
+        valid = max(0.0, min(1.0, float(valid_fraction)))
+        if valid >= self.validity_target:
+            return 0.0
+        if valid <= self.validity_floor:
+            return base
+        scale = ((self.validity_target - valid)
+                 / (self.validity_target - self.validity_floor))
+        return base * scale
+
     def describe(self) -> str:
         if not self.enabled:
             return "feedback signal OFF"
@@ -160,7 +208,12 @@ class FeedbackConfig:
         return (f"feedback signal ON  {sched}  "
                 f"clip={self.clip or 'none'}  "
                 f"constant_groups={'in' if self.include_constant_groups else 'out'}  "
-                f"cap={self.max_per_step or 'all'}")
+                f"cap={self.max_per_step or 'all'}"
+                + (f"  adaptive-validity={self.validity_floor:.0%}-"
+                   f"{self.validity_target:.0%}"
+                   if self.adaptive else "")
+                + (f"  fb/reward<={self.max_reward_ratio:.2f}"
+                   if self.max_reward_ratio > 0 else ""))
 
 
 def _name(key: str) -> str:
@@ -279,6 +332,51 @@ def select_capped(indices: Sequence[int], cap: int) -> List[int]:
         return idx
     step = len(idx) / float(cap)
     return [idx[int(i * step)] for i in range(cap)]
+
+
+def select_balanced(indices: Sequence[int], signatures: Sequence[str],
+                    total_cap: int = 0, per_signature_cap: int = 0) -> List[int]:
+    """Round-robin failure selection so one repeated crash cannot dominate."""
+    buckets = {}
+    for idx in indices:
+        sig = signatures[idx] if idx < len(signatures) else "unknown"
+        buckets.setdefault(sig or "unknown", []).append(idx)
+    # Spread each signature's candidates across the whole batch before the
+    # cross-signature round robin. Otherwise a common failure would still take
+    # all of its retained examples from the earliest parent groups.
+    bucket_cap = (per_signature_cap if per_signature_cap > 0
+                  else total_cap if total_cap > 0 else 0)
+    if bucket_cap > 0:
+        buckets = {sig: select_capped(items, bucket_cap)
+                   for sig, items in buckets.items()}
+    out = []
+    used = {sig: 0 for sig in buckets}
+    while buckets and (total_cap <= 0 or len(out) < total_cap):
+        for sig in list(buckets):
+            if not buckets[sig] or (per_signature_cap > 0
+                                    and used[sig] >= per_signature_cap):
+                del buckets[sig]
+                continue
+            out.append(buckets[sig].pop(0))
+            used[sig] += 1
+            if total_cap > 0 and len(out) >= total_cap:
+                break
+    return out
+
+
+def bound_feedback_advantage(adv, reward_advantage: float,
+                             cfg: FeedbackConfig):
+    """Limit feedback's mean magnitude relative to the max-seeking signal."""
+    ratio = float(getattr(cfg, "max_reward_ratio", 0.0) or 0.0)
+    if ratio <= 0:
+        return adv, 1.0
+    mean_abs = float(adv.abs().mean().item())
+    target = ratio * max(abs(float(reward_advantage)),
+                         float(getattr(cfg, "reward_scale_floor", 0.0)))
+    if mean_abs <= target or mean_abs <= 1e-12:
+        return adv, 1.0
+    scale = target / mean_abs
+    return adv * scale, scale
 
 
 # ----------------------------------------------------------------------

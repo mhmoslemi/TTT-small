@@ -138,6 +138,12 @@ class Config:
     memory_inject_mode: str = "append"      # append | system
     memory_token_budget: int = 1200
     memory_grant_context: bool = True
+    memory_arm_control_fraction: float = 0.0
+    memory_arm_explore_fraction: float = 0.0
+    memory_arm_max_lessons: int = 1
+    memory_arm_exploration_c: float = 0.5
+    memory_outcome_credit: bool = False
+    memory_text_reinforce: bool = True
     memory_extract_mode: str = "contrast"   # contrast | split
     memory_extract_from: str = "both"       # both | failure | success (split only)
     memory_curate_every: int = 0            # 0 = never; N = every N steps
@@ -175,6 +181,12 @@ class Config:
     feedback_include_constant_groups: bool = True
     feedback_inject_mode: str = "append"   # append | user_turn
     feedback_normalize: bool = False
+    feedback_adaptive: bool = False
+    feedback_validity_floor: float = 0.5
+    feedback_validity_target: float = 0.9
+    feedback_max_reward_ratio: float = 0.0
+    feedback_reward_scale_floor: float = 0.25
+    feedback_max_per_signature: int = 0
 
 
 # ======================================================================
@@ -293,6 +305,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    choices=["none", "recent", "importance"], default=None)
     p.add_argument("--memory-catalog-max-lessons", type=int, default=None)
     p.add_argument("--memory-token-budget", type=int, default=None)
+    p.add_argument("--memory-arm-control-fraction", type=float, default=None,
+                   help="Share of each existing group generated without memory.")
+    p.add_argument("--memory-arm-explore-fraction", type=float, default=None,
+                   help="Share of each group assigned to an under-tested lesson.")
+    p.add_argument("--memory-arm-max-lessons", type=int, default=None,
+                   help="Maximum lessons placed together in one causal arm.")
+    p.add_argument("--memory-arm-exploration-c", type=float, default=None,
+                   help="UCB uncertainty weight for the exploratory memory arm.")
+    p.add_argument("--memory-outcome-credit", action="store_const",
+                   const=True, default=None,
+                   help="Credit lessons from matched best@K uplift vs null arms.")
+    p.add_argument("--memory-no-text-reinforce", dest="memory_text_reinforce",
+                   action="store_const", const=False, default=None,
+                   help="Do not treat LLM paraphrase/confirmation as evidence.")
     p.add_argument("--memory-extract-mode",
                    choices=["contrast", "split"], default=None,
                    help="contrast = one call over successes and failures "
@@ -347,6 +373,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    choices=["append", "user_turn"], default=None)
     p.add_argument("--feedback-normalize", action="store_const",
                    const=True, default=None)
+    p.add_argument("--feedback-adaptive", action="store_const",
+                   const=True, default=None,
+                   help="Gate feedback by the observed step validity rate.")
+    p.add_argument("--feedback-validity-floor", type=float, default=None)
+    p.add_argument("--feedback-validity-target", type=float, default=None)
+    p.add_argument("--feedback-max-reward-ratio", type=float, default=None,
+                   help="Bound mean feedback advantage relative to reward advantage.")
+    p.add_argument("--feedback-reward-scale-floor", type=float, default=None,
+                   help="Nonzero reward scale used to repair constant-failure groups.")
+    p.add_argument("--feedback-max-per-signature", type=int, default=None,
+                   help="Cap teacher forwards for any one repeated failure class.")
 
     return p
 
@@ -786,10 +823,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from problems.base import ParentContext
     from gen_workers import make_progress_bar
 
-    from memory import RolloutRecord, build_injection, inject_block
-    from feedback import (FeedbackStats, build_reprompt, feedback_advantage,
-                          format_feedback, is_failure, render_chat,
-                          select_capped)
+    from memory import (MemoryArm, RolloutRecord, allocate_memory_arms,
+                        build_injection, credit_memory_arms, inject_block)
+    from feedback import (FeedbackStats, bound_feedback_advantage,
+                          build_reprompt, feedback_advantage, format_feedback,
+                          is_failure, render_chat, select_balanced)
 
     step_t0 = time.time()
     sampler.set_current_step(step_idx)
@@ -820,9 +858,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     save_ctor = (bool(getattr(problem, "saves_construction", False))
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
-    fb_lambda = fb_cfg.lambda_at(step_idx) if fb_cfg is not None else 0.0
-    fb_on = bool(fb_cfg is not None and fb_cfg.enabled and fb_lambda > 0.0)
-    if (fb_cfg is not None and fb_cfg.enabled and not fb_on):
+    fb_base_lambda = fb_cfg.lambda_at(step_idx) if fb_cfg is not None else 0.0
+    fb_candidate_on = bool(
+        fb_cfg is not None and fb_cfg.enabled and fb_base_lambda > 0.0)
+    if (fb_cfg is not None and fb_cfg.enabled and not fb_candidate_on):
         print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
     fail_score = float(getattr(problem, "fail_score", 0.0))
     reprompt_by_key = {}        # (group, rollout) -> reprompt text for a failure
@@ -831,15 +870,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
-    retrieved_by_group = {}     # group -> ids of the lessons put in its prompt
-    mem_tokens_by_group = {}    # group -> tokens the injected block occupied
-    messages_by_group = {}      # group -> the message list, for reprompt(x_p, f_i)
+    mem_arm_updates = []        # matched treatment-vs-null outcome diagnostics
+    mem_arm_rollouts = {}       # arm -> number of generated programs this step
 
     # ----- BUILD PROMPTS (one per parent/group) -----
     # Three passes now, because memory lookup is a batched LLM call rather than
     # a vector query: collect the parent contexts, ask the model once which
     # lessons it wants for all of them, then render.
-    prompts_by_group = []
     parent_ctxs = []
     base_messages = []
 
@@ -869,53 +906,65 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         chosen_by_group = lookup.select_batch(
             parent_ctxs, step_idx=step_idx, adapter_path=adapter_path)
 
-    for g, parent in enumerate(parents):
-        messages = base_messages[g]
-        pc = parent_ctxs[g]
-
-        chosen = chosen_by_group.get(g, [])
-        if memory is not None and chosen:
-            # Order is the order the model asked for, so build_injection trims
-            # from the tail: its last pick is the one it wanted least.
-            block, n_tok, kept = build_injection(
-                chosen, tokenizer, getattr(mem_cfg, "token_budget", 0))
-            retrieved_by_group[g] = [l.id for l in kept]
-            mem_tokens_by_group[g] = n_tok
-            # Preferred path: the problem places the block itself, between the
-            # parent state and the instruction, and adapts its instruction to
-            # it. Problems that predate the `memory` argument fall back to the
-            # trainer appending the block after the instruction.
-            if memory_aware_prompt:
-                messages = problem.build_prompt(pc, memory=block)
-            else:
-                messages = inject_block(
-                    messages, block,
-                    mode=getattr(mem_cfg, "inject_mode", "append"))
-        elif memory is not None:
-            retrieved_by_group[g] = []
-            mem_tokens_by_group[g] = 0
-
+    def _render(messages):
         try:
-            prompt_text = tokenizer.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 enable_thinking=False,
             )
-            # enable_thinking=False,  reasoning_effort="low", # gpt oss
-            # print('------ low think ------')
         except TypeError:
-            prompt_text = tokenizer.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
-        messages_by_group[g] = messages
-        prompts_by_group.append(prompt_text)
 
-    if memory is not None and mem_tokens_by_group:
-        vals = list(mem_tokens_by_group.values())
-        used = sum(1 for v in vals if v)
-        print(f"[step {step_idx}] memory injected {used}/{len(vals)} prompts, "
-              f"{min(vals)}-{max(vals)} tokens "
-              f"(budget {getattr(mem_cfg, 'token_budget', 0)}); "
-              f"max_new_tokens unchanged at {cfg.max_new_tokens}")
+    # One parent can now own several prompt arms, but their counts still sum to
+    # exactly cfg.group_size. Entropic advantages are computed over the union.
+    prompt_jobs = []
+    for g, _parent in enumerate(parents):
+        pc = parent_ctxs[g]
+        chosen = chosen_by_group.get(g, [])
+        if memory is not None and mem_cfg is not None:
+            arms = allocate_memory_arms(
+                cfg.group_size, chosen, memory, mem_cfg, step_idx)
+        else:
+            arms = [MemoryArm("no_memory", [], int(cfg.group_size))]
+
+        # Rotate prompt order across parents and steps. This prevents a memory
+        # arm from always receiving the first or last segment of the sampler's
+        # RNG stream while remaining deterministic and resume-safe.
+        if len(arms) > 1:
+            shift = (int(step_idx) + int(g)) % len(arms)
+            arms = arms[shift:] + arms[:shift]
+
+        for arm in arms:
+            messages = base_messages[g]
+            kept, n_tok = [], 0
+            if arm.lessons:
+                block, n_tok, kept = build_injection(
+                    arm.lessons, tokenizer, getattr(mem_cfg, "token_budget", 0))
+                if memory_aware_prompt:
+                    messages = problem.build_prompt(pc, memory=block)
+                else:
+                    messages = inject_block(
+                        messages, block,
+                        mode=getattr(mem_cfg, "inject_mode", "append"))
+            prompt_jobs.append({
+                "parent_group": g,
+                "arm": arm.name,
+                "memory_ids": [lesson.id for lesson in kept],
+                "memory_tokens": int(n_tok),
+                "messages": messages,
+                "prompt_text": _render(messages),
+                "count": int(arm.count),
+            })
+            mem_arm_rollouts[arm.name] = (
+                mem_arm_rollouts.get(arm.name, 0) + int(arm.count))
+
+    if memory is not None and prompt_jobs:
+        vals = [job["memory_tokens"] for job in prompt_jobs]
+        print(f"[step {step_idx}] memory arms {mem_arm_rollouts}; injected "
+              f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
+              f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
 
     num_groups = len(parents)
     total_rollouts = num_groups * cfg.group_size
@@ -931,11 +980,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         n_reward_workers = max(1, (os.cpu_count() or 8) - max(0, cfg.num_gpus))
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
-    group_responses = {g: [] for g in range(num_groups)}   # (text, token_ids), arrival order
+    # (text, token_ids, prompt_job_index), arrival order under each parent.
+    group_responses = {g: [] for g in range(num_groups)}
     reward_futures = {g: [] for g in range(num_groups)}    # aligned RewardResult futures
 
-    def _submit_rollout(g, text, token_ids):
-        group_responses[g].append((text, token_ids))
+    def _submit_rollout(job_idx, text, token_ids):
+        job = prompt_jobs[job_idx]
+        g = job["parent_group"]
+        group_responses[g].append((text, token_ids, job_idx))
         fut = reward_pool.submit(
             problem.compute_reward, text, parent_ctxs[g], cfg.sandbox_timeout_s
         )
@@ -949,17 +1001,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # saved above, before the memory lookup). Each (worker, group) job
             # that lands is queued for reward eval right away, so by the time
             # generation finishes most rewards are done.
-            for group_idx, job_results in gen_pool.iter_group_jobs(
-                    prompts_by_group=prompts_by_group,
+            for job_idx, job_results in gen_pool.iter_group_jobs(
+                    prompts_by_group=[job["prompt_text"] for job in prompt_jobs],
                     group_size=cfg.group_size,
+                    counts_by_group=[job["count"] for job in prompt_jobs],
                     adapter_path=adapter_path,
                     max_new_tokens=cfg.max_new_tokens,
                     temperature=cfg.temperature,
                     top_p=cfg.top_p,
                     step_idx=step_idx,
-            ):
+                ):
                 for (text, token_ids) in job_results:
-                    _submit_rollout(group_idx, text, token_ids)
+                    _submit_rollout(job_idx, text, token_ids)
         else:
             # Single-GPU: generate group by group; submit each group's rewards
             # right after it's generated so eval overlaps the next group's gen.
@@ -969,12 +1022,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                    + step_idx * 1009 + 13) % (2**31 - 1))
             gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
             try:
-                for g, prompt_text in enumerate(prompts_by_group):
+                for job_idx, job in enumerate(prompt_jobs):
                     responses, _ = generate_responses(
-                        model, tokenizer, prompt_text, cfg.group_size, cfg
+                        model, tokenizer, job["prompt_text"], job["count"], cfg
                     )
                     for (text, token_ids) in responses:
-                        _submit_rollout(g, text, token_ids)
+                        _submit_rollout(job_idx, text, token_ids)
                     gen_bar.update(len(responses))
             finally:
                 gen_bar.close()
@@ -998,18 +1051,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # by code so a collapsed group (same program N times) counts once.
     best_valid_yield = 0.0
     distinct_good_hashes = set()
+    step_valid_count = 0
+    step_rollout_count = 0
+    prompt_ids_by_job = {}
 
     for g, parent in enumerate(parents):
-        prompt_text = prompts_by_group[g]
-        responses = group_responses[g]          # list of (text, token_ids)
+        responses = group_responses[g]          # list of (text, token_ids, job)
         futs = reward_futures[g]                 # aligned RewardResult futures
-        pc = parent_ctxs[g]
 
         rewards = []
         codes = []
         valids = []
         outs = []        # list of RewardResult
-        for r_idx, (text, token_ids) in enumerate(responses):
+        for r_idx, (text, token_ids, job_idx) in enumerate(responses):
             res = futs[r_idx].result()           # already computed (or finishes now)
             rewards.append(res.reward)
             codes.append(res.code or "")
@@ -1022,6 +1076,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # growth signals for this group
         if len(valids):
             best_valid_yield = max(best_valid_yield, sum(valids) / len(valids))
+        step_valid_count += sum(valids)
+        step_rollout_count += len(valids)
         parent_val = float(parent.value) if parent.value is not None else 0.0
         for r_idx in range(len(responses)):
             if valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val:
@@ -1031,9 +1087,30 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
               f"valid={sum(valids)}/{len(valids)}  beta={beta:.9f}")
 
+        # Outcome-based memory credit. All arms share this parent and the same
+        # total K budget; expected_subsample_max corrects unequal arm sizes.
+        arm_observations = {}
+        for r_idx, (_text, _token_ids, job_idx) in enumerate(responses):
+            job = prompt_jobs[job_idx]
+            obs = arm_observations.setdefault(job["arm"], {
+                "memory_ids": job["memory_ids"], "rewards": [], "valids": [],
+            })
+            obs["rewards"].append(float(rewards[r_idx]))
+            obs["valids"].append(bool(valids[r_idx]))
+        if (memory is not None and mem_cfg is not None
+                and bool(getattr(mem_cfg, "outcome_credit", False))):
+            updates = credit_memory_arms(
+                memory, arm_observations, parent_val, step_idx)
+            mem_arm_updates.extend({"group": g, **update} for update in updates)
+            for update in updates:
+                print(f"    memory {update['arm']}: n={update['n']} "
+                      f"tail uplift={update['tail_uplift']:+.9f} "
+                      f"valid={update['valid']}/{update['rollouts']}")
+
         # Save every rollout (response + meta) to disk for debugging
-        for r_idx, (text, token_ids) in enumerate(responses):
+        for r_idx, (text, token_ids, job_idx) in enumerate(responses):
             res = outs[r_idx]
+            job = prompt_jobs[job_idx]
             # Allocate a durable ID even for invalid/duplicate candidates. A
             # valid candidate uses this exact State object in sampler.update,
             # so a child selected in a later step links back to this rollout.
@@ -1081,8 +1158,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "parent_selection_score": (float(pick_info["score"])
                                            if pick_info.get("score") is not None else None),
                 "archive_eligible": archive_eligible,
-                "memory_ids": retrieved_by_group.get(g, []),
-                "memory_tokens": mem_tokens_by_group.get(g, 0),
+                "memory_arm": job["arm"],
+                "memory_ids": job["memory_ids"],
+                "memory_tokens": job["memory_tokens"],
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -1099,7 +1177,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "seed": int(cfg.seed),
             }
             save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
-                         prompt_text=prompt_text)
+                         prompt_text=job["prompt_text"])
             saved_rollouts += 1
             if memory is not None:
                 mem_records.append(RolloutRecord(
@@ -1119,20 +1197,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     ran=bool(res.ran),
                     msg=res.msg or "",
                     stdout=res.stdout or "",
+                    memory_arm=job["arm"],
+                    memory_ids=list(job["memory_ids"]),
                 ))
 
         # ---- reprompt(x_p, f_i) for every failed rollout (Sec. 2.3) ------
         # Built here, while the RewardResult is in hand. The teacher forward
         # itself happens in the train loop, where log pi_thetabar is already
         # available from the existing forward pass.
-        if fb_on:
-            for r_idx, (text, token_ids) in enumerate(responses):
+        if fb_candidate_on:
+            for r_idx, (text, token_ids, job_idx) in enumerate(responses):
                 res = outs[r_idx]
                 if not is_failure(res, fail_score):
                     continue
                 f_i = format_feedback(res.msg or "", res.stdout or "",
                                       int(fb_cfg.chars))
-                rp_messages = build_reprompt(messages_by_group[g], f_i,
+                rp_messages = build_reprompt(prompt_jobs[job_idx]["messages"], f_i,
                                              mode=fb_cfg.inject_mode)
                 reprompt_by_key[(g, r_idx)] = render_chat(tokenizer, rp_messages)
 
@@ -1142,20 +1222,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # is where it pays most, since an all-failed group is exactly the case
         # the reward channel cannot score at all.
         constant = float(rewards_np.max() - rewards_np.min()) < 1e-12
-        if constant and not (fb_on and fb_cfg.include_constant_groups):
+        if constant and not (fb_candidate_on and fb_cfg.include_constant_groups):
             continue
 
-        prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(model.device)
-        for r_idx, ((text, token_ids), adv) in enumerate(zip(responses, advantages)):
+        for r_idx, ((text, token_ids, job_idx), adv) in enumerate(
+                zip(responses, advantages)):
             if len(token_ids) == 0:
                 continue
+            if job_idx not in prompt_ids_by_job:
+                prompt_ids_by_job[job_idx] = tokenizer(
+                    prompt_jobs[job_idx]["prompt_text"],
+                    return_tensors="pt").input_ids.to(model.device)
             response_ids = torch.tensor([token_ids], device=model.device)
+            res = outs[r_idx]
             all_examples.append({
-                "prompt_ids": prompt_ids,
+                "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
                 "advantage": float(adv),
                 "behavior_logprobs": None,   # IS disabled (workers don't return logprobs)
                 "reprompt_text": reprompt_by_key.get((g, r_idx)),
+                "failure_signature": RolloutRecord(
+                    msg=res.msg or "").failure_signature(),
+                "reward_constant": constant,
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before
@@ -1166,20 +1254,48 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
           f"pairs before adapter training", flush=True)
 
+    valid_fraction = (step_valid_count / step_rollout_count
+                      if step_rollout_count else 0.0)
+    fb_lambda = (fb_cfg.effective_lambda(step_idx, valid_fraction)
+                 if fb_cfg is not None and fb_cfg.enabled else 0.0)
+    fb_on = bool(fb_candidate_on and fb_lambda > 0.0)
+    if fb_candidate_on:
+        print(f"[step {step_idx}] feedback: validity={valid_fraction:.1%}, "
+              f"scheduled lambda={fb_base_lambda:.4f}, "
+              f"effective lambda={fb_lambda:.4f}")
+
+    # Constant groups only carry a feedback signal. Drop them when the adaptive
+    # controller turns feedback off after seeing this step's validity.
+    if not fb_on:
+        all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
+
     # Cap the teacher forwards. Applied to all_examples rather than to
     # reprompt_by_key, because the examples were built during the scoring loop
     # above and already hold their reprompt text; shrinking the dict now would
-    # change nothing. Even stride, so the cap does not silently restrict the
-    # signal to the first group or two.
-    if fb_on and fb_cfg.max_per_step > 0:
+    # change nothing. Selection is balanced across failure signatures and
+    # spread across the batch rather than restricted to the first groups.
+    feedback_teacher_rollouts = 0
+    if fb_on:
         with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt_text")]
-        if len(with_fb) > fb_cfg.max_per_step:
-            keep = set(select_capped(with_fb, int(fb_cfg.max_per_step)))
+        signatures = [ex.get("failure_signature", "unknown") for ex in all_examples]
+        keep = set(select_balanced(
+            with_fb, signatures, total_cap=int(fb_cfg.max_per_step),
+            per_signature_cap=int(getattr(fb_cfg, "max_per_signature", 0))))
+        if len(keep) < len(with_fb):
             for i in with_fb:
                 if i not in keep:
                     all_examples[i]["reprompt_text"] = None
-            print(f"[step {step_idx}] feedback: capped to {fb_cfg.max_per_step} "
+            print(f"[step {step_idx}] feedback: balanced/capped to {len(keep)} "
                   f"of {len(with_fb)} failed rollouts")
+        feedback_teacher_rollouts = len(keep)
+
+        # A constant-reward example with no retained repair prompt has neither
+        # a reward nor a feedback signal. Keeping it would only run the policy
+        # and reference forwards for a KL-only update and dilute the batch.
+        all_examples = [
+            ex for ex in all_examples
+            if not (ex["reward_constant"] and not ex.get("reprompt_text"))
+        ]
 
     rollout_time = time.time() - rollout_t0
     print(f"[step {step_idx}] rollout+eval time: {rollout_time:.1f}s  "
@@ -1202,8 +1318,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             curator.run(step_idx, adapter_path=adapter_path)
         memory.save()
 
-    step_stats = {"best_valid_yield": float(best_valid_yield),
-                  "distinct_good": int(len(distinct_good_hashes))}
+    step_stats = {
+        "best_valid_yield": float(best_valid_yield),
+        "distinct_good": int(len(distinct_good_hashes)),
+        "valid_fraction": float(valid_fraction),
+        "feedback_lambda_effective": float(fb_lambda),
+        "feedback_teacher_rollouts": int(feedback_teacher_rollouts),
+        "memory_arm_rollouts": mem_arm_rollouts,
+        "memory_arm_updates": mem_arm_updates,
+    }
 
     if not all_examples:
         print(f"[step {step_idx}] no training signal (all groups had constant reward)")
@@ -1265,6 +1388,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if fb_adv is None:
                 fb_stats.skipped += 1
             else:
+                fb_adv, _fb_scale = bound_feedback_advantage(
+                    fb_adv, reward_advantage=adv, cfg=fb_cfg)
                 fb_stats.add(fb_adv)
                 eff_adv = eff_adv + fb_adv
 

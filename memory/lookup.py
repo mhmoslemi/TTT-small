@@ -50,7 +50,8 @@ class MemoryLookup:
             items = sorted(self.bank.lessons, key=lambda l: l.step, reverse=True)
         else:
             items = sorted(self.bank.lessons,
-                           key=lambda l: (l.importance, l.step), reverse=True)
+                           key=lambda l: (l.mean_tail_uplift(),
+                                          l.importance, l.step), reverse=True)
         return [l.id for l in items[:k]]
 
     # ------------------------------------------------------------------

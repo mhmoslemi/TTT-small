@@ -21,6 +21,7 @@ the query being program text.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -36,7 +37,9 @@ class MemoryBank:
         self._path: Optional[Path] = None
         self.stats = {"proposed": 0, "added": 0, "duplicates": 0,
                       "reinforced": 0, "evicted": 0, "rejected": 0,
-                      "lookups": 0, "selections": 0, "empty_selections": 0}
+                      "lookups": 0, "selections": 0, "empty_selections": 0,
+                      "outcome_updates": 0, "tail_wins": 0,
+                      "curations": 0, "curated_away": 0}
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -89,7 +92,8 @@ class MemoryBank:
             return []
         items = self.lessons
         if limit > 0 and len(items) > limit:
-            items = sorted(items, key=lambda l: (l.importance, l.step),
+            items = sorted(items, key=lambda l: (
+                l.mean_tail_uplift(), l.importance, l.step),
                            reverse=True)[:limit]
         # Stable, readable order for the model: oldest first, so ids it has seen
         # before stay in the same place between steps.
@@ -101,7 +105,8 @@ class MemoryBank:
         limit = int(self.cfg.catalog_max_lessons if limit is None else limit)
         items = self.lessons
         if limit > 0 and len(items) > limit:
-            items = sorted(items, key=lambda l: (l.importance, l.step),
+            items = sorted(items, key=lambda l: (
+                l.mean_tail_uplift(), l.importance, l.step),
                            reverse=True)[:limit]
         return [l.id for l in items]
 
@@ -115,9 +120,10 @@ class MemoryBank:
         for lesson in lessons:
             dup = self._duplicate_of(lesson)
             if dup is not None:
-                # Re-deriving something already recorded is independent
-                # confirmation, not waste. Reinforce and drop the copy.
-                self._bump(dup, float(self.cfg.reinforce_delta))
+                # Textual re-derivation is not causal evidence. Keep the legacy
+                # behavior only when explicitly requested.
+                if bool(getattr(self.cfg, "text_reinforce", True)):
+                    self._bump(dup, float(self.cfg.reinforce_delta))
                 self.stats["duplicates"] += 1
                 continue
             self.lessons.append(lesson)
@@ -128,6 +134,8 @@ class MemoryBank:
         return added
 
     def reinforce(self, ids: Sequence[str], delta: Optional[float] = None) -> int:
+        if not bool(getattr(self.cfg, "text_reinforce", True)):
+            return 0
         delta = float(self.cfg.reinforce_delta if delta is None else delta)
         hit = 0
         for lesson_id in ids or ():
@@ -136,6 +144,53 @@ class MemoryBank:
                 self._bump(lesson, delta)
                 hit += 1
         return hit
+
+    def record_outcome(self, ids: Sequence[str], rollouts: int, valid: int,
+                       improved: int, tail_uplift: float, step: int) -> int:
+        """Attach matched null-arm evidence to every lesson in one prompt arm."""
+        hit = 0
+        for lesson_id in ids or ():
+            lesson = self.by_id(lesson_id)
+            if lesson is None:
+                continue
+            first_trial = lesson.arm_trials == 0
+            lesson.arm_trials += 1
+            lesson.arm_rollouts += int(rollouts)
+            lesson.arm_valid += int(valid)
+            lesson.arm_parent_improvements += int(improved)
+            lesson.tail_uplift_sum += float(tail_uplift)
+            lesson.tail_uplift_best = (
+                float(tail_uplift) if first_trial
+                else max(float(lesson.tail_uplift_best), float(tail_uplift)))
+            lesson.last_outcome_step = int(step)
+            if tail_uplift > 0:
+                lesson.arm_tail_wins += 1
+                self.stats["tail_wins"] += 1
+            hit += 1
+        self.stats["outcome_updates"] += hit
+        return hit
+
+    def exploration_lesson(self, excluded=(), step: int = 0,
+                           c: float = 0.5) -> Optional[Lesson]:
+        """UCB choice for the under-tested memory arm, with novelty tie-breaks."""
+        excluded = set(excluded or ())
+        candidates = [l for l in self.lessons if l.id not in excluded]
+        if not candidates:
+            return None
+        total = sum(l.arm_trials for l in candidates) + 1
+        means = [abs(l.tail_uplift_sum / l.arm_trials) for l in candidates
+                 if l.arm_trials > 0]
+        reward_scale = max(means, default=1e-3)
+
+        def score(lesson):
+            if lesson.arm_trials <= 0:
+                return (float("inf"), -lesson.uses, lesson.step)
+            mean = lesson.tail_uplift_sum / lesson.arm_trials
+            bonus = (float(c) * reward_scale
+                     * math.sqrt(math.log(total + 1) / lesson.arm_trials))
+            return (mean + bonus, -lesson.uses, lesson.step)
+
+        return max(candidates, key=score)
 
     def _bump(self, lesson: Lesson, delta: float) -> None:
         lesson.importance = clamp_importance(lesson.importance + delta)
@@ -166,7 +221,8 @@ class MemoryBank:
         if cap <= 0 or len(self.lessons) <= cap:
             return
         order = sorted(range(len(self.lessons)),
-                       key=lambda i: (self.lessons[i].importance,
+                       key=lambda i: (self.lessons[i].mean_tail_uplift(),
+                                      self.lessons[i].importance,
                                       self.lessons[i].uses,
                                       self.lessons[i].step))
         drop = set(order[: len(self.lessons) - cap])
@@ -212,4 +268,8 @@ class MemoryBank:
         data = json.loads(Path(path).read_text())
         self.lessons = [Lesson.from_dict(d) for d in data.get("lessons", [])]
         self._by_id = {l.id: l for l in self.lessons}
+        # Carry counters forward while remaining compatible with old banks.
+        for key, value in (data.get("stats") or {}).items():
+            if key in self.stats:
+                self.stats[key] = value
         return len(self.lessons)

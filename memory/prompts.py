@@ -364,7 +364,8 @@ def build_lookup_messages(meta_description: str, parent_block: str,
         f"## Task\n{meta_description}\n\n"
         f"## Current candidate\n{parent_block}\n\n"
         "## Lesson index (the complete memory)\n"
-        "id  [scope/outcome, importance, step, times used]  title :: summary\n\n"
+        "id  [scope/outcome, importance, step, times used, causal tail evidence]"
+        "  title :: summary\n\n"
         + "\n".join(catalog)
         + "\n\n## What to choose\n"
         "Pick lessons that bear on THIS candidate and what you would change about "
@@ -372,7 +373,9 @@ def build_lookup_messages(meta_description: str, parent_block: str,
         "what the candidate already does. Ignore anything restating the task. A "
         "lesson many steps have used is not automatically right for this state; if "
         "the run appears stuck, the frequently-used entries are the likeliest "
-        "cause and the least useful choice.\n\n"
+        "cause and the least useful choice. Prefer positive matched tail-uplift "
+        "evidence when it is relevant, but do not confuse an under-tested lesson "
+        "with a bad one; the exploration arm handles uncertainty separately.\n\n"
         + _LOOKUP_SCHEMA.format(k=max_select)
     )
     return [{"role": "user", "content": user}]
