@@ -286,7 +286,8 @@ def select_capped(indices: Sequence[int], cap: int) -> List[int]:
 # ----------------------------------------------------------------------
 def feedback_advantage(compute_token_logprobs, model, tokenizer,
                        reprompt_text: str, response_ids, rollout_logprobs,
-                       cfg: FeedbackConfig, lam: Optional[float] = None):
+                       cfg: FeedbackConfig, lam: Optional[float] = None,
+                       chunk: int = 0):
     """
     Returns the detached per-token A^fb aligned 1:1 with response_ids, already
     multiplied by the coefficient in force, or None if it could not be computed.
@@ -302,7 +303,8 @@ def feedback_advantage(compute_token_logprobs, model, tokenizer,
     try:
         rp_ids = tokenizer(reprompt_text, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            q_lp = compute_token_logprobs(model, rp_ids, response_ids, with_grad=False)
+            q_lp = compute_token_logprobs(model, rp_ids, response_ids,
+                                          with_grad=False, chunk=chunk)
     except Exception as e:
         print(f"[feedback] teacher forward failed ({e!r}); skipping this rollout")
         return None

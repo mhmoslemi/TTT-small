@@ -306,7 +306,7 @@ def run_program(
     multi_gpu: bool = False,
     extra_env: Optional[dict[str, str]] = None,
 ) -> RunResult:
-    print("[Running]")
+    # print("[Running]")
     # set up a pipe so the tester can communicate its verdict with us
     env = os.environ.copy()
     if extra_env is not None:

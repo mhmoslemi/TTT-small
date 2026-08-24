@@ -26,9 +26,16 @@ advance. Keying on the step is what makes step t reproducible on its own: it no
 longer depends on how many generations happened before it, so a memory run and
 a no-memory run draw the same samples at step 0, and the memory maker's own
 calls (which use step_idx + 1_000_000) cannot shift the rollout stream.
-Determinism holds for a fixed num_gpus and group_size, since distribute_jobs
-splits the group across workers and changing the split changes which sequence
-each worker draws.
+Determinism holds for a fixed num_gpus, group_size AND gen_micro_batch, since
+distribute_jobs splits the group across workers and changing the split (or the
+micro-batch chunking) changes which sequence each worker draws.
+
+OOM RECOVERY. The worker halves its per-call sequence count and retries when
+generate() OOMs, and keeps the reduced size for the rest of the run. This
+mirrors the single-GPU path in train_multy.py. Without it a step whose parents
+have grown longer than the seed states (longer prompt -> larger eager prefill
+attention) killed the worker outright, and the main process then hung forever
+on result_queue.get().
 
 No async. Plain torch.multiprocessing with persistent workers and queues.
 
@@ -183,6 +190,15 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
 
+    # Persistent per-worker ceiling on sequences per generate() call. 0 means
+    # "no learned limit yet"; the effective cap is then the configured
+    # micro-batch (or the whole job). It ONLY ever shrinks: once this worker
+    # OOMs at some size it never tries that size again, this step or any later
+    # one. Prompts only grow as the search finds longer programs, so a limit
+    # learned at step 2 is the right limit for step 3+. This is what stops a
+    # long-prompt step from killing the worker and hanging the whole run.
+    gen_cap = 0
+
     # Signal that we finished loading
     ready_queue.put(rank)
 
@@ -191,18 +207,6 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         if task is None:
             break
         step, adapter_path, jobs, gen_kwargs = task
-
-        # if seed is not None:
-        #     # Keyed on (seed, step, rank) rather than advanced sequentially, so
-        #     # step t is reproducible on its own and does not depend on how many
-        #     # generations happened before it.
-        #     s = worker_seed(seed, step, rank)
-        #     random.seed(s)
-        #     np.random.seed(s % (2 ** 32 - 1))
-        #     torch.manual_seed(s)
-        #     if torch.cuda.is_available():
-        #         torch.cuda.manual_seed_all(s)
-
 
         if seed is not None:
             # Keyed on (seed, step, rank), not advanced sequentially, so step t
@@ -216,36 +220,86 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             random.seed(s)
             _np.random.seed(s % (2**32 - 1))
             torch.manual_seed(s)
-            torch.cuda.manual_seed_all(s) 
+            torch.cuda.manual_seed_all(s)
 
         gen_model = ensure_adapter(adapter_path)
+
+        # Micro-batch cap: hold at most `mb` sequences in flight per generate()
+        # call, looping until this job's `count` is done. This bounds KV memory
+        # by `mb` regardless of how big group_size is. mb <= 0 (or >= count)
+        # means one shot. NOTE: mb bounds the number of sequences, NOT the
+        # per-sequence prefill cost, which is O(prompt_len^2) in eager attention
+        # and grows as parents get longer. The OOM-halving loop below is what
+        # keeps that spike from killing the worker.
+        mb = int(gen_kwargs.get("micro_batch", 0) or 0)
 
         for (group_idx, prompt, count) in jobs:
             enc = tokenizer([prompt], return_tensors="pt").to(device)
             input_len = enc.input_ids.shape[1]
-            with torch.inference_mode():
-                out = gen_model.generate(
-                    **enc,
-                    num_return_sequences=count,
-                    max_new_tokens=gen_kwargs["max_new_tokens"],
-                    do_sample=True,
-                    temperature=gen_kwargs["temperature"],
-                    top_p=gen_kwargs["top_p"],
-                    pad_token_id=pad_id,
-                )
-            # out shape: (count, input_len + gen_len)
-            job_results = []
-            for i in range(out.shape[0]):
-                gen_ids = out[i, input_len:].tolist()
-                if eos_id is not None and eos_id in gen_ids:
-                    gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-                text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                job_results.append((text, gen_ids))
 
-            # Report this job immediately so the main process can advance the
-            # progress bar AND start evaluating these rollouts while the GPUs
-            # keep generating the remaining jobs.
-            result_queue.put((rank, group_idx, job_results))
+            remaining = count
+            while remaining > 0:
+                # Effective per-call ceiling: the smaller of the configured
+                # micro-batch and any limit learned from a past OOM. Both unset
+                # means the whole remaining job in one call.
+                limit = count
+                if mb > 0:
+                    limit = mb
+                if gen_cap > 0:
+                    limit = min(limit, gen_cap)
+                n = min(limit, remaining)
+
+                try:
+                    with torch.inference_mode():
+                        out = gen_model.generate(
+                            **enc,
+                            num_return_sequences=n,
+                            max_new_tokens=gen_kwargs["max_new_tokens"],
+                            do_sample=True,
+                            temperature=gen_kwargs["temperature"],
+                            top_p=gen_kwargs["top_p"],
+                            pad_token_id=pad_id,
+                        )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    if n <= 1:
+                        # Cannot fit even one sequence for this prompt. Emit
+                        # empty placeholders for the rest of the job so the main
+                        # process's rollout counter still reaches total_expected
+                        # and the step does not hang on result_queue.get().
+                        # These land as empty (invalid) rollouts and are skipped
+                        # in training (len(token_ids) == 0). They are lost, not
+                        # fatal.
+                        print(f"[worker {rank}] OOM at n=1 on group {group_idx} "
+                              f"(prompt {input_len} tok); dropping {remaining} "
+                              f"rollout(s) this step", flush=True)
+                        result_queue.put(
+                            (rank, group_idx, [("", []) for _ in range(remaining)]))
+                        remaining = 0
+                        break
+                    gen_cap = max(1, n // 2)
+                    print(f"[worker {rank}] OOM on group {group_idx} at n={n} "
+                          f"(prompt {input_len} tok); halving per-call to "
+                          f"{gen_cap} and retrying (sticky for the run)",
+                          flush=True)
+                    continue
+
+                # out shape: (n, input_len + gen_len)
+                job_results = []
+                for i in range(out.shape[0]):
+                    gen_ids = out[i, input_len:].tolist()
+                    if eos_id is not None and eos_id in gen_ids:
+                        gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
+                    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    job_results.append((text, gen_ids))
+
+                # Report each chunk immediately so the main process can advance
+                # the progress bar AND start evaluating these rollouts while the
+                # GPUs keep generating the rest. The consumer counts rollouts,
+                # not messages, so several messages per group are fine.
+                result_queue.put((rank, group_idx, job_results))
+                remaining -= n
+                del out
 
     print(f"[worker {rank}] shutting down", flush=True)
 
@@ -256,11 +310,13 @@ class GenerationPool:
     """
 
     def __init__(self, model_name, num_workers, gpu_ids=None,
-                 max_seq_length=4096, load_in_4bit=False, seed=None):
+                 max_seq_length=4096, load_in_4bit=False, seed=None,
+                 gen_micro_batch=0):
         self.model_name = model_name
         self.num_workers = num_workers
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
+        self.gen_micro_batch = int(gen_micro_batch or 0)
         assert len(self.gpu_ids) == num_workers
 
         ctx = mp.get_context("spawn")
@@ -306,13 +362,16 @@ class GenerationPool:
         Drives a "rollouts" progress bar over total rollouts (set
         show_progress=False to suppress). Stops after exactly total_expected
         rollouts, so every per-job message is drained and none leak into the
-        next step's queue.
+        next step's queue. A worker that hits an unrecoverable OOM emits empty
+        placeholders for its dropped rollouts, so the count still reaches
+        total_expected instead of hanging here.
         """
         worker_jobs = distribute_jobs(prompts_by_group, group_size, self.num_workers)
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
             "top_p": top_p,
+            "micro_batch": self.gen_micro_batch,
         }
         total_expected = sum(count for wj in worker_jobs for (_, _, count) in wj)
 

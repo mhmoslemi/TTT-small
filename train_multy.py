@@ -77,6 +77,15 @@ class Config:
 
     train_examples_per_microbatch: int = 1
 
+    # Bound the transient log_softmax allocation in compute_token_logprobs by
+    # slicing the response positions into chunks of at most this many tokens.
+    # The forward pass is untouched; only the float32 log_softmax + gather is
+    # chunked, so results are EXACT (log_softmax is per-position over the vocab).
+    # This is what keeps the feedback teacher forward from OOMing when it stacks
+    # on top of the still-alive training graph. 0 = single shot (identical to
+    # before). Nothing here depends on the model or its vocab.
+    logprob_chunk: int = 0
+
     # Sampling
     temperature: float = 1.0
     top_p: float = 1.0
@@ -105,6 +114,12 @@ class Config:
     # gpu_ids: str = "0,1,2,3,4,5,6,7"
     gpu_ids: str = "1,2,4,6"
     # gpu_ids: str = "1"
+    # Max sequences each GPU holds per generate() call. The worker loops in
+    # chunks of this size until the group's rollouts are done, so group_size can
+    # be anything while per-GPU KV memory stays bounded by this. 0 = one shot
+    # (byte-identical to no micro-batch; a deterministic run with 0 draws exactly
+    # what it did before this feature existed).
+    gen_micro_batch: int = 0
 
     # ---- Memory (Sec. 2.2) ----
     # `memory` is the master switch. When it is False, every memory_* field
@@ -218,6 +233,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--logprob-chunk", type=int, default=None,
+                   help="Slice compute_token_logprobs over response positions "
+                        "into chunks of at most this many tokens, bounding the "
+                        "float32 log_softmax spike. Exact (no precision loss). "
+                        "0 = single shot. Use when the feedback teacher forward "
+                        "OOMs on a large-vocab model.")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
@@ -242,6 +263,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-ids", type=str, default=None,
                    help="Comma-separated physical GPU ids for the workers, e.g. "
                         "'0,1,2,3,4,5,6,7'. Defaults to 0..num_gpus-1.")
+    p.add_argument("--gen-micro-batch", type=int, default=None,
+                   help="Max sequences each GPU holds per generate() call. The "
+                        "worker loops in chunks of this size until the group's "
+                        "rollouts are done, so group_size can be anything while "
+                        "per-GPU KV memory stays bounded by this. 0 = one shot.")
 
     # ---- memory (Sec. 2.2) ----
     p.add_argument("--memory", dest="memory", action="store_const",
@@ -431,8 +457,11 @@ def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg:
 
     responses = []
     remaining = group_size
-    # Start by trying the whole group in one call.
-    batch = group_size
+    # Start by trying the whole group in one call. Cap the first attempt at the
+    # micro-batch size when set, so the single-GPU path honors the same per-call
+    # ceiling as the multi-GPU workers; OOM halving still applies below it.
+    mb = int(getattr(cfg, "gen_micro_batch", 0) or 0)
+    batch = group_size if (mb <= 0 or mb > group_size) else mb
 
     while remaining > 0:
         n = min(batch, remaining)
@@ -454,28 +483,51 @@ def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg:
 # ======================================================================
 # Logprob computation
 # ======================================================================
-def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool):
+def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
+                           chunk: int = 0):
     """
-    Returns the per-token log-probabilities of the response under the model.
+    Per-token log-probabilities of the response under the model.
 
     prompt_ids:   (1, P) tensor
     response_ids: (1, R) tensor
     Output:       (R,) tensor of token logprobs
+
+    `chunk` caps the transient log_softmax allocation. The forward runs once (a
+    single model(full_ids) call, needed for correct causal attention), but the
+    float32 log_softmax + gather over the response positions is done in slices
+    of at most `chunk` tokens. The full (1, R, V) float32 tensor is what spikes
+    memory on a large-vocab model; slicing caps the spike at (1, chunk, V) no
+    matter how long the response is or how big the vocab is. log_softmax is
+    per-position over the vocab dim, so this is EXACT, not an approximation.
+
+    chunk <= 0 (or chunk >= R) takes the original single-shot path, byte-
+    identical to before this argument existed, so a deterministic run with
+    chunk=0 draws exactly what it did before.
     """
     import torch
     import torch.nn.functional as F
 
     full_ids = torch.cat([prompt_ids, response_ids], dim=1)
+    P = prompt_ids.shape[1]
+    R = response_ids.shape[1]
     context = torch.enable_grad() if with_grad else torch.no_grad()
     with context:
         out = model(full_ids)
         logits = out.logits  # (1, T, V)
-        P = prompt_ids.shape[1]
-        R = response_ids.shape[1]
-        # Predict response token at position P+k from logits at position P+k-1
-        pred_logits = logits[:, P - 1 : P - 1 + R, :]
-        log_probs = F.log_softmax(pred_logits.float(), dim=-1)
-        gathered = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)  # (1, R)
+        # Predict response token at position P+k from logits at position P+k-1.
+        pred_logits = logits[:, P - 1 : P - 1 + R, :]  # (1, R, V)
+
+        if chunk and 0 < chunk < R:
+            parts = []
+            for s in range(0, R, chunk):
+                e = min(s + chunk, R)
+                lp = F.log_softmax(pred_logits[:, s:e, :].float(), dim=-1)
+                g = lp.gather(2, response_ids[:, s:e].unsqueeze(-1)).squeeze(-1)
+                parts.append(g)          # keep only (1, e-s); lp freed next iter
+            gathered = torch.cat(parts, dim=1)  # (1, R)
+        else:
+            log_probs = F.log_softmax(pred_logits.float(), dim=-1)
+            gathered = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)  # (1, R)
     return gathered.squeeze(0)
 
 
@@ -663,6 +715,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 messages, tokenize=False, add_generation_prompt=True,
                 enable_thinking=False,
             )
+            # enable_thinking=False,  reasoning_effort="low", # gpt oss
+            # print('------ low think ------')
         except TypeError:
             prompt_text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
@@ -962,11 +1016,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         rid = ex["response_ids"]
         adv = ex["advantage"]
 
-        cur_lp = compute_token_logprobs(model, pid, rid, with_grad=True)  # (R,)
+        cur_lp = compute_token_logprobs(model, pid, rid, with_grad=True,
+                                        chunk=cfg.logprob_chunk)  # (R,)
 
         try:
             with backend.disable_adapter(), torch.no_grad():
-                base_lp = compute_token_logprobs(model, pid, rid, with_grad=False)
+                base_lp = compute_token_logprobs(model, pid, rid, with_grad=False,
+                                                 chunk=cfg.logprob_chunk)
         except Exception as e:
             if not hasattr(train_step, "_kl_warned"):
                 print(f"[warn] disable_adapter failed ({e}); training without KL penalty")
@@ -991,7 +1047,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             fb_adv = feedback_advantage(
                 compute_token_logprobs, model, tokenizer,
                 ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
-                lam=fb_lambda)
+                lam=fb_lambda, chunk=cfg.logprob_chunk)
             if fb_adv is None:
                 fb_stats.skipped += 1
             else:
@@ -1118,6 +1174,7 @@ def main():
     print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     print(f"Max seq length:     {cfg.max_seq_length}")
+    print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
     print(f"Memory:             {'on' if mem_cfg.enabled else 'off'}")
@@ -1189,8 +1246,13 @@ def main():
             max_seq_length=cfg.max_seq_length,
             load_in_4bit=cfg.load_in_4bit,
             seed=run_seed,
+            gen_micro_batch=cfg.gen_micro_batch,
         )
-        print("[init] generation pool ready")
+        if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
+            print(f"[init] generation pool ready "
+                  f"(micro-batch {cfg.gen_micro_batch}/GPU, chunked)")
+        else:
+            print("[init] generation pool ready")
     else:
         print("[init] single-GPU generation (no worker pool)")
 

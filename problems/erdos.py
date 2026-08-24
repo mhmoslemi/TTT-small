@@ -209,7 +209,8 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 ## Output format
 
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
+
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 
 
 - Exactly ONE ```python block, containing the complete program. It is extracted
@@ -218,7 +219,9 @@ Make sure to /think step by step, first give your strategy between <strategy> an
 - No second code block. No partial snippets earlier in the response.
 - The block must define `run` at top level and be runnable on its own.
 '''
-# Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+
+# Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
+
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------
