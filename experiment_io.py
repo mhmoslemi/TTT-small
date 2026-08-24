@@ -124,6 +124,52 @@ def save_rollout(
     (step_dir / f"{base}.meta.json").write_text(json.dumps(safe_meta, indent=2))
 
 
+def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
+                           parents: list, picks_info: list):
+    """Persist the exact parents selected for a step before generation/training.
+
+    The sampler checkpoint only contains nodes that survived archive pruning.
+    This event file is deliberately independent of that checkpoint so a later
+    tree plot can also reconstruct selections whose children were invalid,
+    duplicates, or eventually pruned.
+    """
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    step_dir.mkdir(exist_ok=True)
+    selected = []
+    for group, parent in enumerate(parents):
+        info = picks_info[group] if group < len(picks_info) else {}
+        selected.append({
+            "group": group,
+            "parent_id": str(parent.id),
+            "parent_timestep": int(parent.timestep),
+            "parent_reward": (float(parent.value)
+                              if parent.value is not None else None),
+            "parent_raw_score": (float(parent.raw_score)
+                                 if parent.raw_score is not None else None),
+            "parent_is_seed": bool(parent.is_seed),
+            "ancestor_ids": [str(p.get("id")) for p in (parent.parents or [])
+                             if p.get("id") is not None],
+            "visit_count": int(info.get("n", 0)),
+            "q_value": (float(info["Q"]) if info.get("Q") is not None else None),
+            "prior": (float(info["P"]) if info.get("P") is not None else None),
+            "exploration_bonus": (float(info["bonus"])
+                                  if info.get("bonus") is not None else None),
+            "selection_score": (float(info["score"])
+                                if info.get("score") is not None else None),
+        })
+    payload = {
+        "version": 1,
+        "step": int(step),
+        "sampler_type": str(sampler_type),
+        "parents": selected,
+    }
+    path = step_dir / f"step{step:02d}.parents.json"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+    return path
+
+
 def save_step_summary(exp_dir: Path, step: int, summary: dict):
     """Write a per-step summary (group stats, best so far, timings)."""
     step_dir = Path(exp_dir) / f"step{step:02d}"

@@ -782,7 +782,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     from advantage import entropic_adaptive_advantages
     from sampler import State
-    from experiment_io import save_rollout
+    from experiment_io import save_parent_selections, save_rollout
     from problems.base import ParentContext
     from gen_workers import make_progress_bar
 
@@ -800,6 +800,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"  parent {i} [{tag}]  value={info['value']:.9f}  n={info['n']}  "
               f"Q={info['Q']:.9f}  P={info['P']:.9f}  bonus={info['bonus']:.9f}  "
               f"score={info['score']:.9f}")
+
+    # Save the selection event immediately. Unlike the sampler checkpoint,
+    # this survives later archive pruning and also exists if generation or
+    # adapter training is interrupted.
+    sampler_type = type(sampler).__name__
+    save_parent_selections(
+        exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info)
+    print(f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
+          f"generation/training", flush=True)
 
     # The coefficient in force this step. When it reaches zero the whole
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
@@ -820,6 +829,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     all_examples = []
     all_children = []
+    saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
     retrieved_by_group = {}     # group -> ids of the lessons put in its prompt
     mem_tokens_by_group = {}    # group -> tokens the injected block occupied
@@ -1024,10 +1034,29 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, (text, token_ids) in enumerate(responses):
             res = outs[r_idx]
+            # Allocate a durable ID even for invalid/duplicate candidates. A
+            # valid candidate uses this exact State object in sampler.update,
+            # so a child selected in a later step links back to this rollout.
+            child = State.make(
+                timestep=step_idx,
+                value=rewards[r_idx],
+                code=res.code or "",
+                raw_score=res.raw_score,
+                construction=res.construction,
+            )
+            archive_eligible = bool(valids[r_idx] and codes[r_idx])
+            if archive_eligible:
+                all_children.append((child, parent))
+            pick_info = (sampler.last_picks_info[g]
+                         if g < len(sampler.last_picks_info) else {})
             meta = {
                 "step": step_idx,
                 "group": g,
                 "rollout": r_idx,
+                "node_id": child.id,
+                "parent_id": parent.id,
+                "parent_timestep": int(parent.timestep),
+                "sampler_type": sampler_type,
                 "reward": float(rewards[r_idx]),
                 "raw_score": (float(res.raw_score) if res.raw_score is not None else None),
                 "valid": bool(valids[r_idx]),
@@ -1039,7 +1068,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "n_response_tokens": len(token_ids),
                 "sandbox_stdout": (res.stdout or "")[:2000],
                 "parent_value": float(parent.value) if parent.value is not None else None,
+                "parent_raw_score": (float(parent.raw_score)
+                                     if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
+                "parent_visit_count": int(pick_info.get("n", 0)),
+                "parent_q_value": (float(pick_info["Q"])
+                                   if pick_info.get("Q") is not None else None),
+                "parent_prior": (float(pick_info["P"])
+                                 if pick_info.get("P") is not None else None),
+                "parent_exploration_bonus": (float(pick_info["bonus"])
+                                             if pick_info.get("bonus") is not None else None),
+                "parent_selection_score": (float(pick_info["score"])
+                                           if pick_info.get("score") is not None else None),
+                "archive_eligible": archive_eligible,
                 "memory_ids": retrieved_by_group.get(g, []),
                 "memory_tokens": mem_tokens_by_group.get(g, 0),
                 # The solution itself, and the one it started from. Neither is
@@ -1059,6 +1100,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             }
             save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
                          prompt_text=prompt_text)
+            saved_rollouts += 1
             if memory is not None:
                 mem_records.append(RolloutRecord(
                     step=step_idx, group=g, rollout=r_idx,
@@ -1094,19 +1136,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                              mode=fb_cfg.inject_mode)
                 reprompt_by_key[(g, r_idx)] = render_chat(tokenizer, rp_messages)
 
-        # Children for the sampler
-        for r_idx, (text, token_ids) in enumerate(responses):
-            res = outs[r_idx]
-            if valids[r_idx] and codes[r_idx]:
-                child = State.make(
-                    timestep=step_idx,
-                    value=rewards[r_idx],
-                    code=codes[r_idx],
-                    raw_score=res.raw_score,
-                    construction=res.construction,
-                )
-                all_children.append((child, parent))
-
         # If reward is constant in this group there is no A^rew signal. With
         # the feedback signal on, those rollouts are still worth training on:
         # A^rew_i = 0 but A^fb is not, which is the whole point of Eq. 9. This
@@ -1128,6 +1157,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "behavior_logprobs": None,   # IS disabled (workers don't return logprobs)
                 "reprompt_text": reprompt_by_key.get((g, r_idx)),
             })
+
+    # Persistence barrier: every response/prompt/meta file is on disk before
+    # memory work or any adapter forward/backward/update begins below. This is
+    # intentionally separate from stepXX.summary.json, which is the completion
+    # marker and therefore can only be written after the trained adapter and
+    # resumable checkpoint have both been saved by the caller.
+    print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
+          f"pairs before adapter training", flush=True)
 
     # Cap the teacher forwards. Applied to all_examples rather than to
     # reprompt_by_key, because the examples were built during the scoring loop
@@ -1173,6 +1210,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return step_stats
 
     # ----- TRAIN STEP -----
+    print(f"[step {step_idx}] starting adapter training; rollout artifacts "
+          f"are already on disk", flush=True)
     backend.set_training_mode()
     optimizer.zero_grad()
 
