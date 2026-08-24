@@ -243,49 +243,6 @@ def visible_tree(nodes, edges, step=None, max_step=None, max_children=16,
     return {node_id: nodes[node_id] for node_id in visible_ids}, kept_edges, omitted
 
 
-def overview_tree(nodes, edges, step=None, max_step=None, valid_only=False):
-    """Return a sparse overview: selected lineage plus each step's best child."""
-    scoped_nodes, scoped_edges, _ = visible_tree(
-        nodes, edges, step=step, max_step=max_step, max_children=0,
-        valid_only=valid_only)
-
-    def selected_in_scope(node):
-        if step is not None:
-            return step in node["selected_steps"]
-        if max_step is not None:
-            return any(value <= max_step for value in node["selected_steps"])
-        return bool(node["selected_steps"])
-
-    important = {node_id for node_id, node in scoped_nodes.items()
-                 if selected_in_scope(node)}
-    by_step = defaultdict(list)
-    for edge in scoped_edges:
-        child = scoped_nodes[edge["child"]]
-        if child["valid"] and child["reward"] is not None:
-            by_step[edge["step"]].append(edge["child"])
-    for child_ids in by_step.values():
-        important.add(max(child_ids,
-                          key=lambda node_id: scoped_nodes[node_id]["reward"]))
-
-    overview_edges = [edge for edge in scoped_edges if edge["child"] in important]
-    visible_ids = set(important)
-    visible_ids.update(edge["parent"] for edge in overview_edges)
-    visible_ids.update(edge["child"] for edge in overview_edges)
-
-    # Count collapsed rollout siblings for the optional single-step detail
-    # annotation, while keeping the full-run overview visually quiet.
-    total_by_parent = defaultdict(int)
-    shown_by_parent = defaultdict(int)
-    for edge in scoped_edges:
-        total_by_parent[edge["parent"]] += 1
-    for edge in overview_edges:
-        shown_by_parent[edge["parent"]] += 1
-    omitted = {parent_id: total - shown_by_parent[parent_id]
-               for parent_id, total in total_by_parent.items()}
-    return ({node_id: scoped_nodes[node_id] for node_id in visible_ids},
-            overview_edges, omitted)
-
-
 def tree_layout(nodes, edges):
     """Tidy-tree x positions with chronological training-step y positions."""
     children = defaultdict(list)
@@ -354,18 +311,13 @@ def _fmt(value):
 
 
 def plot_tree(run_dir, output=None, step=None, max_step=None, max_children=16,
-              valid_only=False, labels="auto", title=None, view="auto"):
+              valid_only=False, labels="auto", title=None):
     run_dir = Path(run_dir)
     config, problem, metric_name, maximize = _run_info(run_dir)
     nodes, edges, sampler_types = load_tree_events(run_dir)
-    actual_view = ("expanded" if step is not None else "overview") if view == "auto" else view
-    if actual_view == "overview":
-        shown, shown_edges, omitted = overview_tree(
-            nodes, edges, step=step, max_step=max_step, valid_only=valid_only)
-    else:
-        shown, shown_edges, omitted = visible_tree(
-            nodes, edges, step=step, max_step=max_step,
-            max_children=max_children, valid_only=valid_only)
+    shown, shown_edges, omitted = visible_tree(
+        nodes, edges, step=step, max_step=max_step,
+        max_children=max_children, valid_only=valid_only)
     if not shown:
         raise ValueError("the requested filters leave no nodes to plot")
 
@@ -461,26 +413,10 @@ def plot_tree(run_dir, output=None, step=None, max_step=None, max_children=16,
         ax.scatter([bx], [by], facecolors="none", edgecolors=RED,
                    s=245, linewidths=2.0, zorder=7)
 
-    if labels == "all":
+    if labels == "all" or (labels == "auto" and node_count <= 24):
         label_ids = set(shown)
     elif labels == "none":
         label_ids = set()
-    elif labels == "selected":
-        label_ids = set(selected_ids)
-        if best_id:
-            label_ids.add(best_id)
-    elif node_count <= 24:
-        label_ids = set(shown)
-    elif actual_view == "overview":
-        # One numeric callout per generation step is enough to read progress;
-        # every other raw score remains encoded by the shared color scale.
-        label_ids = {best_id} if best_id else set()
-        by_generated_step = defaultdict(list)
-        for node_id, node in shown.items():
-            if node["generated_step"] is not None and node["reward"] is not None:
-                by_generated_step[node["generated_step"]].append(node_id)
-        for node_ids in by_generated_step.values():
-            label_ids.add(max(node_ids, key=lambda nid: shown[nid]["reward"]))
     else:
         label_ids = set(selected_ids)
         if best_id:
@@ -516,8 +452,6 @@ def plot_tree(run_dir, output=None, step=None, max_step=None, max_children=16,
                               ec=GRID, lw=0.5, alpha=0.88))
 
     for parent_id, count in omitted.items():
-        if actual_view != "expanded" or step is None:
-            continue
         if count <= 0 or parent_id not in positions:
             continue
         x, y = positions[parent_id]
@@ -529,14 +463,12 @@ def plot_tree(run_dir, output=None, step=None, max_step=None, max_children=16,
         config.get("sampler", "legacy/unknown"))
     scope = f"step {step}" if step is not None else (
         f"through step {max_step}" if max_step is not None else "full run")
-    view_label = "selected-lineage overview" if actual_view == "overview" else "expanded children"
     direction = "maximize" if maximize else "minimize"
     fig.suptitle(title or f"{problem}: post-run search tree",
                  x=0.075, y=0.955, ha="left", fontsize=14,
                  color=INK, fontweight="bold")
     fig.text(0.075, 0.91,
-             f"{sampler_label} · {scope} · {view_label} · "
-             f"{len(shown_edges):,} shown edges / "
+             f"{sampler_label} · {scope} · {len(shown_edges):,} shown edges / "
              f"{len(edges):,} saved rollouts · raw {metric_name} ({direction})",
              ha="left", fontsize=9.2, color=INK_SOFT)
 
@@ -593,10 +525,7 @@ def main():
     scope.add_argument("--max-step", type=int, default=None,
                        help="show the tree only through this step")
     parser.add_argument("--max-children", type=int, default=16,
-                        help="expanded-view children per parent; 0 shows all")
-    parser.add_argument("--view", choices=("auto", "overview", "expanded"),
-                        default="auto",
-                        help="overview for lineage, expanded for rollout children")
+                        help="children shown per parent; 0 shows every child")
     parser.add_argument("--valid-only", action="store_true",
                         help="hide invalid generated children")
     parser.add_argument("--labels", choices=("auto", "all", "selected", "none"),
@@ -609,7 +538,7 @@ def main():
         plot_tree(args.run_dir, output=args.out, step=args.step,
                   max_step=args.max_step, max_children=args.max_children,
                   valid_only=args.valid_only, labels=args.labels,
-                  title=args.title, view=args.view)
+                  title=args.title)
     except ValueError as exc:
         parser.error(str(exc))
 
