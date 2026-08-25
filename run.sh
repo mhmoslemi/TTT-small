@@ -127,25 +127,64 @@ for arg in "$@"; do
     esac
 done
 
+
+# if [ "$resume_run" -eq 1 ]; then
+#     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py "$@"
+# else
+#     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
+#         --num-steps 12 --deterministic --seed 42 \
+#         --groups-per-step 4 --group-size 16 \
+#         --max-groups-per-step 4 --max-group-size 16 \
+#         --growth-force-step 3 --num-gpus 3 --gpu-ids 4,5,6 --no-memory --no-feedback \
+#         --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 \
+#         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
+# fi
+ 
+
+
+# if [ "$resume_run" -eq 1 ]; then
+#     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py "$@"
+# else
+#     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
+#         --num-steps 12 --deterministic --seed 42 \
+#         --groups-per-step 4 --group-size 16 \
+#         --max-groups-per-step 4 --max-group-size 16 \
+#         --growth-force-step 3 --num-gpus 3 --gpu-ids 4,5,6 \
+#         --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --no-feedback \
+#         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
+# fi
+
+
+
+
+
+
+
+
 if [ "$resume_run" -eq 1 ]; then
     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py "$@"
 else
     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
-        --num-steps 100 \
-        --groups-per-step 8 --group-size 64 \
-        --max-groups-per-step 8 --max-group-size 64 \
-        --growth-force-step 5 --num-gpus 3 --gpu-ids 4,5,6 \
-        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 \
+        --num-steps 12 --deterministic --seed 42 \
+        --groups-per-step 4 --group-size 16 \
+        --max-groups-per-step 4 --max-group-size 16 \
+        --growth-force-step 3 --num-gpus 3 --gpu-ids 4,5,6 \
+        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --no-memory --feedback --feedback-max-per-step 16 --feedback-max-per-signature 4 \
+        --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
+fi
+ 
+
+if [ "$resume_run" -eq 1 ]; then
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py "$@"
+else
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
+        --num-steps 12 --deterministic --seed 42 \
+        --groups-per-step 4 --group-size 16 \
+        --max-groups-per-step 4 --max-group-size 16 \
+        --growth-force-step 3 --num-gpus 3 --gpu-ids 4,5,6 \
+        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback --feedback-max-per-step 16 --feedback-max-per-signature 4 \
         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
 fi
  
 
 
-# problem
-# reinforce
-
-# gpu 6 : lr 0 
-# gpu 7 : lr 1
-
-
-# srun --jobid=4918491 --overlap watch -n 0.1 nvidia-smi
