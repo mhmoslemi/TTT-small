@@ -36,14 +36,6 @@ class Config:
     # Model
     model_name: str = "Qwen/Qwen3-8B"
     backend: str = "auto"        # "auto" | "unsloth" | "hf"
-    model_kind: str = "llm"      # "llm" | "vlm"
-    # Static images prepended to every parent prompt. Visual problems can
-    # instead override Problem.vision_inputs(parent) for state-dependent views.
-    vision_images: list = field(default_factory=list)
-    # Frozen is the practical default: train the language policy and leave the
-    # much larger vision tower unchanged. Set true only when visual perception
-    # itself, rather than reasoning over it, needs adaptation.
-    vlm_finetune_vision_layers: bool = False
     max_seq_length: int = 32000
     load_in_4bit: bool = False
     lora_rank: int = 32
@@ -227,27 +219,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # CLI overrides — all default None so we can tell 'not given' from 'given'.
     p.add_argument("--backend", choices=["auto", "unsloth", "hf"], default=None)
     p.add_argument("--model-name", default=None)
-    p.add_argument("--model-kind", choices=["llm", "vlm"], default=None,
-                   help="llm = text-only causal model; vlm = vision-language "
-                        "model with processor/image inputs.")
-    p.add_argument("--vlm", dest="model_kind", action="store_const",
-                   const="vlm", default=None,
-                   help="Shorthand for --model-kind vlm.")
-    p.add_argument("--llm", dest="model_kind", action="store_const",
-                   const="llm", help="Force the original text-only path.")
-    p.add_argument("--vision-image", dest="vision_images", action="append",
-                   default=None, metavar="PATH",
-                   help="Local image prepended to every rollout prompt. Repeat "
-                        "for multiple images. Requires --vlm.")
-    p.add_argument("--vlm-finetune-vision-layers",
-                   dest="vlm_finetune_vision_layers",
-                   action="store_const", const=True, default=None,
-                   help="Add LoRA to the vision tower as well as the language "
-                        "policy. The vision tower is frozen by default.")
-    p.add_argument("--vlm-freeze-vision-layers",
-                   dest="vlm_finetune_vision_layers",
-                   action="store_const", const=False,
-                   help="Explicitly keep the VLM vision tower frozen.")
     p.add_argument("--load-in-4bit", action="store_const", const=True, default=None)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--lora-rank", type=int, default=None)
@@ -517,9 +488,6 @@ def load_config():
     known = {f.name for f in fields(Config)}
     cfg_kwargs = {k: v for k, v in merged.items() if k in known}
     cfg = Config(**cfg_kwargs)
-    if isinstance(cfg.vision_images, (str, bytes)):
-        cfg.vision_images = [str(cfg.vision_images)]
-        merged["vision_images"] = list(cfg.vision_images)
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 
@@ -534,8 +502,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     (text, gen_token_ids).
     """
     import torch
-    from model_io import decode_tokens, decoder_token_ids
-    eos_id, pad_id = decoder_token_ids(tokenizer)
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
 
     with torch.inference_mode():
         out = model.generate(
@@ -552,12 +520,12 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
         gen_ids = out[i, input_len:].tolist()
         if eos_id is not None and eos_id in gen_ids:
             gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-        text = decode_tokens(tokenizer, gen_ids)
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
         results.append((text, gen_ids))
     return results
 
 
-def generate_responses(model, tokenizer, prompt, group_size: int, cfg: Config):
+def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg: Config):
     """
     Generate `group_size` responses from a single prompt, batched.
 
@@ -569,9 +537,8 @@ def generate_responses(model, tokenizer, prompt, group_size: int, cfg: Config):
     Returns (list of (text, gen_token_ids), prompt_len_in_tokens).
     """
     import torch
-    from model_io import encode_prompt, model_device
-    inputs = encode_prompt(tokenizer, prompt, device=model_device(model))
-    input_len = inputs["input_ids"].shape[1]
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+    input_len = inputs.input_ids.shape[1]
 
     responses = []
     remaining = group_size
@@ -601,13 +568,12 @@ def generate_responses(model, tokenizer, prompt, group_size: int, cfg: Config):
 # ======================================================================
 # Logprob computation
 # ======================================================================
-def compute_token_logprobs(model, prompt_inputs, response_ids, with_grad: bool,
+def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
                            chunk: int = 0):
     """
     Per-token log-probabilities of the response under the model.
 
-    prompt_inputs: (1, P) input-id tensor, or a processor BatchFeature/dict.
-                   VLM dictionaries also carry pixel values and image metadata.
+    prompt_ids:   (1, P) tensor
     response_ids: (1, R) tensor
     Output:       (R,) tensor of token logprobs
 
@@ -626,44 +592,12 @@ def compute_token_logprobs(model, prompt_inputs, response_ids, with_grad: bool,
     import torch
     import torch.nn.functional as F
 
-    ids_only = torch.is_tensor(prompt_inputs)
-    if ids_only:
-        prompt_inputs = {"input_ids": prompt_inputs}
-    else:
-        prompt_inputs = dict(prompt_inputs)
-    prompt_ids = prompt_inputs["input_ids"]
     full_ids = torch.cat([prompt_ids, response_ids], dim=1)
     P = prompt_ids.shape[1]
     R = response_ids.shape[1]
-
-    forward_inputs = dict(prompt_inputs)
-    forward_inputs["input_ids"] = full_ids
-    attention_mask = forward_inputs.get("attention_mask")
-    if torch.is_tensor(attention_mask):
-        response_mask = torch.ones(
-            (attention_mask.shape[0], R), dtype=attention_mask.dtype,
-            device=attention_mask.device)
-        forward_inputs["attention_mask"] = torch.cat(
-            [attention_mask, response_mask], dim=1)
-
-    # Some VLMs attach a text-length-aligned mask in addition to the ordinary
-    # attention mask. Generated response positions see the same images as the
-    # final prompt token. Image tensors/grid metadata themselves are unchanged.
-    for key in ("token_type_ids", "mm_token_type_ids",
-                "cross_attention_mask"):
-        value = forward_inputs.get(key)
-        if (torch.is_tensor(value) and value.ndim >= 2
-                and value.shape[1] == P and R > 0):
-            shape = list(value.shape)
-            shape[1] = R
-            tail = value[:, -1:, ...].expand(*shape)
-            forward_inputs[key] = torch.cat([value, tail], dim=1)
-
     context = torch.enable_grad() if with_grad else torch.no_grad()
     with context:
-        # Preserve the original text-only call exactly; multimodal forwards
-        # need the processor's additional image tensors and masks.
-        out = model(full_ids) if ids_only else model(**forward_inputs)
+        out = model(full_ids)
         logits = out.logits  # (1, T, V)
         # Predict response token at position P+k from logits at position P+k-1.
         pred_logits = logits[:, P - 1 : P - 1 + R, :]  # (1, R, V)
@@ -888,14 +822,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from experiment_io import save_parent_selections, save_rollout
     from problems.base import ParentContext
     from gen_workers import make_progress_bar
-    from model_io import (encode_prompt, make_prompt, model_device,
-                          prompt_images, prompt_text)
 
     from memory import (MemoryArm, RolloutRecord, allocate_memory_arms,
                         build_injection, credit_memory_arms, inject_block)
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           build_reprompt, feedback_advantage, format_feedback,
-                          is_failure, select_balanced)
+                          is_failure, render_chat, select_balanced)
 
     step_t0 = time.time()
     sampler.set_current_step(step_idx)
@@ -932,7 +864,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if (fb_cfg is not None and fb_cfg.enabled and not fb_candidate_on):
         print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
     fail_score = float(getattr(problem, "fail_score", 0.0))
-    reprompt_by_key = {}        # (group, rollout) -> feedback-conditioned prompt
+    reprompt_by_key = {}        # (group, rollout) -> reprompt text for a failure
 
     all_examples = []
     all_children = []
@@ -947,7 +879,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # lessons it wants for all of them, then render.
     parent_ctxs = []
     base_messages = []
-    base_images = []
 
     for g, parent in enumerate(parents):
         sampler.record_expansion(parent, count=cfg.group_size)
@@ -959,7 +890,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         )
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
-        base_images.append(problem.vision_inputs(pc))
 
     # The adapter is saved BEFORE the lookup, not just before generation, so the
     # selection call runs on the same policy the rollouts will. Same file either
@@ -975,6 +905,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if memory is not None and lookup is not None:
         chosen_by_group = lookup.select_batch(
             parent_ctxs, step_idx=step_idx, adapter_path=adapter_path)
+
+    def _render(messages):
+        try:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
 
     # One parent can now own several prompt arms, but their counts still sum to
     # exactly cfg.group_size. Entropic advantages are computed over the union.
@@ -1007,18 +948,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     messages = inject_block(
                         messages, block,
                         mode=getattr(mem_cfg, "inject_mode", "append"))
-            payload = make_prompt(
-                tokenizer, messages, model_kind=cfg.model_kind,
-                image_paths=base_images[g])
             prompt_jobs.append({
                 "parent_group": g,
                 "arm": arm.name,
                 "memory_ids": [lesson.id for lesson in kept],
                 "memory_tokens": int(n_tok),
                 "messages": messages,
-                "prompt": payload,
-                "prompt_text": prompt_text(payload),
-                "image_paths": list(prompt_images(payload)),
+                "prompt_text": _render(messages),
                 "count": int(arm.count),
             })
             mem_arm_rollouts[arm.name] = (
@@ -1066,7 +1002,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # that lands is queued for reward eval right away, so by the time
             # generation finishes most rewards are done.
             for job_idx, job_results in gen_pool.iter_group_jobs(
-                    prompts_by_group=[job["prompt"] for job in prompt_jobs],
+                    prompts_by_group=[job["prompt_text"] for job in prompt_jobs],
                     group_size=cfg.group_size,
                     counts_by_group=[job["count"] for job in prompt_jobs],
                     adapter_path=adapter_path,
@@ -1088,7 +1024,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             try:
                 for job_idx, job in enumerate(prompt_jobs):
                     responses, _ = generate_responses(
-                        model, tokenizer, job["prompt"], job["count"], cfg
+                        model, tokenizer, job["prompt_text"], job["count"], cfg
                     )
                     for (text, token_ids) in responses:
                         _submit_rollout(job_idx, text, token_ids)
@@ -1117,7 +1053,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     distinct_good_hashes = set()
     step_valid_count = 0
     step_rollout_count = 0
-    prompt_inputs_by_job = {}
+    prompt_ids_by_job = {}
 
     for g, parent in enumerate(parents):
         responses = group_responses[g]          # list of (text, token_ids, job)
@@ -1225,7 +1161,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "memory_arm": job["arm"],
                 "memory_ids": job["memory_ids"],
                 "memory_tokens": job["memory_tokens"],
-                "vision_images": job["image_paths"],
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -1279,9 +1214,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                       int(fb_cfg.chars))
                 rp_messages = build_reprompt(prompt_jobs[job_idx]["messages"], f_i,
                                              mode=fb_cfg.inject_mode)
-                reprompt_by_key[(g, r_idx)] = make_prompt(
-                    tokenizer, rp_messages, model_kind=cfg.model_kind,
-                    image_paths=prompt_jobs[job_idx]["image_paths"])
+                reprompt_by_key[(g, r_idx)] = render_chat(tokenizer, rp_messages)
 
         # If reward is constant in this group there is no A^rew signal. With
         # the feedback signal on, those rollouts are still worth training on:
@@ -1296,21 +1229,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 zip(responses, advantages)):
             if len(token_ids) == 0:
                 continue
-            if job_idx not in prompt_inputs_by_job:
-                encoded = encode_prompt(
-                    tokenizer, prompt_jobs[job_idx]["prompt"],
-                    device=model_device(model))
-                prompt_inputs_by_job[job_idx] = (
-                    encoded if cfg.model_kind == "vlm" else encoded["input_ids"])
-            response_ids = torch.tensor(
-                [token_ids], device=model_device(model))
+            if job_idx not in prompt_ids_by_job:
+                prompt_ids_by_job[job_idx] = tokenizer(
+                    prompt_jobs[job_idx]["prompt_text"],
+                    return_tensors="pt").input_ids.to(model.device)
+            response_ids = torch.tensor([token_ids], device=model.device)
             res = outs[r_idx]
             all_examples.append({
-                "prompt_inputs": prompt_inputs_by_job[job_idx],
+                "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
                 "advantage": float(adv),
                 "behavior_logprobs": None,   # IS disabled (workers don't return logprobs)
-                "reprompt": reprompt_by_key.get((g, r_idx)),
+                "reprompt_text": reprompt_by_key.get((g, r_idx)),
                 "failure_signature": RolloutRecord(
                     msg=res.msg or "").failure_signature(),
                 "reward_constant": constant,
@@ -1341,12 +1271,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Cap the teacher forwards. Applied to all_examples rather than to
     # reprompt_by_key, because the examples were built during the scoring loop
-    # above and already hold their reprompt; shrinking the dict now would
+    # above and already hold their reprompt text; shrinking the dict now would
     # change nothing. Selection is balanced across failure signatures and
     # spread across the batch rather than restricted to the first groups.
     feedback_teacher_rollouts = 0
     if fb_on:
-        with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt")]
+        with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt_text")]
         signatures = [ex.get("failure_signature", "unknown") for ex in all_examples]
         keep = set(select_balanced(
             with_fb, signatures, total_cap=int(fb_cfg.max_per_step),
@@ -1354,7 +1284,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if len(keep) < len(with_fb):
             for i in with_fb:
                 if i not in keep:
-                    all_examples[i]["reprompt"] = None
+                    all_examples[i]["reprompt_text"] = None
             print(f"[step {step_idx}] feedback: balanced/capped to {len(keep)} "
                   f"of {len(with_fb)} failed rollouts")
         feedback_teacher_rollouts = len(keep)
@@ -1364,7 +1294,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # and reference forwards for a KL-only update and dilute the batch.
         all_examples = [
             ex for ex in all_examples
-            if not (ex["reward_constant"] and not ex.get("reprompt"))
+            if not (ex["reward_constant"] and not ex.get("reprompt_text"))
         ]
 
     rollout_time = time.time() - rollout_t0
@@ -1419,16 +1349,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     fb_stats = FeedbackStats()
 
     for ex in all_examples:
-        prompt_inputs = ex["prompt_inputs"]
+        pid = ex["prompt_ids"]
         rid = ex["response_ids"]
         adv = ex["advantage"]
 
-        cur_lp = compute_token_logprobs(model, prompt_inputs, rid, with_grad=True,
+        cur_lp = compute_token_logprobs(model, pid, rid, with_grad=True,
                                         chunk=cfg.logprob_chunk)  # (R,)
 
         try:
             with backend.disable_adapter(), torch.no_grad():
-                base_lp = compute_token_logprobs(model, prompt_inputs, rid, with_grad=False,
+                base_lp = compute_token_logprobs(model, pid, rid, with_grad=False,
                                                  chunk=cfg.logprob_chunk)
         except Exception as e:
             if not hasattr(train_step, "_kl_warned"):
@@ -1443,17 +1373,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         # ---- feedback-based failure signal (Sec. 2.3, Eq. 9) -------------
         # A_{i,l} = A^rew_i + lambda_f * d_i * A^fb_{i,l}, and d_i is implicit:
-        # reprompt is only ever set for a failed rollout.
+        # reprompt_text is only ever set for a failed rollout.
         #
         # cur_lp.detach() IS log pi_thetabar here. Gradients accumulate across
         # every example and optimizer.step() runs once at the end of the loop,
         # so theta has not moved since the rollouts were sampled. If that ever
         # changes to more than one update per step, this term needs its own
         # forward pass at thetabar.
-        if fb_on and ex.get("reprompt"):
+        if fb_on and ex.get("reprompt_text"):
             fb_adv = feedback_advantage(
                 compute_token_logprobs, model, tokenizer,
-                ex["reprompt"], rid, cur_lp.detach(), fb_cfg,
+                ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
                 lam=fb_lambda, chunk=cfg.logprob_chunk)
             if fb_adv is None:
                 fb_stats.skipped += 1
@@ -1539,11 +1469,6 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 def main():
     cfg, merged = load_config()
 
-    if cfg.model_kind not in ("llm", "vlm"):
-        raise ValueError("model_kind must be 'llm' or 'vlm'")
-    if cfg.model_kind != "vlm" and cfg.vision_images:
-        raise ValueError("vision_images were provided but model_kind is not 'vlm'")
-
     # Select the run directory before runtime-only context adjustments so a
     # fresh config.json stores the reusable base configuration.
     from experiment_io import (make_experiment_dir, save_final_summary,
@@ -1587,9 +1512,6 @@ def main():
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
-    print(f"Model kind:         {cfg.model_kind}"
-          + (f" ({len(cfg.vision_images)} static image(s))"
-             if cfg.model_kind == "vlm" else ""))
     print(f"Backend:            {cfg.backend}")
     print(f"Target:             {cfg.target}")
     print(f"Steps:              {cfg.num_steps}")
@@ -1702,7 +1624,6 @@ def main():
             model_name=cfg.model_name,
             num_workers=cfg.num_gpus,
             gpu_ids=gpu_ids,
-            model_kind=cfg.model_kind,
             max_seq_length=cfg.max_seq_length,
             load_in_4bit=cfg.load_in_4bit,
             seed=run_seed,

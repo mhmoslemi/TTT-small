@@ -93,8 +93,7 @@ def make_progress_bar(total, desc="progress"):
 def distribute_jobs(prompts_by_group, group_size, num_workers,
                     counts_by_group=None):
     """
-    prompts_by_group: rendered strings or VLM prompt payloads, one per group
-                      (index = group_idx)
+    prompts_by_group: list of prompt strings, one per group (index = group_idx)
 
     Returns worker_jobs: list (len num_workers) of lists of
         (group_idx, prompt_text, count)
@@ -126,7 +125,7 @@ def worker_seed(seed, step, rank):
     return (int(seed) * 1_000_003 + int(step) * 1009 + int(rank) * 7 + 13) % (2 ** 31 - 1)
 
 
-def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4bit,
+def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                  task_queue, result_queue, ready_queue, seed=None):
     """
     Persistent worker. Loads the model once, then serves generation tasks
@@ -138,37 +137,19 @@ def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4
     import random
     import numpy as np
     import torch
-    import transformers
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
     from peft.utils import set_peft_model_state_dict
     from safetensors.torch import load_file
-    from model_io import (decode_tokens, decoder_token_ids, encode_prompt,
-                          ensure_pad_token, is_vlm, text_tokenizer)
 
     # With CUDA_VISIBLE_DEVICES set, our GPU is cuda:0 inside this process
     device = "cuda:0"
 
     print(f"[worker {rank}] loading {model_name} on physical GPU {gpu_id} ...", flush=True)
-    vision = is_vlm(model_kind)
-    if vision:
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-        auto_cls = None
-        for class_name in (
-                "AutoModelForImageTextToText", "AutoModelForMultimodalLM",
-                "AutoModelForVision2Seq"):
-            auto_cls = getattr(transformers, class_name, None)
-            if auto_cls is not None:
-                break
-        if auto_cls is None:
-            raise ImportError("Transformers has no image-to-text auto model class")
-    else:
-        processor = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        auto_cls = AutoModelForCausalLM
-    ensure_pad_token(processor)
-    decoder = text_tokenizer(processor)
-    decoder.padding_side = "left"  # left-pad for decoder-only batched generation
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # left-pad for decoder-only batched generation
 
     model_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=True)
     if load_in_4bit:
@@ -181,7 +162,7 @@ def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4
         except ImportError:
             pass
 
-    base = auto_cls.from_pretrained(model_name, **model_kwargs)
+    base = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     if not load_in_4bit:
         base = base.to(device)
     base.eval()
@@ -213,7 +194,8 @@ def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4
             current_adapter = adapter_path
         return peft_model
 
-    eos_id, pad_id = decoder_token_ids(processor)
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
 
     # Persistent per-worker ceiling on sequences per generate() call. 0 means
     # "no learned limit yet"; the effective cap is then the configured
@@ -259,8 +241,8 @@ def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4
         mb = int(gen_kwargs.get("micro_batch", 0) or 0)
 
         for (group_idx, prompt, count) in jobs:
-            enc = encode_prompt(processor, prompt, device=device)
-            input_len = enc["input_ids"].shape[1]
+            enc = tokenizer([prompt], return_tensors="pt").to(device)
+            input_len = enc.input_ids.shape[1]
 
             remaining = count
             while remaining > 0:
@@ -315,7 +297,7 @@ def _worker_loop(rank, gpu_id, model_name, model_kind, max_seq_length, load_in_4
                     gen_ids = out[i, input_len:].tolist()
                     if eos_id is not None and eos_id in gen_ids:
                         gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-                    text = decode_tokens(processor, gen_ids)
+                    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
                     job_results.append((text, gen_ids))
 
                 # Report each chunk immediately so the main process can advance
@@ -335,11 +317,9 @@ class GenerationPool:
     """
 
     def __init__(self, model_name, num_workers, gpu_ids=None,
-                 model_kind="llm",
                  max_seq_length=4096, load_in_4bit=False, seed=None,
                  gen_micro_batch=0):
         self.model_name = model_name
-        self.model_kind = model_kind
         self.num_workers = num_workers
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
@@ -355,7 +335,7 @@ class GenerationPool:
         for r in range(num_workers):
             p = ctx.Process(
                 target=_worker_loop,
-                args=(r, self.gpu_ids[r], model_name, model_kind, max_seq_length,
+                args=(r, self.gpu_ids[r], model_name, max_seq_length,
                       load_in_4bit, self.task_queues[r], self.result_queue,
                       ready_queue, self.seed),
                 daemon=True,

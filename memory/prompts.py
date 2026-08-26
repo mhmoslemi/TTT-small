@@ -455,9 +455,7 @@ def count_tokens(tokenizer, text: str) -> int:
     if tokenizer is None:
         return max(1, len(text) // 4)
     try:
-        from model_io import text_tokenizer
-        decoder = text_tokenizer(tokenizer)
-        return len(decoder(text, add_special_tokens=False).input_ids)
+        return len(tokenizer(text, add_special_tokens=False).input_ids)
     except Exception:
         return max(1, len(text) // 4)
 
@@ -505,13 +503,7 @@ def inject_block(messages: List[Dict], block: str,
         return [{"role": "system", "content": block}] + out
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user":
-            content = out[i].get("content", "")
-            if isinstance(content, list):
-                out[i]["content"] = list(content) + [
-                    {"type": "text", "text": block}
-                ]
-            else:
-                out[i]["content"] = str(content) + "\n\n" + block
+            out[i]["content"] = out[i]["content"] + "\n\n" + block
             return out
     out.append({"role": "user", "content": block})
     return out

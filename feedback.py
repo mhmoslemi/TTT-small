@@ -291,13 +291,7 @@ def build_reprompt(messages: List[Dict], feedback_text: str,
 
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user":
-            content = out[i].get("content", "")
-            if isinstance(content, list):
-                out[i]["content"] = list(content) + [
-                    {"type": "text", "text": block}
-                ]
-            else:
-                out[i]["content"] = str(content) + "\n\n" + block
+            out[i]["content"] = out[i]["content"] + "\n\n" + block
             return out
 
     out.append({"role": "user", "content": block})
@@ -389,7 +383,7 @@ def bound_feedback_advantage(adv, reward_advantage: float,
 # A^fb (Eq. 9)
 # ----------------------------------------------------------------------
 def feedback_advantage(compute_token_logprobs, model, tokenizer,
-                       reprompt, response_ids, rollout_logprobs,
+                       reprompt_text: str, response_ids, rollout_logprobs,
                        cfg: FeedbackConfig, lam: Optional[float] = None,
                        chunk: int = 0):
     """
@@ -403,16 +397,11 @@ def feedback_advantage(compute_token_logprobs, model, tokenizer,
     step has happened since the rollouts were sampled.
     """
     import torch
-    from model_io import VisionPrompt, encode_prompt, model_device
 
     try:
-        rp_inputs = encode_prompt(
-            tokenizer, reprompt, device=model_device(model))
-        if not isinstance(reprompt, VisionPrompt):
-            # Keep the original LLM forward path (input ids only) unchanged.
-            rp_inputs = rp_inputs["input_ids"]
+        rp_ids = tokenizer(reprompt_text, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            q_lp = compute_token_logprobs(model, rp_inputs, response_ids,
+            q_lp = compute_token_logprobs(model, rp_ids, response_ids,
                                           with_grad=False, chunk=chunk)
     except Exception as e:
         print(f"[feedback] teacher forward failed ({e!r}); skipping this rollout")

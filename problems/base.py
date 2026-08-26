@@ -93,20 +93,6 @@ class Problem(ABC):
         self.num_seed_states = int(self.cfg.get("num_seed_states", 8))
         self.seed = int(self.cfg.get("seed", 42))
 
-    def vision_inputs(self, parent: ParentContext) -> List[str]:
-        """Local images to prepend to this parent's user prompt.
-
-        The default supports static ``vision_images`` from YAML/CLI. A visual
-        scientific problem can override this method to render a different
-        observation for every search state. Paths, rather than PIL objects, are
-        used so spawned generation workers can reopen the same inputs.
-        """
-
-        images = self.cfg.get("vision_images", []) or []
-        if isinstance(images, (str, bytes)):
-            images = [images]
-        return [str(path) for path in images]
-
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
     def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
