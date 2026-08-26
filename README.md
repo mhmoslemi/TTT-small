@@ -121,3 +121,5 @@ python train.py --backend hf
 | `sandbox.py` | Subprocess code execution with timeout (no Ray) |
 | `experiment_io.py` | Per-run directory creation and rollout logging |
  -->
+
+Current VLM usage is documented in [VLM_SUPPORT.md](VLM_SUPPORT.md).

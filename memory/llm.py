@@ -24,35 +24,36 @@ CURATE_STEP_OFFSET = 3_000_000
 
 def render_chat(tokenizer, messages: List[Dict]) -> str:
     """Same call and fallback the trainer uses for the rollout prompt."""
-    try:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=False)
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
+    from model_io import render_chat as _render_chat
+    return _render_chat(tokenizer, messages)
 
 
 class InProcessMemoryLLM:
     """Single-GPU fallback: generate on the training model itself."""
 
-    def __init__(self, cfg, backend, model, tokenizer, seed=None):
+    def __init__(self, cfg, backend, model, tokenizer, seed=None,
+                 model_kind="llm"):
         self.cfg = cfg
         self.backend = backend
         self.model = model
         self.tokenizer = tokenizer
         self.seed = seed
+        self.model_kind = model_kind
 
     def complete(self, messages: List[Dict], adapter_path=None, step_idx: int = 0,
                  max_new_tokens: Optional[int] = None,
                  temperature: Optional[float] = None) -> str:
         import torch
+        from model_io import (decode_tokens, decoder_token_ids, encode_prompt,
+                              make_prompt, model_device)
 
-        prompt_text = render_chat(self.tokenizer, messages)
-        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
-        input_len = inputs.input_ids.shape[1]
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id or eos_id
+        prompt = make_prompt(
+            self.tokenizer, messages,
+            model_kind=self.model_kind)
+        inputs = encode_prompt(
+            self.tokenizer, prompt, device=model_device(self.model))
+        input_len = inputs["input_ids"].shape[1]
+        eos_id, pad_id = decoder_token_ids(self.tokenizer)
 
         if self.seed is not None:
             # Reseeding is what keeps the single-GPU path reproducible: without
@@ -83,7 +84,7 @@ class InProcessMemoryLLM:
         gen_ids = out[0, input_len:].tolist()
         if eos_id is not None and eos_id in gen_ids:
             gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-        return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        return decode_tokens(self.tokenizer, gen_ids)
 
     def complete_many(self, messages_list: Sequence[List[Dict]], adapter_path=None,
                       step_idx: int = 0, max_new_tokens: Optional[int] = None,
@@ -96,15 +97,22 @@ class InProcessMemoryLLM:
 class PoolMemoryLLM:
     """Multi-GPU: run on the idle workers holding the current adapter."""
 
-    def __init__(self, cfg, gen_pool, tokenizer):
+    def __init__(self, cfg, gen_pool, tokenizer, model_kind="llm"):
         self.cfg = cfg
         self.pool = gen_pool
         self.tokenizer = tokenizer
+        self.model_kind = model_kind
 
     def complete_many(self, messages_list: Sequence[List[Dict]], adapter_path=None,
                       step_idx: int = 0, max_new_tokens: Optional[int] = None,
                       temperature: Optional[float] = None) -> List[str]:
-        prompts = [render_chat(self.tokenizer, m) for m in messages_list]
+        from model_io import make_prompt
+        prompts = [
+            make_prompt(
+                self.tokenizer, messages,
+                model_kind=self.model_kind)
+            for messages in messages_list
+        ]
         if not prompts:
             return []
         out = [""] * len(prompts)
@@ -132,11 +140,14 @@ class PoolMemoryLLM:
 
 
 def make_memory_llm(cfg, backend=None, model=None, tokenizer=None,
-                    gen_pool=None, seed=None, verbose: bool = True):
+                    gen_pool=None, seed=None, model_kind="llm",
+                    verbose: bool = True):
     if gen_pool is not None and bool(getattr(cfg, "use_gen_pool", True)):
         if verbose:
             print("[memory] memory calls run on the generation pool")
-        return PoolMemoryLLM(cfg, gen_pool, tokenizer)
+        return PoolMemoryLLM(
+            cfg, gen_pool, tokenizer, model_kind=model_kind)
     if verbose:
         print("[memory] memory calls run in-process on the training model")
-    return InProcessMemoryLLM(cfg, backend, model, tokenizer, seed=seed)
+    return InProcessMemoryLLM(
+        cfg, backend, model, tokenizer, seed=seed, model_kind=model_kind)
