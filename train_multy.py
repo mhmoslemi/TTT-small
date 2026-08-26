@@ -35,7 +35,9 @@ class Config:
 
     # Model
     model_name: str = "Qwen/Qwen3-8B"
-    backend: str = "auto"        # "auto" | "unsloth" | "hf"
+    # "vllm" is a convenience mode: HF+PEFT trains, vLLM generates rollouts.
+    backend: str = "auto"        # "auto" | "unsloth" | "hf" | "vllm"
+    generation_backend: str = "hf"   # "hf" | "vllm"
     max_seq_length: int = 32000
     load_in_4bit: bool = False
     lora_rank: int = 32
@@ -122,6 +124,12 @@ class Config:
     # (byte-identical to no micro-batch; a deterministic run with 0 draws exactly
     # what it did before this feature existed).
     gen_micro_batch: int = 0
+    # vLLM owns its own scheduler/KV cache. gen_micro_batch, when nonzero, is
+    # passed as max_num_seqs; 0 lets vLLM choose. Generation GPUs should be
+    # separate from the main training GPU unless the cards have ample headroom.
+    vllm_gpu_memory_utilization: float = 0.9
+    vllm_enforce_eager: bool = False
+    vllm_enable_prefix_caching: bool = True
 
     # ---- Memory (Sec. 2.2) ----
     # `memory` is the master switch. When it is False, every memory_* field
@@ -217,7 +225,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Sub-type for multi-mode problems (ac1/ac2, trimul/mla_decode_nvidia).")
 
     # CLI overrides — all default None so we can tell 'not given' from 'given'.
-    p.add_argument("--backend", choices=["auto", "unsloth", "hf"], default=None)
+    p.add_argument(
+        "--backend", choices=["auto", "unsloth", "hf", "vllm"], default=None,
+        help="Training backend. 'vllm' is shorthand for HF+PEFT training plus "
+             "vLLM rollout generation (vLLM itself does not backpropagate).")
+    p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
+                   help="Engine used by generation workers. Independent of the "
+                        "differentiable training backend.")
     p.add_argument("--model-name", default=None)
     p.add_argument("--load-in-4bit", action="store_const", const=True, default=None)
     p.add_argument("--max-seq-length", type=int, default=None)
@@ -285,7 +299,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Max sequences each GPU holds per generate() call. The "
                         "worker loops in chunks of this size until the group's "
                         "rollouts are done, so group_size can be anything while "
-                        "per-GPU KV memory stays bounded by this. 0 = one shot.")
+                        "per-GPU KV memory stays bounded by this. With vLLM this "
+                        "sets max_num_seqs. 0 lets the backend choose.")
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
+                   help="Fraction of each generation GPU reserved by vLLM's "
+                        "weights and KV cache (default: 0.9).")
+    p.add_argument("--vllm-enforce-eager", dest="vllm_enforce_eager",
+                   action="store_const", const=True, default=None,
+                   help="Disable CUDA graphs in vLLM.")
+    p.add_argument("--no-vllm-enforce-eager", dest="vllm_enforce_eager",
+                   action="store_const", const=False)
+    p.add_argument("--vllm-prefix-caching", dest="vllm_enable_prefix_caching",
+                   action="store_const", const=True, default=None)
+    p.add_argument("--no-vllm-prefix-caching",
+                   dest="vllm_enable_prefix_caching",
+                   action="store_const", const=False)
 
     # ---- memory (Sec. 2.2) ----
     p.add_argument("--memory", dest="memory", action="store_const",
@@ -484,10 +512,27 @@ def load_config():
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
+    # vLLM is an inference engine, not a differentiable trainer. Treat the
+    # convenient `--backend vllm` spelling as the complete no-Unsloth mode.
+    if str(merged.get("backend", "")).lower() == "vllm":
+        merged["backend"] = "hf"
+        merged["generation_backend"] = "vllm"
+        print("[config] vLLM mode: HF+PEFT training + vLLM generation")
+
+    generation_backend = str(merged.get("generation_backend", "hf")).lower()
+    if generation_backend not in ("hf", "vllm"):
+        raise ValueError("generation_backend must be 'hf' or 'vllm'")
+    merged["generation_backend"] = generation_backend
+    util = float(merged.get("vllm_gpu_memory_utilization", 0.9))
+    if not 0.0 < util <= 1.0:
+        raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
+
     # 5) build the Config from the fields it knows; leave the rest in `merged`
     known = {f.name for f in fields(Config)}
     cfg_kwargs = {k: v for k, v in merged.items() if k in known}
     cfg = Config(**cfg_kwargs)
+    if cfg.generation_backend == "vllm" and int(cfg.num_gpus or 0) < 1:
+        raise ValueError("vLLM generation requires num_gpus >= 1")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 
@@ -1512,7 +1557,8 @@ def main():
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
-    print(f"Backend:            {cfg.backend}")
+    print(f"Training backend:   {cfg.backend}")
+    print(f"Generation backend: {cfg.generation_backend}")
     print(f"Target:             {cfg.target}")
     print(f"Steps:              {cfg.num_steps}")
     print(f"Groups per step:    {cfg.groups_per_step}")
@@ -1611,15 +1657,20 @@ def main():
               f"from {n_rollouts} earlier rollouts")
     print(f"[init] sampler archive size = {sampler.archive_size()}")
 
-    # ---- generation pool (multi-GPU) ----
+    # ---- generation pool ----
     gen_pool = None
-    if cfg.num_gpus and cfg.num_gpus > 1:
+    # The original HF path stays in-process for one GPU. vLLM always runs in a
+    # worker so its CUDA/runtime state is isolated from the training model.
+    use_gen_pool = bool(cfg.num_gpus) and (
+        cfg.num_gpus > 1 or cfg.generation_backend == "vllm")
+    if use_gen_pool:
         from gen_workers import GenerationPool
         if cfg.gpu_ids:
             gpu_ids = [int(x) for x in cfg.gpu_ids.split(",")]
         else:
             gpu_ids = list(range(cfg.num_gpus))
-        print(f"[init] starting generation pool: {cfg.num_gpus} GPUs {gpu_ids}")
+        print(f"[init] starting {cfg.generation_backend} generation pool: "
+              f"{cfg.num_gpus} GPUs {gpu_ids}")
         gen_pool = GenerationPool(
             model_name=cfg.model_name,
             num_workers=cfg.num_gpus,
@@ -1628,10 +1679,17 @@ def main():
             load_in_4bit=cfg.load_in_4bit,
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
+            backend=cfg.generation_backend,
+            lora_rank=cfg.lora_rank,
+            vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+            vllm_enforce_eager=cfg.vllm_enforce_eager,
+            vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
         )
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
+            limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
+                          else "micro-batch")
             print(f"[init] generation pool ready "
-                  f"(micro-batch {cfg.gen_micro_batch}/GPU, chunked)")
+                  f"({limit_name} {cfg.gen_micro_batch}/GPU)")
         else:
             print("[init] generation pool ready")
     else:

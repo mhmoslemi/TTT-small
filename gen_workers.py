@@ -1,41 +1,36 @@
 """
-Multi-GPU generation pool (Approach 2b).
+Persistent multi-GPU rollout generation pool.
 
 We run one persistent worker process per GPU. Each worker:
-  - loads a PLAIN transformers copy of the base model on its GPU (no Unsloth)
-  - wraps it with the current LoRA adapter (loaded from a file on disk)
-  - generates its share of rollouts with batched model.generate()
-  - reloads the adapter from disk at the start of each step (weight sync)
+  - loads either a plain Transformers model or a vLLM engine
+  - applies the current LoRA adapter saved by the trainer
+  - generates its share of rollouts in batches
   - reports results PER JOB so the main process can (a) drive a rollout progress
     bar and (b) start evaluating each rollout's program on CPU threads WHILE the
     GPUs keep generating the rest.
 
-The MAIN process (in train_multy.py) keeps the Unsloth model for TRAINING only.
-Each step it saves the LoRA adapter to a directory, then asks the pool to
-generate using that adapter. This keeps Unsloth where it helps (the backward
-pass) and uses boring-but-reliable HF for generation across all GPUs.
+The main process owns the differentiable training model. Each step it saves the
+small LoRA adapter to a new directory, then asks the pool to generate with those
+weights. In vLLM mode this is deliberately a trainer/rollout split: vLLM is the
+fast inference engine, while HF+PEFT (or optionally Unsloth) performs backward.
 
 IMPORTANCE SAMPLING (fix 6) IS DISABLED FOR SPEED.
 We do NOT compute per-token behavior logprobs; generation returns tokens only.
 generate_groups() fills the trainer's logprob slot with None (read as on-policy,
 IS ratio = 1). iter_group_jobs() yields plain (text, token_ids) pairs.
 
-SEEDING. Each worker reseeds random / numpy / torch from (seed, step, rank)
-before every task, rather than seeding once at startup and letting the stream
-advance. Keying on the step is what makes step t reproducible on its own: it no
-longer depends on how many generations happened before it, so a memory run and
-a no-memory run draw the same samples at step 0, and the memory maker's own
-calls (which use step_idx + 1_000_000) cannot shift the rollout stream.
+SEEDING. HF workers reseed random / numpy / torch from (seed, step, rank)
+before every task. vLLM workers use stable per-request seeds derived from
+(seed, step, rank, group). Keying on the step makes step t reproducible on its
+own, and the memory maker's offset calls cannot shift the rollout stream.
 Determinism holds for a fixed num_gpus, group_size AND gen_micro_batch, since
 distribute_jobs splits the group across workers and changing the split (or the
 micro-batch chunking) changes which sequence each worker draws.
 
-OOM RECOVERY. The worker halves its per-call sequence count and retries when
-generate() OOMs, and keeps the reduced size for the rest of the run. This
-mirrors the single-GPU path in train_multy.py. Without it a step whose parents
-have grown longer than the seed states (longer prompt -> larger eager prefill
-attention) killed the worker outright, and the main process then hung forever
-on result_queue.get().
+OOM RECOVERY. The HF worker halves its per-call sequence count and retries when
+generate() OOMs. vLLM owns scheduling and KV-cache admission itself; an engine
+failure is sent back to the main process and aborts the step instead of hanging
+or silently converting an infrastructure problem into low rewards.
 
 No async. Plain torch.multiprocessing with persistent workers and queues.
 
@@ -47,7 +42,8 @@ Protocol (per step):
 """
 
 import os
-import time
+import queue
+import traceback
 import multiprocessing as mp
 
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
@@ -125,8 +121,8 @@ def worker_seed(seed, step, rank):
     return (int(seed) * 1_000_003 + int(step) * 1009 + int(rank) * 7 + 13) % (2 ** 31 - 1)
 
 
-def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
-                 task_queue, result_queue, ready_queue, seed=None):
+def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
+                    task_queue, result_queue, ready_queue, seed=None, **_unused):
     """
     Persistent worker. Loads the model once, then serves generation tasks
     until it receives None.
@@ -207,7 +203,7 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     gen_cap = 0
 
     # Signal that we finished loading
-    ready_queue.put(rank)
+    ready_queue.put(("ready", rank, ""))
 
     while True:
         task = task_queue.get()
@@ -311,45 +307,242 @@ def _worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     print(f"[worker {rank}] shutting down", flush=True)
 
 
+def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
+                        lora_rank, gpu_memory_utilization,
+                        enforce_eager=False, enable_prefix_caching=True,
+                        max_num_seqs=0, seed=None):
+    """Build vLLM constructor arguments without importing vLLM.
+
+    Kept separate both for unit testing and so the parent process never imports
+    vLLM/CUDA before workers are pinned to their GPUs.
+    """
+    supported_lora_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+    requested_rank = int(lora_rank)
+    if requested_rank < 1:
+        raise ValueError("LoRA rank must be positive")
+    max_lora_rank = next(
+        (rank for rank in supported_lora_ranks if rank >= requested_rank), None)
+    if max_lora_rank is None:
+        raise ValueError(
+            f"vLLM LoRA rank {requested_rank} exceeds supported maximum "
+            f"{supported_lora_ranks[-1]}")
+
+    kwargs = {
+        "model": model_name,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "max_model_len": int(max_seq_length),
+        "enable_lora": True,
+        "max_lora_rank": max_lora_rank,
+        "max_loras": 1,
+        "max_cpu_loras": 2,
+        "gpu_memory_utilization": float(gpu_memory_utilization),
+        "enforce_eager": bool(enforce_eager),
+        "enable_prefix_caching": bool(enable_prefix_caching),
+        "disable_log_stats": True,
+    }
+    if int(max_num_seqs or 0) > 0:
+        kwargs["max_num_seqs"] = int(max_num_seqs)
+    if seed is not None:
+        kwargs["seed"] = int(seed)
+    if load_in_4bit:
+        # Current vLLM uses the out-of-tree vllm-bnb-plugin for this mode.
+        # Pre-quantized checkpoints are inferred automatically, but explicitly
+        # requesting 4-bit here means in-flight BitsAndBytes quantization.
+        kwargs["quantization"] = "bitsandbytes"
+    return kwargs
+
+
+def _vllm_job_seed(seed, step, rank, group_idx):
+    """Stable per-request seed; None preserves vLLM's stochastic default."""
+    if seed is None:
+        return None
+    return (worker_seed(seed, step, rank) + int(group_idx) * 104_729) % (2 ** 31 - 1)
+
+
+def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
+                      task_queue, result_queue, ready_queue, seed=None,
+                      lora_rank=32, gpu_memory_utilization=0.9,
+                      enforce_eager=False, enable_prefix_caching=True,
+                      gen_micro_batch=0):
+    """Persistent vLLM engine, one process and one engine per generation GPU."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if seed is not None:
+        # vLLM documents this setting for deterministic V1 offline inference.
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    try:
+        from vllm import LLM, SamplingParams
+        from vllm.lora.request import LoRARequest
+
+        engine_seed = (worker_seed(seed, 0, rank) if seed is not None
+                       else int.from_bytes(os.urandom(4), "little") % (2 ** 31 - 1))
+        engine_kwargs = _vllm_engine_kwargs(
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            load_in_4bit=load_in_4bit,
+            lora_rank=lora_rank,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            enable_prefix_caching=enable_prefix_caching,
+            max_num_seqs=gen_micro_batch,
+            seed=engine_seed,
+        )
+        print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
+              f"{gpu_id} ...", flush=True)
+        llm = LLM(**engine_kwargs)
+    except Exception:
+        ready_queue.put(("error", rank, traceback.format_exc()))
+        return
+
+    # Paths are versioned (adapter_step000, adapter_step001, ...). Giving each
+    # path a unique positive id prevents vLLM from serving a stale cached LoRA.
+    adapter_ids = {}
+    next_adapter_id = 1
+    ready_queue.put(("ready", rank, ""))
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        step, adapter_path, jobs, gen_kwargs = task
+        if not jobs:
+            continue
+
+        try:
+            lora_request = None
+            if adapter_path is not None:
+                adapter_key = os.path.realpath(os.fspath(adapter_path))
+                if adapter_key not in adapter_ids:
+                    adapter_ids[adapter_key] = next_adapter_id
+                    next_adapter_id += 1
+                adapter_id = adapter_ids[adapter_key]
+                lora_request = LoRARequest(
+                    f"ttt_adapter_{adapter_id}", adapter_id, adapter_key)
+
+            # One call gives vLLM the whole worker workload so its scheduler can
+            # batch different prompts and all n samples under the memory limit.
+            prompts = [prompt for (_group_idx, prompt, _count) in jobs]
+            sampling = [
+                SamplingParams(
+                    n=int(count),
+                    max_tokens=int(gen_kwargs["max_new_tokens"]),
+                    temperature=float(gen_kwargs["temperature"]),
+                    top_p=float(gen_kwargs["top_p"]),
+                    seed=_vllm_job_seed(seed, step, rank, group_idx),
+                    skip_special_tokens=True,
+                )
+                for (group_idx, _prompt, count) in jobs
+            ]
+            outputs = llm.generate(
+                prompts,
+                sampling_params=sampling,
+                lora_request=lora_request,
+                use_tqdm=False,
+            )
+
+            for job_pos, (group_idx, _prompt, count) in enumerate(jobs):
+                request_output = (outputs[job_pos]
+                                  if job_pos < len(outputs) else None)
+                job_results = ([
+                    (candidate.text, list(candidate.token_ids))
+                    for candidate in request_output.outputs
+                ][:int(count)] if request_output is not None else [])
+                # Preserve the queue contract even if an engine/version returns
+                # fewer samples than requested; downstream treats these as
+                # invalid rollouts instead of blocking forever.
+                if len(job_results) < int(count):
+                    job_results.extend(
+                        [("", []) for _ in range(int(count) - len(job_results))])
+                result_queue.put((rank, group_idx, job_results))
+        except Exception:
+            detail = traceback.format_exc()
+            print(f"[vllm worker {rank}] generation failed:\n{detail}",
+                  flush=True)
+            result_queue.put((rank, None, {"error": detail}))
+
+    print(f"[vllm worker {rank}] shutting down", flush=True)
+
+
 class GenerationPool:
     """
-    Manages num_workers persistent generation processes (one per GPU).
+    Manages persistent generation processes (one engine per GPU).
+
+    backend="hf" preserves the original Transformers workers. backend="vllm"
+    uses vLLM for rollout inference while keeping exactly the same queue API.
     """
 
     def __init__(self, model_name, num_workers, gpu_ids=None,
                  max_seq_length=4096, load_in_4bit=False, seed=None,
-                 gen_micro_batch=0):
+                 gen_micro_batch=0, backend="hf", lora_rank=32,
+                 vllm_gpu_memory_utilization=0.9,
+                 vllm_enforce_eager=False,
+                 vllm_enable_prefix_caching=True):
         self.model_name = model_name
-        self.num_workers = num_workers
+        self.num_workers = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
         self.gen_micro_batch = int(gen_micro_batch or 0)
-        assert len(self.gpu_ids) == num_workers
+        self.backend = str(backend).lower()
+        if self.backend not in ("hf", "vllm"):
+            raise ValueError(
+                f"unknown generation backend {backend!r}; expected hf|vllm")
+        if len(self.gpu_ids) != self.num_workers:
+            raise ValueError("gpu_ids must contain exactly num_workers entries")
+        if len(set(self.gpu_ids)) != len(self.gpu_ids):
+            raise ValueError("gpu_ids must not contain duplicates")
 
         ctx = mp.get_context("spawn")
-        self.task_queues = [ctx.Queue() for _ in range(num_workers)]
+        self.task_queues = [ctx.Queue() for _ in range(self.num_workers)]
         self.result_queue = ctx.Queue()
         ready_queue = ctx.Queue()
 
         self.procs = []
-        for r in range(num_workers):
+        worker_target = (_vllm_worker_loop
+                         if self.backend == "vllm" else _hf_worker_loop)
+        worker_options = {
+            "lora_rank": int(lora_rank),
+            "gpu_memory_utilization": float(vllm_gpu_memory_utilization),
+            "enforce_eager": bool(vllm_enforce_eager),
+            "enable_prefix_caching": bool(vllm_enable_prefix_caching),
+            "gen_micro_batch": self.gen_micro_batch,
+        }
+        for r in range(self.num_workers):
             p = ctx.Process(
-                target=_worker_loop,
+                target=worker_target,
                 args=(r, self.gpu_ids[r], model_name, max_seq_length,
                       load_in_4bit, self.task_queues[r], self.result_queue,
                       ready_queue, self.seed),
-                daemon=True,
+                kwargs=worker_options,
+                # vLLM may manage child processes depending on its version and
+                # engine settings; Python daemonic processes cannot do that.
+                daemon=(self.backend != "vllm"),
             )
             p.start()
             self.procs.append(p)
 
         # Wait for all workers to finish loading
-        print(f"[pool] waiting for {num_workers} workers to load ...", flush=True)
+        print(f"[pool] waiting for {self.num_workers} {self.backend} worker(s) "
+              f"to load ...", flush=True)
         loaded = 0
-        while loaded < num_workers:
-            ready_queue.get()
+        while loaded < self.num_workers:
+            try:
+                status, rank, detail = ready_queue.get(timeout=1.0)
+            except queue.Empty:
+                dead = [(idx, proc.exitcode) for idx, proc in enumerate(self.procs)
+                        if proc.exitcode is not None]
+                if dead:
+                    self.shutdown()
+                    raise RuntimeError(
+                        f"generation worker(s) exited during startup: {dead}")
+                continue
+            if status == "error":
+                self.shutdown()
+                raise RuntimeError(
+                    f"{self.backend} generation worker {rank} failed to start:\n"
+                    f"{detail}")
             loaded += 1
-            print(f"[pool] {loaded}/{num_workers} workers ready", flush=True)
+            print(f"[pool] {loaded}/{self.num_workers} workers ready", flush=True)
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
@@ -392,7 +585,21 @@ class GenerationPool:
         bar = make_progress_bar(total_expected, desc="rollouts") if show_progress else None
         try:
             while collected < total_expected:
-                rank, group_idx, job_results = self.result_queue.get()
+                try:
+                    rank, group_idx, job_results = self.result_queue.get(timeout=1.0)
+                except queue.Empty:
+                    dead = [(idx, proc.exitcode)
+                            for idx, proc in enumerate(self.procs)
+                            if proc.exitcode is not None]
+                    if dead:
+                        raise RuntimeError(
+                            f"generation worker(s) exited during inference: {dead}")
+                    continue
+                if group_idx is None and isinstance(job_results, dict):
+                    detail = job_results.get("error", "unknown worker failure")
+                    raise RuntimeError(
+                        f"generation worker {rank} failed during inference:\n"
+                        f"{detail}")
                 collected += len(job_results)
                 if bar is not None:
                     bar.update(len(job_results))

@@ -1,3 +1,27 @@
+# vLLM rollout backend
+
+The search loop can run without Unsloth by using HF+PEFT for the differentiable
+LoRA update and vLLM for rollout inference:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 python train_multy.py \
+  --problem erdos --config configs/erdos.yaml \
+  --backend vllm --num-gpus 4 --gpu-ids 1,2,3,4
+```
+
+`--backend vllm` is shorthand for `--backend hf --generation-backend vllm`.
+This split is necessary because vLLM is an inference engine and does not provide
+the gradient/backward pass used by the online update. GPU 0 in the example owns
+the training model; the four vLLM workers use GPUs 1--4. The normal HF worker
+path remains the default, so existing commands are unchanged.
+
+Install vLLM in a PyTorch/CUDA-compatible environment following the
+[official GPU installation guide](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/).
+If `--load-in-4bit` is used, current vLLM releases also require
+`vllm-bnb-plugin`. Useful controls are `--vllm-gpu-memory-utilization`,
+`--vllm-enforce-eager`, `--no-vllm-prefix-caching`, and `--gen-micro-batch`
+(mapped to vLLM's `max_num_seqs`).
+
 <!-- # TTT-Discover — Local 
 
 
