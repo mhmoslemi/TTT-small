@@ -181,9 +181,8 @@ else
     CUDA_VISIBLE_DEVICES=0,1,2,3,4 python train_multy.py --problem erdos --config configs/erdos.yaml \
         --num-steps 22 --deterministic --seed 42 \
         --groups-per-step 5 --group-size 16 \
-        --max-groups-per-step 5 --max-group-size 16 \
-        --growth-force-step 3 --num-gpus 5 --gpu-ids 0,1,2,3,4 \
-        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback --feedback-max-per-step 16 --feedback-max-per-signature 4 \
+        --growth-force-step 3 --gpu-ids 0,1,2,3,4 \
+        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback \
         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
 fi
  

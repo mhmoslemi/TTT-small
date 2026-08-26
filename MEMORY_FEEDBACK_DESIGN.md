@@ -50,8 +50,9 @@ controlled by the current step's validity rate:
 - zero at or above `feedback_validity_target`.
 
 Teacher examples are selected round-robin across normalized verifier failure
-signatures. `feedback_max_per_step` bounds total extra forwards and
-`feedback_max_per_signature` prevents one repeated crash from dominating. The
+signatures. By default, `feedback_max_per_step=0` resolves to 20% of the current
+G*K batch and `feedback_max_per_signature=0` resolves to 25% of that teacher
+budget. Positive values remain fixed overrides; `-1` means unlimited. The
 mean magnitude of the already-weighted feedback advantage is capped relative
 to the max-seeking reward advantage by `feedback_max_reward_ratio`. A small
 `feedback_reward_scale_floor` still allows repair learning in an all-failed,

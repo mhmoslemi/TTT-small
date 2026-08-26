@@ -12,6 +12,7 @@ from gen_workers import (
     _vllm_job_seed,
     _vllm_worker_loop,
 )
+from feedback import FeedbackConfig
 
 
 class _Queue:
@@ -26,6 +27,19 @@ class _Queue:
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_feedback_caps_scale_from_current_batch(self):
+        cfg = FeedbackConfig(enabled=True)
+        self.assertEqual(cfg.resolve_caps(5, 16), (16, 4))
+        self.assertEqual(cfg.resolve_caps(8, 64), (103, 26))
+
+    def test_feedback_caps_keep_explicit_and_unlimited_modes(self):
+        fixed = FeedbackConfig(
+            enabled=True, max_per_step=12, max_per_signature=3)
+        self.assertEqual(fixed.resolve_caps(20, 100), (12, 3))
+        unlimited = FeedbackConfig(
+            enabled=True, max_per_step=-1, max_per_signature=-1)
+        self.assertEqual(unlimited.resolve_caps(5, 16), (0, 0))
+
     def test_vllm_engine_kwargs_map_runtime_controls(self):
         kwargs = _vllm_engine_kwargs(
             model_name="org/model",
@@ -197,6 +211,32 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(cfg.generation_backend, "vllm")
         self.assertEqual(merged["backend"], "hf")
         self.assertEqual(merged["generation_backend"], "vllm")
+
+    def test_batch_maxima_and_gpu_count_are_derived(self):
+        fake_numpy = types.ModuleType("numpy")
+        fake_yaml = types.ModuleType("yaml")
+        fake_yaml.safe_load = lambda _stream: {}
+        sys.modules.pop("train_multy", None)
+
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            from train_multy import load_config
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "empty.yaml"
+                config_path.write_text("{}\n")
+                argv = [
+                    "train_multy.py", "--config", str(config_path),
+                    "--groups-per-step", "5", "--group-size", "16",
+                    "--gpu-ids", "0,2,4,6,7",
+                ]
+                with patch.object(sys, "argv", argv):
+                    cfg, merged = load_config()
+
+        self.assertEqual(cfg.max_groups_per_step, 5)
+        self.assertEqual(cfg.max_group_size, 16)
+        self.assertEqual(cfg.num_gpus, 5)
+        self.assertEqual(cfg.gpu_ids, "0,2,4,6,7")
+        self.assertEqual(merged["num_gpus"], 5)
 
 
 if __name__ == "__main__":

@@ -68,8 +68,10 @@ class Config:
     # clamped to (max_groups_per_step, max_group_size). Growth is monotonic: it
     # never shrinks. At step >= growth_force_step, (G, K) are pinned to the max
     # no matter what the signals say.
-    max_groups_per_step: int = 8
-    max_group_size: int = 64
+    # None means "same as the starting value"; explicit larger values enable
+    # adaptive growth. Resolved to concrete ints during config loading.
+    max_groups_per_step: Optional[int] = None
+    max_group_size: Optional[int] = None
     growth_force_step: int = 10    # from this step on, run at max unconditionally
     growth_valid_yield: float = 0.7   # best group's valid fraction must reach this
     growth_distinct_min: int = 4      # this many distinct improved children needed
@@ -113,11 +115,10 @@ class Config:
     reward_workers: int = 0
 
     # Multi-GPU generation
-    num_gpus: int = 4
-    # num_gpus: int = 1
-    # gpu_ids: str = "0,1,2,3,4,5,6,7"
-    gpu_ids: str = "1,2,4,6"
-    # gpu_ids: str = "1"
+    # gpu_ids is authoritative when present; num_gpus is derived from its
+    # length. Passing --num-gpus alone selects devices 0..N-1.
+    num_gpus: Optional[int] = None
+    gpu_ids: str = "0"
     # Max sequences each GPU holds per generate() call. The worker loops in
     # chunks of this size until the group's rollouts are done, so group_size can
     # be anything while per-GPU KV memory stays bounded by this. 0 = one shot
@@ -185,7 +186,9 @@ class Config:
     feedback_lambda_final: float = 0.0
     feedback_clip: float = 5.0             # clamp |A^fb| per token; 0 = Eq. 9 as written
     feedback_chars: int = 1200             # verifier text budget in the reprompt
-    feedback_max_per_step: int = 0         # 0 = every failed rollout
+    # 0 = auto (20% of current G*K); -1 = all failures; >0 = explicit cap.
+    feedback_max_per_step: int = 0
+    feedback_auto_fraction: float = 0.20
     feedback_include_constant_groups: bool = True
     feedback_inject_mode: str = "append"   # append | user_turn
     feedback_normalize: bool = False
@@ -194,7 +197,9 @@ class Config:
     feedback_validity_target: float = 0.9
     feedback_max_reward_ratio: float = 0.0
     feedback_reward_scale_floor: float = 0.25
+    # 0 = auto (25% of step cap); -1 = unlimited; >0 = explicit cap.
     feedback_max_per_signature: int = 0
+    feedback_auto_signature_fraction: float = 0.25
 
 
 # ======================================================================
@@ -250,9 +255,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-seed-states", type=int, default=None)
     # ---- adaptive batch growth (groups-per-step / group-size are the START) --
     p.add_argument("--max-groups-per-step", type=int, default=None,
-                   help="Cap that G (groups per step) ratchets up to.")
+                   help="Cap that G ratchets up to. Omit to use the starting G.")
     p.add_argument("--max-group-size", type=int, default=None,
-                   help="Cap that K (rollouts per group) ratchets up to.")
+                   help="Cap that K ratchets up to. Omit to use the starting K.")
     p.add_argument("--growth-force-step", type=int, default=None,
                    help="From this step on, run at (max G, max K) no matter what.")
     p.add_argument("--growth-valid-yield", type=float, default=None,
@@ -289,12 +294,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Threads for reward evaluation. 0 = auto. Use 1 for any "
                         "problem whose reward is a measured runtime.")
     p.add_argument("--num-gpus", type=int, default=None,
-                   help="Number of GPUs for parallel generation. 1 = single-process "
-                        "in-line generation (no worker pool). >1 spawns that many "
-                        "plain-HF generation workers, one per GPU.")
+                   help="Number of generation GPUs. Normally omit this: it is "
+                        "derived from --gpu-ids. Passing it alone selects 0..N-1.")
     p.add_argument("--gpu-ids", type=str, default=None,
                    help="Comma-separated physical GPU ids for the workers, e.g. "
-                        "'0,1,2,3,4,5,6,7'. Defaults to 0..num_gpus-1.")
+                        "'0,1,2,3,4,5,6,7'. Its length sets num_gpus.")
     p.add_argument("--gen-micro-batch", type=int, default=None,
                    help="Max sequences each GPU holds per generate() call. The "
                         "worker loops in chunks of this size until the group's "
@@ -396,7 +400,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--feedback-lambda-final", type=float, default=None)
     p.add_argument("--feedback-clip", type=float, default=None)
     p.add_argument("--feedback-chars", type=int, default=None)
-    p.add_argument("--feedback-max-per-step", type=int, default=None)
+    p.add_argument("--feedback-max-per-step", type=int, default=None,
+                   help="Teacher-forward cap: 0 = auto from G*K, -1 = all, "
+                        ">0 = fixed override.")
+    p.add_argument("--feedback-auto-fraction", type=float, default=None,
+                   help="Automatic teacher budget as a fraction of current G*K "
+                        "(default: 0.20).")
     p.add_argument("--feedback-inject-mode",
                    choices=["append", "user_turn"], default=None)
     p.add_argument("--feedback-normalize", action="store_const",
@@ -411,13 +420,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--feedback-reward-scale-floor", type=float, default=None,
                    help="Nonzero reward scale used to repair constant-failure groups.")
     p.add_argument("--feedback-max-per-signature", type=int, default=None,
-                   help="Cap teacher forwards for any one repeated failure class.")
+                   help="Per-failure-class cap: 0 = auto from the step cap, "
+                        "-1 = unlimited, >0 = fixed override.")
+    p.add_argument("--feedback-auto-signature-fraction", type=float, default=None,
+                   help="Automatic per-signature cap as a fraction of the step "
+                        "cap (default: 0.25).")
 
     return p
 
 
 # CLI arg name -> config key (only where they differ)
 _CLI_TO_CFG = {"lr": "learning_rate"}
+
+
+def _parse_gpu_ids(value) -> list:
+    """Parse and validate the physical GPU list without importing CUDA."""
+    if value is None:
+        return []
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    try:
+        ids = [int(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"gpu_ids must be comma-separated integers: {value!r}") from exc
+    if any(gpu_id < 0 for gpu_id in ids):
+        raise ValueError("gpu_ids must be non-negative")
+    if len(set(ids)) != len(ids):
+        raise ValueError("gpu_ids must not contain duplicates")
+    return ids
 
 
 def load_config():
@@ -526,6 +555,50 @@ def load_config():
     util = float(merged.get("vllm_gpu_memory_utilization", 0.9))
     if not 0.0 < util <= 1.0:
         raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
+
+    # Omitted growth caps mean fixed batch size. Resolve after YAML and CLI so
+    # `--groups-per-step 5 --group-size 16` becomes max G=5, max K=16 even if
+    # the selected problem YAML has different starting values.
+    if args.groups_per_step is not None and args.max_groups_per_step is None:
+        merged["max_groups_per_step"] = int(merged["groups_per_step"])
+    if args.group_size is not None and args.max_group_size is None:
+        merged["max_group_size"] = int(merged["group_size"])
+    if merged.get("max_groups_per_step") is None:
+        merged["max_groups_per_step"] = int(merged["groups_per_step"])
+    if merged.get("max_group_size") is None:
+        merged["max_group_size"] = int(merged["group_size"])
+    if int(merged["max_groups_per_step"]) < int(merged["groups_per_step"]):
+        raise ValueError("max_groups_per_step cannot be below groups_per_step")
+    if int(merged["max_group_size"]) < int(merged["group_size"]):
+        raise ValueError("max_group_size cannot be below group_size")
+
+    # A GPU list is already an exact worker specification, so its length is the
+    # single source of truth. `--num-gpus N` remains as a convenience when no
+    # list is passed and expands to devices 0..N-1.
+    gpu_ids = _parse_gpu_ids(merged.get("gpu_ids"))
+    if args.gpu_ids is not None:
+        if args.num_gpus is not None and int(args.num_gpus) != len(gpu_ids):
+            raise ValueError(
+                f"--num-gpus={args.num_gpus} disagrees with {len(gpu_ids)} "
+                f"id(s) in --gpu-ids")
+        merged["num_gpus"] = len(gpu_ids)
+    elif args.num_gpus is not None:
+        n_gpus = int(args.num_gpus)
+        if n_gpus < 0:
+            raise ValueError("num_gpus must be >= 0")
+        gpu_ids = list(range(n_gpus))
+        merged["num_gpus"] = n_gpus
+    elif gpu_ids:
+        merged["num_gpus"] = len(gpu_ids)
+    else:
+        n_gpus = int(merged.get("num_gpus") or 0)
+        if n_gpus < 0:
+            raise ValueError("num_gpus must be >= 0")
+        gpu_ids = list(range(n_gpus))
+        merged["num_gpus"] = n_gpus
+    merged["gpu_ids"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    print(f"[config] generation GPUs: {gpu_ids} "
+          f"(num_gpus={merged['num_gpus']}, derived from gpu_ids)")
 
     # 5) build the Config from the fields it knows; leave the rest in `merged`
     known = {f.name for f in fields(Config)}
@@ -1320,12 +1393,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # change nothing. Selection is balanced across failure signatures and
     # spread across the batch rather than restricted to the first groups.
     feedback_teacher_rollouts = 0
+    feedback_step_cap = 0
+    feedback_signature_cap = 0
     if fb_on:
+        feedback_step_cap, feedback_signature_cap = fb_cfg.resolve_caps(
+            cfg.groups_per_step, cfg.group_size)
+        total_label = feedback_step_cap or "all"
+        signature_label = feedback_signature_cap or "all"
+        print(f"[step {step_idx}] feedback budget: total={total_label}, "
+              f"per-signature={signature_label} for "
+              f"G={cfg.groups_per_step}, K={cfg.group_size}")
         with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt_text")]
         signatures = [ex.get("failure_signature", "unknown") for ex in all_examples]
         keep = set(select_balanced(
-            with_fb, signatures, total_cap=int(fb_cfg.max_per_step),
-            per_signature_cap=int(getattr(fb_cfg, "max_per_signature", 0))))
+            with_fb, signatures, total_cap=feedback_step_cap,
+            per_signature_cap=feedback_signature_cap))
         if len(keep) < len(with_fb):
             for i in with_fb:
                 if i not in keep:
@@ -1369,6 +1451,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "valid_fraction": float(valid_fraction),
         "feedback_lambda_effective": float(fb_lambda),
         "feedback_teacher_rollouts": int(feedback_teacher_rollouts),
+        "feedback_step_cap": int(feedback_step_cap),
+        "feedback_signature_cap": int(feedback_signature_cap),
         "memory_arm_rollouts": mem_arm_rollouts,
         "memory_arm_updates": mem_arm_updates,
     }
@@ -1665,10 +1749,7 @@ def main():
         cfg.num_gpus > 1 or cfg.generation_backend == "vllm")
     if use_gen_pool:
         from gen_workers import GenerationPool
-        if cfg.gpu_ids:
-            gpu_ids = [int(x) for x in cfg.gpu_ids.split(",")]
-        else:
-            gpu_ids = list(range(cfg.num_gpus))
+        gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
         print(f"[init] starting {cfg.generation_backend} generation pool: "
               f"{cfg.num_gpus} GPUs {gpu_ids}")
         gen_pool = GenerationPool(

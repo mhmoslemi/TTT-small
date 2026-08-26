@@ -26,9 +26,9 @@ optimizer.step() once at the end, so throughout that loop theta == thetabar and
 `cur_lp.detach()` from the existing forward IS log pi_thetabar. Only the
 feedback-conditioned forward is new, and it runs under no_grad.
 
-Cost: one extra prompt+response forward per FAILED rollout. In your runs
-failures are 50-70% of 512, so expect the train phase to grow by roughly half
-unless you cap it with feedback_max_per_step.
+Cost: one extra prompt+response forward per selected FAILED rollout. By default
+the teacher budget scales with the current rollout batch instead of being a
+fixed count, so adaptive changes to G or K preserve the same compute fraction.
 """
 
 from __future__ import annotations
@@ -58,7 +58,9 @@ class FeedbackConfig:
     lambda_final: float = 0.0
     clip: float = 5.0             # clamp |A^fb| per token; 0 disables (paper has no clip)
     chars: int = 1200             # verifier text budget in the reprompt
-    max_per_step: int = 0         # 0 = every failed rollout; >0 caps the extra forwards
+    # 0 = automatic fraction of G*K; -1 = every failure; >0 = explicit cap.
+    max_per_step: int = 0
+    auto_fraction: float = 0.20
     include_constant_groups: bool = True
     inject_mode: str = "append"   # append | user_turn
     normalize: bool = False       # standardize A^fb within a response
@@ -76,7 +78,9 @@ class FeedbackConfig:
     # cannot silently become the main scientific objective.
     max_reward_ratio: float = 0.0  # 0 disables the bound (legacy)
     reward_scale_floor: float = 0.25
-    max_per_signature: int = 0     # cap repeated copies of one failure class
+    # 0 = automatic fraction of the step cap; -1 = unlimited; >0 = explicit.
+    max_per_signature: int = 0
+    auto_signature_fraction: float = 0.25
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any], verbose: bool = True) -> "FeedbackConfig":
@@ -136,8 +140,10 @@ class FeedbackConfig:
             raise ValueError("feedback_clip must be >= 0")
         if self.chars < 0:
             raise ValueError("feedback_chars must be >= 0")
-        if self.max_per_step < 0:
-            raise ValueError("feedback_max_per_step must be >= 0")
+        if self.max_per_step < -1:
+            raise ValueError("feedback_max_per_step must be -1, 0, or positive")
+        if not 0.0 < self.auto_fraction <= 1.0:
+            raise ValueError("feedback_auto_fraction must be in (0, 1]")
         if self.anneal_steps < 0:
             raise ValueError("feedback_anneal_steps must be >= 0")
         if self.anneal_shape not in ("linear", "cosine"):
@@ -155,8 +161,45 @@ class FeedbackConfig:
             raise ValueError("feedback_max_reward_ratio must be >= 0")
         if self.reward_scale_floor < 0:
             raise ValueError("feedback_reward_scale_floor must be >= 0")
-        if self.max_per_signature < 0:
-            raise ValueError("feedback_max_per_signature must be >= 0")
+        if self.max_per_signature < -1:
+            raise ValueError(
+                "feedback_max_per_signature must be -1, 0, or positive")
+        if not 0.0 < self.auto_signature_fraction <= 1.0:
+            raise ValueError(
+                "feedback_auto_signature_fraction must be in (0, 1]")
+
+    def resolve_caps(self, groups: int, group_size: int) -> tuple[int, int]:
+        """Return concrete (step, signature) caps for the current G and K.
+
+        The defaults preserve the user's tuned G=5, K=16 values: 20% of 80 is
+        16 teacher forwards, and 25% of that cap is 4 copies of one signature.
+        Ceil keeps small experiments from accidentally turning feedback off.
+        A returned zero means unlimited, matching select_balanced().
+        """
+        import math
+
+        batch = max(0, int(groups)) * max(0, int(group_size))
+        if self.max_per_step > 0:
+            total_cap = int(self.max_per_step)
+        elif self.max_per_step == 0:
+            total_cap = (max(1, int(math.ceil(batch * self.auto_fraction)))
+                         if batch else 0)
+        else:  # -1: explicitly unlimited
+            total_cap = 0
+
+        if self.max_per_signature > 0:
+            signature_cap = int(self.max_per_signature)
+        elif self.max_per_signature == 0:
+            basis = total_cap or batch
+            signature_cap = (
+                max(1, int(math.ceil(basis * self.auto_signature_fraction)))
+                if basis else 0)
+        else:  # -1: explicitly unlimited
+            signature_cap = 0
+
+        if total_cap > 0 and signature_cap > 0:
+            signature_cap = min(signature_cap, total_cap)
+        return total_cap, signature_cap
 
     def lambda_at(self, step: int) -> float:
         """
@@ -205,10 +248,18 @@ class FeedbackConfig:
         sched = (f"lambda_f={self.lambda_f}" if self.anneal_steps <= 0
                  else f"lambda_f {self.lambda_f}->{self.lambda_final} over "
                       f"{self.anneal_steps} steps ({self.anneal_shape})")
+        cap = (f"auto {self.auto_fraction:.0%} of G*K"
+               if self.max_per_step == 0
+               else "all" if self.max_per_step < 0
+               else str(self.max_per_step))
+        sig_cap = (f"auto {self.auto_signature_fraction:.0%} of cap"
+                   if self.max_per_signature == 0
+                   else "all" if self.max_per_signature < 0
+                   else str(self.max_per_signature))
         return (f"feedback signal ON  {sched}  "
                 f"clip={self.clip or 'none'}  "
                 f"constant_groups={'in' if self.include_constant_groups else 'out'}  "
-                f"cap={self.max_per_step or 'all'}"
+                f"cap={cap}  signature-cap={sig_cap}"
                 + (f"  adaptive-validity={self.validity_floor:.0%}-"
                    f"{self.validity_target:.0%}"
                    if self.adaptive else "")
