@@ -234,6 +234,15 @@ Make sure to think and return the final program between ```python and ```.'''
     # ------------------------------------------------------------------
     def score(self, output: Any, stdout: str) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
+        if not isinstance(output, list) or not output:
+            res.msg = "bad_return_sequence"
+            res.failure_kind = "code"
+            return res
+        if any(isinstance(x, bool) or not isinstance(x, (int, float))
+               or not np.isfinite(x) for x in output):
+            res.msg = "bad_return_values"
+            res.failure_kind = "code"
+            return res
         if not self._verify(output):
             res.msg = "Invalid solution."
             return res

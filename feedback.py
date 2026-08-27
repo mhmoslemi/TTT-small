@@ -1,5 +1,5 @@
 """
-Feedback-based failure signal (Sec. 2.3, Eq. 9).
+Feedback-based program-repair signal (Sec. 2.3, Eq. 9).
 
 A scalar reward says a rollout failed. It does not say which tokens caused the
 failure. Eq. 9 recovers that by reusing the rollout policy as a
@@ -18,7 +18,8 @@ Combined per Sec. 2.3:
 
     A_{i,l} = A^rew_i + lambda_f * d_i * A^fb_{i,l}
 
-with d_i the failure indicator, so successful rollouts are untouched.
+with d_i indicating a code-level failure. Scientific constraint violations,
+timeouts, low scores, and infrastructure failures are deliberately excluded.
 
 ONE FORWARD PASS, NOT TWO. The second term above is log pi_thetabar, the
 rollout policy. The trainer accumulates gradients over every example and calls
@@ -26,9 +27,10 @@ optimizer.step() once at the end, so throughout that loop theta == thetabar and
 `cur_lp.detach()` from the existing forward IS log pi_thetabar. Only the
 feedback-conditioned forward is new, and it runs under no_grad.
 
-Cost: one extra prompt+response forward per selected FAILED rollout. By default
-the teacher budget scales with the current rollout batch instead of being a
-fixed count, so adaptive changes to G or K preserve the same compute fraction.
+Cost: one extra prompt+response forward per selected CODE-FAILED rollout. By
+default the teacher budget scales with the current rollout batch instead of
+being a fixed count, so adaptive changes to G or K preserve the same compute
+fraction.
 """
 
 from __future__ import annotations
@@ -58,7 +60,8 @@ class FeedbackConfig:
     lambda_final: float = 0.0
     clip: float = 5.0             # clamp |A^fb| per token; 0 disables (paper has no clip)
     chars: int = 1200             # verifier text budget in the reprompt
-    # 0 = automatic fraction of G*K; -1 = every failure; >0 = explicit cap.
+    # 0 = automatic fraction of G*K; -1 = every eligible code failure;
+    # >0 = explicit cap.
     max_per_step: int = 0
     auto_fraction: float = 0.20
     include_constant_groups: bool = True
@@ -66,10 +69,11 @@ class FeedbackConfig:
     normalize: bool = False       # standardize A^fb within a response
 
     # --- adaptive repair budget ---
-    # A fixed time schedule cannot tell whether failures are still the
+    # A fixed time schedule cannot tell whether code failures are still the
     # bottleneck. When enabled, the scheduled coefficient is multiplied by a
-    # validity-deficit controller: full below `validity_floor`, zero at/above
-    # `validity_target`, linear between them.
+    # code-validity controller: full below `validity_floor`, zero at/above
+    # `validity_target`, linear between them. Config names retain "validity"
+    # for compatibility with existing YAML files.
     adaptive: bool = False
     validity_floor: float = 0.5
     validity_target: float = 0.9
@@ -229,7 +233,7 @@ class FeedbackConfig:
         return "  ".join(pts)
 
     def effective_lambda(self, step: int, valid_fraction: float) -> float:
-        """Scheduled coefficient, optionally gated by the observed validity."""
+        """Scheduled coefficient, optionally gated by code-valid rollouts."""
         base = self.lambda_at(step)
         if not self.adaptive:
             return base
@@ -260,7 +264,7 @@ class FeedbackConfig:
                 f"clip={self.clip or 'none'}  "
                 f"constant_groups={'in' if self.include_constant_groups else 'out'}  "
                 f"cap={cap}  signature-cap={sig_cap}"
-                + (f"  adaptive-validity={self.validity_floor:.0%}-"
+                + (f"  adaptive-code-validity={self.validity_floor:.0%}-"
                    f"{self.validity_target:.0%}"
                    if self.adaptive else "")
                 + (f"  fb/reward<={self.max_reward_ratio:.2f}"
@@ -363,14 +367,23 @@ def render_chat(tokenizer, messages: List[Dict],
         )
 
 
-def is_failure(res, fail_score: float = 0.0) -> bool:
+def is_code_failure(res) -> bool:
+    """Whether a rollout is eligible for token-level program repair.
+
+    Explicit failure kinds are authoritative. The fallback supports older or
+    third-party RewardResult-like objects: parse failures and non-timeout
+    execution failures count, while anything that reached the scientific
+    validator does not.
     """
-    d_i = 1{r_i = 0 or the attempt failed}. `valid` is checked as well as the
-    reward so a problem with a negative fail_score cannot mislabel an invalid
-    rollout as a success.
-    """
-    return not (bool(getattr(res, "valid", False))
-                and float(getattr(res, "reward", 0.0)) > float(fail_score))
+    kind = str(getattr(res, "failure_kind", "") or "").strip().lower()
+    if kind:
+        return kind == "code"
+    if not bool(getattr(res, "parsed", False)):
+        return True
+    if bool(getattr(res, "ran", False)):
+        return False
+    msg = str(getattr(res, "msg", "") or "").lower()
+    return "timeout" not in msg
 
 
 def select_capped(indices: Sequence[int], cap: int) -> List[int]:
@@ -501,10 +514,10 @@ class FeedbackStats:
 
     def line(self, step_idx: int, lam: float) -> str:
         if self.n == 0:
-            return (f"[step {step_idx}] feedback: no failed rollouts scored "
+            return (f"[step {step_idx}] feedback: no code failures scored "
                     f"(lambda={lam:.3f})"
                     + (f", {self.skipped} skipped" if self.skipped else ""))
-        return (f"[step {step_idx}] feedback: {self.n} failed rollouts scored"
+        return (f"[step {step_idx}] feedback: {self.n} code failures scored"
                 + (f" ({self.skipped} skipped)" if self.skipped else "")
                 + f"  lambda={lam:.3f}"
                 f"  mean|lambda*A^fb|={self.sum_abs / self.n:.4f}"

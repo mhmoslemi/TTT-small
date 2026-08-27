@@ -180,7 +180,7 @@ class Config:
     memory_dedup_jaccard: float = 0.6
     memory_persist: bool = True
 
-    # ---- Feedback-based failure signal (Sec. 2.3, Eq. 9) ----
+    # ---- Feedback-based program-repair signal (Sec. 2.3, Eq. 9) ----
     # `feedback` is the master switch, same rule as `memory`: when it is False
     # every feedback_* field below is ignored.
     feedback: bool = False
@@ -190,7 +190,8 @@ class Config:
     feedback_lambda_final: float = 0.0
     feedback_clip: float = 5.0             # clamp |A^fb| per token; 0 = Eq. 9 as written
     feedback_chars: int = 1200             # verifier text budget in the reprompt
-    # 0 = auto (20% of current G*K); -1 = all failures; >0 = explicit cap.
+    # 0 = auto (20% of current G*K); -1 = all eligible code failures;
+    # >0 = explicit cap.
     feedback_max_per_step: int = 0
     feedback_auto_fraction: float = 0.20
     feedback_include_constant_groups: bool = True
@@ -412,8 +413,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--feedback-clip", type=float, default=None)
     p.add_argument("--feedback-chars", type=int, default=None)
     p.add_argument("--feedback-max-per-step", type=int, default=None,
-                   help="Teacher-forward cap: 0 = auto from G*K, -1 = all, "
-                        ">0 = fixed override.")
+                   help="Code-failure teacher cap: 0 = auto from G*K, "
+                        "-1 = all, >0 = fixed override.")
     p.add_argument("--feedback-auto-fraction", type=float, default=None,
                    help="Automatic teacher budget as a fraction of current G*K "
                         "(default: 0.20).")
@@ -423,7 +424,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    const=True, default=None)
     p.add_argument("--feedback-adaptive", action="store_const",
                    const=True, default=None,
-                   help="Gate feedback by the observed step validity rate.")
+                   help="Gate feedback by the observed code-valid rate.")
     p.add_argument("--feedback-validity-floor", type=float, default=None)
     p.add_argument("--feedback-validity-target", type=float, default=None)
     p.add_argument("--feedback-max-reward-ratio", type=float, default=None,
@@ -958,7 +959,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         build_injection, credit_memory_arms, inject_block)
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           build_reprompt, feedback_advantage, format_feedback,
-                          is_failure, render_chat, select_balanced)
+                          is_code_failure, render_chat, select_balanced)
 
     step_t0 = time.time()
     sampler.set_current_step(step_idx)
@@ -994,8 +995,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         fb_cfg is not None and fb_cfg.enabled and fb_base_lambda > 0.0)
     if (fb_cfg is not None and fb_cfg.enabled and not fb_candidate_on):
         print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
-    fail_score = float(getattr(problem, "fail_score", 0.0))
-    reprompt_by_key = {}        # (group, rollout) -> reprompt text for a failure
+    reprompt_by_key = {}    # (group, rollout) -> reprompt for a code failure
 
     all_examples = []
     all_children = []
@@ -1184,6 +1184,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     distinct_good_hashes = set()
     step_valid_count = 0
     step_rollout_count = 0
+    step_code_failure_count = 0
     prompt_ids_by_job = {}
 
     for g, parent in enumerate(parents):
@@ -1209,6 +1210,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             best_valid_yield = max(best_valid_yield, sum(valids) / len(valids))
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
+        step_code_failure_count += sum(is_code_failure(res) for res in outs)
         parent_val = float(parent.value) if parent.value is not None else 0.0
         for r_idx in range(len(responses)):
             if valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val:
@@ -1271,6 +1273,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "parsed": bool(res.parsed),
                 "ran": bool(res.ran),
                 "msg": res.msg,
+                "failure_kind": res.failure_kind,
                 "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
                 "beta": float(beta),
                 "n_response_tokens": len(token_ids),
@@ -1332,14 +1335,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     memory_ids=list(job["memory_ids"]),
                 ))
 
-        # ---- reprompt(x_p, f_i) for every failed rollout (Sec. 2.3) ------
+        # ---- reprompt(x_p, f_i) for code failures only (Sec. 2.3) --------
         # Built here, while the RewardResult is in hand. The teacher forward
         # itself happens in the train loop, where log pi_thetabar is already
         # available from the existing forward pass.
         if fb_candidate_on:
             for r_idx, (text, token_ids, job_idx) in enumerate(responses):
                 res = outs[r_idx]
-                if not is_failure(res, fail_score):
+                if not is_code_failure(res):
                     continue
                 f_i = format_feedback(res.msg or "", res.stdout or "",
                                       int(fb_cfg.chars))
@@ -1390,16 +1393,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     valid_fraction = (step_valid_count / step_rollout_count
                       if step_rollout_count else 0.0)
-    fb_lambda = (fb_cfg.effective_lambda(step_idx, valid_fraction)
+    code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count
+                           if step_rollout_count else 1.0)
+    fb_lambda = (fb_cfg.effective_lambda(step_idx, code_valid_fraction)
                  if fb_cfg is not None and fb_cfg.enabled else 0.0)
     fb_on = bool(fb_candidate_on and fb_lambda > 0.0)
     if fb_candidate_on:
-        print(f"[step {step_idx}] feedback: validity={valid_fraction:.1%}, "
+        print(f"[step {step_idx}] feedback: code-validity="
+              f"{code_valid_fraction:.1%} "
+              f"({step_code_failure_count} code failures), "
               f"scheduled lambda={fb_base_lambda:.4f}, "
               f"effective lambda={fb_lambda:.4f}")
 
     # Constant groups only carry a feedback signal. Drop them when the adaptive
-    # controller turns feedback off after seeing this step's validity.
+    # controller turns feedback off after seeing this step's code validity.
     if not fb_on:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
@@ -1429,7 +1436,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 if i not in keep:
                     all_examples[i]["reprompt_text"] = None
             print(f"[step {step_idx}] feedback: balanced/capped to {len(keep)} "
-                  f"of {len(with_fb)} failed rollouts")
+                  f"of {len(with_fb)} code-failed rollouts")
         feedback_teacher_rollouts = len(keep)
 
         # A constant-reward example with no retained repair prompt has neither
@@ -1481,6 +1488,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "best_valid_yield": float(best_valid_yield),
         "distinct_good": int(len(distinct_good_hashes)),
         "valid_fraction": float(valid_fraction),
+        "feedback_code_valid_fraction": float(code_valid_fraction),
         "feedback_lambda_effective": float(fb_lambda),
         "feedback_teacher_rollouts": int(feedback_teacher_rollouts),
         "feedback_step_cap": int(feedback_step_cap),
@@ -1532,9 +1540,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         kl_adv = cfg.kl_penalty_coef * (avg_logp_diff - (cur_lp - base_lp))
         eff_adv = adv + kl_adv
 
-        # ---- feedback-based failure signal (Sec. 2.3, Eq. 9) -------------
+        # ---- feedback-based program repair (Sec. 2.3, Eq. 9) -------------
         # A_{i,l} = A^rew_i + lambda_f * d_i * A^fb_{i,l}, and d_i is implicit:
-        # reprompt_text is only ever set for a failed rollout.
+        # reprompt_text is only ever set for an eligible code failure.
         #
         # cur_lp.detach() IS log pi_thetabar here. Gradients accumulate across
         # every example and optimizer.step() runs once at the end of the loop,
@@ -1830,7 +1838,7 @@ def main():
     elif legacy_resume is not None and memory is not None:
         print("[resume] warning: legacy memory.json cannot be rolled back to the "
               "restarted step; it will be reused as-is")
-    # ---- feedback-based failure signal (Sec. 2.3) ----
+    # ---- feedback-based program-repair signal (Sec. 2.3) ----
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
     print(f"[init] {fb_cfg.describe()}")

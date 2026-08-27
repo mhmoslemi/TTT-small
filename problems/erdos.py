@@ -240,6 +240,10 @@ Make sure to /think step by step, first give your strategy between <strategy> an
     # ------------------------------------------------------------------
     def score(self, output: Any, stdout: str) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
+        if not (isinstance(output, (tuple, list)) and len(output) == 3):
+            res.msg = "bad_return_shape"
+            res.failure_kind = "code"
+            return res
         if not verify_erdos_solution(output):
             res.msg = "Invalid solution."
             return res

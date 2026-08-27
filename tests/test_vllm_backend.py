@@ -12,7 +12,7 @@ from gen_workers import (
     _vllm_job_seed,
     _vllm_worker_loop,
 )
-from feedback import FeedbackConfig, render_chat
+from feedback import FeedbackConfig, is_code_failure, render_chat
 
 
 class _Queue:
@@ -27,6 +27,25 @@ class _Queue:
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_feedback_only_accepts_code_failures(self):
+        result = types.SimpleNamespace
+        self.assertTrue(is_code_failure(result(
+            failure_kind="code", parsed=True, ran=False, msg="SyntaxError")))
+        self.assertFalse(is_code_failure(result(
+            failure_kind="constraint", parsed=True, ran=True,
+            msg="Invalid solution")))
+        self.assertFalse(is_code_failure(result(
+            failure_kind="timeout", parsed=True, ran=False,
+            msg="Timeout after 120s")))
+        self.assertFalse(is_code_failure(result(
+            failure_kind="infrastructure", parsed=True, ran=False,
+            msg="task files missing")))
+        self.assertTrue(is_code_failure(result(
+            failure_kind="", parsed=False, ran=False, msg="no_code_block")))
+        self.assertFalse(is_code_failure(result(
+            failure_kind="", parsed=True, ran=False,
+            msg="run_failed: Timeout after 120s")))
+
     def test_feedback_reprompt_uses_rollout_thinking_mode(self):
         class Tokenizer:
             def __init__(self):

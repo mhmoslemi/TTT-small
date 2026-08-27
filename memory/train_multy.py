@@ -442,7 +442,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     from memory import RolloutRecord, build_injection, inject_block
     from feedback import (FeedbackStats, build_reprompt, feedback_advantage,
-                          format_feedback, is_failure, render_chat,
+                          format_feedback, is_code_failure, render_chat,
                           select_capped)
 
     step_t0 = time.time()
@@ -456,8 +456,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"score={info['score']:.4f}")
 
     fb_on = bool(fb_cfg is not None and fb_cfg.enabled)
-    fail_score = float(getattr(problem, "fail_score", 0.0))
-    reprompt_by_key = {}        # (group, rollout) -> reprompt text for a failure
+    reprompt_by_key = {}        # (group, rollout) -> code-repair reprompt
 
     all_examples = []
     all_children = []
@@ -683,14 +682,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     stdout=res.stdout or "",
                 ))
 
-        # ---- reprompt(x_p, f_i) for every failed rollout (Sec. 2.3) ------
+        # ---- reprompt(x_p, f_i) for code failures only (Sec. 2.3) --------
         # Built here, while the RewardResult is in hand. The teacher forward
         # itself happens in the train loop, where log pi_thetabar is already
         # available from the existing forward pass.
         if fb_on:
             for r_idx, (text, token_ids) in enumerate(responses):
                 res = outs[r_idx]
-                if not is_failure(res, fail_score):
+                if not is_code_failure(res):
                     continue
                 f_i = format_feedback(res.msg or "", res.stdout or "",
                                       int(fb_cfg.chars))

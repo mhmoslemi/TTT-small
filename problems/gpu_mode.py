@@ -480,10 +480,11 @@ Rules:
         return out
 
     # ------------------------------------------------------------------
-    def _fail(self, msg: str, logs: str = "") -> RewardResult:
+    def _fail(self, msg: str, logs: str = "",
+              failure_kind: str = "code") -> RewardResult:
         return RewardResult(reward=self.fail_score, raw_score=None, valid=False,
                             parsed=True, ran=False, msg=msg, stdout=logs,
-                            construction=[])
+                            construction=[], failure_kind=failure_kind)
 
     def compute_reward(self, response_text: str, parent: ParentContext,
                        timeout_s: float) -> RewardResult:
@@ -491,12 +492,13 @@ Rules:
         code = extract_python_code(response_text)
         if code is None:
             return RewardResult(reward=self.fail_score, parsed=False,
-                                msg="no_code_block")
+                                msg="no_code_block", failure_kind="code")
 
         if "@triton.jit" not in code:
             return self._fail("Code must contain @triton.jit.")
         if self.problem_type == "trimul" and "identity" in code:
-            return self._fail("Identity kernel is not allowed.")
+            return self._fail("Identity kernel is not allowed.",
+                              failure_kind="constraint")
 
         missing = self.missing_task_files()
         if missing:
@@ -505,7 +507,7 @@ Rules:
                 f"but they are not in the repo. Fetch them from "
                 f"github.com/gpu-mode/reference-kernels "
                 f"(problems/bioml/trimul, problems/amd/mla-decode) into the "
-                f"same directory as task.yml.")
+                f"same directory as task.yml.", failure_kind="infrastructure")
 
         timeout = float(self.kernel_timeout_s or 0.0) or float(timeout_s or 0.0)
         if timeout > 0:
@@ -526,7 +528,19 @@ Rules:
                                       "logs": "", "score_us": None})
 
         if not out.get("ok"):
-            return self._fail(out.get("msg", "run failed"), out.get("logs", ""))
+            msg = str(out.get("msg", "run failed"))
+            msg_lower = msg.lower()
+            if "timeout" in msg_lower:
+                kind = "timeout"
+            elif ("failed to pass test cases" in msg_lower
+                  or "no passing leaderboard run" in msg_lower):
+                kind = "constraint"
+            elif ("could not find" in msg_lower
+                  or "task files missing" in msg_lower):
+                kind = "infrastructure"
+            else:
+                kind = "code"
+            return self._fail(msg, out.get("logs", ""), failure_kind=kind)
 
         score_us = float(out["score_us"])
         res = RewardResult()

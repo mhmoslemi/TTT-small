@@ -205,7 +205,7 @@ The policy update uses $A_i^{\max}$ across the tokens of response $i$, together 
 
 ## 6. Verifier feedback as token-level failure repair
 
-A scalar failure reward identifies a bad response but cannot identify the responsible decisions. Many failed responses therefore receive the same reward even though one has a syntax error, another violates a constraint, and a third is almost valid. Mean- or max-relative reward alone cannot distinguish them.
+A scalar failure reward identifies a bad response but cannot identify the responsible decisions. The dense feedback channel is intentionally restricted to program repair: missing or malformed code, syntax or compilation errors, runtime exceptions, and broken output interfaces. Timeouts, low scores, infrastructure failures, and runnable programs that violate problem-specific scientific constraints remain governed only by the task reward (and may still inform memory); they do not receive token-level feedback.
 
 For a failed response $y_i=(y_{i,1},\ldots,y_{i,L_i})$, let $x_p$ be its original parent prompt and $f_i$ the verifier's diagnostic. Freeze the rollout policy $\pi_{\bar\theta}$, then evaluate the already-sampled response under two contexts:
 
@@ -237,7 +237,7 @@ This has a direct interpretation:
 
 Thus the verifier acts as information, not as a second reward function. No separate teacher or learned critic is required; the current policy interprets the diagnostic itself.
 
-For failure indicator $d_i$, the combined token advantage is
+Let $d_i=1$ only when response $i$ has an eligible code-level failure, and $d_i=0$ otherwise. The combined token advantage is
 
 $$
 A_{i,\ell}
@@ -247,13 +247,13 @@ A_i^{\max}
 \lambda_f d_i A^{\mathrm{fb}}_{i,\ell}.
 $$
 
-Successful responses are unaffected by the feedback term. Failed responses retain the global direction supplied by max-seeking reward while receiving dense local repair information.
+Successful responses and scientific-constraint failures are unaffected by the feedback term. Eligible code failures retain the global direction supplied by max-seeking reward while receiving dense local repair information.
 
 ### Adaptive and balanced use of feedback
 
-Feedback is most useful when invalidity is the bottleneck. Its strength is therefore controlled by the observed validity deficit: it is strongest at low validity, decreases as the valid fraction approaches a target region, and turns off when repair is no longer needed. Its magnitude is also bounded relative to the reward advantage so that “be valid” cannot silently replace “make a better discovery” as the optimization objective.
+Feedback is most useful when program correctness is the bottleneck. Its strength is therefore controlled by the observed code-validity deficit: it is strongest when many rollouts have code-level failures, decreases as the code-valid fraction approaches a target region, and turns off when program repair is no longer needed. Scientific feasibility does not enter this controller. Its magnitude remains bounded relative to the reward advantage so that “write runnable code” cannot silently replace “make a better discovery” as the optimization objective.
 
-The feedback budget scales with the number of rollouts available in the current step. Within that budget, failures are sampled round-robin across normalized failure signatures, with a cap per signature. This prevents one common error message from dominating the dense signal and preserves evidence about rarer failure modes.
+The feedback budget still scales with the number of rollouts available in the current step. Within that budget, eligible code failures are sampled round-robin across normalized failure signatures, with the same cap per signature. This prevents one common error message from dominating the dense signal and preserves evidence about rarer coding failures.
 
 ## 7. Memory as a causal contextual bandit
 
@@ -371,7 +371,7 @@ The framework deliberately does not collapse every observation into one scalar:
 |---|---|---|---|
 | Current PUCT | archived state | best child plus exploration bonus | allocate evaluations across branches |
 | Max-seeking GRPO | sibling rollout | entropic relative reward | move policy probability toward the upper tail |
-| Verifier feedback | token in a failed rollout | feedback-conditioned log-ratio | repair invalid or incorrect trajectories |
+| Verifier feedback | token in a code-failed rollout | feedback-conditioned log-ratio | repair malformed or crashing programs |
 | Memory bandit | lesson intervention at a parent | matched best-of-$n$ uplift | retain only reusable experience that causally helps search |
 
 This separation prevents two common objective errors. First, frequent validity failures should trigger repair, but high validity alone is not scientific progress. Second, a plausible or frequently selected lesson should not receive credit unless it improves the tail under a matched budget.

@@ -170,6 +170,7 @@ Make sure to /think step by step, first give your strategy between <strategy> an
         res = RewardResult(reward=self.fail_score)
         if not (isinstance(output, tuple) and len(output) == 3):
             res.msg = "bad_return_shape"
+            res.failure_kind = "code"
             return res
         centers, radii, _ = output
         try:
@@ -177,13 +178,16 @@ Make sure to /think step by step, first give your strategy between <strategy> an
             radii = np.asarray(radii, dtype=float).ravel()
         except (ValueError, TypeError) as e:
             res.msg = f"bad_array: {e}"
+            res.failure_kind = "code"
             return res
 
         if centers.ndim != 2 or centers.shape[1] != 2 or centers.shape[0] != self.num_circles:
             res.msg = f"bad_centers_shape: {centers.shape}"
+            res.failure_kind = "code"
             return res
         if radii.shape != (self.num_circles,):
             res.msg = f"bad_radii_shape: {radii.shape}"
+            res.failure_kind = "code"
             return res
 
         valid, msg = validate_packing(centers, radii)

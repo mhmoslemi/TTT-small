@@ -47,6 +47,11 @@ class RewardResult:
     stdout: str = ""
     code: str = ""
     construction: Optional[list] = None  
+    # Failure stage used only to decide whether token-level feedback applies.
+    # code = malformed source/runtime/interface bug; constraint = a runnable
+    # program rejected by the scientific verifier; timeout/infrastructure are
+    # explicitly excluded from feedback.
+    failure_kind: str = ""
 
 
 # ----------------------------------------------------------------------
@@ -128,15 +133,21 @@ class Problem(ABC):
         code = extract_python_code(response_text)
         if code is None:
             res.msg = "no_code_block"
+            res.failure_kind = "code"
             return res
         res.parsed = True
         res.code = code
 
         full_code = self.preprocess(code, parent)
         out = run_code(full_code, entrypoint=self.entrypoint, timeout_s=timeout_s)
-        res.stdout = out.get("stdout", "")
+        diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
+                       out.get("stderr", "")]
+        res.stdout = "\n".join(str(x).strip() for x in diagnostics if x).strip()
         if not out.get("ok"):
-            res.msg = f"run_failed: {out.get('error', 'unknown')}"
+            error = str(out.get("error", "unknown"))
+            res.msg = f"run_failed: {error}"
+            res.failure_kind = ("timeout" if "timeout" in error.lower()
+                                else "code")
             return res
         res.ran = True
 
@@ -149,4 +160,6 @@ class Problem(ABC):
             scored.stdout = res.stdout
         if not scored.valid and not scored.msg:
             scored.msg = "invalid"
+        if not scored.valid and not scored.failure_kind:
+            scored.failure_kind = "constraint"
         return scored

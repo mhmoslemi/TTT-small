@@ -142,6 +142,18 @@ def run_denoising():
     # ------------------------------------------------------------------
     def score(self, output: Any, stdout: str) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
+        if not isinstance(output, (list, tuple)) or len(output) < 2:
+            res.msg = "bad_return_shape"
+            res.failure_kind = "code"
+            return res
+        try:
+            finite_metrics = np.isfinite(output[0]) and np.isfinite(output[1])
+        except (TypeError, ValueError):
+            finite_metrics = False
+        if not finite_metrics:
+            res.msg = "bad_return_values"
+            res.failure_kind = "code"
+            return res
         if not verify_denoising(output):
             res.msg = "Invalid solution."
             return res
