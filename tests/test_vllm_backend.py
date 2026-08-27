@@ -12,7 +12,7 @@ from gen_workers import (
     _vllm_job_seed,
     _vllm_worker_loop,
 )
-from feedback import FeedbackConfig
+from feedback import FeedbackConfig, render_chat
 
 
 class _Queue:
@@ -27,6 +27,23 @@ class _Queue:
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_feedback_reprompt_uses_rollout_thinking_mode(self):
+        class Tokenizer:
+            def __init__(self):
+                self.enable_thinking = None
+
+            def apply_chat_template(self, _messages, **kwargs):
+                self.enable_thinking = kwargs["enable_thinking"]
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        self.assertEqual(
+            render_chat(tokenizer, [{"role": "user", "content": "x"}],
+                        enable_thinking=True),
+            "rendered",
+        )
+        self.assertIs(tokenizer.enable_thinking, True)
+
     def test_feedback_caps_scale_from_current_batch(self):
         cfg = FeedbackConfig(enabled=True)
         self.assertEqual(cfg.resolve_caps(5, 16), (16, 4))
@@ -227,7 +244,7 @@ class VLLMBackendTests(unittest.TestCase):
                 argv = [
                     "train_multy.py", "--config", str(config_path),
                     "--groups-per-step", "5", "--group-size", "16",
-                    "--gpu-ids", "0,2,4,6,7",
+                    "--gpu-ids", "0,2,4,6,7", "--thinking",
                 ]
                 with patch.object(sys, "argv", argv):
                     cfg, merged = load_config()
@@ -236,6 +253,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(cfg.max_group_size, 16)
         self.assertEqual(cfg.num_gpus, 5)
         self.assertEqual(cfg.gpu_ids, "0,2,4,6,7")
+        self.assertIs(cfg.thinking, True)
         self.assertEqual(merged["num_gpus"], 5)
 
 

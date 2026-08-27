@@ -55,7 +55,13 @@ def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
     current_sum = np.sum(h_values)
 
     if current_sum != target_sum:
-        h_values = h_values * (target_sum / current_sum)
+        # Invalid candidates can have an all-zero or numerically tiny sum. The
+        # verifier rejects the resulting non-finite normalization below; keep
+        # NumPy from also emitting a noisy RuntimeWarning for that candidate.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            h_values = h_values * (target_sum / current_sum)
+        if not np.all(np.isfinite(h_values)):
+            raise ValueError("Normalization produced NaN or inf values")
         if np.any(h_values < 0) or np.any(h_values > 1):
             raise ValueError(f"After normalization, h(x) is not in [0, 1]. Range: [{h_values.min()}, {h_values.max()}]")
 

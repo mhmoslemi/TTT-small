@@ -121,12 +121,41 @@ class PUCTSampler:
                 self._states.append(s)
                 self._seed_ids.add(s.id)
 
+        # Independent records of the raw extrema. They are updated before code
+        # deduplication and archive pruning, so "best ever" cannot regress when
+        # a stochastic rerun of identical code obtains a better native metric.
+        self._best_raw_min = None
+        self._best_raw_max = None
+        self._record_raw_states(self._states)
+
         # Stats from last sample_states call (for printing)
         self.last_picks_info = []
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _finite_raw(state):
+        if state.raw_score is None:
+            return None
+        try:
+            raw = float(state.raw_score)
+        except (TypeError, ValueError):
+            return None
+        return raw if np.isfinite(raw) else None
+
+    def _record_raw_states(self, states):
+        for state in states:
+            raw = self._finite_raw(state)
+            if raw is None:
+                continue
+            if (self._best_raw_min is None
+                    or raw < float(self._best_raw_min.raw_score)):
+                self._best_raw_min = state
+            if (self._best_raw_max is None
+                    or raw > float(self._best_raw_max.raw_score)):
+                self._best_raw_max = state
+
     def _build_children_map(self):
         children = {}
         for s in self._states:
@@ -316,6 +345,13 @@ class PUCTSampler:
         snapshot_top_states() cannot iterate self._states while it is rebuilt.
         """
         with self._prior_lock:
+            # Do this before deduplication/pruning: every successfully evaluated
+            # child counts toward the run's problem-native best-ever value.
+            self._record_raw_states(
+                child for child, _parent in children_with_parents
+                if child.value is not None
+            )
+
             # Update m for parents (best child reward)
             parent_best = {}
             for child, parent in children_with_parents:
@@ -390,6 +426,16 @@ class PUCTSampler:
             return max(non_seeds,
                        key=lambda s: s.value if s.value is not None else -np.inf)
 
+    def best_raw_state(self, maximize: bool = True):
+        """Best state ever evaluated in the problem's native metric direction.
+
+        Seeds are included because a generated candidate has not necessarily
+        beaten the initial construction. The record is independent of archive
+        deduplication/pruning and is included in sampler checkpoints.
+        """
+        with self._prior_lock:
+            return self._best_raw_max if maximize else self._best_raw_min
+
     def archive_size(self):
         return len(self._states)
 
@@ -406,6 +452,10 @@ class PUCTSampler:
                 "current_step": int(self._current_step),
                 "external_prior": dict(self._external_prior),
                 "external_prior_alpha": float(self._external_prior_alpha),
+                "best_raw_min": (asdict(self._best_raw_min)
+                                 if self._best_raw_min is not None else None),
+                "best_raw_max": (asdict(self._best_raw_max)
+                                 if self._best_raw_max is not None else None),
             }
 
     def load_state_dict(self, payload):
@@ -436,6 +486,14 @@ class PUCTSampler:
             self._external_prior_alpha = float(
                 payload.get("external_prior_alpha", 1.0)
             )
+            raw_min = payload.get("best_raw_min")
+            raw_max = payload.get("best_raw_max")
+            self._best_raw_min = State(**raw_min) if raw_min else None
+            self._best_raw_max = State(**raw_max) if raw_max else None
+            # Backward compatibility for checkpoints written before the raw
+            # extrema were persisted.
+            if self._best_raw_min is None or self._best_raw_max is None:
+                self._record_raw_states(self._states)
             self.last_picks_info = []
 
     def import_legacy_states(self, states, total_expansions: int = 0):
@@ -444,9 +502,11 @@ class PUCTSampler:
             existing_codes = {s.code for s in self._states if s.code}
             for state in states:
                 if state.code and state.code in existing_codes:
+                    self._record_raw_states([state])
                     continue
                 state.parents = []
                 self._states.append(state)
+                self._record_raw_states([state])
                 if state.code:
                     existing_codes.add(state.code)
             if len(self._states) > self.max_buffer_size:

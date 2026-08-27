@@ -95,6 +95,10 @@ class Config:
     # Sampling
     temperature: float = 1.0
     top_p: float = 1.0
+    # Qwen hybrid models render a thinking preamble when this is enabled.
+    # This controls solution rollouts (and their matched feedback reprompts),
+    # not the separate memory extraction/selection calls.
+    thinking: bool = False
 
     # PUCT
     puct_c: float = 1.0
@@ -278,6 +282,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "OOMs on a large-vocab model.")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None)
+    p.add_argument("--thinking", dest="thinking",
+                   action="store_const", const=True, default=None,
+                   help="Enable thinking mode in chat templates that support it "
+                        "(for example hybrid Qwen3 checkpoints).")
+    p.add_argument("--no-thinking", dest="thinking",
+                   action="store_const", const=False,
+                   help="Disable thinking mode, overriding the YAML.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--deterministic", dest="deterministic",
                    action="store_const", const=True, default=None,
@@ -606,6 +617,8 @@ def load_config():
     cfg = Config(**cfg_kwargs)
     if cfg.generation_backend == "vllm" and int(cfg.num_gpus or 0) < 1:
         raise ValueError("vLLM generation requires num_gpus >= 1")
+    print(f"[config] rollout thinking: "
+          f"{'enabled' if cfg.thinking else 'disabled'}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 
@@ -1028,7 +1041,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         try:
             return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=bool(cfg.thinking),
             )
         except TypeError:
             return tokenizer.apply_chat_template(
@@ -1332,7 +1345,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                       int(fb_cfg.chars))
                 rp_messages = build_reprompt(prompt_jobs[job_idx]["messages"], f_i,
                                              mode=fb_cfg.inject_mode)
-                reprompt_by_key[(g, r_idx)] = render_chat(tokenizer, rp_messages)
+                reprompt_by_key[(g, r_idx)] = render_chat(
+                    tokenizer, rp_messages,
+                    enable_thinking=bool(cfg.thinking),
+                )
 
         # If reward is constant in this group there is no A^rew signal. With
         # the feedback signal on, those rollouts are still worth training on:
@@ -1430,6 +1446,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Update archive
     sampler.update(all_children)
+
+    # Report the problem-native metric before any memory or gradient work. This
+    # is deliberately separate from reward: some problems maximize the raw
+    # quantity, while others (Erdos bounds, runtime, MSE) minimize it.
+    best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
+    if best_raw is not None:
+        direction = "higher is better" if problem.maximize else "lower is better"
+        print(
+            f"[step {step_idx}] best-ever raw {problem.metric_name}: "
+            f"{float(best_raw.raw_score):.9f} ({direction}; "
+            f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})",
+            flush=True,
+        )
+    else:
+        print(f"[step {step_idx}] best-ever raw {problem.metric_name}: unavailable",
+              flush=True)
 
     # ----- MEMORY (Sec. 2.2) ---------------------------------------------
     # Deliberately above the early return below. A step where every group had

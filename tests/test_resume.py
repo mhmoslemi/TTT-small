@@ -26,6 +26,35 @@ def test_sampler_checkpoint_round_trip():
     assert restored.best_state().construction == [1.0, 2.0]
 
 
+def test_best_raw_state_respects_problem_direction_and_includes_seed():
+    class Seed:
+        value = 2.0
+        code = "seed"
+        raw_score = 0.5
+        construction = None
+
+    sampler = PUCTSampler(num_seeds=0, seed_states=[Seed()],
+                          topk_children=3)
+    parent = sampler._states[0]
+    low = State.make(1, 3.0, "low", raw_score=0.4)
+    high = State.make(1, 1.0, "high", raw_score=0.8)
+    missing = State.make(1, 4.0, "missing", raw_score=None)
+    sampler.update([(low, parent), (high, parent), (missing, parent)])
+
+    assert sampler.best_raw_state(maximize=False) is low
+    assert sampler.best_raw_state(maximize=True) is high
+
+    # A better stochastic result from identical code is not inserted into the
+    # search archive, but it must still advance the best-ever raw record.
+    duplicate = State.make(2, 5.0, "low", raw_score=0.3)
+    sampler.update([(duplicate, parent)])
+    assert sampler.best_raw_state(maximize=False) is duplicate
+
+    restored = PUCTSampler(num_seeds=1)
+    restored.load_state_dict(sampler.state_dict())
+    assert restored.best_raw_state(maximize=False).raw_score == 0.3
+
+
 def test_experiment_config_keeps_problem_specific_keys(tmp_path):
     cfg = Config()
     run_dir = make_experiment_dir(

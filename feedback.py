@@ -349,12 +349,13 @@ def build_reprompt(messages: List[Dict], feedback_text: str,
     return out
 
 
-def render_chat(tokenizer, messages: List[Dict]) -> str:
-    """Same call and fallback the trainer uses for the rollout prompt."""
+def render_chat(tokenizer, messages: List[Dict],
+                enable_thinking: bool = False) -> str:
+    """Render exactly like the rollout prompt, including its thinking mode."""
     try:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=bool(enable_thinking),
         )
     except TypeError:
         return tokenizer.apply_chat_template(
