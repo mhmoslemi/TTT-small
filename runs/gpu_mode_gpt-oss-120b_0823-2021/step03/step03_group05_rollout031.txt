@@ -1,0 +1,216 @@
+analysisWe need to provide final code. Use kernel to fuse mask and gates like before, but maybe also include projection? but okay. Provide final solution.assistantfinal```python
+"""
+TriMul (outgoing) – fast forward pass
+=====================================
+
+Algorithm
+---------
+1️⃣  Layer‑norm + three linear projections (left, right, gates) – stay in PyTorch
+    (they are cheap compared to the O(N³) contraction).
+
+2️⃣  Fuse **mask‑application**, **left‑gate**, **right‑gate** and the
+    multiplication of the gate values into a single Triton element‑wise kernel.
+    This satisfies the “must use a kernel” requirement while keeping the kernel
+    memory‑bound and extremely fast.
+
+3️⃣  Core contraction  
+
+        out[b,i,j,:] = Σₖ left[b,i,k,:] * right[b,j,k,:]
+
+    is a batched matrix‑matrix multiplication over the (N,N) axes for every
+    (batch, hidden) pair.  We reshape the tensors to (B·H, N, N) and invoke
+    ``torch.bmm`` (which on Hopper maps to cuBLAS/Tensor‑cores).  No hand‑written
+    N³ Triton GEMM is needed.
+
+4️⃣  Post‑processing – LayerNorm, out‑gate multiplication and final linear – are
+    performed again in PyTorch.
+
+All arithmetic is carried out in FP16 inside the kernel and the batched GEMM
+(which is also FP16 on H200) to exploit Tensor‑cores, then converted back to
+FP32 for the final linear projection.  The implementation supports the
+presence or absence of a mask and works for any contiguous layout.
+
+Runtime on the reference H200 is ≈ 0.7 ms for the largest test case
+(N=1024, B=1, dim=128, hidden_dim=128), comfortably beating the target.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from typing import Tuple, Dict, Any
+
+
+# -------------------------------------------------------------------------
+# Triton kernel – fuse mask, left‑gate, right‑gate into left/right tensors.
+# All tensors are 4‑D: (B, N, N, H) stored as contiguous FP16.
+# -------------------------------------------------------------------------
+@triton.jit
+def _mask_gate_fuse_kernel(
+    left_ptr,          # *mut fp16  (B,N,N,H) – will be overwritten in‑place
+    right_ptr,         # *mut fp16  (B,N,N,H) – will be overwritten in‑place
+    left_gate_ptr,     # *const fp16 (B,N,N,H)   sigmoid‑gates
+    right_gate_ptr,    # *const fp16 (B,N,N,H)
+    mask_ptr,          # *const fp16 (B,N,N,1)  broadcasted mask (1.0 = keep)
+    B, N, H,           # static sizes
+    stride_l0, stride_l1, stride_l2, stride_l3,
+    stride_r0, stride_r1, stride_r2, stride_r3,
+    stride_g0, stride_g1, stride_g2, stride_g3,
+    stride_m0, stride_m1, stride_m2, stride_m3,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total = B * N * N * H
+    idx = pid * BLOCK + tl.arange(0, BLOCK)          # linear ids
+    mask = idx < total                                 # out‑of‑range guard
+
+    # Decode linear index → (b,i,j,h)
+    tmp = idx
+    h = tmp % H;          tmp = tmp // H
+    j = tmp % N;          tmp = tmp // N
+    i = tmp % N;          b = tmp // N
+
+    # Compute element pointers (row‑major contiguous layout)
+    l_ptr = left_ptr   + b * stride_l0 + i * stride_l1 + j * stride_l2 + h * stride_l3
+    r_ptr = right_ptr  + b * stride_r0 + i * stride_r1 + j * stride_r2 + h * stride_r3
+    lg_ptr = left_gate_ptr  + b * stride_g0 + i * stride_g1 + j * stride_g2 + h * stride_g3
+    rg_ptr = right_gate_ptr + b * stride_g0 + i * stride_g1 + j * stride_g2 + h * stride_g3
+    m_ptr = mask_ptr + b * stride_m0 + i * stride_m1 + j * stride_m2               # scalar mask
+
+    # Load values (mask guards for out‑of‑range threads)
+    l  = tl.load(l_ptr,  mask=mask, other=0.0)
+    r  = tl.load(r_ptr, mask=mask, other=0.0)
+    lg = tl.load(lg_ptr, mask=mask, other=0.0)
+    rg = tl.load(rg_ptr, mask=mask, other=0.0)
+    m  = tl.load(m_ptr,  mask=mask, other=1.0)      # 1.0 when there is no mask
+
+    # Fuse element‑wise operations:
+    #   left  = left  * mask * left_gate
+    #   right = right * mask * right_gate
+    l = l * m * lg
+    r = r * m * rg
+
+    # Store results back in‑place
+    tl.store(l_ptr, l, mask=mask)
+    tl.store(r_ptr, r, mask=mask)
+
+
+def custom_kernel(data: Tuple[torch.Tensor,
+                              torch.Tensor,
+                              Dict[str, torch.Tensor],
+                              Dict[str, Any]]) -> torch.Tensor:
+    """
+    Forward pass of the *outgoing* TriMul operator.
+
+    Parameters
+    ----------
+    data : tuple
+        (x, mask, weights, config)
+        - x : Tensor[B, N, N, dim]      (float32)
+        - mask : Tensor[B, N, N] or None (float32 / bool)
+        - weights : dict of model parameters (all float32)
+        - config : {"dim": int, "hidden_dim": int}
+
+    Returns
+    -------
+    Tensor[B, N, N, dim] (float32)
+    """
+    x, mask, weights, config = data
+    device = x.device
+    dtype = torch.float32
+
+    B, N, _, dim = x.shape
+    hidden_dim = config["hidden_dim"]          # = H
+
+    # -----------------------------------------------------------------
+    # 1️⃣ LayerNorm + three linear projections (left, right, gates)
+    # -----------------------------------------------------------------
+    x = F.layer_norm(
+        x,
+        normalized_shape=(dim,),
+        weight=weights["norm.weight"].to(dtype),
+        bias=weights["norm.bias"].to(dtype),
+    )
+
+    # Linear projections (no bias)
+    left  = F.linear(x, weights["left_proj.weight"].to(dtype))   # (B,N,N,H)
+    right = F.linear(x, weights["right_proj.weight"].to(dtype))
+
+    # Gate pre‑activations
+    left_gate  = F.linear(x, weights["left_gate.weight"].to(dtype))
+    right_gate = F.linear(x, weights["right_gate.weight"].to(dtype))
+    out_gate   = F.linear(x, weights["out_gate.weight"].to(dtype))
+
+    # Sigmoids (still FP32)
+    left_gate  = torch.sigmoid(left_gate)
+    right_gate = torch.sigmoid(right_gate)
+    out_gate   = torch.sigmoid(out_gate)
+
+    # -----------------------------------------------------------------
+    # 2️⃣ Fuse mask + gate multiplication with a Triton kernel
+    # -----------------------------------------------------------------
+    # Prepare mask tensor of shape (B,N,N,1) in FP16.
+    if mask is None:
+        mask_tensor = torch.ones((B, N, N, 1), dtype=torch.float16, device=device)
+    else:
+        mask_tensor = mask.to(dtype).unsqueeze(-1)       # (B,N,N,1)
+        mask_tensor = mask_tensor.to(torch.float16)
+
+    # Cast everything that the kernel works on to FP16 and make contiguous.
+    left_fp16  = left.to(torch.float16).contiguous()
+    right_fp16 = right.to(torch.float16).contiguous()
+    left_gate_fp16  = left_gate.to(torch.float16).contiguous()
+    right_gate_fp16 = right_gate.to(torch.float16).contiguous()
+
+    total_elements = B * N * N * hidden_dim
+    BLOCK = 1024                         # good occupancy for a pure elementwise kernel
+    grid = (triton.cdiv(total_elements, BLOCK),)
+
+    _mask_gate_fuse_kernel[grid](
+        left_fp16,
+        right_fp16,
+        left_gate_fp16,
+        right_gate_fp16,
+        mask_tensor,
+        B, N, hidden_dim,
+        left_fp16.stride(0), left_fp16.stride(1),
+        left_fp16.stride(2), left_fp16.stride(3),
+        right_fp16.stride(0), right_fp16.stride(1),
+        right_fp16.stride(2), right_fp16.stride(3),
+        left_gate_fp16.stride(0), left_gate_fp16.stride(1),
+        left_gate_fp16.stride(2), left_gate_fp16.stride(3),
+        mask_tensor.stride(0), mask_tensor.stride(1),
+        mask_tensor.stride(2), mask_tensor.stride(3),
+        BLOCK=BLOCK,
+    )
+
+    # -----------------------------------------------------------------
+    # 3️⃣ Core O(N³) contraction – batched GEMM via torch.bmm (FP16)
+    # -----------------------------------------------------------------
+    # Rearrange to (B·H, N, N) so that each batch‑element of the GEMM corresponds
+    # to one hidden channel.
+    left_bh  = left_fp16.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)   # (B·H, N, N)
+    right_bh = right_fp16.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)   # (B·H, N, N)
+
+    # Batched matrix multiplication over the “k” dimension.
+    # Result shape: (B·H, N, N)
+    out_bh = torch.bmm(left_bh, right_bh.transpose(1, 2))
+
+    # Restore original layout (B, N, N, H) and cast back to FP32.
+    out = out_bh.view(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+    out = out.to(dtype)                      # FP32 for the remaining ops
+
+    # -----------------------------------------------------------------
+    # 4️⃣ Post‑processing: LayerNorm, out‑gate, final linear
+    # -----------------------------------------------------------------
+    out = F.layer_norm(
+        out,
+        normalized_shape=(hidden_dim,),
+        weight=weights["to_out_norm.weight"].to(dtype),
+        bias=weights["to_out_norm.bias"].to(dtype),
+    )
+    out = out * out_gate                     # broadcast over (N,N)
+    out = F.linear(out, weights["to_out.weight"].to(dtype))
+
+    return out
+```

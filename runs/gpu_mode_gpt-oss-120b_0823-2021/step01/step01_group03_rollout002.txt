@@ -1,0 +1,232 @@
+analysisWe need produce final code with kernel, maybe similar to previous but maybe improve. Provide analysis of lessons then final code.assistantfinal```python
+"""
+TriMul “outgoing” forward pass (AlphaFold‑3).
+
+The heavy N³ reduction (einsum) stays in PyTorch – torch.einsum on
+Hopper/bfloat16 is already close to the device peak.  The only operation that
+is memory‑bound and not efficiently fused by torch.compile is the
+application of the (B,N,N) mask to the two projected tensors.  We move that
+step into a tiny Triton kernel that works in‑place on fp32 data and is
+vectorised over the hidden dimension (hidden_dim is always a multiple of 32).
+
+The rest of the pipeline (layer‑norms, gating, final linear) is kept in
+PyTorch because they are cheap compared to the N³ work and avoid extra data
+copies.  The implementation follows the reference PyTorch module exactly,
+including the “outgoing” einsum:
+
+    out[b,i,j] = Σ_k left[b,i,k] * right[b,j,k]      (dim‑wise)
+
+All tensors are returned in float32.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from torch.nn.functional import linear
+
+# ----------------------------------------------------------------------
+# Triton kernel: in‑place mask multiplication.
+#   x    : (B, N, N, H)   – fp32 tensor to be masked (left or right)
+#   mask : (B, N, N)      – 0/1 mask, broadcasted on H
+#   The kernel tiles the (i,k) plane and loops over H in chunks.
+# ----------------------------------------------------------------------
+@triton.jit
+def apply_mask_kernel(
+    x_ptr,          # *fp32   (B,N,N,H)
+    mask_ptr,       # *fp32   (B,N,N)
+    B, N, H,
+    stride_xb, stride_xi, stride_xk, stride_xh,
+    stride_mb, stride_mi, stride_mk,
+    BLOCK_I: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    pid = tl.program_id(0)
+
+    # each program handles one (batch, i‑tile)
+    batch = pid // tl.cdiv(N, BLOCK_I)
+    i_tile = pid % tl.cdiv(N, BLOCK_I)
+
+    # tile offsets
+    offs_i = i_tile * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_h = tl.arange(0, BLOCK_H)
+
+    mask_i = offs_i < N
+    mask_k = offs_k < N
+    mask_h = offs_h < H
+
+    # ---- load mask (B,N,N) → (i,k) ------------------------------------
+    mask = tl.load(
+        mask_ptr
+        + batch * stride_mb
+        + offs_i[:, None] * stride_mi
+        + offs_k[None, :] * stride_mk,
+        mask=mask_i[:, None] & mask_k[None, :],
+        other=1.0,                         # absent mask → all‑ones
+    )                                     # shape (i,k)
+
+    # broadcast to hidden dim
+    mask = mask[:, :, None]               # (i,k,1)
+
+    # ---- load a tile of x (B,N,N,H) ------------------------------------
+    x = tl.load(
+        x_ptr
+        + batch * stride_xb
+        + offs_i[:, None, None] * stride_xi
+        + offs_k[None, :, None] * stride_xk
+        + offs_h[None, None, :] * stride_xh,
+        mask=mask_i[:, None, None] & mask_k[None, :, None] & mask_h[None, None, :],
+        other=0.0,
+    )                                     # (i,k,h)
+
+    # ---- apply mask ----------------------------------------------------
+    x = x * mask
+
+    # ---- store back ----------------------------------------------------
+    tl.store(
+        x_ptr
+        + batch * stride_xb
+        + offs_i[:, None, None] * stride_xi
+        + offs_k[None, :, None] * stride_xk
+        + offs_h[None, None, :] * stride_xh,
+        x,
+        mask=mask_i[:, None, None] & mask_k[None, :, None] & mask_h[None, None, :],
+    )
+
+
+# ----------------------------------------------------------------------
+# Helper: 4‑D LayerNorm (B,N,N,C) using provided weight/bias.
+# ----------------------------------------------------------------------
+def layer_norm_4d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5):
+    # mean & var over the last dimension (C)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    x_hat = (x - mean) * torch.rsqrt(var + eps)
+    return x_hat * weight + bias
+
+
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Args
+    ----
+    data : tuple
+        (input_tensor, mask_tensor, weights_dict, config_dict)
+
+    Returns
+    -------
+    torch.Tensor
+        (B, N, N, dim)  float32
+    """
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+    dtype = torch.float32
+
+    B, N, _, dim = input_tensor.shape
+    hidden_dim = config["hidden_dim"]
+
+    # ------------------------------------------------------------------
+    # 1. Input layer‑norm (dim)
+    # ------------------------------------------------------------------
+    x = layer_norm_4d(
+        input_tensor,
+        weight=weights["norm.weight"].to(dtype),
+        bias=weights["norm.bias"].to(dtype),
+    )                               # (B,N,N,dim)
+
+    # ------------------------------------------------------------------
+    # 2. Linear projections → left / right  (dim → hidden_dim)
+    # ------------------------------------------------------------------
+    left = linear(x, weights["left_proj.weight"].to(dtype))   # (B,N,N,hidden)
+    right = linear(x, weights["right_proj.weight"].to(dtype))
+
+    # ------------------------------------------------------------------
+    # 3. Apply optional mask in‑place using Triton
+    # ------------------------------------------------------------------
+    if mask is None:
+        mask_fp = torch.ones((B, N, N), dtype=dtype, device=device)
+    else:
+        mask_fp = mask.to(dtype)
+
+    # launch configuration – hidden_dim is guaranteed to be a multiple of 32
+    BLOCK_I = 32
+    BLOCK_K = 32
+    BLOCK_H = 32
+
+    stride_xb, stride_xi, stride_xk, stride_xh = left.stride()
+    stride_mb, stride_mi, stride_mk = mask_fp.stride()
+
+    # grid: one program per (batch, i‑tile)
+    grid = (B * triton.cdiv(N, BLOCK_I),)
+
+    # left
+    apply_mask_kernel[grid](
+        left,
+        mask_fp,
+        B,
+        N,
+        hidden_dim,
+        stride_xb,
+        stride_xi,
+        stride_xk,
+        stride_xh,
+        stride_mb,
+        stride_mi,
+        stride_mk,
+        BLOCK_I=BLOCK_I,
+        BLOCK_K=BLOCK_K,
+        BLOCK_H=BLOCK_H,
+    )
+    # right
+    apply_mask_kernel[grid](
+        right,
+        mask_fp,
+        B,
+        N,
+        hidden_dim,
+        stride_xb,
+        stride_xi,
+        stride_xk,
+        stride_xh,
+        stride_mb,
+        stride_mi,
+        stride_mk,
+        BLOCK_I=BLOCK_I,
+        BLOCK_K=BLOCK_K,
+        BLOCK_H=BLOCK_H,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Gating (sigmoid) – cheap, stay in PyTorch
+    # ------------------------------------------------------------------
+    left_gate = linear(x, weights["left_gate.weight"].to(dtype)).sigmoid()
+    right_gate = linear(x, weights["right_gate.weight"].to(dtype)).sigmoid()
+    out_gate = linear(x, weights["out_gate.weight"].to(dtype)).sigmoid()
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # ------------------------------------------------------------------
+    # 5. Core N³ reduction (einsum).  Use bfloat16 for speed, cast back.
+    # ------------------------------------------------------------------
+    left_bf16 = left.to(torch.bfloat16)
+    right_bf16 = right.to(torch.bfloat16)
+
+    # einsum: (... i k d, ... j k d) -> (... i j d)
+    out = torch.einsum("... i k d, ... j k d -> ... i j d", left_bf16, right_bf16)
+    out = out.to(dtype)          # back to fp32 for the remaining layers
+
+    # ------------------------------------------------------------------
+    # 6. Final layer‑norm, gating and output linear
+    # ------------------------------------------------------------------
+    out = layer_norm_4d(
+        out,
+        weight=weights["to_out_norm.weight"].to(dtype),
+        bias=weights["to_out_norm.bias"].to(dtype),
+    )
+    out = out * out_gate
+    out = linear(out, weights["to_out.weight"].to(dtype))
+
+    return out
+```

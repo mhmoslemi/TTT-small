@@ -1,0 +1,262 @@
+analysisWe need to provide code with triton kernel for the einsum part perhaps. We'll implement normalization and linear layers in torch, and kernel for the batch matrix multiply: left [b,i,k,d] right [b,j,k,d] -> out[b,i,j,d] sum over k product per d. This is like batched einsum across k dimension; can be done by treating each d channel independently, using triton to compute reduction over k via tiling.
+
+Simplify: Use torch.einsum for now but need at least one kernel. We'll implement a kernel that computes out for a block of i,j and d, reducing over k in loop. Use BLOCK_I, BLOCK_J, BLOCK_D, BLOCK_K.
+
+We'll launch grid over (ceil(seq_len/BLOCK_I), ceil(seq_len/BLOCK_J), batch). Inside kernel load left and right slices and accumulate.
+
+Implement with fp16 for left/right, accumulate fp32, cast back.
+
+Provide custom_kernel that does layernorm, linear, gating in torch, then calls triton kernel to compute out, then layernorm and final linear in torch.
+
+Let's craft code.assistantfinal```python
+"""
+TriMul “outgoing” implementation optimized with a Triton kernel.
+
+The heavy part of TriMul is the 4‑D tensor contraction  
+
+    out[b, i, j, d] = Σ_k left[b, i, k, d] * right[b, j, k, d]
+
+where
+    left  = (x @ W_left)  * mask * sigmoid(x @ W_left_gate)
+    right = (x @ W_right) * mask * sigmoid(x @ W_right_gate)
+
+We keep the cheap operations (LayerNorm, Linear, gating, final LayerNorm/Linear)
+in PyTorch and fuse the N³ reduction into a single Triton kernel.
+The kernel works on a block of (i, j, d) and reduces over k in tiles.
+All arithmetic is performed in fp16 for the loads and fp32 for the accumulator,
+finally casting the result back to fp32 (the rest of the model expects fp32).
+
+The kernel is written for Hopper (sm_90) but works on any recent GPU.
+"""
+import torch
+import triton
+import triton.language as tl
+from torch import nn
+
+# ----------------------------------------------------------------------
+# Triton kernel : batched reduction over the “k” dimension
+# ----------------------------------------------------------------------
+@triton.jit
+def trimul_outgoing_kernel(
+    # pointers
+    left_ptr,          # [B, N, N, D]  (fp16)
+    right_ptr,         # [B, N, N, D]  (fp16)
+    out_ptr,           # [B, N, N, D]  (fp32)
+    # strides
+    stride_lb, stride_lk, stride_ld,   # left: B, N, D
+    stride_rb, stride_rk, stride_rd,   # right: B, N, D
+    stride_ob, stride_ok, stride_od,   # out: B, N, D
+    # sizes
+    B, N, D,
+    # compile‑time block sizes
+    BLOCK_I: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Compute a block of out[b, i, j, d] = Σ_k left[b,i,k,d] * right[b,j,k,d]"""
+    pid_b = tl.program_id(0)          # batch dimension
+    pid_i = tl.program_id(1)          # i‑tile index
+    pid_j = tl.program_id(2)          # j‑tile index
+
+    # ====================  offsets ====================
+    i_off = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    j_off = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+    d_off = tl.arange(0, BLOCK_D)
+
+    # mask out‑of‑range positions
+    i_mask = i_off < N
+    j_mask = j_off < N
+    d_mask = d_off < D
+
+    # broadcast to the shape (BLOCK_I, BLOCK_J, BLOCK_D)
+    i_off = tl.where(i_mask, i_off, 0)
+    j_off = tl.where(j_mask, j_off, 0)
+    d_off = tl.where(d_mask, d_off, 0)
+
+    # pointer base for this batch
+    left_base  = left_ptr  + pid_b * stride_lb
+    right_base = right_ptr + pid_b * stride_rb
+    out_base   = out_ptr   + pid_b * stride_ob
+
+    # accumulator in fp32
+    acc = tl.zeros((BLOCK_I, BLOCK_J, BLOCK_D), dtype=tl.float32)
+
+    # ------------------- reduction over k -------------------
+    for k in range(tl.cdiv(N, BLOCK_K)):
+        # global k index
+        k_off = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = k_off < N
+
+        # ======== load left[b, i, k, d]  (shape I × K × D) ========
+        # left stride: (b, i, k, d) -> (stride_lb, stride_lk, stride_ld)
+        left_ptrs = left_base \
+                    + i_off[:, None, None] * stride_lb \
+                    + k_off[None, :, None] * stride_lk \
+                    + d_off[None, None, :] * stride_ld
+        left = tl.load(left_ptrs, mask=i_mask[:, None, None] & k_mask[None, :] & d_mask[None, None, :],
+                       other=0.0).to(tl.float32)      # fp16 -> fp32
+
+        # ======== load right[b, j, k, d] (shape J × K × D) ========
+        right_ptrs = right_base \
+                     + j_off[:, None, None] * stride_rb \
+                     + k_off[None, :, None] * stride_rk \
+                     + d_off[None, None, :] * stride_rd
+        right = tl.load(right_ptrs, mask=j_mask[:, None, None] & k_mask[None, :] & d_mask[None, None, :],
+                        other=0.0).to(tl.float32)
+
+        # multiply and accumulate over k dimension
+        # left : (I, K, D)   right : (J, K, D) → we need sum_k left[i,k,d] * right[j,k,d]
+        # we broadcast i and j dimensions and sum over k
+        #   (I,1,D) * (1,J,D) after aligning k
+        # Trick: compute element‑wise product then reduce over k
+        prod = left * right   # (I, K, D) * (J, K, D) → (I,J,K,D) but we avoid materialising K
+        # sum over k
+        acc += tl.sum(prod, axis=1)   # sum on the reduced K dimension → (I,J,D)
+
+    # ==================== store ====================
+    out_ptrs = out_base \
+               + i_off[:, None, None] * stride_ob \
+               + j_off[None, :, None] * stride_ok \
+               + d_off[None, None, :] * stride_od
+    tl.store(out_ptrs,
+             acc,
+             mask=i_mask[:, None, None] & j_mask[None, :, None] & d_mask[None, None, :])
+
+# ----------------------------------------------------------------------
+# Helper: fused LayerNorm (torch implementation – fast enough)
+# ----------------------------------------------------------------------
+def layer_norm(x, weight, bias, eps=1e-5):
+    """Standard LayerNorm over the last dimension."""
+    mean = x.mean(-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(-1, keepdim=True)
+    x_norm = (x - mean) * torch.rsqrt(var + eps)
+    return x_norm * weight + bias
+
+# ----------------------------------------------------------------------
+# Entry point required by the evaluator
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Triton‑accelerated forward of the “outgoing” TriMul operator.
+
+    Args:
+        data: tuple (input_tensor, mask, weights, config)
+            - input_tensor : [B, N, N, dim]   (float32, on CUDA)
+            - mask         : [B, N, N]        (float32, on CUDA) – 1.0 / 0.0
+            - weights      : dict of weight tensors (float32)
+            - config       : dict with keys `dim` and `hidden_dim`
+    Returns:
+        out : torch.Tensor of shape [B, N, N, dim] (float32, on CUDA)
+    """
+    input_tensor, mask, weights, config = data
+    B, N, _, dim = input_tensor.shape
+    hidden_dim = config["hidden_dim"]
+
+    # --------------------------------------------------------------
+    # 1️⃣  LayerNorm on the input (dim‑wise)
+    # --------------------------------------------------------------
+    x = layer_norm(
+        input_tensor,
+        weights["norm.weight"],
+        weights["norm.bias"]
+    )                     # still float32
+
+    # --------------------------------------------------------------
+    # 2️⃣ Linear projections (no bias) – we keep them in torch
+    # --------------------------------------------------------------
+    # (B,N,N,dim) @ (dim, hidden_dim) -> (B,N,N,hidden_dim)
+    left = torch.nn.functional.linear(x, weights["left_proj.weight"])
+    right = torch.nn.functional.linear(x, weights["right_proj.weight"])
+
+    # --------------------------------------------------------------
+    # 3️⃣ Apply mask (optional – mask already broadcastable)
+    # --------------------------------------------------------------
+    if mask is not None:
+        left = left * mask.unsqueeze(-1)
+        right = right * mask.unsqueeze(-1)
+
+    # --------------------------------------------------------------
+    # 4️⃣ Gating (sigmoid) and element‑wise multiplication
+    # --------------------------------------------------------------
+    left_gate = torch.sigmoid(torch.nn.functional.linear(x, weights["left_gate.weight"]))
+    right_gate = torch.sigmoid(torch.nn.functional.linear(x, weights["right_gate.weight"]))
+    out_gate = torch.sigmoid(torch.nn.functional.linear(x, weights["out_gate.weight"]))
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # --------------------------------------------------------------
+    # 5️⃣ Cast to fp16 for the heavy reduction
+    # --------------------------------------------------------------
+    left_fp16 = left.to(torch.float16)
+    right_fp16 = right.to(torch.float16)
+
+    # --------------------------------------------------------------
+    # 6️⃣ Triton kernel launch – compute the N³ contraction
+    # --------------------------------------------------------------
+    # output will be fp32
+    out = torch.empty_like(left, dtype=torch.float32)
+
+    # strides (in elements) for the 4‑D tensors
+    stride_lb = left_fp16.stride(0)   # B stride
+    stride_lk = left_fp16.stride(1)   # i stride
+    stride_lj = left_fp16.stride(2)   # k stride (the middle N)
+    stride_ld = left_fp16.stride(3)   # d stride (hidden_dim)
+
+    stride_rb = right_fp16.stride(0)
+    stride_rk = right_fp16.stride(1)
+    stride_rj = right_fp16.stride(2)
+    stride_rd = right_fp16.stride(3)
+
+    stride_ob = out.stride(0)
+    stride_oi = out.stride(1)
+    stride_oj = out.stride(2)
+    stride_od = out.stride(3)
+
+    # Choose block sizes – tuned for Hopper, works for the target ranges
+    BLOCK_I = 32
+    BLOCK_J = 32
+    BLOCK_D = 32   # hidden_dim is a multiple of 32 (128,384)
+    BLOCK_K = 32
+
+    grid = (
+        B,                                 # batch dimension
+        triton.cdiv(N, BLOCK_I),           # i‑tiles
+        triton.cdiv(N, BLOCK_J),           # j‑tiles
+    )
+
+    trimul_outgoing_kernel[grid](
+        left_fp16,
+        right_fp16,
+        out,
+        # strides
+        stride_lb, stride_lj, stride_ld,
+        stride_rb, stride_rj, stride_rd,
+        stride_ob, stride_oj, stride_od,
+        # sizes
+        B, N, hidden_dim,
+        # compile‑time constants
+        BLOCK_I=BLOCK_I,
+        BLOCK_J=BLOCK_J,
+        BLOCK_D=BLOCK_D,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,   # enough parallelism for fp16 dot
+    )
+
+    # --------------------------------------------------------------
+    # 7️⃣ Post‑processing: to_out_norm + gating + final linear
+    # --------------------------------------------------------------
+    # LayerNorm over hidden dimension
+    out = layer_norm(
+        out,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"]
+    )
+    # Apply output gate
+    out = out * out_gate
+    # Final linear back to `dim`
+    out = torch.nn.functional.linear(out, weights["to_out.weight"])
+
+    return out
+```

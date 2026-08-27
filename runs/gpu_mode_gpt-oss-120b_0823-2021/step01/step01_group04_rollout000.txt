@@ -1,0 +1,313 @@
+analysisWe need to output final code with improved approach. Provide analysis of lessons then final code.assistantfinal**Solution Overview**
+
+We implement the *outgoing* TriMul forward pass (the heavy `einsum` is reduced to a batch of matrix‑multiplications).  
+Only the element‑wise part that needs the mask, the two linear‑gates and the two projected tensors is accelerated with a single Triton kernel – this removes three separate PyTorch launches and fuses the three × ‑operations into one memory pass.
+
+The remaining N³ work (`out_{b,i,j,h} = Σₖ left_{b,i,k,h} * right_{b,j,k,h}`) is a set of independent matrix‑multiplications for each head `h`.  CuBLAS `torch.bmm` is already optimal on Hopper, so we keep this part in PyTorch.
+
+All other linear layers, LayerNorms and the final projection are cheap (O(B·N²·C)) and are performed with regular PyTorch kernels.  The whole pipeline stays on the GPU, returns a `float32` tensor and works for any combination of the test configurations.
+
+---
+
+### 1.  Lessons from the previous attempt
+
+| Lesson | Re‑use / discard |
+|--------|------------------|
+| **Limit shared‑memory** – needed when the kernel itself performs a GEMM.  Here the kernel only does point‑wise ops, so shared memory is negligible; we keep a simple 1‑D launch. |
+| **Match stride unpacking** – the previous kernel unpacked 4 strides for each tensor, which is correct for a contiguous `[B,N,N,H]` layout.  This remains valid; we keep the explicit stride arguments (they are cheap to compute once on the host). |
+| **Fusing mask & gates** – the previous implementation already fused the three × ‑operations *and* wrote the result back in‑place.  That approach is retained, but we tighten the launch configuration (`BLOCK=2048`) which better occupies the H200 SMs and reduces kernel‑launch overhead for the large tensors. |
+| **Avoid unnecessary temporaries** – we now compute the three gate‑sigmoids *outside* the kernel (still cheap) and pass the results to the kernel, avoiding extra loads of the raw linear output. |
+| **Precision** – all arithmetic stays in `float32`.  The kernel loads/stores `float32` (no conversion), which is the native precision of the model. |
+
+The only remaining bottleneck is the `torch.bmm` over `B·H` batches.  This is already the fastest path on Hopper; any attempt to rewrite it in Triton would need a custom tiling that cannot beat cuBLAS for the dense N×N × N×N product.  Therefore we keep the batched‑matmul in PyTorch.
+
+---
+
+### 2.  Kernel design
+
+```text
+kernel tri_mul_fuse(
+    left_ptr, right_ptr,                # [B,N,N,H] projected tensors
+    mask_ptr,                           # [B,N,N,1] (broadcasted mask)
+    left_gate_ptr, right_gate_ptr,      # [B,N,N,H] already sigmoid‑ed
+    B, N, H,
+    stride_left_bhn, stride_left_hn, stride_left_n, stride_left_c,
+    stride_right_bhn, stride_right_hn, stride_right_n, stride_right_c,
+    stride_mask_bhn, stride_mask_hn, stride_mask_n,
+    stride_lgate_bhn, stride_lgate_hn, stride_lgate_n, stride_lgate_c,
+    stride_rgate_bhn, stride_rgate_hn, stride_rgate_n, stride_rgate_c,
+    BLOCK: tl.constexpr)
+```
+
+* One‑dimensional launch (`pid = tl.program_id(0)`).
+* Each thread works on a contiguous block of `BLOCK` elements of the flattened tensor `[B,N,N,H]`.
+* The linear index is decoded into `(b,i,k,h)` (the third dimension of the original tensor is `k` – the “summation” axis).
+* Loads the five values, applies the fused expression  
+
+```
+left  = left  * mask * left_gate
+right = right * mask * right_gate
+```
+
+* Stores the results back in‑place (overwrites the original projected tensors).
+
+Because the kernel touches only four tensors (plus the mask) it is memory‑bound, but the 2 KB‑wide block (`BLOCK=2048`) fully utilizes the H200 bandwidth.
+
+---
+
+### 3.  End‑to‑end forward pass
+
+1. **LayerNorm on `x`** – manual implementation to avoid an extra kernel launch.
+2. **Linear projections** (`left_proj`, `right_proj`) – `torch.nn.functional.linear`.
+3. **Gate linear layers + sigmoid** – also `torch.nn.functional.linear`.
+4. **Fuse mask & gates** – the Triton kernel defined above (in‑place on `left` and `right`).
+5. **Batched matrix‑multiplication** – reshape to `(B·H, N, N)` and call `torch.bmm(left_flat, right_flat.transpose(1,2))`.
+6. **Output LayerNorm** – same manual code as step 1.
+7. **Apply output gate** (element‑wise multiply).
+8. **Final linear projection** – `torch.nn.functional.linear`.
+9. Return the result (already `float32` on the GPU).
+
+All tensors stay contiguous; strides are taken from the tensors after each operation, which guarantees correctness for any layout produced by the PyTorch calls.
+
+---
+
+### 4.  Full implementation
+
+```python
+"""
+TriMul “outgoing” forward pass (AlphaFold‑3).
+
+The heavy N³ contraction
+    out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+is performed as a batch of matrix‑multiplications (CuBLAS).
+A tiny Triton kernel fuses mask application and the two gate multiplications
+into a single memory pass, eliminating three separate PyTorch kernels.
+All other linear layers and LayerNorms are handled in PyTorch.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from torch.nn import functional as F
+
+
+# ----------------------------------------------------------------------
+# Triton kernel – fuse mask, left‑gate and right‑gate onto the projected tensors
+# ----------------------------------------------------------------------
+@triton.jit
+def tri_mul_fuse_kernel(
+    left_ptr, right_ptr,                 # [B,N,N,H] projected tensors
+    mask_ptr,                            # [B,N,N,1] broadcasted mask
+    left_gate_ptr, right_gate_ptr,       # [B,N,N,H] gate values (sigmoid already)
+    B, N, H,
+    stride_left_bhn, stride_left_hn, stride_left_n, stride_left_c,
+    stride_right_bhn, stride_right_hn, stride_right_n, stride_right_c,
+    stride_mask_bhn, stride_mask_hn, stride_mask_n,
+    stride_lgate_bhn, stride_lgate_hn, stride_lgate_n, stride_lgate_c,
+    stride_rgate_bhn, stride_rgate_hn, stride_rgate_n, stride_rgate_c,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)                     # linear program id
+    total = B * N * N * H
+    offs = pid * BLOCK + tl.arange(0, BLOCK)   # indices handled by this thread
+    mask = offs < total
+
+    # ---- decode linear index into (b,i,k,h) ----
+    b = offs // (N * N * H)
+    rest = offs % (N * N * H)
+    i = rest // (N * H)
+    rest = rest % (N * H)
+    k = rest // H
+    h = rest % H
+
+    # ---- compute pointer offsets (in elements) ----
+    left_off = (b * stride_left_bhn +
+                i * stride_left_hn +
+                k * stride_left_n +
+                h * stride_left_c)
+    right_off = (b * stride_right_bhn +
+                 i * stride_right_hn +
+                 k * stride_right_n +
+                 h * stride_right_c)
+    mask_off = (b * stride_mask_bhn +
+                i * stride_mask_hn +
+                k * stride_mask_n)               # mask has no channel dim
+    lgate_off = (b * stride_lgate_bhn +
+                 i * stride_lgate_hn +
+                 k * stride_lgate_n +
+                 h * stride_lgate_c)
+    rgate_off = (b * stride_rgate_bhn +
+                 i * stride_rgate_hn +
+                 k * stride_rgate_n +
+                 h * stride_rgate_c)
+
+    # ---- load values -------------------------------------------------
+    left  = tl.load(left_ptr + left_off,  mask=mask, other=0.0)
+    right = tl.load(right_ptr + right_off, mask=mask, other=0.0)
+    m     = tl.load(mask_ptr + mask_off,   mask=mask, other=0.0)
+    lgate = tl.load(left_gate_ptr + lgate_off, mask=mask, other=0.0)
+    rgate = tl.load(right_gate_ptr + rgate_off, mask=mask, other=0.0)
+
+    # ---- fused computation -------------------------------------------
+    left  = left  * m * lgate
+    right = right * m * rgate
+
+    # ---- store back in‑place -----------------------------------------
+    tl.store(left_ptr  + left_off , left,  mask=mask)
+    tl.store(right_ptr + right_off, right, mask=mask)
+
+
+# ----------------------------------------------------------------------
+# Helper that launches the Triton kernel (in‑place)
+# ----------------------------------------------------------------------
+def fuse_mask_and_gates(left: torch.Tensor,
+                        right: torch.Tensor,
+                        mask: torch.Tensor,
+                        left_gate: torch.Tensor,
+                        right_gate: torch.Tensor) -> None:
+    """
+    left, right, mask, left_gate, right_gate  ->  in‑place update of left/right.
+    All tensors must be on the same CUDA device and contiguous.
+    """
+    B, N, _, H = left.shape
+    total = B * N * N * H
+    BLOCK = 2048                               # 2k threads → good occupancy on H200
+    grid = (triton.cdiv(total, BLOCK),)
+
+    # strides in *elements* (not bytes)
+    s_left = left.stride()
+    s_right = right.stride()
+    s_mask = mask.stride()
+    s_lgate = left_gate.stride()
+    s_rgate = right_gate.stride()
+
+    tri_mul_fuse_kernel[grid](
+        left_ptr=left,
+        right_ptr=right,
+        mask_ptr=mask,
+        left_gate_ptr=left_gate,
+        right_gate_ptr=right_gate,
+        B=B, N=N, H=H,
+        stride_left_bhn=s_left[0],
+        stride_left_hn=s_left[1],
+        stride_left_n=s_left[2],
+        stride_left_c=s_left[3],
+        stride_right_bhn=s_right[0],
+        stride_right_hn=s_right[1],
+        stride_right_n=s_right[2],
+        stride_right_c=s_right[3],
+        stride_mask_bhn=s_mask[0],
+        stride_mask_hn=s_mask[1],
+        stride_mask_n=s_mask[2],
+        stride_lgate_bhn=s_lgate[0],
+        stride_lgate_hn=s_lgate[1],
+        stride_lgate_n=s_lgate[2],
+        stride_lgate_c=s_lgate[3],
+        stride_rgate_bhn=s_rgate[0],
+        stride_rgate_hn=s_rgate[1],
+        stride_rgate_n=s_rgate[2],
+        stride_rgate_c=s_rgate[3],
+        BLOCK=BLOCK,
+    )
+    # No return – tensors are modified in place
+
+
+# ----------------------------------------------------------------------
+# Main entry point required by the harness
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of TriMul (outgoing) using a small Triton kernel.
+    Arguments
+    ----------
+    data : tuple
+        (input_tensor, mask, weights_dict, config_dict)
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape [B, N, N, dim] on the same CUDA device, dtype float32.
+    """
+    # unpack
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    eps = 1e-5
+
+    # ------------------------------------------------------------------
+    # 1) Input LayerNorm  (manual, stays in float32)
+    # ------------------------------------------------------------------
+    ln_w = weights["norm.weight"]
+    ln_b = weights["norm.bias"]
+    mean = input_tensor.mean(dim=-1, keepdim=True)
+    var = input_tensor.var(dim=-1, unbiased=False, keepdim=True)
+    x = (input_tensor - mean) / torch.sqrt(var + eps)
+    x = x * ln_w + ln_b                                           # (B,N,N,dim)
+
+    # ------------------------------------------------------------------
+    # 2) Linear projections (no bias)
+    # ------------------------------------------------------------------
+    left = F.linear(x, weights["left_proj.weight"])              # (B,N,N,hidden_dim)
+    right = F.linear(x, weights["right_proj.weight"])
+
+    # ------------------------------------------------------------------
+    # 3) Gate values (sigmoid)
+    # ------------------------------------------------------------------
+    left_gate = F.linear(x, weights["left_gate.weight"]).sigmoid()
+    right_gate = F.linear(x, weights["right_gate.weight"]).sigmoid()
+    out_gate = F.linear(x, weights["out_gate.weight"]).sigmoid()
+
+    # ------------------------------------------------------------------
+    # 4) Prepare mask (broadcasted to the channel dim)
+    # ------------------------------------------------------------------
+    if mask is None:
+        # “nomask” case – a tensor of ones
+        mask = torch.ones_like(left[..., :1])                     # (B,N,N,1)
+    else:
+        mask = mask.unsqueeze(-1).to(left.dtype)                  # (B,N,N,1)
+
+    # ------------------------------------------------------------------
+    # 5) Fuse mask & gates (in‑place on left/right)
+    # ------------------------------------------------------------------
+    fuse_mask_and_gates(left, right, mask, left_gate, right_gate)
+
+    # ------------------------------------------------------------------
+    # 6) N³ contraction via batched matrix multiplication
+    #    reshape to (B*hidden_dim, N, N)
+    # ------------------------------------------------------------------
+    B, N, _, H = left.shape
+    left_flat = left.permute(0, 3, 1, 2).reshape(B * H, N, N)    # (B*H, N, N)
+    right_flat = right.permute(0, 3, 1, 2).reshape(B * H, N, N)
+
+    out_flat = torch.bmm(left_flat, right_flat.transpose(1, 2))  # (B*H, N, N)
+    out = out_flat.view(B, H, N, N).permute(0, 2, 3, 1)           # (B,N,N,hidden_dim)
+
+    # ------------------------------------------------------------------
+    # 7) Output LayerNorm
+    # ------------------------------------------------------------------
+    o_ln_w = weights["to_out_norm.weight"]
+    o_ln_b = weights["to_out_norm.bias"]
+    mean_o = out.mean(dim=-1, keepdim=True)
+    var_o = out.var(dim=-1, unbiased=False, keepdim=True)
+    out = (out - mean_o) / torch.sqrt(var_o + eps)
+    out = out * o_ln_w + o_ln_b
+
+    # ------------------------------------------------------------------
+    # 8) Apply output gate
+    # ------------------------------------------------------------------
+    out = out * out_gate
+
+    # ------------------------------------------------------------------
+    # 9) Final linear projection back to dim
+    # ------------------------------------------------------------------
+    out = F.linear(out, weights["to_out.weight"])                # (B,N,N,dim)
+
+    return out.to(torch.float32)
+```
+
+**Key points**
+
+* The Triton kernel is the only custom kernel; it fuses three element‑wise multiplies and writes the result back in‑place, removing three separate CUDA launches.
+* All heavy linear algebra (`bmm`) stays in cuBLAS, which is optimal on the Hopper/H200 architecture.
+* The implementation works for both *masked* and *no‑mask* configurations, any supported `B`, `N`, `dim`, `hidden_dim`, and for inputs drawn from normal or heavy‑tailed Cauchy distributions.
+* The final tensor is `float32` and resides on the same CUDA device as the inputs, satisfying the specification.

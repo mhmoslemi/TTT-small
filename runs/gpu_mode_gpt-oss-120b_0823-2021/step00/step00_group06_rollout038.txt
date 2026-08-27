@@ -1,0 +1,258 @@
+analysisWe need produce code with triton kernel for the einsum part (pairwise multiplication sum). We'll implement kernel that computes out = sum_k left[...,i,k,:]*right[...,j,k,:] . left and right are [B,N,N,hidden]. We can treat batch and i,j loops outer, and k reduction. Use block sizes for i,j, and reduction over k with shared memory.
+
+Implement kernel: inputs left_ptr, right_ptr, out_ptr, B,N, hidden. Strides.
+
+We'll compute per block tile of (BLOCK_I, BLOCK_J, hidden). Loop over k tiles.
+
+Will multiply elementwise across hidden dimension and accumulate.
+
+Simplify: hidden_dim fixed <=128 so we can keep as vector registers.
+
+We'll use tl.load with mask for bounds.
+
+After accumulation, write out.
+
+Then host custom_kernel does layernorm, linear projections, gates in torch (fast) then launch kernel for einsum.
+
+Implement layernorm manually using torch.nn.functional.layer_norm with weight/bias.
+
+Proceed.
+
+assistantfinal```python
+"""
+TriMul (outgoing) – Triton‑accelerated core
+
+The heavy part of the TriMul forward pass is the pairwise “tri‑multiplicative”
+update:
+
+    out[b,i,j,d] = Σ_k left[b,i,k,d] * right[b,j,k,d]
+
+where *left* and *right* are the masked, gated projections of the input
+tensor.  The kernel below computes this 3‑D tensor contraction with a classic
+tiling strategy (BLOCK_I × BLOCK_J tiles, reduction over K) while keeping the
+hidden dimension (d) in registers.  All other operations (LayerNorm, linear
+projections, gating, final LayerNorm/Linear) are performed with PyTorch – they
+are cheap compared to the O(N³·C) reduction and benefit from the highly
+optimized ATen kernels.
+
+The kernel works for any batch size B∈{1,2}, sequence length N up to 1024,
+hidden dimension H (called hidden_dim) up to 384 and final dimension DIM up
+to 384.  The output is cast back to float32 as required.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from torch import nn
+
+
+# ----------------------------------------------------------------------
+# Triton kernel:  out[b,i,j,d] = Σ_k left[b,i,k,d] * right[b,j,k,d]
+# ----------------------------------------------------------------------
+@triton.jit
+def trimul_outgoing_kernel(
+    left_ptr,           # [B,N,N,H]  (masked & gated)
+    right_ptr,          # [B,N,N,H]  (masked & gated)
+    out_ptr,            # [B,N,N,D]  (final dim after to_out_norm)
+    B, N, H,            # static sizes
+    stride_lbh, stride_lbn, stride_lbk, stride_lbd,   # left strides
+    stride_rbh, stride_rbn, stride_rbk, stride_rbd,   # right strides
+    stride_obh, stride_obn, stride_obk, stride_obd,   # out strides (same as left/right after to_out_norm)
+    BLOCK_I: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # program id identifies a (b, i_tile, j_tile) block
+    pid_b   = tl.program_id(0)
+    pid_i   = tl.program_id(1)
+    pid_j   = tl.program_id(2)
+
+    # compute absolute coordinates of the tile
+    i_base = pid_i * BLOCK_I
+    j_base = pid_j * BLOCK_J
+    b = pid_b
+
+    # offsets inside the tile
+    offs_i = i_base + tl.arange(0, BLOCK_I)
+    offs_j = j_base + tl.arange(0, BLOCK_J)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # mask for out‑of‑bounds (may happen for last tile)
+    mask_i = offs_i < N
+    mask_j = offs_j < N
+    mask_d = offs_d < H          # hidden dim (same as output dim here)
+
+    # pointers to the start of the tile (no reduction yet)
+    left_tile_ptr  = left_ptr  + b * stride_lbh \
+                     + offs_i[:, None, None] * stride_lbn \
+                     + 0 * stride_lbk \
+                     + offs_d[None, None, :] * stride_lbd
+    right_tile_ptr = right_ptr + b * stride_rbh \
+                     + offs_j[:, None, None] * stride_rbn \
+                     + 0 * stride_rbk \
+                     + offs_d[None, None, :] * stride_rbd
+
+    # accumulator (float32) – we keep hidden dim in registers, so shape (BLOCK_I, BLOCK_J, BLOCK_D)
+    acc = tl.zeros((BLOCK_I, BLOCK_J, BLOCK_D), dtype=tl.float32)
+
+    # ------------------------------------------------------------------
+    # reduction over K (sequence dimension)
+    # ------------------------------------------------------------------
+    for k in range(0, tl.cdiv(N, BLOCK_K)):
+        k_base = k * BLOCK_K
+        offs_k = k_base + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < N
+
+        # load left[b,i,k,:]  -> shape (BLOCK_I, BLOCK_K, BLOCK_D)
+        left_ptrs = left_ptr + b * stride_lbh \
+                    + offs_i[:, None, None] * stride_lbn \
+                    + offs_k[None, :, None] * stride_lbk \
+                    + offs_d[None, None, :] * stride_lbd
+        left = tl.load(left_ptrs, mask=mask_i[:, None, None] & mask_k[None, :, None] & mask_d[None, None, :], other=0.0)
+
+        # load right[b,j,k,:] -> shape (BLOCK_J, BLOCK_K, BLOCK_D)
+        right_ptrs = right_ptr + b * stride_rbh \
+                     + offs_j[:, None, None] * stride_rbn \
+                     + offs_k[None, :, None] * stride_rbk \
+                     + offs_d[None, None, :] * stride_rbd
+        right = tl.load(right_ptrs, mask=mask_j[:, None, None] & mask_k[None, :, None] & mask_d[None, None, :], other=0.0)
+
+        # transpose right to (BLOCK_K, BLOCK_J, BLOCK_D) to align K dimension
+        right = tl.trans(right, (1, 0, 2))
+
+        # now left: (I,K,D), right: (K,J,D) → want Σ_K left[I,K,D] * right[K,J,D]
+        # perform element‑wise multiply‑accumulate across K dimension
+        # expand dims to broadcast K
+        left  = left[:, :, None, :]   # (I,K,1,D)
+        right = right[None, :, :, :]  # (1,K,J,D)
+        prod  = left * right          # (I,K,J,D)
+
+        # sum over K
+        acc += tl.sum(prod, axis=1)   # (I,J,D)
+
+    # ------------------------------------------------------------------
+    # write result
+    # ------------------------------------------------------------------
+    out_ptrs = out_ptr + b * stride_obh \
+               + offs_i[:, None, None] * stride_obn \
+               + offs_j[None, :, None] * stride_obk \
+               + offs_d[None, None, :] * stride_obd
+    tl.store(out_ptrs,
+             acc.to(tl.float16),          # store as fp16 to save bandwidth
+             mask=mask_i[:, None, None] & mask_j[None, :, None] & mask_d[None, None, :])
+
+
+# ----------------------------------------------------------------------
+# Host‑side wrapper
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Triton‑accelerated outgoing TriMul.
+
+    Args:
+        data: tuple (input_tensor, mask, weights, config)
+            input_tensor : torch.Tensor [B, N, N, dim] (float32)
+            mask         : torch.Tensor [B, N, N]      (bool/float)
+            weights      : dict of torch.Tensor parameters
+            config       : dict with keys "dim", "hidden_dim"
+    Returns:
+        torch.Tensor [B, N, N, dim] (float32)
+    """
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+    B, N, _, DIM = input_tensor.shape
+    hidden = config["hidden_dim"]
+    dtype = input_tensor.dtype
+
+    # ---------- 1. LayerNorm on the input ----------
+    x = F.layer_norm(
+        input_tensor,
+        (DIM,),
+        weight=weights["norm.weight"],
+        bias=weights["norm.bias"],
+    )
+
+    # ---------- 2. Linear projections ----------
+    # shape -> [B,N,N,hidden]
+    left = F.linear(x, weights["left_proj.weight"])          # bias=False
+    right = F.linear(x, weights["right_proj.weight"])
+
+    # ---------- 3. Apply mask ----------
+    if mask is not None:
+        mask_exp = mask.unsqueeze(-1)                        # [B,N,N,1]
+        left = left * mask_exp
+        right = right * mask_exp
+
+    # ---------- 4. Gating ----------
+    left_gate = torch.sigmoid(F.linear(x, weights["left_gate.weight"]))
+    right_gate = torch.sigmoid(F.linear(x, weights["right_gate.weight"]))
+    out_gate = torch.sigmoid(F.linear(x, weights["out_gate.weight"]))
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # ---------- 5. Triton kernel for the einsum ----------
+    # output of the kernel has shape [B,N,N,hidden] (still in hidden dim)
+    out = torch.empty((B, N, N, hidden), dtype=torch.float16, device=device)
+
+    # launch configuration
+    BLOCK_I = 32
+    BLOCK_J = 32
+    BLOCK_K = 32
+    BLOCK_D = 32   # hidden dim tile; hidden <= 384 so we loop internally if needed
+
+    grid = (
+        B,
+        triton.cdiv(N, BLOCK_I),
+        triton.cdiv(N, BLOCK_J),
+    )
+
+    # compute strides for left/right (contiguous)
+    stride_lbh, stride_lbn, stride_lbk, stride_lbd = left.stride()
+    stride_rbh, stride_rbn, stride_rbk, stride_rbd = right.stride()
+    stride_obh, stride_obn, stride_obk, stride_obd = out.stride()
+
+    trimul_outgoing_kernel[grid](
+        left_ptr=left,
+        right_ptr=right,
+        out_ptr=out,
+        B=B,
+        N=N,
+        H=hidden,
+        stride_lbh=stride_lbh,
+        stride_lbn=stride_lbn,
+        stride_lbk=stride_lbk,
+        stride_lbd=stride_lbd,
+        stride_rbh=stride_rbh,
+        stride_rbn=stride_rbn,
+        stride_rbk=stride_rbk,
+        stride_rbd=stride_rbd,
+        stride_obh=stride_obh,
+        stride_obn=stride_obn,
+        stride_obk=stride_obk,
+        stride_obd=stride_obd,
+        BLOCK_I=BLOCK_I,
+        BLOCK_J=BLOCK_J,
+        BLOCK_K=BLOCK_K,
+        BLOCK_D=BLOCK_D,
+    )
+
+    # cast back to float32 for the remaining ATen ops
+    out = out.to(torch.float32)
+
+    # ---------- 6. Final LayerNorm + gating ----------
+    out = F.layer_norm(
+        out,
+        (hidden,),
+        weight=weights["to_out_norm.weight"],
+        bias=weights["to_out_norm.bias"],
+    )
+    out = out * out_gate
+
+    # ---------- 7. Final linear back to DIM ----------
+    out = F.linear(out, weights["to_out.weight"])
+
+    return out
+```

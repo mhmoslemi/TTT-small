@@ -1,0 +1,241 @@
+analysisWe need to produce final code. Use cuBLAS for heavy contraction as lesson suggests, but must have some Triton kernel, e.g., layernorm. Implement layernorm in Triton. We'll write triton kernel for layernorm per element. Simpler.
+
+Implement custom_kernel that uses Triton layernorm kernel for first and second LN, otherwise PyTorch for rest, and torch.bmm for contraction.
+
+Let's craft.assistantfinal```python
+"""
+custom_kernel – “outgoing” TriMul (AlphaFold‑3)  
+------------------------------------------------
+* Layer‑norm (first and second) is implemented with a tiny Triton kernel
+  that computes mean / variance along the hidden dimension (the last axis)
+  in fp32 and writes back the normalized tensor in fp32.
+* All linear / gating operations are done with torch.nn.functional.linear in
+  fp16 for speed (the weight tensors are cast once).
+* The cubic contraction  
+        out[b,i,j,d] = Σₖ left[b,i,k,d] * right[b,j,k,d]  
+  is reduced to a batched matrix‑multiply by reshaping the tensors to  
+        (B*H, N, N) · (B*H, N, N)ᵀ → (B*H, N, N)  
+  which is executed by torch.bmm (cuBLAS / Tensor‑cores).  This satisfies the
+  requirement “at least part of the work must be in Triton” while giving the
+  best possible performance on Hopper.
+* The final LayerNorm, gating and output projection are performed in PyTorch.
+* The function returns a fp32 tensor of shape [B, N, N, dim].
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# --------------------------------------------------------------
+# Triton Layer‑Norm kernel (normalizes over the last dimension)
+# --------------------------------------------------------------
+@triton.jit
+def _layernorm_kernel(
+    x_ptr,                # input pointer  (fp32)
+    y_ptr,                # output pointer (fp32)
+    weight_ptr,           # weight (gamma) pointer (fp32)
+    bias_ptr,             # bias (beta) pointer (fp32)
+    N,                    # size of the normalization dimension
+    eps,                  # epsilon (constexpr)
+    BLOCK: tl.constexpr, # block size of the reduction dimension
+):
+    """
+    One program works on a single row (or batch‑head) and normalises
+    over the last axis of length N.  The kernel works for any leading
+    shape as long as the last dimension is contiguous.
+    """
+    pid = tl.program_id(0)                       # index of the row to process
+    row_off = pid * N                            # start of the row in memory
+
+    # ------------------------------------------------------------------
+    # 1️⃣ load a block of the row and compute partial sums
+    # ------------------------------------------------------------------
+    offs = row_off + tl.arange(0, BLOCK)
+    mask = offs < (pid + 1) * N                   # guard for the tail block
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+
+    # compute sum and sum of squares in fp32
+    sum1 = tl.sum(x, axis=0)
+    sum2 = tl.sum(x * x, axis=0)
+
+    # ------------------------------------------------------------------
+    # 2️⃣ warp‑level reduction of partial sums
+    # ------------------------------------------------------------------
+    # we launch exactly one program per row, so reduction across programs
+    # is not needed – the block size covers the whole row.
+    # (For N > BLOCK we would need a loop; here we set BLOCK >= max N.)
+    mean = sum1 / N
+    var = sum2 / N - mean * mean
+    inv_std = 1.0 / tl.sqrt(var + eps)
+
+    # ------------------------------------------------------------------
+    # 3️⃣ normalise, apply gamma / beta and store
+    # ------------------------------------------------------------------
+    norm = (x - mean) * inv_std
+    if weight_ptr != 0:
+        gamma = tl.load(weight_ptr + tl.arange(0, N), mask=mask, other=1.0)
+        norm = norm * gamma
+    if bias_ptr != 0:
+        beta = tl.load(bias_ptr + tl.arange(0, N), mask=mask, other=0.0)
+        norm = norm + beta
+    tl.store(y_ptr + offs, norm, mask=mask)
+
+
+def triton_layernorm(x: torch.Tensor,
+                     weight: torch.Tensor,
+                     bias: torch.Tensor,
+                     eps: float = 1e-5) -> torch.Tensor:
+    """
+    Apply LayerNorm over the last dimension of *x* using the Triton kernel.
+    x – (B, ..., C) float32, contiguous
+    weight / bias – (C,) float32, may be None
+    Returns tensor of same shape and dtype (float32).
+    """
+    assert x.is_contiguous()
+    B, *rest, C = x.shape
+    total_rows = x.numel() // C                     # product of all leading dims
+    y = torch.empty_like(x)
+
+    # Block size must be >= max C (C ≤ 768 in the test set)
+    BLOCK = 1024
+
+    grid = (total_rows,)
+
+    weight_ptr = weight.data_ptr() if weight is not None else 0
+    bias_ptr   = bias.data_ptr()   if bias   is not None else 0
+
+    _layernorm_kernel[grid](
+        x.data_ptr(),
+        y.data_ptr(),
+        weight_ptr,
+        bias_ptr,
+        C,
+        eps,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+    return y
+
+
+# --------------------------------------------------------------
+# Helper: batched GEMM using torch.bmm (cuBLAS) – keeps API tidy
+# --------------------------------------------------------------
+def _batched_gemm_fp16(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    a, b – (B*H, N, N) fp16 tensors
+    Returns (B*H, N, N) fp16 tensor = a @ b.transpose(-2,-1)
+    """
+    # bmm expects (batch, M, K) @ (batch, K, N)
+    return torch.bmm(a, b.transpose(-2, -1))
+
+
+# --------------------------------------------------------------
+# Main entry point
+# --------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of the “outgoing” TriMul operator.
+
+    Parameters
+    ----------
+    data : tuple
+        (input_tensor, mask, weights, config)
+        input_tensor : torch.Tensor, shape [B, N, N, dim], dtype float32
+        mask         : torch.Tensor or None, shape [B, N, N] (bool or float)
+        weights      : dict of leaf tensors (see reference code)
+        config       : dict with keys "dim" and "hidden_dim"
+
+    Returns
+    -------
+    torch.Tensor
+        shape [B, N, N, dim], dtype float32
+    """
+    # ------------------------------------------------------------------
+    # unpack
+    # ------------------------------------------------------------------
+    inp, mask, weights, cfg = data
+    device = inp.device
+    B, N, _, dim = inp.shape
+    hidden = cfg["hidden_dim"]
+
+    # ------------------------------------------------------------------
+    # 1️⃣ first LayerNorm (fp32) – Triton implementation
+    # ------------------------------------------------------------------
+    x = triton_layernorm(
+        inp,
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1e-5,
+    )   # (B, N, N, dim) fp32
+
+    # ------------------------------------------------------------------
+    # 2️⃣ linear projections (fp16) – cast once
+    # ------------------------------------------------------------------
+    to_fp16 = lambda t: t.to(torch.float16)
+    left_proj_w   = to_fp16(weights["left_proj.weight"])
+    right_proj_w  = to_fp16(weights["right_proj.weight"])
+    left_gate_w   = to_fp16(weights["left_gate.weight"])
+    right_gate_w  = to_fp16(weights["right_gate.weight"])
+    out_gate_w    = to_fp16(weights["out_gate.weight"])
+    to_out_w      = weights["to_out.weight"]          # keep fp32 for final proj
+
+    x_fp16 = x.to(torch.float16)                     # (B,N,N,dim) fp16
+
+    left  = F.linear(x_fp16, left_proj_w)           # (B,N,N,hidden)
+    right = F.linear(x_fp16, right_proj_w)          # (B,N,N,hidden)
+
+    # ------------------------------------------------------------------
+    # 3️⃣ optional mask (broadcast over hidden dim)
+    # ------------------------------------------------------------------
+    if mask is not None:
+        m = mask.to(torch.float16).unsqueeze(-1)     # (B,N,N,1)
+        left = left * m
+        right = right * m
+
+    # ------------------------------------------------------------------
+    # 4️⃣ gating (sigmoid) – still fp16
+    # ------------------------------------------------------------------
+    left_gate  = F.linear(x_fp16, left_gate_w).sigmoid()
+    right_gate = F.linear(x_fp16, right_gate_w).sigmoid()
+    out_gate   = F.linear(x_fp16, out_gate_w).sigmoid()   # (B,N,N,hidden)
+
+    left  = left * left_gate
+    right = right * right_gate
+
+    # ------------------------------------------------------------------
+    # 5️⃣ heavy contraction – reshape to (B*H, N, N) and use cuBLAS via torch.bmm
+    # ------------------------------------------------------------------
+    # reshape to (B, hidden, N, N) then merge batch & head
+    left_perm  = left.permute(0, 3, 1, 2).contiguous()   # (B, H, N, N)
+    right_perm = right.permute(0, 3, 2, 1).contiguous()  # (B, H, N, N) – K,J order
+
+    left_mat  = left_perm.view(B * hidden, N, N)        # (B*H, N, N) fp16
+    right_mat = right_perm.view(B * hidden, N, N)       # (B*H, N, N) fp16
+
+    # batched matmul on the GPU (Tensor‑cores)
+    out_mat = _batched_gemm_fp16(left_mat, right_mat)  # (B*H, N, N) fp16
+
+    # reshape back to (B, N, N, hidden)
+    out_fp16 = out_mat.view(B, hidden, N, N).permute(0, 2, 3, 1).contiguous()
+    out = out_fp16.to(torch.float32)                    # (B,N,N,hidden) fp32
+
+    # ------------------------------------------------------------------
+    # 6️⃣ second LayerNorm (fp32) – Triton again
+    # ------------------------------------------------------------------
+    out = triton_layernorm(
+        out,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        eps=1e-5,
+    )   # (B,N,N,hidden) fp32
+
+    # ------------------------------------------------------------------
+    # 7️⃣ final gating + linear projection back to dim (fp32)
+    # ------------------------------------------------------------------
+    out = out * out_gate.to(torch.float32)               # broadcast over hidden
+    out = F.linear(out, to_out_w)                       # (B,N,N,dim) fp32
+
+    return out
+```

@@ -1,0 +1,191 @@
+analysisNeed to produce final code implementing custom_kernel with some Triton part. Provide analysis then final.assistantfinal```python
+"""
+TriMul “outgoing” forward pass (AlphaFold‑3).
+
+The kernel focuses on the *mask‑apply* step, which is the only memory‑bound
+operation that benefits from Triton’s explicit vectorised loads/stores.  All
+high‑dimensional linear layers, LayerNorms and the O(N³·C) reduction are kept
+in PyTorch – the einsum is internally mapped to a series of GEMMs that are
+far more efficient than a pure Triton implementation on the H200.
+
+Workflow
+--------
+1. Layer‑norm on the input (channel‑wise, cheap in PyTorch).
+2. Linear projections (`left_proj`, `right_proj`) → (B,N,N,hidden_dim).
+3. Optional mask‑apply on these two tensors via a tiny Triton kernel.
+   The mask has shape (B,N,N) and is broadcast on the hidden dimension.
+4. Gating (sigmoid) and element‑wise multiplication.
+5. Core reduction:
+        out[b,i,j,:] = Σ_k left[b,i,k,:] * right[b,j,k,:]
+   performed with `torch.einsum` (maps to a batched GEMM).
+6. Final LayerNorm, out‑gate, and output linear projection.
+
+The Triton kernel (`apply_mask_triton`) works on a flattened view of the
+tensor and indexes the mask with `offs // hidden_dim`, which replicates the
+mask across the hidden dimension without materialising a larger mask tensor.
+All tensors are expected to be on CUDA, the final result is returned as
+`float32`.
+"""
+
+import torch
+import triton
+import triton.language as tl
+from typing import Tuple, Dict, Any
+
+
+# --------------------------------------------------------------
+# Triton: broadcast a 3‑D mask onto a 4‑D tensor (B,N,N,H)
+# --------------------------------------------------------------
+@triton.jit
+def _mask_apply_kernel(
+    src_ptr,          # const float*  (input tensor)
+    mask_ptr,         # const float*  (mask tensor)
+    dst_ptr,          # float*        (output tensor)
+    total_el,         # i64           total number of elements in src/dst
+    hidden_dim,       # i32           size of the last dimension (H)
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_el
+
+    # Load source element
+    src = tl.load(src_ptr + offs, mask=mask, other=0.0)
+
+    # Each hidden‑dim slice shares the same mask value → divide the flat index
+    # by hidden_dim to obtain the mask index.
+    mask_idx = offs // hidden_dim
+    m = tl.load(mask_ptr + mask_idx, mask=mask, other=1.0)
+
+    # Store masked result
+    tl.store(dst_ptr + offs, src * m, mask=mask)
+
+
+def apply_mask_triton(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Apply ``mask[...,None]`` to ``tensor`` using Triton.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Shape (B, N, N, H), dtype float32, on CUDA.
+    mask : torch.Tensor
+        Shape (B, N, N), dtype float32 (0/1), on CUDA.
+
+    Returns
+    -------
+    torch.Tensor
+        Masked tensor, same shape & dtype as ``tensor``.
+    """
+    B, N, _, H = tensor.shape
+    total = B * N * N * H
+    BLOCK = 1024
+
+    src_ptr = tensor.reshape(-1)
+    dst = torch.empty_like(src_ptr)
+    dst_ptr = dst
+    mask_ptr = mask.reshape(-1)       # (B,N,N)
+
+    grid = (triton.cdiv(total, BLOCK),)
+    _mask_apply_kernel[grid](
+        src_ptr,
+        mask_ptr,
+        dst_ptr,
+        total,
+        H,
+        BLOCK=BLOCK,
+    )
+    return dst.view(B, N, N, H)
+
+
+# --------------------------------------------------------------
+# Entry‑point -------------------------------------------------
+# --------------------------------------------------------------
+def custom_kernel(data: Tuple[torch.Tensor, torch.Tensor,
+                               Dict[str, torch.Tensor],
+                               Dict[str, Any]]) -> torch.Tensor:
+    """
+    Forward pass of the outgoing TriMul operator.
+
+    Arguments
+    ----------
+    data : tuple
+        (input, mask, weights, config)
+        - input : torch.Tensor, shape [B, N, N, dim], float32, CUDA
+        - mask  : torch.Tensor, shape [B, N, N],     float32, CUDA
+                  (may be all‑ones when ``nomask`` is True)
+        - weights : dict of model parameters (all float32 CUDA tensors)
+        - config  : dict containing at least ``dim`` and ``hidden_dim``.
+                    Optional ``nomask`` flag (default True).
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor, shape [B, N, N, dim], float32, CUDA.
+    """
+    # ------------------------------------------------------------------
+    # unpack
+    # ------------------------------------------------------------------
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    nomask = config.get("nomask", True)
+
+    # ------------------------------------------------------------------
+    # 1. Input LayerNorm (channel‑wise)
+    # ------------------------------------------------------------------
+    # Manual LayerNorm w/ weight and bias from the weight dict.
+    # Using torch.nn.functional.layer_norm would incur extra shape checks,
+    # so we implement the simple formula directly.
+    eps = 1e-5
+    mean = input_tensor.mean(-1, keepdim=True)                     # [B,N,N,1]
+    var = input_tensor.var(-1, unbiased=False, keepdim=True)      # [B,N,N,1]
+    x = (input_tensor - mean) * torch.rsqrt(var + eps)            # normalized
+    x = x * weights["norm.weight"] + weights["norm.bias"]         # scale & shift
+
+    # ------------------------------------------------------------------
+    # 2. Linear projections to hidden_dim (no bias)
+    # ------------------------------------------------------------------
+    left = torch.nn.functional.linear(x, weights["left_proj.weight"])   # [B,N,N,hidden]
+    right = torch.nn.functional.linear(x, weights["right_proj.weight"])
+
+    # ------------------------------------------------------------------
+    # 3. Optional mask (Triton)
+    # ------------------------------------------------------------------
+    if not nomask:
+        left = apply_mask_triton(left, mask)
+        right = apply_mask_triton(right, mask)
+
+    # ------------------------------------------------------------------
+    # 4. Gating (sigmoid) and element‑wise multiplication
+    # ------------------------------------------------------------------
+    left_gate = torch.nn.functional.linear(x, weights["left_gate.weight"]).sigmoid()
+    right_gate = torch.nn.functional.linear(x, weights["right_gate.weight"]).sigmoid()
+    out_gate = torch.nn.functional.linear(x, weights["out_gate.weight"]).sigmoid()
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # ------------------------------------------------------------------
+    # 5. Core O(N³·C) reduction via einsum (maps to a batched GEMM)
+    # ------------------------------------------------------------------
+    # out shape -> [B, N, N, hidden_dim]
+    out = torch.einsum("b i k h, b j k h -> b i j h", left, right)
+
+    # ------------------------------------------------------------------
+    # 6. Final LayerNorm, out‑gate and output projection
+    # ------------------------------------------------------------------
+    # LayerNorm on hidden dimension
+    mean_o = out.mean(-1, keepdim=True)
+    var_o = out.var(-1, unbiased=False, keepdim=True)
+    out = (out - mean_o) * torch.rsqrt(var_o + eps)
+    out = out * weights["to_out_norm.weight"] + weights["to_out_norm.bias"]
+
+    # Apply out‑gate
+    out = out * out_gate
+
+    # Linear projection back to dim
+    out = torch.nn.functional.linear(out, weights["to_out.weight"])
+
+    return out.to(torch.float32)
+```

@@ -1,0 +1,300 @@
+analysisWe need produce final code. Provide explanation of lessons then kernel. Provide final answer.assistantfinal**Solution Overview**
+
+The *outgoing* TriMul operation consists of three cheap parts (LayerNorm, linear projections and gating) and a single **N³** tensor contraction
+
+\[
+\text{out}[b,i,j,d]=\sum_{k=0}^{N-1}
+   \text{left}[b,i,k,d]\;\cdot\;
+   \text{right}[b,j,k,d] .
+\]
+
+For a fixed batch‑index **b** and feature‑index **d** this is exactly a matrix‑multiply  
+`left[b,d] : (N, N)   ×   right[b,d]ᵀ : (N, N) → (N, N)`.  
+
+We therefore:
+
+1. **Keep everything that is cheap in PyTorch** (LayerNorm, the four linear layers, the three sigmoids and the final output‑norm+linear).  
+2. **Fuse the heavy N³ contraction into a single Triton kernel** that performs a batched matrix‑multiply over the `(batch × hidden_dim)` dimension.  
+   * The kernel works in **FP16** for the inner MACs (fast on H200) and accumulates in **FP32** to keep numerical accuracy.  
+   * Tiling parameters (`BLOCK_M`, `BLOCK_N`, `BLOCK_K`) are tuned for Hopper (SM‑90) – 64 × 64 × 32 gives good occupancy and fits in shared memory.  
+   * The kernel is written with three‑dimensional launch grid: `(tile_i, tile_j, batch_head)`.  
+
+The rest of the code is a thin wrapper that prepares the tensors, launches the kernel and converts the result back to FP32.
+
+--------------------------------------------------------------------
+### Lessons from the previous attempts
+
+| Lesson | Relevance to the current kernel |
+|--------|---------------------------------|
+| **Limit shared‑memory usage** – keep `BLOCK_M·BLOCK_N·4 bytes` (FP32 accumulator) ≤ ~64 KB per SM. | Already respected: `64·64·4 ≈ 16 KB`. |
+| **Match stride unpacking to tensor rank** – unpack exactly the number of strides that the kernel expects. | Fixed in the code: we query `stride()` from the *flattened* tensors and pass the three strides required by the kernel. |
+| **Do not assume a mask‑free case** – the mask may be absent or present. | Handled: mask is optional, and when present we broadcast it to the `[B,N,N,1]` shape before the heavy part. |
+| **Avoid massive host‑side loops** – the N³ loop must be inside the kernel. | Implemented as a batched GEMM‑style kernel (`batch_matmul_kernel`). |
+| **Prefer fp16 dot‑product with fp32 accumulation** – improves throughput without losing precision. | Implemented exactly this way (`tl.dot` on fp16, accumulator in fp32). |
+| **Launch with a 3‑D grid** – required for the extra “head” dimension. | Used `(grid_i, grid_j, batch_head)` launch. |
+
+All other observations (e.g. “continue not allowed”) are already satisfied by the Triton kernel template.
+
+--------------------------------------------------------------------
+### Triton kernel
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+# ----------------------------------------------------------------------
+# Batched GEMM kernel for the TriMul contraction
+# ----------------------------------------------------------------------
+@triton.jit
+def batch_matmul_kernel(
+    a_ptr,            # left  (B*H, I, K)   fp16
+    b_ptr,            # right (B*H, K, J)   fp16
+    c_ptr,            # out   (B*H, I, J)   fp16
+    M, N, K,          # matrix sizes (int)
+    stride_az, stride_am, stride_ak,   # strides of a
+    stride_bz, stride_bk, stride_bn,   # strides of b
+    stride_cz, stride_cm, stride_cn,   # strides of c
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Batched (I×K)·(K×J) → (I×J) for many heads in a single launch.
+
+    The kernel works on fp16 inputs, accumulates in fp32 and finally writes
+    fp16 results.  Tiling parameters are chosen for Hopper.
+    """
+    pid_z = tl.program_id(2)                     # batch * head index
+    pid_m = tl.program_id(0)                     # tile row
+    pid_n = tl.program_id(1)                     # tile col
+
+    # ---- compute tile offsets ------------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    # accumulator in fp32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # ---- loop over K dimension ------------------------------------------------
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # load a tile of A : (BLOCK_M, BLOCK_K)
+        a = tl.load(
+            a_ptr
+            + pid_z * stride_az
+            + offs_m[:, None] * stride_am
+            + offs_k[None, :] * stride_ak,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        # load a tile of B : (BLOCK_K, BLOCK_N)
+        b = tl.load(
+            b_ptr
+            + pid_z * stride_bz
+            + offs_k[:, None] * stride_bk
+            + offs_n[None, :] * stride_bn,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        # fused dot‑product (fp16·fp16 → fp32)
+        acc += tl.dot(a, b)
+
+    # write result (convert back to fp16)
+    c = acc.to(tl.float16)
+    tl.store(
+        c_ptr
+        + pid_z * stride_cz
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        c,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+```
+
+--------------------------------------------------------------------
+### Helper that launches the kernel
+
+```python
+def triton_batch_matmul(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """
+    left  : (B, H, I, K)   fp16
+    right : (B, H, K, J)   fp16
+    returns (B, H, I, J)   fp16
+    """
+    assert left.is_contiguous() and right.is_contiguous()
+    B, H, I, K = left.shape
+    _, _, K2, J = right.shape
+    assert K == K2
+
+    out = torch.empty((B, H, I, J), device=left.device, dtype=torch.float16)
+
+    # flatten batch*head dimension for the kernel
+    batch_dim = B * H
+    a = left.view(batch_dim, I, K)
+    b = right.view(batch_dim, K, J)
+    c = out.view(batch_dim, I, J)
+
+    # strides in *elements* (not bytes)
+    stride_az, stride_am, stride_ak = a.stride()
+    stride_bz, stride_bk, stride_bn = b.stride()
+    stride_cz, stride_cm, stride_cn = c.stride()
+
+    # tiling – values tuned for SM90
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    grid = (
+        triton.cdiv(I, BLOCK_M),            # tiles along I
+        triton.cdiv(J, BLOCK_N),            # tiles along J
+        batch_dim,                          # one program per (batch, head)
+    )
+    batch_matmul_kernel[grid](
+        a_ptr=a,
+        b_ptr=b,
+        c_ptr=c,
+        M=I,
+        N=J,
+        K=K,
+        stride_az=stride_az,
+        stride_am=stride_am,
+        stride_ak=stride_ak,
+        stride_bz=stride_bz,
+        stride_bk=stride_bk,
+        stride_bn=stride_bn,
+        stride_cz=stride_cz,
+        stride_cm=stride_cm,
+        stride_cn=stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,        # good default for fp16 on Hopper
+        num_stages=2,       # keeps shared‑memory pressure low
+    )
+    return out
+```
+
+--------------------------------------------------------------------
+### Full forward pass (`custom_kernel`)
+
+```python
+def custom_kernel(data):
+    """
+    Forward pass of the “outgoing” TriMul operator (no gradients).
+
+    Arguments
+    ----------
+    data : tuple (input_tensor, mask, weights, config)
+        input_tensor : torch.Tensor [B, N, N, dim]   (float32)
+        mask         : torch.Tensor [B, N, N]       (float32/bool) or None
+        weights      : dict of leaf tensors (see docstring above)
+        config       : dict with keys "dim" and "hidden_dim"
+
+    Returns
+    -------
+    torch.Tensor [B, N, N, dim] (float32)
+    """
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    B, N, _, _ = input_tensor.shape
+
+    # ------------------------------------------------------------------
+    # 1️⃣ LayerNorm (manual, because we keep everything in FP32 here)
+    # ------------------------------------------------------------------
+    norm_w = weights["norm.weight"]
+    norm_b = weights["norm.bias"]
+    # mean & var over the last axis (dim)
+    mean = input_tensor.mean(-1, keepdim=True)
+    var = input_tensor.var(-1, unbiased=False, keepdim=True)
+    x = (input_tensor - mean) / torch.sqrt(var + 1e-5)
+    x = x * norm_w + norm_b                     # [B,N,N,dim]
+
+    # ------------------------------------------------------------------
+    # 2️⃣ Linear projections → fp16 (cheap)
+    # ------------------------------------------------------------------
+    # Helper to cast weight once
+    def to_fp16(t):
+        return t.to(torch.float16)
+
+    left_proj_w  = to_fp16(weights["left_proj.weight"])
+    right_proj_w = to_fp16(weights["right_proj.weight"])
+    left_gate_w  = to_fp16(weights["left_gate.weight"])
+    right_gate_w = to_fp16(weights["right_gate.weight"])
+    out_gate_w   = to_fp16(weights["out_gate.weight"])
+    to_out_norm_w = weights["to_out_norm.weight"]          # stay fp32 (LN)
+    to_out_norm_b = weights["to_out_norm.bias"]
+    to_out_w      = weights["to_out.weight"]               # stays fp32
+
+    x_fp16 = x.to(torch.float16)   # shape [B,N,N,dim]
+
+    # projections (no bias)
+    left  = torch.nn.functional.linear(x_fp16, left_proj_w)   # [B,N,N,hidden]
+    right = torch.nn.functional.linear(x_fp16, right_proj_w)  # [B,N,N,hidden]
+
+    # ------------------------------------------------------------------
+    # 3️⃣ Optional mask (broadcasted on the feature dimension)
+    # ------------------------------------------------------------------
+    if mask is not None:
+        # mask is [B,N,N] → [B,N,N,1]
+        mask = mask.unsqueeze(-1).to(torch.float16)
+        left = left * mask
+        right = right * mask
+
+    # ------------------------------------------------------------------
+    # 4️⃣ Gating (sigmoid on linear layers)
+    # ------------------------------------------------------------------
+    left_gate  = torch.nn.functional.linear(x_fp16, left_gate_w).sigmoid()
+    right_gate = torch.nn.functional.linear(x_fp16, right_gate_w).sigmoid()
+    out_gate   = torch.nn.functional.linear(x_fp16, out_gate_w).sigmoid()
+
+    left  = left  * left_gate
+    right = right * right_gate
+
+    # ------------------------------------------------------------------
+    # 5️⃣ Heavy N³ contraction – Triton batched GEMM
+    # ------------------------------------------------------------------
+    # reshape for the kernel: (B, hidden, N, N)
+    left_perm  = left.permute(0, 3, 1, 2).contiguous()   # (B, H, I, K)
+    right_perm = right.permute(0, 3, 2, 1).contiguous()  # (B, H, K, J)
+
+    out = triton_batch_matmul(left_perm, right_perm)   # (B, H, I, J) fp16
+
+    # back to original layout and to fp32 for the remaining cheap ops
+    out = out.permute(0, 2, 3, 1).contiguous().to(torch.float32)   # (B,N,N,dim)
+
+    # ------------------------------------------------------------------
+    # 6️⃣ Output LayerNorm (FP32)
+    # ------------------------------------------------------------------
+    mean_o = out.mean(-1, keepdim=True)
+    var_o  = out.var(-1, unbiased=False, keepdim=True)
+    out = (out - mean_o) / torch.sqrt(var_o + 1e-5)
+    out = out * to_out_norm_w + to_out_norm_b
+
+    # ------------------------------------------------------------------
+    # 7️⃣ Final gating + linear projection (FP32)
+    # ------------------------------------------------------------------
+    out = out * out_gate.to(torch.float32)
+    out = torch.nn.functional.linear(out, to_out_w)   # final projection
+
+    return out
+```
+
+--------------------------------------------------------------------
+### Why this implementation meets the requirements
+
+* **Correctness** – The mathematical operations match the reference PyTorch code line‑by‑line (LayerNorm, four linear layers, three sigmoids, the `einsum`‑style contraction, output‑norm, final gating & projection).  
+* **Performance** – The only O(N³) work is done in a fused Triton GEMM that:
+  * processes many heads in one launch (batch × hidden_dim),
+  * uses FP16 arithmetic with FP32 accumulation,
+  * exploits Hopper’s large shared‑memory bandwidth,
+  * avoids any Python‑level loops.
+* **Flexibility** – Works for any `bs ∈ {1,2}`, `seq_len ∈ {128,…,1024}`, `dim ∈ {128,384}` and for the presence/absence of a mask.  
+* **Hardware‑specific tuning** – Tile sizes (64 × 64 × 32) and `num_warps=4` are known to give high occupancy on SM90; `num_stages=2` keeps shared‑memory usage well below the limit.  
+* **Compliance** – Uses Triton 3.3.1 API, respects launch‑grid conventions, never falls back to a pure‑Python path, and returns a `torch.float32` tensor as required.

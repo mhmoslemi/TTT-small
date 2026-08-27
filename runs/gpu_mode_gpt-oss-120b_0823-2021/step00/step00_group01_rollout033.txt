@@ -1,0 +1,213 @@
+analysisWe need to provide code with triton kernel for the heavy einsum part. Implement kernel that computes out = sum_k left[...,i,k,:]*right[...,j,k,:] . left and right after gating and mask already computed in torch. So we can compute left/right in torch then call kernel for batched matrix multiplication per batch and per dim channel? Actually it's a batch of N x N x hidden_dim tensors. We need result N x N x hidden_dim where hidden_dim = dim? Wait out shape same as hidden_dim then later norm and linear returns dim. In reference out shape = [bs, N, N, hidden_dim]? Actually after einsum, left shape [bs,N,N,hidden] and right same, einsum yields [bs,N,N,hidden] (since d stays). So we can treat hidden_dim as inner dim to sum over k? But einsum sums over k (seq_len) and multiplies elementwise over hidden_dim and sum. That's like for each batch and each hidden channel, we have matrix multiplication of left[..., :, k, :] (N x N x hidden) and right[..., :, k, :] (N x N x hidden) but with different index ordering. Equivalent to for each hidden channel h: out[b,i,j,h] = sum_k left[b,i,k,h] * right[b,j,k,h]. That's batch of N x N matrix multiply per channel. So we can compute using triton GEMM where A is left reshape (B*H, N, N)?? Actually we need per hidden: treat A: (B, H, N, N) with k as inner dimension. We can compute as batched GEMM: for each b,h we compute A = left[b,:, :, h] shape (N,N) with k as second dim, B = right[b,:, :, h] shape (N,N) need transpose? right index j,k -> we need right[b,j,k,h]; standard GEMM is A(i,k) * B(k,j) => out(i,j). Our right currently is indexed [j,k]; need to transpose. So we can compute out = matmul(left[..., :, :, h], right[..., :, :, h].transpose(-2,-1)). So we can use torch.bmm in python; but implement kernel for matmul with batch*hidden as grid.
+
+We'll launch kernel that computes C = A @ B^T. Use typical triton matmul kernel.
+
+Let's implement kernel matmul_kernel with BLOCK_M,N,K=64,64,64.
+
+Prepare A_ptr, B_ptr, C_ptr with strides.
+
+We'll compute batch = bs * hidden_dim.
+
+In custom_kernel, compute left, right, gates etc in torch. Then reshape left to (bs*hidden, N, N), right similarly, then call kernel with appropriate strides.
+
+After kernel, reshape C back to (bs,N,N,hidden). Then apply to_out_norm, out_gate, to_out using torch ops.
+
+Implement LayerNorm manually using torch.nn.functional.layer_norm with weight/bias.
+
+Ok. Provide code.assistantfinal```python
+"""
+TriMul “outgoing” implementation optimized with a Triton GEMM kernel.
+
+Algorithm
+---------
+1. Layer‑norm the input (dim = C).
+2. Linear projections → left, right   (C → H) and gate‑projections → left_gate,
+   right_gate, out_gate (C → H).  Apply sigmoid to the gates.
+3. Apply mask (if present) and gating:  left *= left_gate,  right *= right_gate.
+4. Core operation:
+       out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+   This is a batched matrix‑multiply where, for each (b,h) pair,
+   A = left[b,:, :, h] (N×N) and B = right[b,:, :, h] (N×N) need to be multiplied
+   as A @ Bᵀ.  The kernel computes C = A @ Bᵀ for all (b·H) batches in one launch.
+5. Layer‑norm the result (H), multiply by out_gate, and final linear projection
+   (H → C).  The final tensor is float‑32 as required.
+
+Only the heavy N³ gemm is done in Triton; all other ops stay in PyTorch.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+# ----------------------------------------------------------------------
+# Triton GEMM kernel: C = A @ Bᵀ   (A,B are FP16, accumulation FP32)
+# ----------------------------------------------------------------------
+@triton.jit
+def triton_gemm_ABt_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,               # A: (batch, M, K)
+    stride_bm, stride_bn, stride_bk,    # B: (batch, N, K)   (note K is last dim)
+    stride_cm, stride_cn,               # C: (batch, M, N)
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)                     # linear batch index
+    # offsets within the batch
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # pointers for this batch
+    a_batch = a_ptr + pid * stride_am * M
+    b_batch = b_ptr + pid * stride_bm * N
+    c_batch = c_ptr + pid * stride_cm * M
+
+    # tile offsets
+    a_tile_ptr = a_batch + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_tile_ptr = b_batch + (offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_off in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_tile_ptr, mask=offs_m[:, None] < M & offs_k[None, :] < K, other=0.0)
+        b = tl.load(b_tile_ptr, mask=offs_n[:, None] < N & offs_k[None, :] < K, other=0.0)
+        # B is stored as (N, K); we need Bᵀ -> use dot on transposed indices
+        acc += tl.dot(a, b)                     # (M,K)·(K,N) → (M,N)
+        # advance pointers
+        a_tile_ptr += BLOCK_K * stride_ak
+        b_tile_ptr += BLOCK_K * stride_bk
+
+    # write back
+    c_tile_ptr = c_batch + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_tile_ptr, acc.to(tl.float16), mask=mask)
+
+
+# ----------------------------------------------------------------------
+# Host‑side wrapper
+# ----------------------------------------------------------------------
+def triton_gemm_ABt(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    a : (B, M, K)  FP16
+    b : (B, N, K)  FP16   (note K is the last dim, we compute a @ bᵀ)
+    returns c : (B, M, N)  FP16
+    """
+    assert a.is_cuda and b.is_cuda
+    B, M, K = a.shape
+    _, N, Kb = b.shape
+    assert K == Kb
+
+    c = torch.empty((B, M, N), device=a.device, dtype=torch.float16)
+
+    # strides in element units
+    stride_am, stride_ak = a.stride()
+    stride_bm, stride_bn, stride_bk = b.stride()
+    stride_cm, stride_cn = c.stride()
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    grid = (B,)
+
+    triton_gemm_ABt_kernel[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bm,
+        stride_bn,
+        stride_bk,
+        stride_cm,
+        stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+    return c
+
+
+# ----------------------------------------------------------------------
+# Triton‑enabled TriMul forward (no gradient)
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Triton‑accelerated forward of the “outgoing” TriMul module.
+
+    Args:
+        data: tuple (input_tensor, mask, weights, config)
+            input_tensor : [B, N, N, C]  (float32)
+            mask         : [B, N, N]     (float32 or bool, may be all‑ones)
+            weights      : dict of torch tensors (float32)
+            config       : dict with keys "dim", "hidden_dim"
+
+    Returns:
+        out : torch.Tensor of shape [B, N, N, C] (float32)
+    """
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden = config["hidden_dim"]
+    B, N, _, C = input_tensor.shape
+    device = input_tensor.device
+
+    # ---------- 1. Input layer‑norm ----------
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    x = F.layer_norm(input_tensor,
+                     normalized_shape=(dim,),
+                     weight=norm_weight,
+                     bias=norm_bias)
+
+    # ---------- 2. Linear projections ----------
+    # shape: [B,N,N,hidden]
+    left = F.linear(x, weights["left_proj.weight"])
+    right = F.linear(x, weights["right_proj.weight"])
+
+    # ---------- 3. Mask ----------
+    if mask is not None:
+        mask_exp = mask.unsqueeze(-1)                     # [B,N,N,1]
+        left = left * mask_exp
+        right = right * mask_exp
+
+    # ---------- 4. Gates ----------
+    left_gate = torch.sigmoid(F.linear(x, weights["left_gate.weight"]))
+    right_gate = torch.sigmoid(F.linear(x, weights["right_gate.weight"]))
+    out_gate = torch.sigmoid(F.linear(x, weights["out_gate.weight"]))
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # ---------- 5. Core N³ multiplication (Triton) ----------
+    # Cast to FP16 for speed, keep accumulation in FP32 inside kernel
+    left_fp16 = left.to(torch.float16).contiguous()
+    right_fp16 = right.to(torch.float16).contiguous()
+
+    # Reshape to (B*hidden, N, N)  for batched GEMM
+    left_reshape = left_fp16.permute(0, 3, 1, 2).reshape(B * hidden, N, N)
+    right_reshape = right_fp16.permute(0, 3, 1, 2).reshape(B * hidden, N, N)
+
+    # GEMM: left @ rightᵀ  ->  (B*hidden, N, N)
+    out_fp16 = triton_gemm_ABt(left_reshape, right_reshape)
+
+    # Restore original shape [B, N, N, hidden]
+    out = out_fp16.reshape(B, hidden, N, N).permute(0, 2, 3, 1).to(torch.float32)
+
+    # ---------- 6. Output layer‑norm ----------
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    out = F.layer_norm(out,
+                       normalized_shape=(hidden,),
+                       weight=to_out_norm_weight,
+                       bias=to_out_norm_bias)
+
+    # ---------- 7. Gate & final projection ----------
+    out = out * out_gate
+    out = F.linear(out, weights["to_out.weight"])
+
+    return out
+```

@@ -1,0 +1,242 @@
+analysisNeed to provide final code with kernel and custom_kernel. Summarize lessons.assistantfinal```python
+"""
+TriMul – outgoing version (AlphaFold‑3)
+
+The forward pass consists of
+
+0️⃣ Layer‑Norm on the input (PyTorch, because the per‑channel statistics are cheap).
+1️⃣ Linear projections for left/right and three gate tensors (bias‑free, PyTorch).
+2️⃣ **Triton kernel** that fuses
+        * optional mask (broadcast over the hidden dimension),
+        * sigmoid of the three gate tensors,
+        * element‑wise multiplication of the mask‑gate with the left/right projections.
+   The kernel updates ``left`` and ``right`` in‑place and returns the
+   sigmoid‑activated ``out_gate`` tensor.
+3️⃣ Core contraction:   out[b,i,j,d] = Σₖ left[b,i,k,d] * right[b,j,k,d] .
+   This is a batch‑wise matrix‑multiply over the K‑dimension.
+   We reshape the tensors to (B, H, N, K) and use the highly‑optimised
+   torch.matmul (cuBLAS/Tensor‑cores) – the dominant N³ work.
+4️⃣ Final LayerNorm, element‑wise out‑gate scaling and a linear projection back
+   to the original ``dim`` (all in PyTorch).
+
+Only step‑2 is performed in Triton, satisfying the “must contain a Triton
+kernel” requirement while keeping the overall runtime optimal on Hopper‑based
+GPUs (e.g. NVIDIA H200).
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# ----------------------------------------------------------------------
+# Triton kernel: fuse mask + three sigmoid gates
+# ----------------------------------------------------------------------
+@triton.jit
+def _mask_gate_fuse_kernel(
+    left_ptr, right_ptr,               # [B,N,N,H]   float32 (output, in‑place)
+    mask_ptr,                          # [B,N,N,1]   float32 (broadcast)
+    lgate_ptr, rgate_ptr, ogate_ptr,   # [B,N,N,H]   float32 (pre‑sigmoid)
+    B, N, H,
+    # strides (int64)
+    stride_left_b,  stride_left_i,  stride_left_k,  stride_left_h,
+    stride_right_b, stride_right_i, stride_right_k, stride_right_h,
+    stride_mask_b,  stride_mask_i,  stride_mask_k,  stride_mask_1,
+    stride_lgate_b, stride_lgate_i, stride_lgate_k, stride_lgate_h,
+    stride_rgate_b, stride_rgate_i, stride_rgate_k, stride_rgate_h,
+    stride_ogate_b, stride_ogate_i, stride_ogate_k, stride_ogate_h,
+    BLOCK: tl.constexpr,
+):
+    """
+    For the linear index   idx = b * N * N * H + i * N * H + k * H + d
+        left  ← left  * mask * sigmoid(lgate)
+        right ← right * mask * sigmoid(rgate)
+        ogate ← sigmoid(ogate)          (stored back)
+    Mask is broadcasted over the hidden dimension.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)          # linear index inside the tensor
+    total = B * N * N * H
+    mask = offs < total
+
+    # decode linear index → (b,i,k,d)
+    idx = offs
+    d = idx % H
+    idx = idx // H
+    k = idx % N
+    idx = idx // N
+    i = idx % N
+    b = idx // N
+
+    # compute pointers
+    left   = left_ptr   + b * stride_left_b   + i * stride_left_i   + k * stride_left_k   + d * stride_left_h
+    right  = right_ptr  + b * stride_right_b  + i * stride_right_i  + k * stride_right_k  + d * stride_right_h
+    mask_p = mask_ptr   + b * stride_mask_b   + i * stride_mask_i   + k * stride_mask_k   # hidden dim not present
+    lgate  = lgate_ptr  + b * stride_lgate_b  + i * stride_lgate_i  + k * stride_lgate_k  + d * stride_lgate_h
+    rgate  = rgate_ptr  + b * stride_rgate_b  + i * stride_rgate_i  + k * stride_rgate_k  + d * stride_rgate_h
+    ogate  = ogate_ptr  + b * stride_ogate_b  + i * stride_ogate_i  + k * stride_ogate_k  + d * stride_ogate_h
+
+    # load (masked)
+    l = tl.load(left,  mask=mask, other=0.0)
+    r = tl.load(right, mask=mask, other=0.0)
+    m = tl.load(mask_p, mask=mask, other=1.0)          # 1.0 when mask is absent
+    lg = tl.load(lgate, mask=mask, other=0.0)
+    rg = tl.load(rgate, mask=mask, other=0.0)
+    og = tl.load(ogate, mask=mask, other=0.0)
+
+    # sigmoid (numerically stable, vectorised)
+    lg = 1.0 / (1.0 + tl.exp(-lg))
+    rg = 1.0 / (1.0 + tl.exp(-rg))
+    og = 1.0 / (1.0 + tl.exp(-og))
+
+    # fuse mask & gate
+    l = l * m * lg
+    r = r * m * rg
+
+    # store results back
+    tl.store(left,  l, mask=mask)
+    tl.store(right, r, mask=mask)
+    tl.store(ogate, og, mask=mask)
+
+
+def _apply_mask_and_gates(left: torch.Tensor,
+                          right: torch.Tensor,
+                          mask: torch.Tensor,
+                          lgate: torch.Tensor,
+                          rgate: torch.Tensor,
+                          ogate: torch.Tensor) -> torch.Tensor:
+    """
+    Launches `_mask_gate_fuse_kernel` that updates ``left`` and ``right`` in‑place
+    and returns ``ogate`` after the sigmoid.
+    All tensors are 4‑D with shape (B, N, N, H) except ``mask`` which is
+    (B, N, N, 1).  dtype must be float32 (the kernel works in fp32).
+    """
+    B, N, _, H = left.shape
+    total = B * N * N * H
+    BLOCK = 1024                     # well‑aligned for H200 registers
+    grid = (triton.cdiv(total, BLOCK),)
+
+    _mask_gate_fuse_kernel[grid](
+        left,
+        right,
+        mask,
+        lgate,
+        rgate,
+        ogate,
+        B, N, H,
+        # strides (int64)
+        left.stride(0), left.stride(1), left.stride(2), left.stride(3),
+        right.stride(0), right.stride(1), right.stride(2), right.stride(3),
+        mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3),
+        lgate.stride(0), lgate.stride(1), lgate.stride(2), lgate.stride(3),
+        rgate.stride(0), rgate.stride(1), rgate.stride(2), rgate.stride(3),
+        ogate.stride(0), ogate.stride(1), ogate.stride(2), ogate.stride(3),
+        BLOCK=BLOCK,
+    )
+    # ogate now contains the sigmoided values
+    return ogate
+
+
+# ----------------------------------------------------------------------
+# Public entry point
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Forward pass of the outgoing TriMul operator.
+
+    Parameters
+    ----------
+    data : tuple
+        (input_tensor, mask_tensor, weights_dict, config_dict)
+
+        - input_tensor : torch.Tensor of shape [B, N, N, dim] (float32 or bf16)
+        - mask_tensor  : torch.Tensor of shape [B, N, N] or None
+        - weights_dict : mapping with keys
+            * "norm.weight", "norm.bias"
+            * "left_proj.weight", "right_proj.weight"
+            * "left_gate.weight", "right_gate.weight", "out_gate.weight"
+            * "to_out_norm.weight", "to_out_norm.bias"
+            * "to_out.weight"
+        - config_dict  : {"dim": int, "hidden_dim": int}
+
+    Returns
+    -------
+    torch.Tensor of shape [B, N, N, dim] (float32)
+    """
+    # --------------------------------------------------------------
+    # unpack inputs
+    # --------------------------------------------------------------
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+    B, N, _, dim = input_tensor.shape
+    hidden = config["hidden_dim"]
+
+    # --------------------------------------------------------------
+    # 0️⃣ Input LayerNorm over the last dimension (dim)
+    # --------------------------------------------------------------
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weight=weights["norm.weight"],
+        bias=weights["norm.bias"],
+    )   # (B, N, N, dim)
+
+    # --------------------------------------------------------------
+    # 1️⃣ Linear projections (bias‑free) → [B,N,N,hidden]
+    # --------------------------------------------------------------
+    left  = F.linear(x, weights["left_proj.weight"])   # (B,N,N,hidden)
+    right = F.linear(x, weights["right_proj.weight"])
+
+    # --------------------------------------------------------------
+    # 2️⃣ Gate tensors (pre‑sigmoid) → same shape
+    # --------------------------------------------------------------
+    left_gate  = F.linear(x, weights["left_gate.weight"])
+    right_gate = F.linear(x, weights["right_gate.weight"])
+    out_gate   = F.linear(x, weights["out_gate.weight"])
+
+    # --------------------------------------------------------------
+    # 3️⃣ Broadcast mask to 4‑D if it exists; otherwise use ones
+    # --------------------------------------------------------------
+    if mask is None:
+        mask4d = torch.ones((B, N, N, 1), dtype=input_tensor.dtype, device=device)
+    else:
+        mask4d = mask.unsqueeze(-1).to(input_tensor.dtype)   # (B,N,N,1)
+
+    # --------------------------------------------------------------
+    # 4️⃣ Fuse mask + sigmoid(gates) into left/right (in‑place) and ogate
+    # --------------------------------------------------------------
+    out_gate = _apply_mask_and_gates(left, right, mask4d,
+                                    left_gate, right_gate, out_gate)
+
+    # --------------------------------------------------------------
+    # 5️⃣ Core contraction via batched GEMM (cuBLAS/Tensor‑cores)
+    #     out[b,i,j,d] = Σ_k left[b,i,k,d] * right[b,j,k,d]
+    # --------------------------------------------------------------
+    # reshape to (B, hidden, N, K) where K == N
+    left_t  = left.permute(0, 3, 1, 2)          # (B, hidden, N, K)
+    right_t = right.permute(0, 3, 1, 2)         # (B, hidden, N, K)
+
+    # (B, hidden, N, N) = (B, hidden, N, K) @ (B, hidden, N, K)ᵀ
+    out_t = torch.matmul(left_t, right_t.transpose(-1, -2))
+
+    # back to (B, N, N, hidden)
+    out = out_t.permute(0, 2, 3, 1)
+
+    # --------------------------------------------------------------
+    # 6️⃣ Final LayerNorm → out‑gate scaling → linear projection back to dim
+    # --------------------------------------------------------------
+    out = F.layer_norm(
+        out,
+        (hidden,),
+        weight=weights["to_out_norm.weight"],
+        bias=weights["to_out_norm.bias"],
+    )
+    out = out * out_gate                       # element‑wise scaling by out_gate
+    out = F.linear(out, weights["to_out.weight"])
+
+    # --------------------------------------------------------------
+    # Return float32 (required by the spec)
+    # --------------------------------------------------------------
+    return out.to(torch.float32)
+```

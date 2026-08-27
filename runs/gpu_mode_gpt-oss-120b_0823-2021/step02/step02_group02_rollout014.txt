@@ -1,0 +1,246 @@
+analysisWe need to produce final code with kernel and wrapper, applying lessons: better to use batched GEMM via torch.bmm which is fast, but need at least part in Triton. Could just implement mask gating etc in PyTorch and only compute contraction via Triton as earlier. Provide improvements maybe use shared memory? Keep similar but maybe adjust BLOCK sizes.
+
+Will output final code.assistantfinal```python
+"""
+TriMul “outgoing” forward pass (AlphaFold‑3) – hybrid PyTorch / Triton implementation.
+
+The expensive contraction
+    out[b, h, i, j] = Σ_k left[b, h, i, k] * right[b, h, j, k]
+is realised as a batched matrix‑multiply on the (B·H, N, N) view.
+We launch a small Triton kernel that:
+* loads a tile of the left operand (shape M×K)
+* loads the transposed tile of the right operand (shape K×N)
+* accumulates in FP32 and writes the result tile (M×N) back in FP16.
+
+All surrounding work (LayerNorm, linear projections, gating, mask handling,
+final LayerNorm, output‑gate, output linear) is performed in PyTorch – this
+keeps the kernel focussed on the O(N³) core while still satisfying the
+“must contain a Triton kernel” requirement.
+
+The kernel is deliberately simple:
+* one program‑id per (batch‑head, tile‑M, tile‑N) block,
+* static tile sizes (BLOCK_M/N/K) chosen to fit comfortably in shared
+  memory on Hopper (≤64 each),
+* FP16 arithmetic with FP32 accumulation (the default on H200).
+
+The host wrapper packs the tensors, launches the kernel and restores the
+original layout.  The final output is float32 as required by the reference
+implementation.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from typing import Tuple, Dict, Any
+
+# -------------------------------------------------------------------------
+# Triton kernel: batched GEMM for a single head (H = hidden_dim)
+# -------------------------------------------------------------------------
+@triton.jit
+def _trimul_kernel(
+    left_ptr,          # const fp16*  [B*H, N, N]
+    right_ptr,         # const fp16*  [B*H, N, N]   (will be read transposed)
+    out_ptr,           #       fp16*  [B*H, N, N]
+    B_H, N,            # integer sizes
+    stride_lbh, stride_lbn, stride_lbk,   # left strides
+    stride_rbh, stride_rbn, stride_rbk,   # right strides
+    stride_obh, stride_obn, stride_obk,   # out strides
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Compute a tile of the contraction:
+        out[bh, i, j] = Σ_k left[bh, i, k] * right[bh, j, k]
+    where bh = b * hidden_dim + h.
+
+    left  : (B*H, N, N)   – row‑major, accessed as (i, k)
+    right : (B*H, N, N)   – we read its transpose -> (k, j)
+    out   : (B*H, N, N)   – row‑major, stored as (i, j)
+    """
+    pid = tl.program_id(0)                     # linear id over (bh, tile_i, tile_j)
+
+    # ----- decode pid ----------------------------------------------------
+    num_tile_i = tl.cdiv(N, BLOCK_M)
+    num_tile_j = tl.cdiv(N, BLOCK_N)
+
+    tile_j = pid % num_tile_j
+    pid //= num_tile_j
+    tile_i = pid % num_tile_i
+    bh = pid // num_tile_i                      # (b * hidden_dim + h)
+
+    # ----- coordinate offsets for this tile -------------------------------
+    offs_i = tile_i * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = tile_j * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_i = offs_i < N
+    mask_j = offs_j < N
+
+    # accumulator in FP32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # ----- loop over K ----------------------------------------------------
+    for k0 in range(0, tl.cdiv(N, BLOCK_K)):
+        offs_k = k0 * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < N
+
+        # left[bh, i, k]  -> (M, K)
+        l_ptr = left_ptr + \
+                bh * stride_lbh + \
+                offs_i[:, None] * stride_lbn + \
+                offs_k[None, :] * stride_lbk
+        l = tl.load(l_ptr,
+                    mask=mask_i[:, None] & mask_k[None, :],
+                    other=0.0).to(tl.float32)
+
+        # right[bh, j, k] read as transposed (k, j) -> (K, N)
+        r_ptr = right_ptr + \
+                bh * stride_rbh + \
+                offs_k[:, None] * stride_rbk + \
+                offs_j[None, :] * stride_rbn
+        r = tl.load(r_ptr,
+                    mask=mask_k[:, None] & mask_j[None, :],
+                    other=0.0).to(tl.float32)
+
+        # dot: (M,K) @ (K,N) -> (M,N)
+        acc += tl.dot(l, r)
+
+    # ----- write result ---------------------------------------------------
+    out_ptrs = out_ptr + \
+               bh * stride_obh + \
+               offs_i[:, None] * stride_obn + \
+               offs_j[None, :] * stride_obk
+    tl.store(out_ptrs,
+             acc.to(tl.float16),
+             mask=mask_i[:, None] & mask_j[None, :])
+
+# -------------------------------------------------------------------------
+# Host‑side wrapper
+# -------------------------------------------------------------------------
+def custom_kernel(
+    data: Tuple[
+        torch.Tensor,                # input  [B, N, N, dim]
+        torch.Tensor,                # mask   [B, N, N]  (may be None)
+        Dict[str, torch.Tensor],     # weights
+        Dict[str, Any],              # config
+    ]
+) -> torch.Tensor:
+    """
+    Forward pass of the outgoing TriMul operator.
+    Returns tensor of shape [B, N, N, dim] (float32).
+    """
+    inp, mask, weights, config = data
+    device = inp.device
+    dtype = torch.float32
+
+    B, N, _, dim = inp.shape
+    hidden_dim = config["hidden_dim"]          # = c_z in the paper
+
+    # -----------------------------------------------------------------
+    # 1. LayerNorm + Linear projections (all in FP32)
+    # -----------------------------------------------------------------
+    x = F.layer_norm(
+        inp,
+        normalized_shape=(dim,),
+        weight=weights["norm.weight"].to(dtype),
+        bias=weights["norm.bias"].to(dtype),
+    )                                            # (B,N,N,dim)
+
+    left = F.linear(x, weights["left_proj.weight"].to(dtype))   # (B,N,N,hidden)
+    right = F.linear(x, weights["right_proj.weight"].to(dtype))
+
+    # -----------------------------------------------------------------
+    # 2. Optional mask (broadcast over hidden dim)
+    # -----------------------------------------------------------------
+    if mask is not None:
+        mask_ = mask.unsqueeze(-1)               # (B,N,N,1)
+        left = left * mask_
+        right = right * mask_
+
+    # -----------------------------------------------------------------
+    # 3. Gating
+    # -----------------------------------------------------------------
+    left_gate = torch.sigmoid(
+        F.linear(x, weights["left_gate.weight"].to(dtype))
+    )
+    right_gate = torch.sigmoid(
+        F.linear(x, weights["right_gate.weight"].to(dtype))
+    )
+    out_gate = torch.sigmoid(
+        F.linear(x, weights["out_gate.weight"].to(dtype))
+    )
+
+    left = left * left_gate
+    right = right * right_gate
+
+    # -----------------------------------------------------------------
+    # 4. Rearrange to [B, H, N, N] and cast to FP16 for the kernel
+    # -----------------------------------------------------------------
+    # (B,N,N,H) -> (B,H,N,N)
+    left = left.permute(0, 3, 1, 2).contiguous()
+    right = right.permute(0, 3, 1, 2).contiguous()
+    left_fp16 = left.to(torch.float16)
+    right_fp16 = right.to(torch.float16)
+
+    # allocate output in FP16, same layout as left/right
+    out_fp16 = torch.empty_like(left_fp16)
+
+    # -----------------------------------------------------------------
+    # 5. Launch Triton kernel (batched GEMM per head)
+    # -----------------------------------------------------------------
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
+
+    # fuse batch and head dimension for a single 1‑D program id space
+    BH = B * hidden_dim
+    grid_m = triton.cdiv(N, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
+    total_programs = BH * grid_m * grid_n
+    grid = (total_programs,)
+
+    _trimul_kernel[grid](
+        left_fp16,
+        right_fp16,
+        out_fp16,
+        BH,
+        N,
+        # strides for left: (BH, N, N)
+        left_fp16.stride(0),          # stride over BH
+        left_fp16.stride(2),          # stride over row (i)
+        left_fp16.stride(3),          # stride over col (k)
+        # strides for right (will be read transposed)
+        right_fp16.stride(0),
+        right_fp16.stride(2),
+        right_fp16.stride(3),
+        # strides for out
+        out_fp16.stride(0),
+        out_fp16.stride(2),
+        out_fp16.stride(3),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    # -----------------------------------------------------------------
+    # 6. Restore original layout (B,N,N,H) and continue in PyTorch
+    # -----------------------------------------------------------------
+    out = out_fp16.to(dtype).permute(0, 2, 3, 1).contiguous()   # (B,N,N,hidden)
+
+    # final LayerNorm over hidden dimension
+    out = F.layer_norm(
+        out,
+        normalized_shape=(hidden_dim,),
+        weight=weights["to_out_norm.weight"].to(dtype),
+        bias=weights["to_out_norm.bias"].to(dtype),
+    )
+
+    # apply output gate (broadcast over N,N)
+    out = out * out_gate
+
+    # final linear back to dim
+    out = F.linear(out, weights["to_out.weight"].to(dtype))
+
+    return out
+```

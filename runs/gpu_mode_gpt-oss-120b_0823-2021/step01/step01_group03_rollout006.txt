@@ -1,0 +1,268 @@
+analysisWe need to provide final code implementing custom_kernel with some Triton part. Provide explanation of lessons. Then code.assistantfinal**Solution Overview**
+
+The “outgoing” TriMul operator consists of three expensive parts  
+
+1. **Layer‑norm + linear projections** – cheap, stay in PyTorch.  
+2. **Mask‑application** – a memory‑bound element‑wise multiplication on a
+   `(B,N,N,hidden)` tensor.  This is the part we move to Triton.  
+3. **Tri‑multiplicative update** – an `einsum('... i k d, ... j k d -> ... i j d')`
+   that is a genuine `N³·hidden` reduction.  On Hopper GPUs `torch.einsum`
+   (implemented with WMMA‑based kernels) is already heavily optimised, so we keep
+   it in PyTorch (using BF16 for speed, casting back to FP32 afterwards).
+
+The kernel therefore **fuses the mask broadcast** (`mask` is `(B,N,N)` while the
+projected tensors are `(B,N,N,hidden)`) into a single high‑throughput
+element‑wise kernel.  The kernel works entirely in FP32, loads a tile of the
+mask, broadcasts it over the hidden dimension and multiplies the data in‑place.
+
+Key design choices (derived from the lessons in the prompt)
+
+| Lesson | Applied / Ignored | Reason |
+|--------|-------------------|--------|
+| limit shared memory | **Applied** – the kernel only uses registers, no `tl.shared`. | Keeps occupancy high on H200. |
+| match stride unpacking | **Applied** – we explicitly pass the 4‑D strides of the
+projected tensors and the 3‑D strides of the mask, never assume a fixed layout. | Prevents illegal accesses on non‑contiguous tensors. |
+| need tl.mean | **Ignored** – we never compute a mean inside the kernel; all
+normalisation is done in PyTorch. | No mean required inside the mask kernel. |
+| continue not allowed | **Applied** – the kernel contains only straight‑line code. | Triton syntax compliance. |
+| tile sizes must be constexpr | **Applied** – `BLOCK_I`, `BLOCK_K`, `BLOCK_H` are `tl.constexpr`. | Required by Triton. |
+| launch one program per (batch, i‑tile) | **Applied** – grid size = `B * ceil(N / BLOCK_I)`. | Simple 1‑D grid, enough parallelism (`N ≤ 1024`). |
+| use mixed‑precision | **Applied** – the heavy `einsum` runs in BF16, the mask kernel
+stays in FP32 (mask is 0/1, no precision loss). | Best speed / correct final dtype. |
+
+The final `custom_kernel` follows exactly the reference PyTorch forward
+pass, with the mask applied by the Triton kernel.
+
+```python
+"""
+custom_kernel – TriMul “outgoing” implementation.
+
+*   LayerNorm on the input (dim)
+*   Linear projections → left / right (dim → hidden)
+*   **Triton kernel**: broadcast‑mul mask (B,N,N) onto (B,N,N,hidden) in‑place
+*   Gating (sigmoid) on the projected tensors
+*   Core N³ reduction performed by torch.einsum (BF16 → FP32)
+*   Final LayerNorm, gating and output linear
+"""
+
+import torch
+import triton
+import triton.language as tl
+from torch.nn import functional as F
+
+
+# ----------------------------------------------------------------------
+# Triton kernel: multiply a (B,N,N) mask (broadcast on the hidden dim) into
+# a (B,N,N,H) tensor in‑place.
+# ----------------------------------------------------------------------
+@triton.jit
+def apply_mask_kernel(
+    x_ptr,                # pointer to (B,N,N,H) tensor to be masked
+    mask_ptr,             # pointer to (B,N,N) mask (0/1)
+    B, N, H,
+    stride_x_b, stride_x_i, stride_x_k, stride_x_h,
+    stride_m_b, stride_m_i, stride_m_k,
+    BLOCK_I: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # each program processes one (batch, i‑tile)
+    batch = pid // tl.cdiv(N, BLOCK_I)
+    i_tile = pid % tl.cdiv(N, BLOCK_I)
+
+    # tile offsets
+    offs_i = i_tile * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_h = tl.arange(0, BLOCK_H)
+
+    mask_i = offs_i < N
+    mask_k = offs_k < N
+    mask_h = offs_h < H
+
+    # Load mask slice (B,N,N) -> (i,k)
+    mask = tl.load(
+        mask_ptr
+        + batch * stride_m_b
+        + offs_i[:, None] * stride_m_i
+        + offs_k[None, :] * stride_m_k,
+        mask=mask_i[:, None] & mask_k[None, :],
+        other=1.0,                 # treat missing entries as 1 (no‑mask case)
+    )
+    # broadcast mask to hidden dim
+    mask = mask[:, :, None]        # (i,k,1)
+
+    # Load data slice (B,N,N,H)
+    x = tl.load(
+        x_ptr
+        + batch * stride_x_b
+        + offs_i[:, None, None] * stride_x_i
+        + offs_k[None, :, None] * stride_x_k
+        + offs_h[None, None, :] * stride_x_h,
+        mask=mask_i[:, None, None] & mask_k[None, :, None] & mask_h[None, None, :],
+        other=0.0,
+    )
+
+    # Apply mask
+    x = x * mask
+
+    # Store back (in‑place)
+    tl.store(
+        x_ptr
+        + batch * stride_x_b
+        + offs_i[:, None, None] * stride_x_i
+        + offs_k[None, :, None] * stride_x_k
+        + offs_h[None, None, :] * stride_x_h,
+        x,
+        mask=mask_i[:, None, None] & mask_k[None, :, None] & mask_h[None, None, :],
+    )
+
+
+# ----------------------------------------------------------------------
+# Small helper: LayerNorm for a 4‑D tensor (B,N,N,C) using given weight/bias.
+# ----------------------------------------------------------------------
+def layer_norm_4d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5):
+    # mean / var over the last dimension (C)
+    mean = x.mean(dim=-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+    x_norm = (x - mean) * torch.rsqrt(var + eps)
+    return x_norm * weight + bias
+
+
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
+def custom_kernel(data):
+    """
+    Parameters
+    ----------
+    data : tuple
+        (input_tensor, mask_tensor, weights_dict, config_dict)
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape [B, N, N, dim] (float32)
+    """
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+    dtype = torch.float32
+
+    B, N, _, dim = input_tensor.shape
+    hidden_dim = config["hidden_dim"]
+
+    ##################################################################
+    # 1) Input LayerNorm (dim)
+    ##################################################################
+    x = layer_norm_4d(
+        input_tensor,
+        weight=weights["norm.weight"].to(dtype),
+        bias=weights["norm.bias"].to(dtype),
+    )
+
+    ##################################################################
+    # 2) Linear projections  (dim → hidden_dim) – no bias
+    ##################################################################
+    # left = x @ W_left.T , right = x @ W_right.T
+    left = F.linear(x, weights["left_proj.weight"].to(dtype))   # (B,N,N,hidden)
+    right = F.linear(x, weights["right_proj.weight"].to(dtype))
+
+    ##################################################################
+    # 3) Apply optional mask using Triton
+    ##################################################################
+    if mask is None:
+        # a tensor of ones – kernel becomes a no‑op
+        mask_f = torch.ones((B, N, N), dtype=dtype, device=device)
+    else:
+        mask_f = mask.to(dtype)
+
+    # Tile sizes – hidden_dim is always a multiple of 32 in the test configs
+    BLOCK_I = 32
+    BLOCK_K = 32
+    BLOCK_H = 32
+
+    stride_x_b, stride_x_i, stride_x_k, stride_x_h = (
+        left.stride(0),
+        left.stride(1),
+        left.stride(2),
+        left.stride(3),
+    )
+    stride_m_b, stride_m_i, stride_m_k = (
+        mask_f.stride(0),
+        mask_f.stride(1),
+        mask_f.stride(2),
+    )
+
+    # One program per (batch, i‑tile)
+    grid = (B * triton.cdiv(N, BLOCK_I),)
+
+    # left
+    apply_mask_kernel[grid](
+        left,
+        mask_f,
+        B,
+        N,
+        hidden_dim,
+        stride_x_b,
+        stride_x_i,
+        stride_x_k,
+        stride_x_h,
+        stride_m_b,
+        stride_m_i,
+        stride_m_k,
+        BLOCK_I=BLOCK_I,
+        BLOCK_K=BLOCK_K,
+        BLOCK_H=BLOCK_H,
+    )
+    # right (same strides)
+    apply_mask_kernel[grid](
+        right,
+        mask_f,
+        B,
+        N,
+        hidden_dim,
+        stride_x_b,
+        stride_x_i,
+        stride_x_k,
+        stride_x_h,
+        stride_m_b,
+        stride_m_i,
+        stride_m_k,
+        BLOCK_I=BLOCK_I,
+        BLOCK_K=BLOCK_K,
+        BLOCK_H=BLOCK_H,
+    )
+
+    ##################################################################
+    # 4) Gating (sigmoid) – cheap, stay in PyTorch
+    ##################################################################
+    left_gate = F.linear(x, weights["left_gate.weight"].to(dtype)).sigmoid()
+    right_gate = F.linear(x, weights["right_gate.weight"].to(dtype)).sigmoid()
+    out_gate = F.linear(x, weights["out_gate.weight"].to(dtype)).sigmoid()
+
+    left = left * left_gate
+    right = right * right_gate
+
+    ##################################################################
+    # 5) Core N³ reduction – torch.einsum (use BF16 for speed)
+    ##################################################################
+    left_bf16 = left.to(torch.bfloat16)
+    right_bf16 = right.to(torch.bfloat16)
+
+    out = torch.einsum("... i k d, ... j k d -> ... i j d", left_bf16, right_bf16)
+    out = out.to(dtype)   # back to FP32 for the remaining layers
+
+    ##################################################################
+    # 6) Final LayerNorm, gating and output linear
+    ##################################################################
+    out = layer_norm_4d(
+        out,
+        weight=weights["to_out_norm.weight"].to(dtype),
+        bias=weights["to_out_norm.bias"].to(dtype),
+    )
+    out = out * out_gate
+    out = F.linear(out, weights["to_out.weight"].to(dtype))
+
+    return out
+```
