@@ -193,7 +193,7 @@ if [ "$resume_run" -eq 1 ]; then
 else
     CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
         --backend vllm \
-        --num-steps 20 --deterministic --seed 42 \
+        --num-steps 50 --deterministic --seed 42 \
         --groups-per-step 8 --group-size 64 \
         --growth-force-step 3 --gpu-ids 5,6 \
         --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback --thinking --temperature 0.6 --top-p 0.95 \
