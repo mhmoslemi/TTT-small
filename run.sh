@@ -188,15 +188,15 @@ done
 
 
 if [ "$resume_run" -eq 1 ]; then
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python train_multy.py \
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py \
         --backend vllm --gpu-ids 1,2,3 "$@"
 else
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python train_multy.py --problem erdos --config configs/erdos.yaml \
+    CUDA_VISIBLE_DEVICES=4,5,6 python train_multy.py --problem erdos --config configs/erdos.yaml \
         --backend vllm \
-        --num-steps 22 --deterministic --seed 42 \
+        --num-steps 20 --deterministic --seed 42 \
         --groups-per-step 8 --group-size 64 \
-        --growth-force-step 3 --gpu-ids 1,2,3 \
-        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback \
+        --growth-force-step 3 --gpu-ids 4,5,6 \
+        --growth-valid-yield 0.7 --growth-distinct-min 2 --growth-factor 2.0 --memory --feedback --thinking --temperature 0.6 --top-p 0.95 \
         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
 fi
  
