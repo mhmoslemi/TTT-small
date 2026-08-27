@@ -200,3 +200,6 @@ else
         --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
 fi
  
+
+
+#  --thinking --temperature 0.6 --top-p 0.95
