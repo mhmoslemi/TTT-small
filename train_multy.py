@@ -81,7 +81,7 @@ class Config:
     max_new_tokens: int = 4200
     grad_clip: float = 1.0
 
-    train_examples_per_microbatch: int = 1
+    train_examples_per_microbatch: int = 64
 
     # Bound the transient log_softmax allocation in compute_token_logprobs by
     # slicing the response positions into chunks of at most this many tokens.
@@ -103,7 +103,7 @@ class Config:
     # PUCT
     puct_c: float = 1.0
     max_buffer_size: int = 1000
-    topk_children_per_parent: int = 2
+    topk_children_per_parent: int = 8
 
     # Misc
     seed: int = 42

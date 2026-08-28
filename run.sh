@@ -214,8 +214,8 @@ else
         --num-steps 50 --no-deterministic \
         --groups-per-step 8 --group-size 64 \
         --gpu-ids 1,2,3 \
-        --memory --feedback --thinking --temperature 0.6 --top-p 0.95 \
-        --model-name /mnt/storage/mohammad/models/Qwen3-8B "$@"
+        --memory --feedback --thinking --temperature 0.6 --top-p 0.95 "$@" \
+        --model-name /mnt/storage/mohammad/models/Qwen3-8B 
 fi
  
 
