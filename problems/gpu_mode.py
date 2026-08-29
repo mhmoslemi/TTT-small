@@ -76,7 +76,7 @@ _DEFAULTS = {
     "mla_decode_nvidia": {
         "score_scale": 5000.0,
         "target": 1700.0,
-        "gpu_type": "H200",
+        "gpu_type": "H100",
         "task_yaml": "examples/gpu_mode/lib/mla-decode/task.yml",
     },
 }

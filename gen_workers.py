@@ -1,7 +1,9 @@
 """
 Persistent multi-GPU rollout generation pool.
 
-We run one persistent worker process per GPU. Each worker:
+HF runs one persistent worker process per GPU. vLLM runs one persistent engine
+per configured GPU group; every engine can use tensor and pipeline parallelism
+instead of loading a complete copy of a large model on every GPU. Each worker:
   - loads either a plain Transformers model or a vLLM engine
   - applies the current LoRA adapter saved by the trainer
   - generates its share of rollouts in batches
@@ -310,7 +312,10 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         lora_rank, gpu_memory_utilization,
                         enforce_eager=False, enable_prefix_caching=True,
-                        max_num_seqs=0, seed=None):
+                        max_num_seqs=0, seed=None, quantization=None,
+                        tensor_parallel_size=1, pipeline_parallel_size=1,
+                        max_num_batched_tokens=0,
+                        enable_expert_parallel=False):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -340,16 +345,32 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         "enforce_eager": bool(enforce_eager),
         "enable_prefix_caching": bool(enable_prefix_caching),
         "disable_log_stats": True,
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "pipeline_parallel_size": int(pipeline_parallel_size),
     }
+    if int(tensor_parallel_size) > 1:
+        # LoRA work is otherwise repeated on every TP rank. Sharding it also
+        # avoids a large adapter-side memory spike on wide models.
+        kwargs["fully_sharded_loras"] = True
+    if int(tensor_parallel_size) * int(pipeline_parallel_size) > 1:
+        kwargs["distributed_executor_backend"] = "mp"
+    if bool(enable_expert_parallel):
+        kwargs["enable_expert_parallel"] = True
     if int(max_num_seqs or 0) > 0:
         kwargs["max_num_seqs"] = int(max_num_seqs)
+    if int(max_num_batched_tokens or 0) > 0:
+        kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
     if seed is not None:
         kwargs["seed"] = int(seed)
-    if load_in_4bit:
-        # Current vLLM uses the out-of-tree vllm-bnb-plugin for this mode.
-        # Pre-quantized checkpoints are inferred automatically, but explicitly
-        # requesting 4-bit here means in-flight BitsAndBytes quantization.
-        kwargs["quantization"] = "bitsandbytes"
+    # `load_in_4bit` belongs to the differentiable training copy. Deliberately
+    # do not translate it to vLLM BitsAndBytes: a QLoRA trainer adapter is valid
+    # on a BF16/FP8/MXFP4 inference base, and coupling the two modes was a common
+    # source of vLLM startup crashes. Pre-quantized checkpoints are auto-detected.
+    # Users who really want an explicit vLLM mode set vllm_quantization in YAML.
+    del load_in_4bit
+    quantization = str(quantization or "").strip()
+    if quantization and quantization.lower() not in ("auto", "none"):
+        kwargs["quantization"] = quantization
     return kwargs
 
 
@@ -364,9 +385,14 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       task_queue, result_queue, ready_queue, seed=None,
                       lora_rank=32, gpu_memory_utilization=0.9,
                       enforce_eager=False, enable_prefix_caching=True,
-                      gen_micro_batch=0):
-    """Persistent vLLM engine, one process and one engine per generation GPU."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                      gen_micro_batch=0, quantization=None,
+                      tensor_parallel_size=1, pipeline_parallel_size=1,
+                      max_num_batched_tokens=0,
+                      enable_expert_parallel=False):
+    """Persistent vLLM engine spanning one physical GPU group."""
+    gpu_group = ([int(x) for x in gpu_id]
+                 if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_group)
     if seed is not None:
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -387,9 +413,15 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             enable_prefix_caching=enable_prefix_caching,
             max_num_seqs=gen_micro_batch,
             seed=engine_seed,
+            quantization=quantization,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_expert_parallel=enable_expert_parallel,
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
-              f"{gpu_id} ...", flush=True)
+              f"group {gpu_group} (TP={tensor_parallel_size}, "
+              f"PP={pipeline_parallel_size}) ...", flush=True)
         llm = LLM(**engine_kwargs)
     except Exception:
         ready_queue.put(("error", rank, traceback.format_exc()))
@@ -466,7 +498,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 
 class GenerationPool:
     """
-    Manages persistent generation processes (one engine per GPU).
+    Manages persistent generation processes. HF uses one engine per GPU. vLLM
+    partitions gpu_ids into TP*PP groups and loads one sharded engine per group.
 
     backend="hf" preserves the original Transformers workers. backend="vllm"
     uses vLLM for rollout inference while keeping exactly the same queue API.
@@ -477,9 +510,14 @@ class GenerationPool:
                  gen_micro_batch=0, backend="hf", lora_rank=32,
                  vllm_gpu_memory_utilization=0.9,
                  vllm_enforce_eager=False,
-                 vllm_enable_prefix_caching=True):
+                 vllm_enable_prefix_caching=True,
+                 vllm_quantization=None,
+                 vllm_tensor_parallel_size=0,
+                 vllm_pipeline_parallel_size=1,
+                 vllm_max_num_batched_tokens=0,
+                 vllm_enable_expert_parallel=False):
         self.model_name = model_name
-        self.num_workers = int(num_workers)
+        requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
         self.gen_micro_batch = int(gen_micro_batch or 0)
@@ -487,10 +525,36 @@ class GenerationPool:
         if self.backend not in ("hf", "vllm"):
             raise ValueError(
                 f"unknown generation backend {backend!r}; expected hf|vllm")
-        if len(self.gpu_ids) != self.num_workers:
+        if len(self.gpu_ids) != requested_num_gpus:
             raise ValueError("gpu_ids must contain exactly num_workers entries")
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must not contain duplicates")
+
+        if self.backend == "vllm":
+            pp = int(vllm_pipeline_parallel_size or 1)
+            tp = int(vllm_tensor_parallel_size or 0)
+            if pp < 1 or tp < 0:
+                raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
+            if tp == 0:
+                if requested_num_gpus % pp:
+                    raise ValueError(
+                        "generation GPU count must be divisible by vLLM PP")
+                tp = requested_num_gpus // pp
+            world_size = tp * pp
+            if world_size < 1 or requested_num_gpus % world_size:
+                raise ValueError(
+                    f"{requested_num_gpus} generation GPUs cannot be split into "
+                    f"vLLM groups of TP={tp} * PP={pp} ({world_size} GPUs)")
+            gpu_groups = [
+                self.gpu_ids[i:i + world_size]
+                for i in range(0, requested_num_gpus, world_size)
+            ]
+        else:
+            tp, pp = 1, 1
+            gpu_groups = [[gpu_id] for gpu_id in self.gpu_ids]
+
+        # Jobs are distributed over independent engines, not over TP ranks.
+        self.num_workers = len(gpu_groups)
 
         ctx = mp.get_context("spawn")
         self.task_queues = [ctx.Queue() for _ in range(self.num_workers)]
@@ -506,11 +570,17 @@ class GenerationPool:
             "enforce_eager": bool(vllm_enforce_eager),
             "enable_prefix_caching": bool(vllm_enable_prefix_caching),
             "gen_micro_batch": self.gen_micro_batch,
+            "quantization": vllm_quantization,
+            "tensor_parallel_size": tp,
+            "pipeline_parallel_size": pp,
+            "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
+            "enable_expert_parallel": bool(vllm_enable_expert_parallel),
         }
         for r in range(self.num_workers):
             p = ctx.Process(
                 target=worker_target,
-                args=(r, self.gpu_ids[r], model_name, max_seq_length,
+                args=(r, (gpu_groups[r] if self.backend == "vllm"
+                          else gpu_groups[r][0]), model_name, max_seq_length,
                       load_in_4bit, self.task_queues[r], self.result_queue,
                       ready_queue, self.seed),
                 kwargs=worker_options,
@@ -522,8 +592,8 @@ class GenerationPool:
             self.procs.append(p)
 
         # Wait for all workers to finish loading
-        print(f"[pool] waiting for {self.num_workers} {self.backend} worker(s) "
-              f"to load ...", flush=True)
+        print(f"[pool] waiting for {self.num_workers} {self.backend} engine(s) "
+              f"on {requested_num_gpus} GPU(s) to load ...", flush=True)
         loaded = 0
         while loaded < self.num_workers:
             try:

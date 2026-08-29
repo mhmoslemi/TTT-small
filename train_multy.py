@@ -1,7 +1,7 @@
 """
 TTT-Discover — multi-problem local runner.
 
-Config():  defaults  <  YAML  <  CLI flags
+Configuration: configs/defaults.yaml < problem YAML < CLI flags
 """
 
 import warnings
@@ -13,210 +13,27 @@ import argparse
 import json
 import random
 import time
-from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Optional, Tuple
+from types import SimpleNamespace
 import numpy as np
 import yaml
 
 
 # ======================================================================
-# Config
+# All configuration values live in configs/defaults.yaml and problem YAMLs.
 # ======================================================================
-@dataclass
-class Config:
-    # Problem selector
-    problem: str = "circle_packing"
-
-        # "circle_packing", "erdos", "ac1", "ac2",
-        # "denoising", "gpu_mode", "ahc",
-
-    problem_type: str = ""        # ac1/ac2, trimul/mla_decode_nvidia, etc.
-
-    # Model
-    model_name: str = "Qwen/Qwen3-8B"
-    # "vllm" is a convenience mode: HF+PEFT trains, vLLM generates rollouts.
-    backend: str = "auto"        # "auto" | "unsloth" | "hf" | "vllm"
-    generation_backend: str = "hf"   # "hf" | "vllm"
-    max_seq_length: int = 32000
-    load_in_4bit: bool = False
-    lora_rank: int = 32
-    lora_alpha: int = 32
-    lora_dropout: float = 0.0
-    target_modules: Tuple[str, ...] = (
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    )
-
-    num_circles: int = 26
-    # None means "let the problem decide". A concrete default here leaks circle
-    # packing's target into every other problem, because Problem.__init__ only
-    # applies its own when this is None.
-    target: Optional[float] = None
-    sandbox_timeout_s: float = 30.0
-
-    # RL hyperparameters
-    num_steps: int = 50
-    groups_per_step: int = 8       # START value; ratchets up toward the max below
-    group_size: int = 64           # START value; ratchets up toward the max below
-    num_seed_states: int = 16
-
-    # ---- adaptive batch growth ----
-    # groups_per_step / group_size are the STARTING (G, K). Each step, if the
-    # best group's valid fraction and the count of distinct improved children
-    # both clear their thresholds, (G, K) are multiplied by growth_factor and
-    # clamped to (max_groups_per_step, max_group_size). Growth is monotonic: it
-    # never shrinks. At step >= growth_force_step, (G, K) are pinned to the max
-    # no matter what the signals say.
-    # None means "same as the starting value"; explicit larger values enable
-    # adaptive growth. Resolved to concrete ints during config loading.
-    max_groups_per_step: Optional[int] = None
-    max_group_size: Optional[int] = None
-    growth_force_step: int = 10    # from this step on, run at max unconditionally
-    growth_valid_yield: float = 0.7   # best group's valid fraction must reach this
-    growth_distinct_min: int = 4      # this many distinct improved children needed
-    growth_factor: float = 2.0        # multiply G and K by this when both clear
-    learning_rate: float = 4e-5
-    kl_penalty_coef: float = 0.1
-    max_new_tokens: int = 4200
-    grad_clip: float = 1.0
-
-    train_examples_per_microbatch: int = 64
-
-    # Bound the transient log_softmax allocation in compute_token_logprobs by
-    # slicing the response positions into chunks of at most this many tokens.
-    # The forward pass is untouched; only the float32 log_softmax + gather is
-    # chunked, so results are EXACT (log_softmax is per-position over the vocab).
-    # This is what keeps the feedback teacher forward from OOMing when it stacks
-    # on top of the still-alive training graph. 0 = single shot (identical to
-    # before). Nothing here depends on the model or its vocab.
-    logprob_chunk: int = 0
-
-    # Sampling
-    temperature: float = 1.0
-    top_p: float = 1.0
-    # Qwen hybrid models render a thinking preamble when this is enabled.
-    # This controls solution rollouts (and their matched feedback reprompts),
-    # not the separate memory extraction/selection calls.
-    thinking: bool = False
-
-    # PUCT
-    puct_c: float = 1.0
-    max_buffer_size: int = 1000
-    topk_children_per_parent: int = 8
-
-    # Misc
-    seed: int = 42
-    deterministic: bool = False        # master switch for reproducible sampling
-    print_responses: int = 0           # how many rollouts to print per step
-    # Cap on the construction length written into each rollout's meta. Erdos
-    # carries 40-100 floats; circle packing and gpu_mode carry none. 0 disables.
-    max_saved_construction: int = 4096
-    # Threads used to evaluate rollouts. 0 = auto (cpu_count - num_gpus), which
-    # is right for a subprocess sandbox and WRONG for anything that benchmarks
-    # on the GPU: concurrent timing runs contend and the reward IS the timing.
-    # Set 1 for gpu_mode.
-    reward_workers: int = 0
-
-    # Multi-GPU generation
-    # gpu_ids is authoritative when present; num_gpus is derived from its
-    # length. Passing --num-gpus alone selects devices 0..N-1.
-    num_gpus: Optional[int] = None
-    gpu_ids: str = "0"
-    # Max sequences each GPU holds per generate() call. The worker loops in
-    # chunks of this size until the group's rollouts are done, so group_size can
-    # be anything while per-GPU KV memory stays bounded by this. 0 = one shot
-    # (byte-identical to no micro-batch; a deterministic run with 0 draws exactly
-    # what it did before this feature existed).
-    gen_micro_batch: int = 0
-    # vLLM owns its own scheduler/KV cache. gen_micro_batch, when nonzero, is
-    # passed as max_num_seqs; 0 lets vLLM choose. Generation GPUs should be
-    # separate from the main training GPU unless the cards have ample headroom.
-    vllm_gpu_memory_utilization: float = 0.9
-    vllm_enforce_eager: bool = False
-    vllm_enable_prefix_caching: bool = True
-
-    # ---- Memory (Sec. 2.2) ----
-    # `memory` is the master switch. When it is False, every memory_* field
-    # below is ignored. No embeddings anywhere: retrieval is the model reading
-    # a one-line index of the whole bank and naming the ids it wants.
-    memory: bool = False
-    memory_lookup_mode: str = "select"      # select | all | none
-    memory_lookup_max_select: int = 5
-    memory_lookup_max_new_tokens: int = 256
-    memory_lookup_temperature: float = 0.3
-    memory_lookup_fallback: str = "none"    # none | recent | importance
-    memory_catalog_max_lessons: int = 0     # 0 = show the whole bank
-    memory_catalog_chars: int = 200
-    memory_inject_mode: str = "append"      # append | system
-    memory_token_budget: int = 1200
-    memory_grant_context: bool = True
-    memory_arm_control_fraction: float = 0.0
-    memory_arm_explore_fraction: float = 0.0
-    memory_arm_max_lessons: int = 1
-    memory_arm_exploration_c: float = 0.5
-    memory_outcome_credit: bool = False
-    memory_text_reinforce: bool = True
-    memory_extract_mode: str = "contrast"   # contrast | split
-    memory_extract_from: str = "both"       # both | failure | success (split only)
-    memory_curate_every: int = 0            # 0 = never; N = every N steps
-    memory_curate_min_bank: int = 20
-    memory_curate_max_items: int = 60
-    memory_curate_min_keep_frac: float = 0.25
-    memory_lessons_per_call: int = 3        # L, a ceiling
-    memory_require_full_lessons: bool = False
-    memory_max_examples_per_call: int = 8
-    memory_max_chars_per_example: int = 1500
-    memory_feedback_chars: int = 800
-    memory_reinforce_delta: float = 0.15
-    memory_max_new_tokens: int = 1024
-    memory_temperature: float = 0.7
-    memory_top_p: float = 0.95
-    memory_use_gen_pool: bool = True
-    memory_forbid_constructions: bool = True
-    memory_max_code_lines: int = 4
-    memory_global_scope_allows_code: bool = False
-    memory_max_lessons: int = 500
-    memory_dedup_jaccard: float = 0.6
-    memory_persist: bool = True
-
-    # ---- Feedback-based program-repair signal (Sec. 2.3, Eq. 9) ----
-    # `feedback` is the master switch, same rule as `memory`: when it is False
-    # every feedback_* field below is ignored.
-    feedback: bool = False
-    feedback_lambda: float = 0.2           # lambda_f at step 0
-    feedback_anneal_steps: int = 0         # 0 = constant; 10 = off from step 10
-    feedback_anneal_shape: str = "linear"  # linear | cosine
-    feedback_lambda_final: float = 0.0
-    feedback_clip: float = 5.0             # clamp |A^fb| per token; 0 = Eq. 9 as written
-    feedback_chars: int = 1200             # verifier text budget in the reprompt
-    # 0 = auto (20% of current G*K); -1 = all eligible code failures;
-    # >0 = explicit cap.
-    feedback_max_per_step: int = 0
-    feedback_auto_fraction: float = 0.20
-    feedback_include_constant_groups: bool = True
-    feedback_inject_mode: str = "append"   # append | user_turn
-    feedback_normalize: bool = False
-    feedback_adaptive: bool = False
-    feedback_validity_floor: float = 0.5
-    feedback_validity_target: float = 0.9
-    feedback_max_reward_ratio: float = 0.0
-    feedback_reward_scale_floor: float = 0.25
-    # 0 = auto (25% of step cap); -1 = unlimited; >0 = explicit cap.
-    feedback_max_per_signature: int = 0
-    feedback_auto_signature_fraction: float = 0.25
 
 
 # ======================================================================
-# CLI parsing + config loading (defaults < YAML < CLI)
+# CLI parsing + config loading (shared YAML < problem YAML < CLI)
 # ======================================================================
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TTT-Discover multi-problem runner")
     # Problem selection
     p.add_argument("--problem", default=None,
                    help="Problem name. Loads configs/<problem>.yaml unless --config "
-                        "is given. Defaults to Config.problem, so changing that one "
-                        "field is enough to switch problems. One of: circle_packing, "
+                        "is given. Defaults to `problem` in configs/defaults.yaml. "
+                        "One of: circle_packing, "
                         "erdos, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
                    help="Explicit path to a YAML config (overrides the --problem lookup).")
@@ -305,6 +122,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--reward-workers", type=int, default=None,
                    help="Threads for reward evaluation. 0 = auto. Use 1 for any "
                         "problem whose reward is a measured runtime.")
+    p.add_argument("--training-gpu-id", type=int, default=None,
+                   help="Physical GPU used exclusively by the training model.")
+    p.add_argument("--available-gpu-ids", type=str, default=None,
+                   help="Ordered physical GPU inventory, used to resolve the "
+                        "last evaluation GPU.")
+    p.add_argument("--reserve-last-gpu-for-evaluation",
+                   dest="reserve_last_gpu_for_evaluation",
+                   action="store_const", const=True, default=None,
+                   help="Reserve the last available GPU for evaluation only.")
+    p.add_argument("--no-reserve-last-gpu-for-evaluation",
+                   dest="reserve_last_gpu_for_evaluation",
+                   action="store_const", const=False)
+    p.add_argument("--evaluation-gpu-id", type=int, default=None,
+                   help="Explicit physical evaluation GPU (normally resolved "
+                        "from --reserve-last-gpu-for-evaluation).")
     p.add_argument("--num-gpus", type=int, default=None,
                    help="Number of generation GPUs. Normally omit this: it is "
                         "derived from --gpu-ids. Passing it alone selects 0..N-1.")
@@ -329,6 +161,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    action="store_const", const=True, default=None)
     p.add_argument("--no-vllm-prefix-caching",
                    dest="vllm_enable_prefix_caching",
+                   action="store_const", const=False)
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=None)
+    p.add_argument("--vllm-pipeline-parallel-size", type=int, default=None)
+    p.add_argument("--vllm-quantization", type=str, default=None,
+                   help="Explicit vLLM quantizer; omit/auto for checkpoint-native.")
+    p.add_argument("--vllm-max-num-batched-tokens", type=int, default=None)
+    p.add_argument("--vllm-enable-expert-parallel",
+                   dest="vllm_enable_expert_parallel",
+                   action="store_const", const=True, default=None)
+    p.add_argument("--no-vllm-enable-expert-parallel",
+                   dest="vllm_enable_expert_parallel",
                    action="store_const", const=False)
 
     # ---- memory (Sec. 2.2) ----
@@ -449,7 +292,10 @@ def _parse_gpu_ids(value) -> list:
     """Parse and validate the physical GPU list without importing CUDA."""
     if value is None:
         return []
-    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        parts = [part.strip() for part in str(value).split(",") if part.strip()]
     try:
         ids = [int(part) for part in parts]
     except ValueError as exc:
@@ -461,12 +307,24 @@ def _parse_gpu_ids(value) -> list:
     return ids
 
 
+def _load_shared_defaults():
+    """Read the single authoritative default-value mapping."""
+    path = Path(__file__).resolve().parent / "configs" / "defaults.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"required shared config not found: {path}")
+    with path.open() as f:
+        values = yaml.safe_load(f) or {}
+    if not isinstance(values, dict):
+        raise ValueError(f"shared config must be a mapping: {path}")
+    return values
+
+
 def load_config():
     """
-    Merge Config() defaults < YAML < resumed config.json < CLI flags.
+    Merge configs/defaults.yaml < problem YAML < resumed config.json < CLI.
 
     Returns (cfg, merged) where:
-      cfg    is a Config built from the engine-level fields, and
+      cfg    is the attribute-style view of the fully merged YAML, and
       merged is the full dict (including problem-only keys like num_circles,
              problem_type, budget_s, score_scale, gpu_type, task_yaml, lib_dir),
              which is what the problem registry consumes.
@@ -474,8 +332,8 @@ def load_config():
     args = _build_arg_parser().parse_args()
 
     # Read the saved run identity early enough to select its YAML. New runs
-    # persist the complete merged config; older ones at least contain the
-    # dataclass fields and can recover standard problem YAMLs by name.
+    # persist the complete merged config; older ones can recover standard
+    # problem YAMLs by name.
     resume_dir = None
     saved = {}
     if args.resume is not None:
@@ -489,18 +347,16 @@ def load_config():
             )
         saved = json.loads(saved_config_path.read_text())
 
-    # 1) defaults from the dataclass
-    merged = {f.name: getattr(Config(), f.name) for f in fields(Config)}
+    # 1) Complete repository-wide YAML defaults. There is intentionally no
+    # second defaults table in Python.
+    merged = _load_shared_defaults()
 
-    # The problem name comes from Config.problem unless --problem overrides it,
-    # so editing that one field switches problems: it picks the YAML, and the
-    # YAML then supplies everything else. Previously --problem carried its own
-    # hardcoded default, which silently won over the dataclass.
+    # The shared YAML's problem selects the problem file unless CLI/resume wins.
     problem_name = (saved.get("problem") if saved
                     else (args.problem if args.problem is not None
                           else merged["problem"]))
 
-    # 2) YAML overlay
+    # 2) problem YAML overlay
     cfg_path = args.config
     if cfg_path is None and saved.get("problem_type"):
         typed = os.path.join(
@@ -518,7 +374,7 @@ def load_config():
     elif args.config is not None:
         raise FileNotFoundError(f"--config path not found: {cfg_path}")
     else:
-        print(f"[config] no YAML at {cfg_path}; using Config() defaults + CLI. "
+        print(f"[config] no problem YAML at {cfg_path}; using shared YAML + CLI. "
               f"This is usually a mistake: the problem's own knobs "
               f"(task paths, batch sizes, reward_workers) live in that file.")
 
@@ -555,18 +411,22 @@ def load_config():
 
     # vLLM is an inference engine, not a differentiable trainer. Treat the
     # convenient `--backend vllm` spelling as the complete no-Unsloth mode.
-    if str(merged.get("backend", "")).lower() == "vllm":
+    if str(merged["backend"]).lower() == "vllm":
         merged["backend"] = "hf"
         merged["generation_backend"] = "vllm"
         print("[config] vLLM mode: HF+PEFT training + vLLM generation")
 
-    generation_backend = str(merged.get("generation_backend", "hf")).lower()
+    generation_backend = str(merged["generation_backend"]).lower()
     if generation_backend not in ("hf", "vllm"):
         raise ValueError("generation_backend must be 'hf' or 'vllm'")
     merged["generation_backend"] = generation_backend
-    util = float(merged.get("vllm_gpu_memory_utilization", 0.9))
+    util = float(merged["vllm_gpu_memory_utilization"])
     if not 0.0 < util <= 1.0:
         raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
+    tp = int(merged["vllm_tensor_parallel_size"] or 0)
+    pp = int(merged["vllm_pipeline_parallel_size"] or 1)
+    if tp < 0 or pp < 1:
+        raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
 
     # Omitted growth caps mean fixed batch size. Resolve after YAML and CLI so
     # `--groups-per-step 5 --group-size 16` becomes max G=5, max K=16 even if
@@ -575,19 +435,67 @@ def load_config():
         merged["max_groups_per_step"] = int(merged["groups_per_step"])
     if args.group_size is not None and args.max_group_size is None:
         merged["max_group_size"] = int(merged["group_size"])
-    if merged.get("max_groups_per_step") is None:
+    if merged["max_groups_per_step"] is None:
         merged["max_groups_per_step"] = int(merged["groups_per_step"])
-    if merged.get("max_group_size") is None:
+    if merged["max_group_size"] is None:
         merged["max_group_size"] = int(merged["group_size"])
     if int(merged["max_groups_per_step"]) < int(merged["groups_per_step"]):
         raise ValueError("max_groups_per_step cannot be below groups_per_step")
     if int(merged["max_group_size"]) < int(merged["group_size"]):
         raise ValueError("max_group_size cannot be below group_size")
 
-    # A GPU list is already an exact worker specification, so its length is the
+    # Resolve physical roles without importing CUDA. With the reservation flag,
+    # the last available id is evaluation-only and gpu_mode benchmarks use it.
+    available_gpu_ids = _parse_gpu_ids(merged["available_gpu_ids"])
+    if not available_gpu_ids:
+        try:
+            available_gpu_ids = _parse_gpu_ids(
+                os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+        except ValueError:
+            # UUID-based visibility needs an explicit integer inventory in YAML.
+            available_gpu_ids = []
+    training_gpu_id = int(merged["training_gpu_id"])
+    if training_gpu_id < 0:
+        raise ValueError("training_gpu_id must be non-negative")
+    if available_gpu_ids and training_gpu_id not in available_gpu_ids:
+        raise ValueError("training_gpu_id must appear in available_gpu_ids")
+
+    evaluation_gpu_id = merged["evaluation_gpu_id"]
+    if bool(merged["reserve_last_gpu_for_evaluation"]):
+        if len(available_gpu_ids) < 2:
+            raise ValueError(
+                "reserve_last_gpu_for_evaluation requires at least two ids in "
+                "available_gpu_ids (or integer CUDA_VISIBLE_DEVICES)")
+        reserved = available_gpu_ids[-1]
+        if evaluation_gpu_id is not None and int(evaluation_gpu_id) != reserved:
+            raise ValueError(
+                f"evaluation_gpu_id={evaluation_gpu_id} is not the last "
+                f"available GPU ({reserved})")
+        evaluation_gpu_id = reserved
+    if evaluation_gpu_id is not None:
+        evaluation_gpu_id = int(evaluation_gpu_id)
+        if evaluation_gpu_id < 0:
+            raise ValueError("evaluation_gpu_id must be non-negative")
+        if evaluation_gpu_id == training_gpu_id:
+            raise ValueError("evaluation GPU cannot also be the training GPU")
+        if available_gpu_ids and evaluation_gpu_id not in available_gpu_ids:
+            raise ValueError("evaluation_gpu_id must appear in available_gpu_ids")
+        merged["evaluation_gpu_id"] = evaluation_gpu_id
+        if str(merged["problem"]).lower() == "gpu_mode":
+            explicit_kernel_gpu = merged.get("kernel_gpu_id")
+            if (explicit_kernel_gpu is not None
+                    and int(explicit_kernel_gpu) != evaluation_gpu_id):
+                raise ValueError(
+                    "kernel_gpu_id disagrees with the isolated evaluation GPU")
+            merged["kernel_gpu_id"] = evaluation_gpu_id
+    merged["training_gpu_id"] = training_gpu_id
+    merged["available_gpu_ids"] = ",".join(
+        str(gpu_id) for gpu_id in available_gpu_ids)
+
+    # A GPU list is already an exact device specification, so its length is the
     # single source of truth. `--num-gpus N` remains as a convenience when no
     # list is passed and expands to devices 0..N-1.
-    gpu_ids = _parse_gpu_ids(merged.get("gpu_ids"))
+    gpu_ids = _parse_gpu_ids(merged["gpu_ids"])
     if args.gpu_ids is not None:
         if args.num_gpus is not None and int(args.num_gpus) != len(gpu_ids):
             raise ValueError(
@@ -603,25 +511,62 @@ def load_config():
     elif gpu_ids:
         merged["num_gpus"] = len(gpu_ids)
     else:
-        n_gpus = int(merged.get("num_gpus") or 0)
+        n_gpus = int(merged["num_gpus"] or 0)
         if n_gpus < 0:
             raise ValueError("num_gpus must be >= 0")
         gpu_ids = list(range(n_gpus))
         merged["num_gpus"] = n_gpus
     merged["gpu_ids"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    if generation_backend == "vllm" and training_gpu_id in gpu_ids:
+        raise ValueError(
+            "vLLM gpu_ids must exclude training_gpu_id; the QLoRA trainer owns "
+            "that card exclusively")
+    if evaluation_gpu_id is not None and evaluation_gpu_id in gpu_ids:
+        raise ValueError(
+            "the isolated evaluation GPU must not appear in gpu_ids")
+    if (generation_backend == "hf" and len(gpu_ids) > 1
+            and training_gpu_id in gpu_ids):
+        raise ValueError(
+            "multi-process HF gpu_ids must exclude training_gpu_id")
     print(f"[config] generation GPUs: {gpu_ids} "
           f"(num_gpus={merged['num_gpus']}, derived from gpu_ids)")
+    print(f"[config] GPU roles: train={training_gpu_id}, "
+          f"generation={gpu_ids}, evaluation={evaluation_gpu_id}")
 
-    # 5) build the Config from the fields it knows; leave the rest in `merged`
-    known = {f.name for f in fields(Config)}
-    cfg_kwargs = {k: v for k, v in merged.items() if k in known}
-    cfg = Config(**cfg_kwargs)
+    # 5) Provide attribute access without duplicating a Python config schema.
+    # Problem-specific YAML keys are harmless here and remain in `merged` too.
+    merged["target_modules"] = tuple(merged["target_modules"])
+    cfg = SimpleNamespace(**merged)
     if cfg.generation_backend == "vllm" and int(cfg.num_gpus or 0) < 1:
         raise ValueError("vLLM generation requires num_gpus >= 1")
+    if cfg.generation_backend == "vllm":
+        resolved_tp = int(cfg.vllm_tensor_parallel_size or 0)
+        pp = int(cfg.vllm_pipeline_parallel_size)
+        if resolved_tp == 0:
+            if int(cfg.num_gpus) % pp:
+                raise ValueError("vLLM generation GPU count must be divisible by PP")
+            resolved_tp = int(cfg.num_gpus) // pp
+        engine_gpus = resolved_tp * pp
+        if engine_gpus < 1 or int(cfg.num_gpus) % engine_gpus:
+            raise ValueError(
+                f"num_gpus={cfg.num_gpus} cannot form complete vLLM groups of "
+                f"TP={resolved_tp} * PP={pp}")
+        print(f"[config] vLLM engines: {int(cfg.num_gpus) // engine_gpus} "
+              f"replica(s), TP={resolved_tp}, PP={pp}, "
+              f"{engine_gpus} GPU(s)/engine")
     print(f"[config] rollout thinking: "
           f"{'enabled' if cfg.thinking else 'disabled'}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
+
+
+def _pin_training_process(training_gpu_id: int) -> None:
+    """Expose one physical GPU before importing torch, Transformers or Unsloth."""
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(training_gpu_id))
+    os.environ["TTT_TRAINING_GPU_ID"] = str(int(training_gpu_id))
+    print(f"[gpu] trainer isolated on physical GPU {training_gpu_id} "
+          f"(logical cuda:0)")
 
 
 # ======================================================================
@@ -657,7 +602,7 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     return results
 
 
-def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg: Config):
+def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg):
     """
     Generate `group_size` responses from a single prompt, batched.
 
@@ -938,11 +883,11 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
 # Generation is streamed and each rollout's program is evaluated on a CPU
 # thread pool WHILE the GPUs keep generating.
 #
-# Optional tuning: add `reward_workers: int = 0` to Config (0 = auto). Auto
+# `reward_workers` is configured in YAML (0 = auto). Auto
 # leaves ~one CPU core per GPU worker for the generation loop.
 # ======================================================================
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
-               cfg: Config, exp_dir, problem, gen_pool=None,
+               cfg, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
                curator=None, fb_cfg=None):
     import os
@@ -1637,6 +1582,12 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 # ======================================================================
 def main():
     cfg, merged = load_config()
+    # This must precede every import path that can initialize CUDA. Worker and
+    # evaluation children replace CUDA_VISIBLE_DEVICES with their own physical
+    # groups before importing their CUDA stacks.
+    _pin_training_process(cfg.training_gpu_id)
+    if cfg.evaluation_gpu_id is not None:
+        os.environ["TTT_EVALUATION_GPU_ID"] = str(cfg.evaluation_gpu_id)
 
     # Select the run directory before runtime-only context adjustments so a
     # fresh config.json stores the reusable base configuration.
@@ -1683,6 +1634,13 @@ def main():
     print(f"Model:              {cfg.model_name}")
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
+    print(f"Training GPU:       physical {cfg.training_gpu_id}")
+    print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
+    print(f"Evaluation GPU:     "
+          f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
+    if cfg.generation_backend == "vllm":
+        print(f"vLLM parallelism:   TP={cfg.vllm_tensor_parallel_size or 'auto'} "
+              f"PP={cfg.vllm_pipeline_parallel_size}")
     print(f"Target:             {cfg.target}")
     print(f"Steps:              {cfg.num_steps}")
     print(f"Groups per step:    {cfg.groups_per_step}")
@@ -1697,7 +1655,7 @@ def main():
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
     print(f"Memory:             {'on' if mem_cfg.enabled else 'off'}")
     print(f"Feedback signal:    "
-          f"{'on' if bool(merged.get('feedback', False)) else 'off'}")
+          f"{'on' if bool(merged['feedback']) else 'off'}")
     print("=" * 70)
 
     # ---- experiment dir ----
@@ -1805,12 +1763,19 @@ def main():
             vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
             vllm_enforce_eager=cfg.vllm_enforce_eager,
             vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
+            vllm_quantization=cfg.vllm_quantization,
+            vllm_tensor_parallel_size=cfg.vllm_tensor_parallel_size,
+            vllm_pipeline_parallel_size=cfg.vllm_pipeline_parallel_size,
+            vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+            vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
         )
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
                           else "micro-batch")
+            limit_scope = ("/engine" if cfg.generation_backend == "vllm"
+                           else "/GPU")
             print(f"[init] generation pool ready "
-                  f"({limit_name} {cfg.gen_micro_batch}/GPU)")
+                  f"({limit_name} {cfg.gen_micro_batch}{limit_scope})")
         else:
             print("[init] generation pool ready")
     else:

@@ -1,6 +1,5 @@
 
 
-import contextlib
 import torch
 
 
@@ -36,6 +35,10 @@ class UnslothBackend:
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=self.cfg.load_in_4bit,
             dtype=torch.bfloat16,
+            # The trainer process is restricted to its configured CUDA device,
+            # and the explicit map prevents Accelerate/Unsloth from rediscovering
+            # and replicating/sharding the policy over every visible card.
+            device_map={"": 0},
         )
         print("[backend=unsloth] attaching LoRA ...")
         model = FastLanguageModel.get_peft_model(

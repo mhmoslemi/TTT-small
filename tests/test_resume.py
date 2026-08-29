@@ -1,11 +1,17 @@
 import json
 import sys
-from dataclasses import asdict
+from types import SimpleNamespace
 
 from sampler import PUCTSampler, State
 from experiment_io import make_experiment_dir
-from train_multy import (Config, _legacy_resume_info, _restore_legacy_archive,
-                         load_config)
+from train_multy import (_legacy_resume_info, _load_shared_defaults,
+                         _restore_legacy_archive, load_config)
+
+
+def _default_config():
+    values = _load_shared_defaults()
+    values["target_modules"] = tuple(values["target_modules"])
+    return SimpleNamespace(**values)
 
 
 def test_sampler_checkpoint_round_trip():
@@ -56,7 +62,7 @@ def test_best_raw_state_respects_problem_direction_and_includes_seed():
 
 
 def test_experiment_config_keeps_problem_specific_keys(tmp_path):
-    cfg = Config()
+    cfg = _default_config()
     run_dir = make_experiment_dir(
         cfg, root=tmp_path,
         config_dict={"problem": "gpu_mode", "task_yaml": "task.yml"},
@@ -70,7 +76,7 @@ def test_experiment_config_keeps_problem_specific_keys(tmp_path):
 def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch):
     run_dir = tmp_path / "old-run"
     run_dir.mkdir()
-    saved = asdict(Config())
+    saved = vars(_default_config())
     saved.update({
         "problem": "erdos",
         "model_name": "saved/model",
@@ -96,7 +102,7 @@ def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch
 def test_old_saved_config_memory_topup_is_not_applied_twice(tmp_path, monkeypatch):
     run_dir = tmp_path / "old-run"
     run_dir.mkdir()
-    saved = asdict(Config())
+    saved = vars(_default_config())
     saved.update({
         "memory": True,
         "memory_grant_context": True,

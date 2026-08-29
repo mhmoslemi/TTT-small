@@ -1,5 +1,24 @@
 # Max-Seeking Agentic Scientific Discovery
 
+## Runtime configuration
+
+Run with `sh run.sh`. The launcher contains environment setup only; experiment
+settings live in `configs/defaults.yaml` and the selected problem YAML. Select a
+different file with, for example,
+`TTT_CONFIG=configs/gpu_mode_trimul.yaml sh run.sh`.
+
+GPU ids in YAML are physical ids. `training_gpu_id` is made the trainer's only
+visible device before Unsloth is imported. `gpu_ids` belongs only to rollout
+generation. For vLLM, each `vllm_tensor_parallel_size` ×
+`vllm_pipeline_parallel_size` block forms one sharded engine; additional full
+blocks are inference replicas. `load_in_4bit` controls the QLoRA training copy
+only, while `vllm_quantization` is independent and defaults to checkpoint-native
+auto-detection.
+
+Kernel configs set `reserve_last_gpu_for_evaluation: true`. The last id in
+`available_gpu_ids` becomes `kernel_gpu_id`, and startup rejects any overlap
+with training or generation.
+
 This document describes the conceptual framework implemented in this repository. It focuses on the scientific objective, the closed-loop discovery process, and the roles of tree search, online policy optimization, verifier feedback, and causal memory. Infrastructure and tuning details are intentionally omitted.
 
 ## 1. Problem setting: discovery is a best-of-budget problem

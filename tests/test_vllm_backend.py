@@ -26,6 +26,32 @@ class _Queue:
         self.items.append(item)
 
 
+def _fake_shared_yaml(stream):
+    if not str(getattr(stream, "name", "")).endswith("defaults.yaml"):
+        return {}
+    return {
+        "problem": "circle_packing",
+        "problem_type": "",
+        "backend": "auto",
+        "generation_backend": "hf",
+        "vllm_gpu_memory_utilization": 0.9,
+        "vllm_tensor_parallel_size": 0,
+        "vllm_pipeline_parallel_size": 1,
+        "groups_per_step": 8,
+        "group_size": 64,
+        "max_groups_per_step": None,
+        "max_group_size": None,
+        "training_gpu_id": 0,
+        "available_gpu_ids": "",
+        "evaluation_gpu_id": None,
+        "reserve_last_gpu_for_evaluation": False,
+        "gpu_ids": "",
+        "num_gpus": None,
+        "target_modules": [],
+        "thinking": False,
+    }
+
+
 class VLLMBackendTests(unittest.TestCase):
     def test_feedback_only_accepts_code_failures(self):
         result = types.SimpleNamespace
@@ -87,6 +113,9 @@ class VLLMBackendTests(unittest.TestCase):
             enable_prefix_caching=False,
             max_num_seqs=12,
             seed=123,
+            quantization="bitsandbytes",
+            tensor_parallel_size=4,
+            pipeline_parallel_size=2,
         )
 
         self.assertEqual(kwargs["model"], "org/model")
@@ -99,6 +128,9 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(kwargs["max_num_seqs"], 12)
         self.assertEqual(kwargs["seed"], 123)
         self.assertEqual(kwargs["quantization"], "bitsandbytes")
+        self.assertEqual(kwargs["tensor_parallel_size"], 4)
+        self.assertEqual(kwargs["pipeline_parallel_size"], 2)
+        self.assertIs(kwargs["fully_sharded_loras"], True)
 
     def test_vllm_engine_kwargs_omit_optional_limits(self):
         kwargs = _vllm_engine_kwargs(
@@ -113,6 +145,16 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertNotIn("max_num_seqs", kwargs)
         self.assertNotIn("seed", kwargs)
+        self.assertNotIn("quantization", kwargs)
+
+    def test_training_4bit_does_not_force_vllm_quantization(self):
+        kwargs = _vllm_engine_kwargs(
+            model_name="org/model",
+            max_seq_length=4096,
+            load_in_4bit=True,
+            lora_rank=32,
+            gpu_memory_utilization=0.9,
+        )
         self.assertNotIn("quantization", kwargs)
 
     def test_vllm_engine_rounds_adapter_capacity_up(self):
@@ -227,7 +269,7 @@ class VLLMBackendTests(unittest.TestCase):
         # Stub them so this test also runs on a CPU-only development machine.
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = lambda _stream: {}
+        fake_yaml.safe_load = _fake_shared_yaml
         sys.modules.pop("train_multy", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
@@ -239,6 +281,7 @@ class VLLMBackendTests(unittest.TestCase):
                 argv = [
                     "train_multy.py", "--config", str(config_path),
                     "--backend", "vllm",
+                    "--training-gpu-id", "0", "--gpu-ids", "1",
                 ]
                 with patch.object(sys, "argv", argv):
                     cfg, merged = load_config()
@@ -251,7 +294,7 @@ class VLLMBackendTests(unittest.TestCase):
     def test_batch_maxima_and_gpu_count_are_derived(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = lambda _stream: {}
+        fake_yaml.safe_load = _fake_shared_yaml
         sys.modules.pop("train_multy", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
@@ -264,6 +307,7 @@ class VLLMBackendTests(unittest.TestCase):
                     "train_multy.py", "--config", str(config_path),
                     "--groups-per-step", "5", "--group-size", "16",
                     "--gpu-ids", "0,2,4,6,7", "--thinking",
+                    "--training-gpu-id", "1",
                 ]
                 with patch.object(sys, "argv", argv):
                     cfg, merged = load_config()
