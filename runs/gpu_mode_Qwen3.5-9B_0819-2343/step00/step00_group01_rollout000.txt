@@ -1,0 +1,424 @@
+To solve this problem, we need to implement a highly optimized version of the Triangle Multiplicative Update (TriMul) kernel using Triton on an NVIDIA L40S (Ada Lovelace) GPU.
+
+### Key Challenges and Strategy
+
+1.  **$O(N^3)$ Complexity**: The core operation is a pairwise dot product over the sequence dimension $N$: `out[i, j] = sum_k(left[i, k] * right[j, k])`. With $N$ up to 1024, a naive loop is impossible. We must restructure this as a matrix multiplication-like operation.
+    *   *Observation*: The operation looks like $\text{out}_{ij} = \sum_k L_{ik} R_{jk}$. This is equivalent to $(L \times P \times R^T)_{ij}$ where $P=I$ (identity) or by reshaping: $\text{out} = L \cdot (L \text{ broadcast along } j) \dots$
+    *   Actually, the standard efficient way to compute $\sum_k A_{ik} B_{jk}$ in linear algebra is if we had access to block-wise matrix multiplication. Here, we have two tensors $L$ and $R$ of shape $[B, N, N, C]$. We want an output of shape $[B, N, N, C]$ where `out[b, i, j, :] = sum_k (L[b, i, k, :] * R[b, j, k, :)`.
+    *   Wait, the signature in the prompt's PyTorch code for the einsum is `'... i k d, ... j k d -> ... i j d'`.
+    *   This is effectively: Group the `k` dimension as the contraction dimension. If we view `Left` as $[B, N, N, C]$ and `Right` as $[B, N, N, C]$, we want the result where indices `i` and `j` are from the first and second dim, and `k` is summed over the third and third dims? No.
+    *   Let's re-read carefully: `out = einsum('... i k d, ... j k d -> ... i j d', left, right)`.
+        *   `left` dims: `[b, i, k, d]`
+        *   `right` dims: `[b, j, k, d]`
+        *   Result `out` dims: `[b, i, j, d]`.
+        *   Summation is over `k` and `d`. Wait, `d` is also summed?
+        *   Input shape is `[B, N, N, C]`. So `i` is $N$, `k` is $N$, `d` is $C$.
+        *   The equation is $\text{out}_{b, i, j, d} = \sum_k (\text{left}_{b, i, k, d} \times \text{right}_{b, j, k, d})$.
+        *   Yes, `d` is *not* summed. The same feature dimension $d$ is used for both left and right at index $k$. It's a dot product across $k$ for each feature channel $d$.
+        *   So, $\text{out}_{b, i, j, d} = \sum_{k=0}^{N-1} L_{b,i,k,d} \cdot R_{b,j,k,d}$.
+
+2.  **Architecture Constraints (L40S / Ada)**:
+    *   **Memory Bandwidth Bound**: Ada has high memory bandwidth but lower peak tensor throughput compared to H100. We need to minimize data movement.
+    *   **Tile Strategy**: We cannot load the entire $N \times N$ matrix. We will use a 2-tile approach (or 3-tile if registers allow) for the $N$ dimension.
+    *   **Vectorization**: Since we have a dimension $C$ at the end, we should process vector blocks of $C$.
+    *   **Masking**: Handle `mask` efficiently by broadcasting it once and multiplying.
+    *   **Sigmoid**: Compute activations before or during the GEMM pass? Computing sigmoids on the full tensor before the kernel saves overhead but consumes memory. Since $N^2$ can be large (1M to 1M elements), computing them in the kernel might double the size needed (left/right inputs + outputs). However, PyTorch operations like `sigmoid` are fused efficiently. We will move the non-memory heavy operations (Linear layers) to PyTorch, and push the *weighted product sum* to Triton.
+
+3.  **Triton Implementation Plan**:
+    *   **Grid**: Launch one program per $(b, i, j)$ pair. Total programs = $B \times N \times N$.
+    *   **Problem**: $B \times N \times N$ can be up to $1 \times 1024 \times 1024 = 1,048,576$. This is too many threads to launch directly on a single device (thread count constraints) and too many kernel launches if not batched.
+    *   **Alternative**: Launch one program per **block of (i, j) pairs**. Let $P_M$ be the block size for $i$ and $P_N$ for $j$.
+        *   However, the inner loop is $k$ and output is $d$.
+        *   Actually, we can treat the computation as a matrix multiplication:
+            Let $L$ be reshaped to $[B \cdot N, N, C]$. Let $R$ be reshaped to $[B \cdot N, N, C]$. We want $R_{out} = L \cdot R^T$?
+            Result $[B \cdot N, N, C]$ where row corresponding to $(b, i)$ sums with row $(b, j)$ over $k$.
+            This is exactly `torch.bmm` if dimensions were right.
+    *   **Refined Kernel Structure**:
+        *   Let's flatten the $i, j$ axes. We need to compute $O[b \cdot i, N, d]$.
+        *   We can iterate over $b$ and $d$ on the outer loops (handled by PyTorch or simple kernel loops), and use Triton to handle the $N \times N$ multiplication for a single block of $i, j$.
+        *   **Specific Approach**:
+            1.  Use PyTorch to compute projections, masks, sgd, etc. This avoids writing Triton kernels for 8 different linear layers, reducing code size and potential errors. The bottleneck is the quadratic sum.
+            2.  Reshape $L$ and $R$ to allow block-wise matrix multiplication.
+            3.  **Block Size**: Given $N \le 1024$, we can tile $N$ into blocks of size $BLOCK$.
+            4.  **Parallelism**: Each thread block will handle a subset of $(i, j)$ pairs. Specifically, a thread block computes `out_block[i_start:i_end, j_start:j_end]`.
+            5.  **Inner Loop ($k$)**: Since $k$ is the summation dimension, we need to store parts of $L$ and $R$ in registers/shared memory.
+                *   Load $L[b, i, k_{block}]$ (row of blocks for $i$) and $R[b, j, k_{block}]$ (col of blocks for $j$).
+                *   Accumulate `acc += L * R`.
+            6.  **Constraints**: $C$ is small (128/384). We can process the whole $C$ dimension in one pass using vectorization (loading 128/256 elements at once) or loop over $C$ if necessary. Given $C$ is small, a loop over $C$ inside the kernel might be fine, or we can use `tl.store` with a vector of accumulators.
+    
+    *   **Optimization for L40S**:
+        *   Use `tl.dot` (bmm) within the kernel? Ada supports `mTensor.core.async`. `tl.dot` usually works well.
+        *   Since $k$ is the loop, $N$ can be 1024. We need to tile $k$ as well?
+        *   Actually, if we fix $i$ and $j$, we need to compute $\sum_k L_{ik} R_{jk}$.
+        *   If we arrange threads to cover $(i, j)$ pairs, the "rows" of work are $k$.
+        *   Let's try a standard tile approach:
+            *   Block size for $i$: $BLOCK_I$, for $j$: $BLOCK_J$.
+            *   Shared Memory/Registers: We need to load a block of $k$ (size $BLOCK_K$).
+            *   If we use `tl.dot` for the inner $k$ dimension? No, $k$ is the contraction dim. We need to multiply a slice of $L$ ($1 \times BLOCK_K \times C$) by a slice of $R$ ($1 \times BLOCK_K \times C$) -> result ($1 \times 1 \times C$).
+            *   Wait, the standard GEMM is $A (M \times K) \times B (K \times N) \to C (M \times N)$.
+            *   Here: For fixed $i, j$, we do $(1 \times C)$ dot $(1 \times C)$? No.
+            *   Dimensions: $L: [N, N]$, $R: [N, N]$. Output $O: [N, N]$. $O_{ij} = \sum_k L_{ik} R_{jk}$.
+            *   This is not a standard matrix mult. It's $\sum (L_i \circ R_j)_k$. Element-wise product of rows summed.
+            *   Correct GEMM view:
+                Let $L$ be $N \times N \times C$. Let $R$ be $N \times N \times C$.
+                We want $O$ where $O_{ij} = \sum_k \sum_d L_{ikd} R_{JKd}$? No, the formula is $\sum_k L_{ik} R_{jk}$ where the vectors $d$ are the same.
+                $\sum_k \sum_d (L_{ikd} \cdot R_{jkd} \cdot 1)$. No, the PyTorch code says `einsum('... i k d, ... j k d -> ... i j d')`.
+                This means $\text{out}[...][i][j][d] = \sum_k (\text{left}[...][i][k][d] \times \text{right}[...][j][k][d])$.
+                The summation is ONLY over $k$. The feature dimension $d$ is preserved per channel.
+                So for each $(i, j)$ and each $d$, we perform a dot product over $k$ of vectors $u_d(i, k) \cdot v_d(j, k)$.
+        
+    *   **Kernel Design**:
+        *   **Outer Loop**: Iterate over $(i, j)$ blocks. Each thread handles a subset of $(i, j)$ pairs.
+        *   **Inner Logic**:
+            *   We need to sum over $k$.
+            *   Since $d$ is preserved, we can compute the sum for all $d$ simultaneously if we vectorize, or loop $d$.
+            *   Given $C \le 384$, looping $d$ in the kernel is viable.
+            *   To optimize on L40S, we should treat $k$ as the "reduction" dimension of a GEMM.
+            *   Reshape problem:
+                We want to compute $O = L \cdot \text{diag}(R_{cols})^T$? No.
+                It is simply: For each $d$, compute matrix $M_d = L_d \times R_d^T$ where $L_d, R_d \in \mathbb{R}^{N \times N}$.
+                Then stack them.
+                This transforms the problem into $C$ independent Matrix Multiplications!
+                $O_{..., i, j, d} = (L_{..., :, :, d} \cdot R_{..., :, :, d}^T)_{i, j}$.
+    
+    *   **Final Algorithm**:
+        1.  Precompute linear layers and masks/sigmoids in PyTorch (fast fused ops).
+        2.  Prepare $L, R$ shaped as $[B, N, N, C]$.
+        3.  Launch a kernel where each sub-tile processes a block of $(i, j)$ pairs for a specific batch $b$ and specific channel $d$. Or, better, process all $d$ in parallel.
+        4.  **Triton Approach**:
+            *   Flatten $N, N$ into a single problem? Or use 2D blocks.
+            *   Let's use a 2D block for $(i, j)$. Thread $(pid_m, pid_n)$ computes $O[b, i, j, d]$.
+            *   Inner loop over $k$ (block $BLOCK_K$).
+            *   Inside: Load $L[b, i_block+i, k_block+k, d]$ and $R[b, j_block+j, k_block+k, d]$.
+            *   Multiply and accumulate in shared local variable (register).
+            *   Optimization: Since $d$ is small, loop over $d$ in the kernel.
+            *   Optimization: `tl.dot` can perform the multiplication for a block of $k$ if we structure it as matrix mult.
+            *   Structure:
+                *   Block $M$ covers $i \in [start, start+M)$.
+                *   Block $N$ covers $j \in [start, start+N)$.
+                *   Shared memory for $K$ rows.
+                *   Iterate $k$ in blocks.
+                *   Load $L_{sub} \in [M, K] \times [1, 1]$? No.
+                *   Standard GEMM: $A (M \times K) \times B (K \times N) \to C (M \times N)$.
+                *   Here for each $d$: $A = L_{block\_i}$, $B = R_{block\_i\_col}$.
+                *   $A$ is size $(BLOCK\_I, BLOCK\_K)$. $B$ is size $(BLOCK\_K, BLOCK\_J)$.
+                *   $C$ is $(BLOCK\_I, BLOCK\_J)$.
+                *   We need to loop $d$ and compute this GEMM for every $d$.
+                *   Can we batch $d$? Yes, `tl.dot` can handle $(M, K, D) \times (K, N, D) \to (M, N, D)$?
+                *   In Triton 3.x, `tl.dot` operates on matmul with accumulation.
+                *   Let's assume we loop $d$.
+            *   **Optimization for C**: If $C$ is 128, 256 threads can hold 128 floats easily.
+            *   **Implementation**:
+                *   Grid: `((B, N, N), ...)` -> Too big.
+                *   Grid: `((B, num_blocks_i, num_blocks_j, ...))`.
+                *   Actually, simpler: Iterate over `b` and `d` as batch parameters to the kernel.
+                *   Kernel `(b, d)` processes the $N \times N$ matrix mult for that specific pair.
+                *   Grid: `(B * C,)`.
+                *   Each kernel instance handles one $(b, d)$ pair.
+                *   Inside, handle the $N \times N$ matrix multiplication in tiles.
+                *   Threads: `(BLOCK_I, BLOCK_J)`. One thread per output element in the tile.
+                *   Shared Memory: $N \times N$ is too big. $BLOCK_K \times C$?
+                *   Standard GEMM pattern in Triton:
+                    *   Load $BLOCK_K \times C$ from L and $BLOCK_K \times C$ from R?
+                    *   Acc is $BLOCK_I \times BLOCK_J \times C$.
+                    *   Loop $k$.
+                    *   Load $L$ rows for current $k$ block. Load $R$ cols for current $k$ block.
+                    *   Perform dot product.
+            *   **Refining GEMM in Triton**:
+                *   We need `tl.dot` for the heavy lifting.
+                *   `tl.dot(a, b)` where `a` is $(M, K)$ and `b` is $(K, N)$. Result $(M, N)$.
+                *   We can do this for each `d` slice.
+                *   To avoid loop overhead for `d`, we can loop `d` on the thread block (shared loop) or just unroll.
+                *   Given $C$ is small, let's loop `d` inside the thread block logic.
+    
+    *   **L40S Specifics**:
+        *   Use `tl.arange` and `tl.where` efficiently.
+        *   Prefer `tl.dot` for the matmul.
+        *   Ensure no TMA (use standard `malloc`/`free` or register shared mem) since TMA is not available.
+        *   Use `tl.static_tensor` or direct indexing.
+    
+    *   **Implementation Details**:
+        1.  Compute all linear layers and masks/pytorch ops.
+        2.  Resulting $L, R \in [B, N, N, C]$.
+        3.  Flatten $B \times C$ into a list of tasks.
+        4.  Kernel Loop: `k` from $0$ to $num\_tasks$.
+        5.  Inside Kernel ($N \times N$ matmul):
+            *   Thread coords $pid\_i, pid\_j$.
+            *   Block sizes $BLOCK\_I, BLOCK\_J$.
+            *   Accumulators in registers (or shared mem if needed, but registers are fast).
+            *   Tiling $K$.
+            *   `tl.dot` on the loaded blocks.
+            *   Since $C$ varies, we might need mixed precision. `bfloat16` is best for L40S tensor cores.
+            *   Convert $L, R$ to `bfloat16` before kernel. Output to `float32`.
+    
+    *   **Handling `mask`**:
+        *   Already applied in PyTorch (multiply by mask before kernel).
+    
+    *   **Code Structure**:
+        *   Define `tri_mul_kernel` at module level.
+        *   `custom_kernel` prepares data and launches `tri_mul_kernel`.
+
+Let's write the code.
+
+```python
+import torch
+from torch import einsum
+import triton
+import triton.language as tl
+
+@triton.jit
+def _tri_mul_kernel(
+    L_ptr, R_ptr, Out_ptr, Mask_ptr,
+    B, N, C,
+    stride_L_b, stride_L_i, stride_L_k, stride_L_d,
+    stride_R_b, stride_R_j, stride_R_k, stride_R_d, # Right dims: b, j, k, d -> wait, right is . to_out_norm(out) * out_gate? 
+    # Re-verify Right dims. 
+    # input: x. left = self.left_proj(x). right = self.right_proj(x).
+    # x: [B, N, N, C]. left/right: [B, N, N, C].
+    # out = einsum('... i k d, ... j k d -> ... i j d', left, right)
+    # So Right is also [B, N, N, C]. Indices: b, j, k, d.
+    # Strides: b, j, k, d.
+    # We want Out: [B, N, N, C]. Indices: b, i, j, d.
+    # Wait, the prompt says: '... i k d, ... j k d -> ... i j d'
+    # Left: i, k. Right: j, k.
+    # Left shape: [B, N, N, C] -> b, i, k, d.
+    # Right shape: [B, N, N, C] -> b, j, k, d.
+    # Yes.
+    
+    # Configs
+    BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    # We treat B and C as flattened iterations? 
+    # No, better to iterate B and C in the host, then run kernel for (B, C).
+    # Or run kernel for all B*C simultaneously? 
+    # Given N is up to 1024, we can't fit many.
+    # Let's iterate B and C via `tl.static` loop? No, Triton loops are tricky.
+    # Standard pattern: Host loops over B and C, calls kernel once per (B, C).
+    pass
+
+# The actual strategy: Host loops B and C. Kernel does N*N matmul with tiling.
+# Why tiling? Because N*N can be 1M, threads are limited.
+# We launch a grid of (BLOCK_M // BLOCK_K, BLOCK_N // BLOCK_K)? No.
+# We need threads to cover the M x N space of the matmul.
+# Grid: (ceil(N/BLOCK_M) * ceil(N/BLOCK_N), 1, 1).
+# Wait, each thread computes multiple elements if we don't do 1 thread = 1 element?
+# Usually 1 thread = 1 element. Total threads = N^2. For N=1024, 1M threads. Possible (L40S has ~1024 blocks * ~2048 threads? No, 1M threads is ~960 blocks if 1024 threads/block, or just 1 block if we use more?)
+# No, L40S has ~15000 cores? No, max active threads per SM is ~20000.
+# Launching 1M threads is fine (1000-2000 blocks).
+# But we also need to tile K.
+# If we use 1 thread per (i, j), and inner loop over k blocks.
+# Each thread loads a row of K and col of K?
+# It's better to tile K too.
+# Let's assume:
+# Block M: size of i, Block N: size of j.
+# Thread (tm, tn) handles Out[tm*BLOCK_M + m, tn*BLOCK_N + n].
+# Inner loop: K. We tile K into BLOCK_K.
+# Each kernel launch processes a specific (B, C).
+# Inside, we need to handle the masking of j (from Right) and i (from Left, though Left is [i, k]).
+# Actually, Mask is on [B, N, N]. In PyTorch, we did `left = left * mask`, `right = right * mask`.
+# But we did `left * mask` where mask[i] is applied? Or mask[i, k]?
+# Prompt: "mask = mask.unsqueeze(-1); left = left * mask".
+# PyTorch: Mask [B, N, N]. Left [B, N, N, C].
+# Broadcasting: Mask[i, j] -> [B, i, j, 1]? 
+# "mask = mask.unsqueeze(-1)" -> [B, N, N, 1].
+# Left [B, N, N, C]. Elementwise mult.
+# Left[b, i, k, c] *= Mask[b, i, k]? 
+# Wait, the PyTorch code: `mask.unsqueeze(-1)` adds dim at end.
+# Mask [B, N, N]. unsqueeze(-1) -> [B, N, N, 1].
+# Left [B, N, N, C].
+# Multiply: Left[b, i, k, d] *= Mask[b, i, k] (broadcasted).
+# Right [B, N, N, C]. Right[b, j, k, d] *= Mask[b, j, k] (broadcasted).
+# Correct. So L[i, k] and R[j, k] are masked by M[i, k] and M[j, k].
+
+# Implementation Details:
+# 1. Flatten B and C loops on host.
+# 2. Kernel handles N x N matmul.
+# 3. Threads cover (m, n) indices.
+# 4. Shared memory for K tiles.
+# 5. Use tl.dot for efficiency.
+
+# Constants
+@triton.heuristics(
+    {
+        "BLOCK_K": lambda N, C, device_property: 64 # Heuristic for L40S
+    }
+)
+def custom_kernel(data: input_t) -> output_t:
+    input_tensor, mask, weights, config = data
+    B, N, C = config["bs"], config["seqlen"], config["dim"]
+    hidden_dim = config["hidden_dim"]
+    
+    # Setup pointers and strides for Triton
+    # We will compute linear layers in PyTorch first to save Triton complexity.
+    # L, R, G_out in [B, N, N, C]
+    
+    # --- PyTorch Preparation ---
+    
+    # Norm
+    x = input_tensor
+    if "norm_weight" in weights:
+        # Manually apply LayerNorm
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        std = var.sqrt() + 1e-5
+        x = (x - mean) / std
+        # Note: We can't easily mix parameters here, but we can just load weights
+        # Actually, the weights dict contains the parameters.
+        # Let's load them correctly.
+        norm_weight = weights["norm.weight"].to(torch.float32)
+        norm_bias = weights["norm.bias"].to(torch.float32)
+        # LayerNorm: gamma, beta. If not provided, assume 1.0, 0.0?
+        # The PyTorch class initializes them. We need to assign them if missing.
+        # But the task says "weights" dict contains the model weights.
+        # So we must load them.
+        # Let's assume standard LayerNorm implementation.
+        # However, to keep Triton simple, we assume the linear projections are the main cost?
+        # No, LayerNorm is small.
+        # We will just replicate the PyTorch logic here but with fused kernel later?
+        # The prompt says "You do not have to implement everything in triton... at least part".
+        # Let's implement the heavy GEMM in Triton, and do the linear stuff in PyTorch.
+        pass
+    
+    # We need to initialize weight parameters into the module or directly load them.
+    # The weights dict has keys like "left_proj.weight".
+    # We can construct the final weights dict manually if needed, but the prompt implies we get a dict.
+    # Let's assume the weights dict has ALL necessary tensors.
+    
+    # Re-creating the PyTorch logic cleanly:
+    # x_norm = (x - mean) / std + beta...
+    # But we don't have norm.weight/beta in the weights dict? 
+    # The example code shows weights["norm.weight"] etc.
+    # So we can do the LayerNorm in PyTorch.
+    
+    # Linear Projections
+    left_proj = torch.nn.functional.linear(x, weights["left_proj.weight"], weights.get("left_proj.bias", None))
+    right_proj = torch.nn.functional.linear(x, weights["right_proj.weight"], weights.get("right_proj.bias", None))
+    left_gate = torch.nn.functional.sigmoid(torch.nn.functional.linear(x, weights["left_gate.weight"]))
+    right_gate = torch.nn.functional.sigmoid(torch.nn.functional.linear(x, weights["right_gate.weight"]))
+    out_gate = torch.nn.functional.sigmoid(torch.nn.functional.linear(x, weights["out_gate.weight"]))
+    
+    # Apply mask and gates
+    if mask is not None:
+        mask_exp = mask.unsqueeze(-1).float() # [B, N, N, 1]
+    else:
+        mask_exp = torch.ones(B, N, N, 1, device=input_tensor.device, dtype=torch.float32)
+    
+    left = left_proj * mask_exp * left_gate
+    right = right_proj * mask_exp * right_gate
+    
+    # Final Linear to Out
+    out = weights["out_proj.weight"] # Not in list, but "to_out.weight"
+    out = torch.nn.functional.linear(left, weights["to_out.weight"], weights.get("to_out.bias", None))
+    # Wait, the final out_gate?
+    # "out = self.to_out_norm(out); out = out * out_gate; return self.to_out(out)"
+    # So: out = to_out(left) * out_gate?
+    # No: left = left_proj * mask * left_gate.
+    # out = einsum(...) -> out.
+    # out = to_out_norm(out).
+    # out = out * out_gate.
+    # out = to_out(out).
+    # So we do:
+    # 1. Compute L, R, Gates.
+    # 2. Do the TriMul sum in Triton.
+    # 3. Then apply to_out_norm, to_out * out_gate, to_out.
+    # We can do the final affine and norm in PyTorch after the main kernel.
+    # This is efficient.
+    
+    # Wait, I missed "to_out_norm".
+    # Let's compute L_sum in Triton.
+    # Then: out_final = to_out(tl.norm(L_sum)? No, to_out_norm is LayerNorm on the result of einsum).
+    # So: 
+    # 1. Run TriMul -> get S [B, N, N, C].
+    # 2. S_norm = LayerNorm(S).
+    # 3. S_final = S_norm * out_gate * to_out(S_norm)?
+    # Wait: "out = self.to_out_norm(out); out = out * out_gate; return self.to_out(out)"
+    # Yes.
+    
+    # So:
+    # 1. TriMul Kernel -> produces `raw_out` [B, N, N, C].
+    # 2. PyTorch: LayerNorm(raw_out) * out_gate -> `post_norm`?
+    # No, LayerNorm is first. `out_norm = LayerNorm(raw_out)`.
+    # `final = out_norm * out_gate`.
+    # `out = self.to_out(final)`.
+    
+    # So we only need the TriMul GEMM in Triton.
+    
+    # Prepare for Triton
+    # Strides
+    def build_strides(tensor, dim):
+        return [tensor.stride(i) for i in range(dim)]
+    
+    # We need to loop over B and C.
+    # To avoid massive grid, we can loop B and C on host and call kernel for each.
+    
+    # Shared Memory size for K: BLOCK_K * C_elements.
+    # We will handle C by looping d inside the thread block or using vectorize.
+    # Given C <= 384, loop over d in thread block is fine.
+    
+    # Kernel Definition
+    @triton.jit
+    def kernel_triton(
+        L_raw_ptr, R_raw_ptr, Out_ptr,
+        stride_L_bi, stride_L_bk, stride_L_cd, # L: [B, i, k, C] flattened? No, we need strides.
+        stride_R_bj, stride_R_bk, stride_R_cd,
+        stride_O_bi, stride_O_bj, stride_O_bk, # O: [B, i, j, C]
+        B, N, C,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        # Program ID mapping: (pid_b, pid_d) -> (b_idx, d_idx)? 
+        # We handle (b, d) as a single task from host loop.
+        # But here we need to handle all B, N, N.
+        # Grid: (ceil(N/BLOCK_M), ceil(N/BLOCK_N)).
+        # So pid maps to (m, n). b and d are fixed thread state.
+        
+        pid = tl.program_id(0) # Linear index into blocks
+        # 2D grid? Let's use 1D grid of blocks.
+        # Actually, let's use 2D grid: (num_blocks_m, num_blocks_n).
+        # pid_m = pid // num_blocks_n, pid_n = pid % num_blocks_n.
+        
+        # We need num_blocks_m and num_blocks_n as kwargs.
+        pass
+
+    # Refined Kernel Launch
+    num_blocks_m = triton.cdiv(N, BLOCK_M)
+    num_blocks_n = triton.cdiv(N, BLOCK_N)
+    
+    for b in range(B):
+        for d in range(C):
+            # Build pointers for L, R, Out slices [b, :, :, d]
+            # L shape [B, N, N, C] -> we access [b, :, :, d]
+            # Strides for L:
+            # L[b, i, k, d]
+            # L is contiguous? We assumed contiguous.
+            # Stride_i = L.stride(1), Stride_k = L.stride(2), ...
+            
+            # We will flatten the host loops to avoid kernel launch overhead?
+            # No, kernel launch overhead is small compared to N*N work.
+            
+            # But wait, C loop: 128, 256, 384. N=1024.
+            # 1024*1024 * 100 = 100 million ops.
+            # We can batch B*C into one launch.
+            num_tasks = B * C
+            grid = (num_blocks_m * num_blocks_n,) # Wait, threads cover M x N space.
+            # Threads are arranged in a 2D grid?
+            # Let's use 1D grid for blocks.
+            # total blocks = num_blocks_m * num_blocks_n.
+            # Each block has threads for (i, j) within it.
+            
+            pass
+
+    # Let's refactor to use a single kernel launch for all B, C by flattening them into the grid?
+    # No, B and C are just indexing.
+    # Best: Loop B and C on host, but use `tl.static` logic?
+    # Or define kernel with `B` and `C` as constexpr and loop them? No, B/C are runtime.
+    # Standard trick: Kernel handles 1 task (b, d). Host loops.
+    # Or Kernel handles all (b, d) via `pid` mapping.
+    # Given B is small (2), C is small (128-384), we can batch them.
+    
+    # Let's implement the kernel to take `B` and `C` and compute everything.
+    # Grid: (num_blocks_m * num_blocks_n, 1, 1).
+    # Inside kernel: use `tl.static` array size for B*C? No.
+    # Use `pid` to map to block (bm, bn) and thread (m, n).
+    # Then use `tl.static` indexing for b, d?
+    # We can't index dynamic B/C with static.
+    # But we can
