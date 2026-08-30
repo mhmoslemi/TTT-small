@@ -1,15 +1,18 @@
 import json
+from pathlib import Path
 import sys
 from types import SimpleNamespace
+import yaml
 
 from sampler import PUCTSampler, State
 from experiment_io import make_experiment_dir
-from train_multy import (_legacy_resume_info, _load_shared_defaults,
-                         _restore_legacy_archive, load_config)
+from train_multy import (_legacy_resume_info, _restore_legacy_archive,
+                         load_config)
 
 
-def _default_config():
-    values = _load_shared_defaults()
+def _complete_config():
+    path = Path(__file__).resolve().parents[1] / "configs" / "erdos.yaml"
+    values = yaml.safe_load(path.read_text())
     values["target_modules"] = tuple(values["target_modules"])
     return SimpleNamespace(**values)
 
@@ -62,7 +65,7 @@ def test_best_raw_state_respects_problem_direction_and_includes_seed():
 
 
 def test_experiment_config_keeps_problem_specific_keys(tmp_path):
-    cfg = _default_config()
+    cfg = _complete_config()
     run_dir = make_experiment_dir(
         cfg, root=tmp_path,
         config_dict={"problem": "gpu_mode", "task_yaml": "task.yml"},
@@ -76,7 +79,7 @@ def test_experiment_config_keeps_problem_specific_keys(tmp_path):
 def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch):
     run_dir = tmp_path / "old-run"
     run_dir.mkdir()
-    saved = vars(_default_config())
+    saved = vars(_complete_config())
     saved.update({
         "problem": "erdos",
         "model_name": "saved/model",
@@ -102,7 +105,7 @@ def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch
 def test_old_saved_config_memory_topup_is_not_applied_twice(tmp_path, monkeypatch):
     run_dir = tmp_path / "old-run"
     run_dir.mkdir()
-    saved = vars(_default_config())
+    saved = vars(_complete_config())
     saved.update({
         "memory": True,
         "memory_grant_context": True,

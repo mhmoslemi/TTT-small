@@ -1,5 +1,7 @@
 
 
+import importlib.util
+import os
 import torch
 
 
@@ -10,6 +12,28 @@ def _ensure_pad_token(tokenizer):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def _use_training_4bit(cfg, *, native_quantization=False):
+    """Resolve the requested QLoRA mode without affecting vLLM."""
+    if not bool(getattr(cfg, "load_in_4bit", False)):
+        return False
+    model_name = str(getattr(cfg, "model_name", ""))
+    if native_quantization or "gpt-oss" in model_name.lower():
+        print(f"[precision] {model_name} has checkpoint-native quantization; "
+              "not applying BitsAndBytes 4-bit again")
+        return False
+    if importlib.util.find_spec("bitsandbytes") is None:
+        print("[precision] bitsandbytes is unavailable; using checkpoint/default "
+              "precision instead of requested 4-bit")
+        return False
+    return True
+
+
+def _offline_mode() -> bool:
+    truthy = {"1", "true", "yes", "on"}
+    return any(str(os.environ.get(name, "")).strip().lower() in truthy
+               for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
 
 
 # ======================================================================
@@ -29,12 +53,21 @@ class UnslothBackend:
         from unsloth import FastLanguageModel
         self._FastLanguageModel = FastLanguageModel
 
+        use_4bit = _use_training_4bit(self.cfg)
+        self.cfg.effective_load_in_4bit = use_4bit
+
         print(f"[backend=unsloth] loading {self.cfg.model_name} ...")
+        offline = _offline_mode()
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=self.cfg.model_name,
             max_seq_length=self.cfg.max_seq_length,
-            load_in_4bit=self.cfg.load_in_4bit,
+            load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
+            # In offline mode Unsloth otherwise remaps a cached upstream model
+            # to an uncached `unsloth/*-bnb-4bit` Hub repository. Pin the exact
+            # requested repo and let BitsAndBytes quantize its cached weights.
+            use_exact_model_name=offline,
+            local_files_only=offline,
             # The trainer process is restricted to its configured CUDA device,
             # and the explicit map prevents Accelerate/Unsloth from rediscovering
             # and replicating/sharding the policy over every visible card.
@@ -53,7 +86,6 @@ class UnslothBackend:
         )
         tokenizer = _ensure_pad_token(tokenizer)
 
-        
         if hasattr(model, "generation_config") and model.generation_config is not None:
             model.generation_config.max_length = None
 
@@ -84,11 +116,17 @@ class HFBackend:
         self.tokenizer = None
 
     def load(self):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         print(f"[backend=hf] loading {self.cfg.model_name} ...")
         tokenizer = AutoTokenizer.from_pretrained(self.cfg.model_name, trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(
+            self.cfg.model_name, trust_remote_code=True)
+        native_quantization = bool(getattr(hf_config, "quantization_config", None))
+        use_4bit = _use_training_4bit(
+            self.cfg, native_quantization=native_quantization)
+        self.cfg.effective_load_in_4bit = use_4bit
 
         # Pinned to one device, NOT "auto". With two visible GPUs, "auto" shards
         # the model across both and puts training weights on the card that
@@ -101,7 +139,7 @@ class HFBackend:
             device_map={"": 0},
             trust_remote_code=True,
         )
-        if self.cfg.load_in_4bit:
+        if use_4bit:
             try:
                 from transformers import BitsAndBytesConfig
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -111,11 +149,13 @@ class HFBackend:
                     bnb_4bit_quant_type="nf4",
                 )
             except ImportError:
-                print("[backend=hf] bitsandbytes not available, ignoring load_in_4bit")
+                use_4bit = False
+                self.cfg.effective_load_in_4bit = False
+                print("[backend=hf] bitsandbytes not available; using default precision")
 
         model = AutoModelForCausalLM.from_pretrained(self.cfg.model_name, **model_kwargs)
 
-        if self.cfg.load_in_4bit:
+        if use_4bit:
             model = prepare_model_for_kbit_training(model)
 
         if hasattr(model, "gradient_checkpointing_enable"):
@@ -163,27 +203,29 @@ def load_backend(name: str, cfg):
     """
     name in {"unsloth", "hf", "auto"}.
 
-    "auto": try Unsloth first, fall back to HF if anything fails
-    (import error, unsupported architecture, etc).
+    "auto": use plain HF in offline mode; otherwise use Unsloth when installed.
+    Importing Unsloth mutates Transformers classes globally, so a failed
+    Unsloth load cannot safely fall back to HF in the same interpreter.
     """
     if name == "hf":
         return HFBackend(cfg)
     if name == "unsloth":
         return UnslothBackend(cfg)
     if name == "auto":
-        try:
-            b = UnslothBackend(cfg)
-            import unsloth 
-            print("[backend=auto] Unsloth available, will try unsloth first")
-            return _AutoFallbackBackend(cfg)
-        except Exception as e:
-            print(f"[backend=auto] Unsloth not importable ({e}); falling back to HF")
+        if _offline_mode():
+            print("[backend=auto] offline mode: selecting HF before importing "
+                  "Unsloth (avoids uncached Unsloth checkpoint remapping)")
             return HFBackend(cfg)
+        if importlib.util.find_spec("unsloth") is not None:
+            print("[backend=auto] Unsloth installed; selecting Unsloth")
+            return _AutoFallbackBackend(cfg)
+        print("[backend=auto] Unsloth is not installed; selecting HF")
+        return HFBackend(cfg)
     raise ValueError(f"Unknown backend: {name}")
 
 
 class _AutoFallbackBackend:
-    """Wrapper that tries Unsloth on .load(); on failure, swaps to HF."""
+    """Online auto-selected Unsloth with a safe post-patch failure message."""
     name = "auto"
 
     def __init__(self, cfg):
@@ -198,11 +240,11 @@ class _AutoFallbackBackend:
             return m, t
         except Exception as e:
             print(f"[backend=auto] Unsloth load failed: {e!r}")
-            print("[backend=auto] Falling back to plain transformers + PEFT")
-            inner = HFBackend(self.cfg)
-            m, t = inner.load()
-            self._inner = inner
-            return m, t
+            raise RuntimeError(
+                "Unsloth patched Transformers before its model load failed, so "
+                "an in-process HF fallback would be unsafe. Re-run with "
+                "backend: hf (or fix/cache the Unsloth checkpoint and use "
+                "backend: unsloth).") from e
 
     def set_inference_mode(self):
         self._inner.set_inference_mode()

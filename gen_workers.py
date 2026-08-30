@@ -241,6 +241,18 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         for (group_idx, prompt, count) in jobs:
             enc = tokenizer([prompt], return_tensors="pt").to(device)
             input_len = enc.input_ids.shape[1]
+            max_new_tokens = min(
+                int(gen_kwargs["max_new_tokens"]),
+                int(max_seq_length) - int(input_len),
+            )
+            if max_new_tokens < 1:
+                print(f"[worker {rank}] group {group_idx} prompt is "
+                      f"{input_len} tokens, at/over max_seq_length="
+                      f"{max_seq_length}; dropping {count} rollout(s)",
+                      flush=True)
+                result_queue.put(
+                    (rank, group_idx, [("", []) for _ in range(count)]))
+                continue
 
             remaining = count
             while remaining > 0:
@@ -259,7 +271,7 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         out = gen_model.generate(
                             **enc,
                             num_return_sequences=n,
-                            max_new_tokens=gen_kwargs["max_new_tokens"],
+                            max_new_tokens=max_new_tokens,
                             do_sample=True,
                             temperature=gen_kwargs["temperature"],
                             top_p=gen_kwargs["top_p"],
@@ -360,6 +372,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if int(max_num_batched_tokens or 0) > 0:
         kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+        if int(max_num_batched_tokens) < int(max_seq_length):
+            kwargs["enable_chunked_prefill"] = True
     if seed is not None:
         kwargs["seed"] = int(seed)
     # `load_in_4bit` belongs to the differentiable training copy. Deliberately
@@ -393,6 +407,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_group)
+    # FlashInfer sampling defaults on in recent vLLM releases and may try to
+    # compile at runtime with nvcc. Keep the dependency-free native sampler as
+    # the default while preserving an explicit operator override.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     if seed is not None:
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -454,17 +472,41 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 
             # One call gives vLLM the whole worker workload so its scheduler can
             # batch different prompts and all n samples under the memory limit.
-            prompts = [prompt for (_group_idx, prompt, _count) in jobs]
+            tokenizer = llm.get_tokenizer()
+            runnable_jobs = []
+            max_tokens_by_job = []
+            for group_idx, prompt, count in jobs:
+                prompt_len = len(tokenizer.encode(prompt))
+                max_tokens = min(
+                    int(gen_kwargs["max_new_tokens"]),
+                    int(max_seq_length) - int(prompt_len),
+                )
+                if max_tokens < 1:
+                    print(f"[vllm worker {rank}] group {group_idx} prompt is "
+                          f"{prompt_len} tokens, at/over max_model_len="
+                          f"{max_seq_length}; dropping {count} rollout(s)",
+                          flush=True)
+                    result_queue.put(
+                        (rank, group_idx, [("", []) for _ in range(int(count))]))
+                    continue
+                runnable_jobs.append((group_idx, prompt, count))
+                max_tokens_by_job.append(max_tokens)
+
+            if not runnable_jobs:
+                continue
+
+            prompts = [prompt for (_group_idx, prompt, _count) in runnable_jobs]
             sampling = [
                 SamplingParams(
                     n=int(count),
-                    max_tokens=int(gen_kwargs["max_new_tokens"]),
+                    max_tokens=int(max_tokens),
                     temperature=float(gen_kwargs["temperature"]),
                     top_p=float(gen_kwargs["top_p"]),
                     seed=_vllm_job_seed(seed, step, rank, group_idx),
                     skip_special_tokens=True,
                 )
-                for (group_idx, _prompt, count) in jobs
+                for (group_idx, _prompt, count), max_tokens
+                in zip(runnable_jobs, max_tokens_by_job)
             ]
             outputs = llm.generate(
                 prompts,
@@ -473,7 +515,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 use_tqdm=False,
             )
 
-            for job_pos, (group_idx, _prompt, count) in enumerate(jobs):
+            for job_pos, (group_idx, _prompt, count) in enumerate(runnable_jobs):
                 request_output = (outputs[job_pos]
                                   if job_pos < len(outputs) else None)
                 job_results = ([
@@ -707,3 +749,62 @@ class GenerationPool:
             p.join(timeout=10)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+
+
+class OnDemandGenerationPool:
+    """A transient pool for a generation group that includes the trainer GPU.
+
+    The callbacks move the differentiable model and optimizer off CUDA before
+    vLLM starts, then restore them after rollout generation.  This keeps the
+    two runtimes sequential instead of asking both allocators to coexist on one
+    H100.  The public surface intentionally matches GenerationPool.
+    """
+
+    sequential = True
+
+    def __init__(self, before_start, after_stop, **pool_kwargs):
+        self._before_start = before_start
+        self._after_stop = after_stop
+        self._pool_kwargs = dict(pool_kwargs)
+        self._pool = None
+        self.num_workers = 1
+
+    @property
+    def active(self):
+        return self._pool is not None
+
+    def _ensure_started(self):
+        if self._pool is not None:
+            return self._pool
+        self._before_start()
+        try:
+            self._pool = GenerationPool(**self._pool_kwargs)
+        except Exception:
+            self._after_stop()
+            raise
+        self.num_workers = self._pool.num_workers
+        return self._pool
+
+    def iter_group_jobs(self, *args, **kwargs):
+        pool = self._ensure_started()
+        yield from pool.iter_group_jobs(*args, **kwargs)
+
+    def generate_groups(self, *args, **kwargs):
+        return self._ensure_started().generate_groups(*args, **kwargs)
+
+    def release(self):
+        if self._pool is None:
+            return
+        pool, self._pool = self._pool, None
+        try:
+            pool.shutdown()
+        finally:
+            self._after_stop()
+            self.num_workers = 1
+
+    def shutdown(self):
+        self.release()

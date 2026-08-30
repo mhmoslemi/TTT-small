@@ -397,6 +397,7 @@ class GpuMode(Problem):
         # which is the training GPU: correct only if nothing else is on it.
         gid = cfg.get("kernel_gpu_id", None)
         self.kernel_gpu_id = None if gid is None else int(gid)
+        self.gpu_lease_timeout_s = float(cfg.get("gpu_lease_timeout_s", 0.0))
         # entrypoint is implicit (custom_kernel inside submission.py)
         self.entrypoint = "custom_kernel"
 
@@ -509,23 +510,36 @@ Rules:
                 f"(problems/bioml/trimul, problems/amd/mla-decode) into the "
                 f"same directory as task.yml.", failure_kind="infrastructure")
 
-        timeout = float(self.kernel_timeout_s or 0.0) or float(timeout_s or 0.0)
-        if timeout > 0:
-            out = run_eval_with_timeout(code, self.lib_dir, self.task_yaml,
-                                        self.problem_type, self.log_chars,
-                                        timeout, self.kernel_gpu_id)
-        else:
-            # timeout disabled: run inline, the original behaviour
-            import multiprocessing.connection as _c
+        if self.kernel_gpu_id is None:
+            return self._fail(
+                "gpu_mode requires a physical kernel_gpu_id derived from "
+                "AVAILABLE_GPUS", failure_kind="infrastructure")
 
-            class _Sink:
-                def send(self, v): self.v = v
-                def close(self): pass
-            sink = _Sink()
-            _eval_child(sink, code, self.lib_dir, self.task_yaml,
-                        self.problem_type, self.log_chars, self.kernel_gpu_id)
-            out = getattr(sink, "v", {"ok": False, "msg": "no result",
-                                      "logs": "", "score_us": None})
+        timeout = float(self.kernel_timeout_s or 0.0) or float(timeout_s or 0.0)
+        from gpu_lease import gpu_lease
+        try:
+            with gpu_lease(self.kernel_gpu_id, self.gpu_lease_timeout_s,
+                           purpose=f"gpu_mode:{self.problem_type}"):
+                if timeout > 0:
+                    out = run_eval_with_timeout(
+                        code, self.lib_dir, self.task_yaml,
+                        self.problem_type, self.log_chars,
+                        timeout, self.kernel_gpu_id)
+                else:
+                    # timeout disabled: run inline, the original behaviour
+                    class _Sink:
+                        def send(self, v): self.v = v
+                        def close(self): pass
+                    sink = _Sink()
+                    _eval_child(sink, code, self.lib_dir, self.task_yaml,
+                                self.problem_type, self.log_chars,
+                                self.kernel_gpu_id)
+                    out = getattr(sink, "v", {
+                        "ok": False, "msg": "no result", "logs": "",
+                        "score_us": None,
+                    })
+        except TimeoutError as exc:
+            return self._fail(str(exc), failure_kind="infrastructure")
 
         if not out.get("ok"):
             msg = str(out.get("msg", "run failed"))

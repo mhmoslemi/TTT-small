@@ -8,11 +8,19 @@ from unittest.mock import patch
 
 from gen_workers import (
     GenerationPool,
+    OnDemandGenerationPool,
     _vllm_engine_kwargs,
     _vllm_job_seed,
     _vllm_worker_loop,
 )
 from feedback import FeedbackConfig, is_code_failure, render_chat
+from gpu_runtime import (
+    GPUMemory,
+    allocate_gpu_roles,
+    resolve_memory_settings,
+    validate_attention_heads,
+)
+from gpu_lease import gpu_lease
 
 
 class _Queue:
@@ -26,12 +34,11 @@ class _Queue:
         self.items.append(item)
 
 
-def _fake_shared_yaml(stream):
-    if not str(getattr(stream, "name", "")).endswith("defaults.yaml"):
-        return {}
-    return {
+def _fake_complete_yaml(stream):
+    values = {
         "problem": "circle_packing",
         "problem_type": "",
+        "model_name": "Qwen/Qwen3-8B",
         "backend": "auto",
         "generation_backend": "hf",
         "vllm_gpu_memory_utilization": 0.9,
@@ -50,9 +57,71 @@ def _fake_shared_yaml(stream):
         "target_modules": [],
         "thinking": False,
     }
+    if "problem: gpu_mode" in stream.read():
+        values["problem"] = "gpu_mode"
+    return values
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_every_problem_yaml_is_standalone(self):
+        config_dir = Path(__file__).resolve().parents[1] / "configs"
+        self.assertFalse((config_dir / "defaults.yaml").exists())
+
+        def top_level_keys(path):
+            keys = set()
+            for line in path.read_text().splitlines():
+                if (not line or line[0].isspace() or line.startswith("#")
+                        or ":" not in line):
+                    continue
+                keys.add(line.split(":", 1)[0])
+            return keys
+
+        paths = sorted(config_dir.glob("*.yaml"))
+        required = top_level_keys(config_dir / "circle_packing.yaml")
+        required.discard("reranker_enabled")
+        self.assertGreaterEqual(len(required), 100)
+        for path in paths:
+            missing = required - top_level_keys(path)
+            self.assertFalse(missing, f"{path.name} missing keys: {sorted(missing)}")
+
+    def test_offline_auto_backend_selects_hf_without_importing_unsloth(self):
+        fake_torch = types.ModuleType("torch")
+        fake_torch.bfloat16 = object()
+        sys.modules.pop("model_backend", None)
+        unsloth_was_imported = "unsloth" in sys.modules
+
+        try:
+            with patch.dict(sys.modules, {"torch": fake_torch}), patch.dict(
+                    os.environ, {"HF_HUB_OFFLINE": "1"}, clear=False):
+                from model_backend import HFBackend, load_backend
+
+                backend = load_backend("auto", types.SimpleNamespace())
+
+            self.assertIsInstance(backend, HFBackend)
+            self.assertEqual("unsloth" in sys.modules, unsloth_was_imported)
+        finally:
+            sys.modules.pop("model_backend", None)
+
+    def test_hf_memory_report_omits_inactive_vllm_knobs(self):
+        cfg = {
+            "generation_backend": "hf",
+            "model_name": "Qwen/Qwen3-8B",
+            "max_seq_length": 4096,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_max_num_batched_tokens": "auto",
+            "vllm_quantization": "",
+            "gen_micro_batch": "auto",
+            "logprob_chunk": "auto",
+            "memory": False,
+        }
+        roles = allocate_gpu_roles([0], "erdos")
+        memory = {0: GPUMemory(0, "L40S", 44.5, 43.7)}
+
+        notes = resolve_memory_settings(cfg, roles, memory)
+
+        self.assertFalse(any("vLLM" in note for note in notes))
+        self.assertTrue(any("generation max sequences" in note for note in notes))
+
     def test_feedback_only_accepts_code_failures(self):
         result = types.SimpleNamespace
         self.assertTrue(is_code_failure(result(
@@ -116,6 +185,7 @@ class VLLMBackendTests(unittest.TestCase):
             quantization="bitsandbytes",
             tensor_parallel_size=4,
             pipeline_parallel_size=2,
+            max_num_batched_tokens=4096,
         )
 
         self.assertEqual(kwargs["model"], "org/model")
@@ -131,6 +201,8 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(kwargs["tensor_parallel_size"], 4)
         self.assertEqual(kwargs["pipeline_parallel_size"], 2)
         self.assertIs(kwargs["fully_sharded_loras"], True)
+        self.assertEqual(kwargs["max_num_batched_tokens"], 4096)
+        self.assertIs(kwargs["enable_chunked_prefill"], True)
 
     def test_vllm_engine_kwargs_omit_optional_limits(self):
         kwargs = _vllm_engine_kwargs(
@@ -196,6 +268,48 @@ class VLLMBackendTests(unittest.TestCase):
                 show_progress=False,
             ))
 
+    def test_on_demand_pool_releases_shared_gpu(self):
+        events = []
+
+        class FakePool:
+            num_workers = 1
+
+            def __init__(self, **kwargs):
+                events.append(("start", kwargs["gpu_ids"]))
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", None))
+
+        pool = OnDemandGenerationPool(
+            before_start=lambda: events.append(("offload", None)),
+            after_stop=lambda: events.append(("restore", None)),
+            model_name="org/model", num_workers=1, gpu_ids=[7],
+        )
+        with patch("gen_workers.GenerationPool", FakePool):
+            got = list(pool.iter_group_jobs())
+            pool.release()
+
+        self.assertEqual(got, [(0, [("ok", [1])])])
+        self.assertEqual(events, [
+            ("offload", None), ("start", [7]),
+            ("shutdown", None), ("restore", None),
+        ])
+
+    def test_gpu_evaluation_lease_is_per_physical_device(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                os.environ, {"TTT_GPU_LEASE_DIR": tmp}):
+            with gpu_lease(3):
+                with self.assertRaises(TimeoutError):
+                    with gpu_lease(3, timeout_s=0.02):
+                        pass
+                with gpu_lease(4, timeout_s=0.02):
+                    pass
+            with gpu_lease(3, timeout_s=0.02):
+                pass
+
     def test_vllm_worker_preserves_result_queue_contract(self):
         fake_vllm = types.ModuleType("vllm")
         fake_request = types.ModuleType("vllm.lora.request")
@@ -222,6 +336,9 @@ class VLLMBackendTests(unittest.TestCase):
         class LLM:
             def __init__(self, **_kwargs):
                 pass
+
+            def get_tokenizer(self):
+                return types.SimpleNamespace(encode=lambda prompt: [1] * len(prompt))
 
             def generate(self, prompts, sampling_params, **_kwargs):
                 return [RequestOutput(prompt, params.n)
@@ -269,7 +386,7 @@ class VLLMBackendTests(unittest.TestCase):
         # Stub them so this test also runs on a CPU-only development machine.
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = _fake_shared_yaml
+        fake_yaml.safe_load = _fake_complete_yaml
         sys.modules.pop("train_multy", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
@@ -283,7 +400,8 @@ class VLLMBackendTests(unittest.TestCase):
                     "--backend", "vllm",
                     "--training-gpu-id", "0", "--gpu-ids", "1",
                 ]
-                with patch.object(sys, "argv", argv):
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "0,1"}):
                     cfg, merged = load_config()
 
         self.assertEqual(cfg.backend, "hf")
@@ -294,7 +412,7 @@ class VLLMBackendTests(unittest.TestCase):
     def test_batch_maxima_and_gpu_count_are_derived(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = _fake_shared_yaml
+        fake_yaml.safe_load = _fake_complete_yaml
         sys.modules.pop("train_multy", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
@@ -309,7 +427,8 @@ class VLLMBackendTests(unittest.TestCase):
                     "--gpu-ids", "0,2,4,6,7", "--thinking",
                     "--training-gpu-id", "1",
                 ]
-                with patch.object(sys, "argv", argv):
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "1,0,2,4,6,7"}):
                     cfg, merged = load_config()
 
         self.assertEqual(cfg.max_groups_per_step, 5)
@@ -318,6 +437,84 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(cfg.gpu_ids, "0,2,4,6,7")
         self.assertIs(cfg.thinking, True)
         self.assertEqual(merged["num_gpus"], 5)
+
+    def test_authoritative_gpu_role_table(self):
+        ordinary_one = allocate_gpu_roles([7], "erdos")
+        self.assertEqual(ordinary_one.training, 7)
+        self.assertEqual(ordinary_one.generation, [7])
+        self.assertIsNone(ordinary_one.evaluation)
+        self.assertTrue(ordinary_one.sequential_generation)
+
+        ordinary_many = allocate_gpu_roles([7, 2, 5], "denoising")
+        self.assertEqual(ordinary_many.generation, [2, 5])
+        self.assertIsNone(ordinary_many.evaluation)
+
+        gpu_one = allocate_gpu_roles([4], "gpu_mode")
+        self.assertEqual(gpu_one.generation, [4])
+        self.assertEqual(gpu_one.evaluation, 4)
+        self.assertTrue(gpu_one.evaluation_shares_generation)
+
+        gpu_two = allocate_gpu_roles([4, 9], "gpu_mode")
+        self.assertEqual(gpu_two.generation, [4])
+        self.assertEqual(gpu_two.evaluation, 9)
+        self.assertFalse(gpu_two.evaluation_shares_generation)
+
+        gpu_many = allocate_gpu_roles([4, 1, 3, 8], "gpu_mode")
+        self.assertEqual(gpu_many.generation, [1, 3])
+        self.assertEqual(gpu_many.evaluation, 8)
+
+    def test_tensor_parallel_head_divisibility_is_checked_early(self):
+        validate_attention_heads(32, 4, "Qwen/Qwen3-8B")
+        with self.assertRaisesRegex(ValueError, "32 attention heads"):
+            validate_attention_heads(32, 6, "Qwen/Qwen3-8B")
+
+    def test_gpu_mode_roles_type_and_tp_come_from_inventory(self):
+        fake_numpy = types.ModuleType("numpy")
+        fake_yaml = types.ModuleType("yaml")
+        fake_yaml.safe_load = _fake_complete_yaml
+        sys.modules.pop("train_multy", None)
+
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            from train_multy import load_config
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "empty.yaml"
+                config_path.write_text("problem: gpu_mode\n")
+                argv = [
+                    "train_multy.py", "--config", str(config_path),
+                    "--problem", "gpu_mode", "--backend", "vllm",
+                ]
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "0,1,2,3,4,6"}):
+                    cfg, _ = load_config()
+
+        self.assertEqual(cfg.training_gpu_id, 0)
+        self.assertEqual(cfg.gpu_ids, "1,2,3,4")
+        self.assertEqual(cfg.evaluation_gpu_id, 6)
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 4)
+        self.assertEqual(cfg.gpu_type, "H100")
+        self.assertEqual(cfg.reward_workers, 1)
+
+    def test_incompatible_inventory_is_rejected_before_model_load(self):
+        fake_numpy = types.ModuleType("numpy")
+        fake_yaml = types.ModuleType("yaml")
+        fake_yaml.safe_load = _fake_complete_yaml
+        sys.modules.pop("train_multy", None)
+
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            from train_multy import load_config
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "empty.yaml"
+                config_path.write_text("problem: gpu_mode\n")
+                argv = [
+                    "train_multy.py", "--config", str(config_path),
+                    "--problem", "gpu_mode", "--backend", "vllm",
+                ]
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "0,1,2,3,4,5,6"}):
+                    with self.assertRaisesRegex(ValueError, "cannot be divided"):
+                        load_config()
 
 
 if __name__ == "__main__":

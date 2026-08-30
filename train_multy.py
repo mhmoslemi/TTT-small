@@ -1,7 +1,7 @@
 """
 TTT-Discover — multi-problem local runner.
 
-Configuration: configs/defaults.yaml < problem YAML < CLI flags
+Configuration: self-contained problem YAML < resumed config < CLI flags
 """
 
 import warnings
@@ -20,19 +20,19 @@ import yaml
 
 
 # ======================================================================
-# All configuration values live in configs/defaults.yaml and problem YAMLs.
+# Every problem YAML is complete. There is no shared default-value file.
 # ======================================================================
 
 
 # ======================================================================
-# CLI parsing + config loading (shared YAML < problem YAML < CLI)
+# CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TTT-Discover multi-problem runner")
     # Problem selection
     p.add_argument("--problem", default=None,
                    help="Problem name. Loads configs/<problem>.yaml unless --config "
-                        "is given. Defaults to `problem` in configs/defaults.yaml. "
+                        "is given. Defaults to erdos. "
                         "One of: circle_packing, "
                         "erdos, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
@@ -123,26 +123,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Threads for reward evaluation. 0 = auto. Use 1 for any "
                         "problem whose reward is a measured runtime.")
     p.add_argument("--training-gpu-id", type=int, default=None,
-                   help="Physical GPU used exclusively by the training model.")
+                   help="Assert the training id derived from AVAILABLE_GPUS.")
     p.add_argument("--available-gpu-ids", type=str, default=None,
-                   help="Ordered physical GPU inventory, used to resolve the "
-                        "last evaluation GPU.")
+                   help="Legacy direct-Python fallback when AVAILABLE_GPUS is "
+                        "unset; run.sh's AVAILABLE_GPUS is authoritative.")
     p.add_argument("--reserve-last-gpu-for-evaluation",
                    dest="reserve_last_gpu_for_evaluation",
                    action="store_const", const=True, default=None,
-                   help="Reserve the last available GPU for evaluation only.")
+                   help="Compatibility flag; gpu_mode reservation is derived "
+                        "from AVAILABLE_GPUS.")
     p.add_argument("--no-reserve-last-gpu-for-evaluation",
                    dest="reserve_last_gpu_for_evaluation",
                    action="store_const", const=False)
     p.add_argument("--evaluation-gpu-id", type=int, default=None,
-                   help="Explicit physical evaluation GPU (normally resolved "
-                        "from --reserve-last-gpu-for-evaluation).")
+                   help="Assert the evaluation id derived from AVAILABLE_GPUS.")
     p.add_argument("--num-gpus", type=int, default=None,
-                   help="Number of generation GPUs. Normally omit this: it is "
-                        "derived from --gpu-ids. Passing it alone selects 0..N-1.")
+                   help="Assert the generation GPU count derived from "
+                        "AVAILABLE_GPUS.")
     p.add_argument("--gpu-ids", type=str, default=None,
-                   help="Comma-separated physical GPU ids for the workers, e.g. "
-                        "'0,1,2,3,4,5,6,7'. Its length sets num_gpus.")
+                   help="Assert the generation group derived from "
+                        "AVAILABLE_GPUS.")
     p.add_argument("--gen-micro-batch", type=int, default=None,
                    help="Max sequences each GPU holds per generate() call. The "
                         "worker loops in chunks of this size until the group's "
@@ -307,21 +307,9 @@ def _parse_gpu_ids(value) -> list:
     return ids
 
 
-def _load_shared_defaults():
-    """Read the single authoritative default-value mapping."""
-    path = Path(__file__).resolve().parent / "configs" / "defaults.yaml"
-    if not path.is_file():
-        raise FileNotFoundError(f"required shared config not found: {path}")
-    with path.open() as f:
-        values = yaml.safe_load(f) or {}
-    if not isinstance(values, dict):
-        raise ValueError(f"shared config must be a mapping: {path}")
-    return values
-
-
 def load_config():
     """
-    Merge configs/defaults.yaml < problem YAML < resumed config.json < CLI.
+    Load one complete problem YAML, then overlay resume state and explicit CLI.
 
     Returns (cfg, merged) where:
       cfg    is the attribute-style view of the fully merged YAML, and
@@ -347,43 +335,35 @@ def load_config():
             )
         saved = json.loads(saved_config_path.read_text())
 
-    # 1) Complete repository-wide YAML defaults. There is intentionally no
-    # second defaults table in Python.
-    merged = _load_shared_defaults()
-
-    # The shared YAML's problem selects the problem file unless CLI/resume wins.
+    # The launcher defaults to erdos. Direct Python calls use the same selection
+    # when neither --config nor --problem is provided.
     problem_name = (saved.get("problem") if saved
                     else (args.problem if args.problem is not None
-                          else merged["problem"]))
+                          else "erdos"))
 
-    # 2) problem YAML overlay
+    # 1) Complete, self-contained problem YAML.
+    config_dir = Path(__file__).resolve().parent / "configs"
     cfg_path = args.config
     if cfg_path is None and saved.get("problem_type"):
-        typed = os.path.join(
-            "configs", f"{problem_name}_{saved['problem_type']}.yaml"
-        )
-        if os.path.exists(typed):
-            cfg_path = typed
-    cfg_path = cfg_path or os.path.join("configs", f"{problem_name}.yaml")
-    ydict = {}
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-            ydict = yaml.safe_load(f) or {}
-        merged.update(ydict)
-        print(f"[config] loaded {cfg_path}")
-    elif args.config is not None:
-        raise FileNotFoundError(f"--config path not found: {cfg_path}")
-    else:
-        print(f"[config] no problem YAML at {cfg_path}; using shared YAML + CLI. "
-              f"This is usually a mistake: the problem's own knobs "
-              f"(task paths, batch sizes, reward_workers) live in that file.")
+        typed = config_dir / f"{problem_name}_{saved['problem_type']}.yaml"
+        if typed.exists():
+            cfg_path = str(typed)
+    cfg_path = cfg_path or str(config_dir / f"{problem_name}.yaml")
+    if not Path(cfg_path).exists():
+        raise FileNotFoundError(f"complete problem config not found: {cfg_path}")
+    with open(cfg_path) as f:
+        ydict = yaml.safe_load(f) or {}
+    if not isinstance(ydict, dict) or not ydict:
+        raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
+    merged = dict(ydict)
+    print(f"[config] loaded {cfg_path}")
 
     # The registry routing key is the YAML's `problem` field when present
     # (this lets e.g. configs/gpu_mode_trimul.yaml declare `problem: gpu_mode`
     # while --problem just selects the file). With no YAML, --problem is the key.
     merged["problem"] = ydict.get("problem", problem_name)
 
-    # 3) Saved config overlay. Older code wrote max_seq_length after adding the
+    # 2) Saved config overlay. Older code wrote max_seq_length after adding the
     # memory allowance; undo that convention before main() adds it again.
     if saved:
         marker = saved.pop("_max_seq_length_includes_memory_topup", None)
@@ -399,7 +379,7 @@ def load_config():
         print(f"[config] resuming original configuration from "
               f"{resume_dir / 'config.json'}")
 
-    # 4) CLI overlay (only explicitly-provided values)
+    # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
     for arg_name, value in vars(args).items():
         if arg_name in skip or value is None:
@@ -420,10 +400,9 @@ def load_config():
     if generation_backend not in ("hf", "vllm"):
         raise ValueError("generation_backend must be 'hf' or 'vllm'")
     merged["generation_backend"] = generation_backend
-    util = float(merged["vllm_gpu_memory_utilization"])
-    if not 0.0 < util <= 1.0:
-        raise ValueError("vllm_gpu_memory_utilization must be in (0, 1]")
-    tp = int(merged["vllm_tensor_parallel_size"] or 0)
+    raw_tp = merged["vllm_tensor_parallel_size"]
+    tp = (0 if str(raw_tp or "").strip().lower() in ("", "auto")
+          else int(raw_tp))
     pp = int(merged["vllm_pipeline_parallel_size"] or 1)
     if tp < 0 or pp < 1:
         raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
@@ -444,96 +423,101 @@ def load_config():
     if int(merged["max_group_size"]) < int(merged["group_size"]):
         raise ValueError("max_group_size cannot be below group_size")
 
-    # Resolve physical roles without importing CUDA. With the reservation flag,
-    # the last available id is evaluation-only and gpu_mode benchmarks use it.
-    available_gpu_ids = _parse_gpu_ids(merged["available_gpu_ids"])
-    if not available_gpu_ids:
-        try:
-            available_gpu_ids = _parse_gpu_ids(
-                os.environ.get("CUDA_VISIBLE_DEVICES", ""))
-        except ValueError:
-            # UUID-based visibility needs an explicit integer inventory in YAML.
-            available_gpu_ids = []
-    training_gpu_id = int(merged["training_gpu_id"])
-    if training_gpu_id < 0:
-        raise ValueError("training_gpu_id must be non-negative")
-    if available_gpu_ids and training_gpu_id not in available_gpu_ids:
-        raise ValueError("training_gpu_id must appear in available_gpu_ids")
+    # Resolve every physical role from one ordered inventory. run.sh exports
+    # AVAILABLE_GPUS and that environment value is authoritative over old YAML
+    # and resumed role fields. Direct Python invocations fall back to the legacy
+    # inventory key, CUDA visibility, then one training device.
+    from gpu_runtime import (allocate_gpu_roles, known_attention_heads,
+                             parse_gpu_ids,
+                             query_gpu_memory, resolve_memory_settings,
+                             validate_attention_heads, validate_selected_gpus)
 
-    evaluation_gpu_id = merged["evaluation_gpu_id"]
-    if bool(merged["reserve_last_gpu_for_evaluation"]):
-        if len(available_gpu_ids) < 2:
-            raise ValueError(
-                "reserve_last_gpu_for_evaluation requires at least two ids in "
-                "available_gpu_ids (or integer CUDA_VISIBLE_DEVICES)")
-        reserved = available_gpu_ids[-1]
-        if evaluation_gpu_id is not None and int(evaluation_gpu_id) != reserved:
-            raise ValueError(
-                f"evaluation_gpu_id={evaluation_gpu_id} is not the last "
-                f"available GPU ({reserved})")
-        evaluation_gpu_id = reserved
-    if evaluation_gpu_id is not None:
-        evaluation_gpu_id = int(evaluation_gpu_id)
-        if evaluation_gpu_id < 0:
-            raise ValueError("evaluation_gpu_id must be non-negative")
-        if evaluation_gpu_id == training_gpu_id:
-            raise ValueError("evaluation GPU cannot also be the training GPU")
-        if available_gpu_ids and evaluation_gpu_id not in available_gpu_ids:
-            raise ValueError("evaluation_gpu_id must appear in available_gpu_ids")
-        merged["evaluation_gpu_id"] = evaluation_gpu_id
-        if str(merged["problem"]).lower() == "gpu_mode":
-            explicit_kernel_gpu = merged.get("kernel_gpu_id")
-            if (explicit_kernel_gpu is not None
-                    and int(explicit_kernel_gpu) != evaluation_gpu_id):
-                raise ValueError(
-                    "kernel_gpu_id disagrees with the isolated evaluation GPU")
-            merged["kernel_gpu_id"] = evaluation_gpu_id
-    merged["training_gpu_id"] = training_gpu_id
-    merged["available_gpu_ids"] = ",".join(
-        str(gpu_id) for gpu_id in available_gpu_ids)
+    inventory_source = "AVAILABLE_GPUS"
+    inventory_value = os.environ.get("AVAILABLE_GPUS")
+    if inventory_value is None:
+        inventory_source = "legacy fallback"
+        inventory_value = (args.available_gpu_ids
+                           if args.available_gpu_ids is not None
+                           else merged.get("available_gpu_ids"))
+        if not str(inventory_value or "").strip():
+            inventory_value = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not str(inventory_value or "").strip():
+            inventory_value = str(int(merged.get("training_gpu_id", 0)))
+        print("[config] warning: AVAILABLE_GPUS is unset; use run.sh so the "
+              "ordered physical inventory is authoritative")
 
-    # A GPU list is already an exact device specification, so its length is the
-    # single source of truth. `--num-gpus N` remains as a convenience when no
-    # list is passed and expands to devices 0..N-1.
-    gpu_ids = _parse_gpu_ids(merged["gpu_ids"])
+    available_gpu_ids = parse_gpu_ids(
+        inventory_value, field=inventory_source)
+    roles = allocate_gpu_roles(available_gpu_ids, merged["problem"])
+    training_gpu_id = roles.training
+    gpu_ids = roles.generation
+    evaluation_gpu_id = roles.evaluation
+
+    # Explicit CLI role flags are accepted only as assertions. They may not
+    # silently override the launcher inventory.
+    assertions = [
+        ("--training-gpu-id", args.training_gpu_id, training_gpu_id),
+        ("--evaluation-gpu-id", args.evaluation_gpu_id, evaluation_gpu_id),
+        ("--num-gpus", args.num_gpus, len(gpu_ids)),
+    ]
+    for flag, actual, expected in assertions:
+        if actual is not None and actual != expected:
+            raise ValueError(
+                f"{flag}={actual} conflicts with {inventory_source}; "
+                f"derived value is {expected}")
     if args.gpu_ids is not None:
-        if args.num_gpus is not None and int(args.num_gpus) != len(gpu_ids):
+        asserted = parse_gpu_ids(args.gpu_ids, field="--gpu-ids")
+        if asserted != gpu_ids:
             raise ValueError(
-                f"--num-gpus={args.num_gpus} disagrees with {len(gpu_ids)} "
-                f"id(s) in --gpu-ids")
-        merged["num_gpus"] = len(gpu_ids)
-    elif args.num_gpus is not None:
-        n_gpus = int(args.num_gpus)
-        if n_gpus < 0:
-            raise ValueError("num_gpus must be >= 0")
-        gpu_ids = list(range(n_gpus))
-        merged["num_gpus"] = n_gpus
-    elif gpu_ids:
-        merged["num_gpus"] = len(gpu_ids)
-    else:
-        n_gpus = int(merged["num_gpus"] or 0)
-        if n_gpus < 0:
-            raise ValueError("num_gpus must be >= 0")
-        gpu_ids = list(range(n_gpus))
-        merged["num_gpus"] = n_gpus
-    merged["gpu_ids"] = ",".join(str(gpu_id) for gpu_id in gpu_ids)
-    if generation_backend == "vllm" and training_gpu_id in gpu_ids:
+                f"--gpu-ids={asserted} conflicts with {inventory_source}; "
+                f"derived generation group is {gpu_ids}")
+    if args.kernel_gpu_id is not None and args.kernel_gpu_id != evaluation_gpu_id:
         raise ValueError(
-            "vLLM gpu_ids must exclude training_gpu_id; the QLoRA trainer owns "
-            "that card exclusively")
-    if evaluation_gpu_id is not None and evaluation_gpu_id in gpu_ids:
-        raise ValueError(
-            "the isolated evaluation GPU must not appear in gpu_ids")
-    if (generation_backend == "hf" and len(gpu_ids) > 1
-            and training_gpu_id in gpu_ids):
-        raise ValueError(
-            "multi-process HF gpu_ids must exclude training_gpu_id")
-    print(f"[config] generation GPUs: {gpu_ids} "
-          f"(num_gpus={merged['num_gpus']}, derived from gpu_ids)")
-    print(f"[config] GPU roles: train={training_gpu_id}, "
-          f"generation={gpu_ids}, evaluation={evaluation_gpu_id}")
+            f"--kernel-gpu-id={args.kernel_gpu_id} conflicts with "
+            f"{inventory_source}; derived evaluation GPU is {evaluation_gpu_id}")
 
-    # 5) Provide attribute access without duplicating a Python config schema.
+    merged["training_gpu_id"] = training_gpu_id
+    merged["available_gpu_ids"] = ",".join(str(x) for x in roles.available)
+    merged["gpu_ids"] = ",".join(str(x) for x in gpu_ids)
+    merged["num_gpus"] = len(gpu_ids)
+    merged["evaluation_gpu_id"] = evaluation_gpu_id
+    merged["sequential_generation"] = roles.sequential_generation
+    merged["evaluation_shares_generation"] = roles.evaluation_shares_generation
+    merged["reserve_last_gpu_for_evaluation"] = bool(
+        roles.gpu_problem and evaluation_gpu_id != training_gpu_id)
+
+    if roles.gpu_problem:
+        if not str(merged.get("gpu_type") or "").strip():
+            merged["gpu_type"] = "H100"
+            print("[config] gpu_mode gpu_type not set; defaulting explicitly to H100")
+        merged["kernel_gpu_id"] = evaluation_gpu_id
+        if int(merged.get("reward_workers") or 0) != 1:
+            print("[config] gpu_mode forces reward_workers=1 for serialized, "
+                  "stable benchmark measurements")
+        merged["reward_workers"] = 1
+
+    # One vLLM engine consumes the entire derived generation group. TP therefore
+    # exactly matches its GPU count; PP and inference replicas are not inferred.
+    if generation_backend == "vllm":
+        merged["vllm_tensor_parallel_size"] = len(gpu_ids)
+        merged["vllm_pipeline_parallel_size"] = 1
+        validate_attention_heads(
+            known_attention_heads(merged.get("model_name", "")),
+            len(gpu_ids),
+            merged.get("model_name", ""),
+        )
+
+    memory = query_gpu_memory()
+    validate_selected_gpus(roles, memory)
+    for note in resolve_memory_settings(merged, roles, memory):
+        print(f"[memory] auto: {note}")
+
+    print(f"[config] AVAILABLE_GPUS={roles.available} ({inventory_source})")
+    print(f"[config] GPU roles: train={training_gpu_id}, "
+          f"generation={gpu_ids}, evaluation={evaluation_gpu_id}; "
+          f"sharing={'sequential' if roles.sequential_generation else 'isolated'}")
+
+    # 4) Provide attribute access without duplicating a Python config schema.
     # Problem-specific YAML keys are harmless here and remain in `merged` too.
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
@@ -569,6 +553,38 @@ def _pin_training_process(training_gpu_id: int) -> None:
           f"(logical cuda:0)")
 
 
+def _move_optimizer_state(optimizer, device) -> None:
+    """Move Adam state recursively without replacing Parameter identities."""
+    import torch
+
+    def move(value):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        return value
+
+    for parameter, state in list(optimizer.state.items()):
+        optimizer.state[parameter] = move(state)
+
+
+def _attention_head_count(model) -> int:
+    cfg = getattr(model, "config", None)
+    for _ in range(3):
+        if cfg is None:
+            return 0
+        for name in ("num_attention_heads", "n_head", "num_heads"):
+            value = getattr(cfg, name, None)
+            if value:
+                return int(value)
+        cfg = getattr(cfg, "text_config", None)
+    return 0
+
+
 # ======================================================================
 # Generation
 # ======================================================================
@@ -582,10 +598,15 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
 
+    max_new_tokens = min(
+        int(cfg.max_new_tokens), int(cfg.max_seq_length) - int(input_len))
+    if max_new_tokens < 1:
+        return [("", []) for _ in range(int(n_samples))]
+
     with torch.inference_mode():
         out = model.generate(
             **inputs,
-            max_new_tokens=cfg.max_new_tokens,
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
@@ -1059,6 +1080,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # (text, token_ids, prompt_job_index), arrival order under each parent.
     group_responses = {g: [] for g in range(num_groups)}
     reward_futures = {g: [] for g in range(num_groups)}    # aligned RewardResult futures
+    deferred_rollouts = []
+    defer_gpu_evaluation = bool(
+        getattr(cfg, "evaluation_shares_generation", False))
 
     def _submit_rollout(job_idx, text, token_ids):
         job = prompt_jobs[job_idx]
@@ -1069,44 +1093,60 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         )
         reward_futures[g].append(fut)
 
+    def _queue_rollout(job_idx, text, token_ids):
+        if defer_gpu_evaluation:
+            deferred_rollouts.append((job_idx, text, token_ids))
+        else:
+            _submit_rollout(job_idx, text, token_ids)
+
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
     try:
-        if gen_pool is not None:
-            # Multi-GPU: consume the generation stream (the adapter was already
-            # saved above, before the memory lookup). Each (worker, group) job
-            # that lands is queued for reward eval right away, so by the time
-            # generation finishes most rewards are done.
-            for job_idx, job_results in gen_pool.iter_group_jobs(
-                    prompts_by_group=[job["prompt_text"] for job in prompt_jobs],
-                    group_size=cfg.group_size,
-                    counts_by_group=[job["count"] for job in prompt_jobs],
-                    adapter_path=adapter_path,
-                    max_new_tokens=cfg.max_new_tokens,
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    step_idx=step_idx,
-                ):
-                for (text, token_ids) in job_results:
-                    _submit_rollout(job_idx, text, token_ids)
-        else:
-            # Single-GPU: generate group by group; submit each group's rewards
-            # right after it's generated so eval overlaps the next group's gen.
-            backend.set_inference_mode()
-            if cfg.deterministic:
-                torch.manual_seed((int(cfg.seed) * 1_000_003
-                                   + step_idx * 1009 + 13) % (2**31 - 1))
-            gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
-            try:
-                for job_idx, job in enumerate(prompt_jobs):
-                    responses, _ = generate_responses(
-                        model, tokenizer, job["prompt_text"], job["count"], cfg
-                    )
-                    for (text, token_ids) in responses:
-                        _submit_rollout(job_idx, text, token_ids)
-                    gen_bar.update(len(responses))
-            finally:
-                gen_bar.close()
+        try:
+            if gen_pool is not None:
+                # Consume the generation stream (the adapter was already saved
+                # above). CPU rewards and rewards on a distinct evaluation GPU
+                # start immediately. A one-card GPU problem defers evaluation
+                # until generation releases that same physical card.
+                for job_idx, job_results in gen_pool.iter_group_jobs(
+                        prompts_by_group=[job["prompt_text"] for job in prompt_jobs],
+                        group_size=cfg.group_size,
+                        counts_by_group=[job["count"] for job in prompt_jobs],
+                        adapter_path=adapter_path,
+                        max_new_tokens=cfg.max_new_tokens,
+                        temperature=cfg.temperature,
+                        top_p=cfg.top_p,
+                        step_idx=step_idx,
+                    ):
+                    for (text, token_ids) in job_results:
+                        _queue_rollout(job_idx, text, token_ids)
+            else:
+                # In-process generation. Ordinary CPU verification overlaps the
+                # next group; one-card GPU-mode verification is deferred.
+                backend.set_inference_mode()
+                if cfg.deterministic:
+                    torch.manual_seed((int(cfg.seed) * 1_000_003
+                                       + step_idx * 1009 + 13) % (2**31 - 1))
+                gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
+                try:
+                    for job_idx, job in enumerate(prompt_jobs):
+                        responses, _ = generate_responses(
+                            model, tokenizer, job["prompt_text"], job["count"], cfg
+                        )
+                        for (text, token_ids) in responses:
+                            _queue_rollout(job_idx, text, token_ids)
+                        gen_bar.update(len(responses))
+                finally:
+                    gen_bar.close()
+        finally:
+            if gen_pool is not None and getattr(gen_pool, "sequential", False):
+                gen_pool.release()
+
+        if deferred_rollouts:
+            print(f"[step {step_idx}] generation released shared evaluation GPU; "
+                  f"starting {len(deferred_rollouts)} serialized benchmark(s)")
+            for job_idx, text, token_ids in deferred_rollouts:
+                _submit_rollout(job_idx, text, token_ids)
 
         # Wait for whatever rewards are still running (a small tail if overlap
         # worked); shows how many were already done when generation finished.
@@ -1671,6 +1711,18 @@ def main():
     from model_backend import load_backend
     backend = load_backend(cfg.backend, cfg)
     model, tokenizer = backend.load()
+    effective_4bit = bool(getattr(cfg, "effective_load_in_4bit",
+                                  cfg.load_in_4bit))
+    print(f"[precision] training copy: "
+          f"{'BitsAndBytes 4-bit' if effective_4bit else 'checkpoint/default precision'}")
+
+    if cfg.generation_backend == "vllm":
+        from gpu_runtime import validate_attention_heads
+        validate_attention_heads(
+            _attention_head_count(model),
+            int(cfg.vllm_tensor_parallel_size),
+            cfg.model_name,
+        )
 
     import torch  # safe to import now
     import random
@@ -1741,21 +1793,20 @@ def main():
 
     # ---- generation pool ----
     gen_pool = None
-    # The original HF path stays in-process for one GPU. vLLM always runs in a
-    # worker so its CUDA/runtime state is isolated from the training model.
+    # The original HF path stays in-process for one GPU. vLLM uses an isolated
+    # worker. When that worker shares the trainer's physical card, its pool is
+    # transient and the trainer/optimizer are offloaded before vLLM starts.
     use_gen_pool = bool(cfg.num_gpus) and (
         cfg.num_gpus > 1 or cfg.generation_backend == "vllm")
     if use_gen_pool:
-        from gen_workers import GenerationPool
+        from gen_workers import GenerationPool, OnDemandGenerationPool
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
-        print(f"[init] starting {cfg.generation_backend} generation pool: "
-              f"{cfg.num_gpus} GPUs {gpu_ids}")
-        gen_pool = GenerationPool(
+        pool_options = dict(
             model_name=cfg.model_name,
             num_workers=cfg.num_gpus,
             gpu_ids=gpu_ids,
             max_seq_length=cfg.max_seq_length,
-            load_in_4bit=cfg.load_in_4bit,
+            load_in_4bit=effective_4bit,
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
@@ -1769,6 +1820,60 @@ def main():
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
         )
+        if cfg.sequential_generation:
+            trainer_offloaded = False
+
+            def _offload_trainer_for_generation():
+                nonlocal trainer_offloaded
+                if trainer_offloaded:
+                    return
+                print("[gpu] offloading trainer to CPU before shared-GPU vLLM "
+                      "generation", flush=True)
+                try:
+                    torch.cuda.synchronize()
+                    _move_optimizer_state(optimizer, "cpu")
+                    model.to("cpu")
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                    trainer_offloaded = True
+                except Exception as exc:
+                    try:
+                        model.to("cuda:0")
+                        _move_optimizer_state(optimizer, "cuda:0")
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "the training model could not be offloaded for "
+                        "sequential vLLM sharing; use generation_backend=hf "
+                        "for this model/runtime or add a generation GPU") from exc
+
+            def _restore_trainer_after_generation():
+                nonlocal trainer_offloaded
+                if not trainer_offloaded:
+                    return
+                print("[gpu] restoring trainer after shared-GPU vLLM "
+                      "generation", flush=True)
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                model.to("cuda:0")
+                _move_optimizer_state(optimizer, "cuda:0")
+                backend.set_training_mode()
+                trainer_offloaded = False
+
+            gen_pool = OnDemandGenerationPool(
+                before_start=_offload_trainer_for_generation,
+                after_stop=_restore_trainer_after_generation,
+                **pool_options,
+            )
+            print(f"[init] sequential vLLM pool configured on shared physical "
+                  f"GPU {gpu_ids[0]} (started only during rollouts)")
+        else:
+            print(f"[init] starting {cfg.generation_backend} generation pool: "
+                  f"{cfg.num_gpus} GPUs {gpu_ids}")
+            gen_pool = GenerationPool(**pool_options)
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
                           else "micro-batch")
@@ -1786,7 +1891,11 @@ def main():
     mem_cfg, memory, extractor, lookup, curator = setup_memory(
         merged, problem, cfg, mem_cfg=mem_cfg,
         backend=backend, model=model, tokenizer=tokenizer,
-        gen_pool=gen_pool, exp_dir=exp_dir,  seed=run_seed,
+        # Shared-card vLLM is deliberately transient. Memory selection and
+        # extraction use the in-process policy so the engine only loads once
+        # per rollout phase, not once per auxiliary call.
+        gen_pool=(None if cfg.sequential_generation else gen_pool),
+        exp_dir=exp_dir, seed=run_seed,
     )
     if resume_payload is not None and memory is not None:
         memory_file = resume_payload.get("memory_file")

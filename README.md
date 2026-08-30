@@ -2,22 +2,50 @@
 
 ## Runtime configuration
 
-Run with `sh run.sh`. The launcher contains environment setup only; experiment
-settings live in `configs/defaults.yaml` and the selected problem YAML. Select a
-different file with, for example,
+Run with `sh run.sh`. Select another problem with, for example,
 `TTT_CONFIG=configs/gpu_mode_trimul.yaml sh run.sh`.
 
-GPU ids in YAML are physical ids. `training_gpu_id` is made the trainer's only
-visible device before Unsloth is imported. `gpu_ids` belongs only to rollout
-generation. For vLLM, each `vllm_tensor_parallel_size` ×
-`vllm_pipeline_parallel_size` block forms one sharded engine; additional full
-blocks are inference replicas. `load_in_4bit` controls the QLoRA training copy
-only, while `vllm_quantization` is independent and defaults to checkpoint-native
-auto-detection.
+Every problem YAML is self-contained and repeats the complete configuration.
+There is no shared defaults file or implicit default-value merge. Resume state
+and explicitly supplied CLI flags are the only overlays on the selected YAML.
 
-Kernel configs set `reserve_last_gpu_for_evaluation: true`. The last id in
-`available_gpu_ids` becomes `kernel_gpu_id`, and startup rejects any overlap
-with training or generation.
+`AVAILABLE_GPUS` in `run.sh` is the single authoritative, ordered list of
+physical GPU ids. YAML and resumed role fields do not override it. The derived
+roles are:
+
+| Problem | Inventory size | Training | Generation | Evaluation |
+|---|---:|---|---|---|
+| CPU-evaluated | 1 | first | first, sequential | CPU |
+| CPU-evaluated | 2+ | first | every remaining id | CPU |
+| GPU-mode | 1 | first | first, sequential | first, sequential |
+| GPU-mode | 2 | first | first, sequential | last, exclusive |
+| GPU-mode | 3+ | first | every middle id | last, exclusive |
+
+For vLLM, the tensor-parallel size is exactly the number of derived generation
+GPUs and all of them form one engine. The model's attention-head count must be
+divisible by that size. If a seven-card machine would derive an incompatible
+TP size, list a compatible ordered subset; for example,
+`AVAILABLE_GPUS=0,1,2,3,4,6` gives GPU-mode TP=4 and reserves physical GPU 6.
+
+On a shared card, HF/Unsloth generates in-process. vLLM is started only for the
+rollout phase: the training model and optimizer are offloaded to CPU, vLLM
+generates, the engine exits, and training is restored. GPU-mode evaluation uses
+a physical-device file lease, and `reward_workers` is forced to one, so two
+candidate benchmarks cannot contend on the evaluation card.
+
+`load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
+available and appropriate; checkpoint-native quantization such as GPT-OSS
+MXFP4 is not quantized again. vLLM quantization remains independent. GPU memory
+is inspected at startup to resolve vLLM utilization, sequence admission,
+prefill batching, and exact log-probability chunking. FlashInfer sampling is
+off by default to avoid an nvcc runtime dependency; set
+`VLLM_USE_FLASHINFER_SAMPLER=1` to opt in.
+
+In offline mode, `backend: auto` selects plain HF before importing Unsloth.
+This prevents a failed Unsloth checkpoint remap from leaving Transformers
+globally patched and corrupting an in-process HF fallback. To require Unsloth,
+set `backend: unsloth`; offline loading then keeps the exact configured model
+name and requires its files to be present in the local Hugging Face cache.
 
 This document describes the conceptual framework implemented in this repository. It focuses on the scientific objective, the closed-loop discovery process, and the roles of tree search, online policy optimization, verifier feedback, and causal memory. Infrastructure and tuning details are intentionally omitted.
 
