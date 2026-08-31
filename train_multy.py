@@ -25,6 +25,9 @@ import yaml
 _ROUTED_DEPENDENCY_NOTICES = (
     "Skipping import of cpp extensions due to incompatible torch version.",
     "No prebuilt binary for CUDA",
+    "You are sending unauthenticated requests to the HF Hub.",
+    "is an Enum subclass and is now natively supported by torch.compile",
+    "`torch_dtype` is deprecated! Use `dtype` instead!",
 )
 
 
@@ -144,6 +147,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
     p.add_argument("--model-name", default=None)
+    p.add_argument(
+        "--training-model-name", default=None,
+        help="Optional trainable checkpoint override. Rollout generation still "
+             "uses --model-name. GPT-OSS QLoRA resolves this automatically to "
+             "a trainable BitsAndBytes checkpoint.")
     p.add_argument("--load-in-4bit", action="store_const", const=True, default=None)
     p.add_argument("--max-seq-length", type=int, default=None)
     p.add_argument("--lora-rank", type=int, default=None)
@@ -206,6 +214,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--reward-workers", type=int, default=None,
                    help="Threads for reward evaluation. 0 = auto. Use 1 for any "
                         "problem whose reward is a measured runtime.")
+    p.add_argument("--eval-cpus", type=int, default=None,
+                   help="CPU threads available to each candidate evaluation. "
+                        "Auto reward-worker counts account for this value.")
     p.add_argument("--training-gpu-id", type=int, default=None,
                    help="Assert the training id derived from AVAILABLE_GPUS.")
     p.add_argument("--available-gpu-ids", type=str, default=None,
@@ -391,6 +402,66 @@ def _parse_gpu_ids(value) -> list:
     return ids
 
 
+def _resolve_training_model_name(model_name, requested_name, load_in_4bit):
+    """Keep inference and trainable checkpoint choices independent.
+
+    OpenAI GPT-OSS is distributed in inference-oriented MXFP4. Transformers
+    cannot train that quantizer and dequantizes it to BF16 when its kernels are
+    unavailable. For QLoRA, use Unsloth's trainable BitsAndBytes conversion
+    while leaving vLLM pointed at the configured original checkpoint.
+    """
+    if str(requested_name or "").strip():
+        return str(requested_name).strip()
+    generation_name = str(model_name).strip()
+    if not bool(load_in_4bit):
+        return generation_name
+    lowered = generation_name.rstrip("/").lower()
+    basename = lowered.rsplit("/", 1)[-1]
+    if "unsloth-bnb-4bit" in lowered:
+        return generation_name
+    aliases = {
+        "gpt-oss-20b": "unsloth/gpt-oss-20b-unsloth-bnb-4bit",
+        "gpt-oss-120b": "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
+    }
+    return aliases.get(basename, generation_name)
+
+
+def _resolve_training_memory_budgets(training_gpu_ids, memory):
+    """Reserve host/runtime headroom and cap checkpoint placement per card."""
+    if not memory or any(gpu_id not in memory for gpu_id in training_gpu_ids):
+        return []
+    budgets = []
+    for gpu_id in training_gpu_ids:
+        gpu = memory[gpu_id]
+        # Keep at least 6 GiB outside Accelerate's weight placement for CUDA,
+        # activations, temporary quantization buffers, and LoRA optimizer state.
+        usable = min(float(gpu.total_gib) * 0.90, float(gpu.free_gib) - 6.0)
+        budgets.append(round(max(1.0, usable), 1))
+    return budgets
+
+
+def _validate_known_training_capacity(training_model_name, budgets):
+    """Fail before loading a known giant checkpoint that cannot fit at all."""
+    if not budgets:
+        return
+    name = str(training_model_name).lower()
+    required_gib = None
+    precision = ""
+    if "gpt-oss-120b" in name and "bnb-4bit" in name:
+        required_gib, precision = 61.0, "trainable 4-bit"
+    elif "gpt-oss-20b" in name and "bnb-4bit" in name:
+        required_gib, precision = 14.0, "trainable 4-bit"
+    elif "gpt-oss-120b" in name:
+        required_gib, precision = 196.0, "BF16 LoRA"
+    if required_gib is not None and sum(budgets) < required_gib:
+        raise ValueError(
+            f"{training_model_name} needs about {required_gib:.0f} GiB for "
+            f"{precision}, but the selected training GPUs have only "
+            f"{sum(budgets):.1f} GiB of safe aggregate placement budget "
+            f"{budgets}. Add GPUs or use load_in_4bit with the trainable "
+            "GPT-OSS BitsAndBytes checkpoint.")
+
+
 def load_config():
     """
     Load one complete problem YAML, then overlay resume state and explicit CLI.
@@ -439,6 +510,14 @@ def load_config():
         ydict = yaml.safe_load(f) or {}
     if not isinstance(ydict, dict) or not ydict:
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
+    from config_validation import validate_problem_config
+    validate_problem_config(
+        ydict,
+        source=cfg_path,
+        require_complete=(
+            Path(cfg_path).expanduser().resolve().parent == config_dir.resolve()
+        ),
+    )
     merged = dict(ydict)
     print(f"[config] loaded {cfg_path}")
 
@@ -536,6 +615,10 @@ def load_config():
     roles = allocate_gpu_roles(available_gpu_ids, merged["problem"])
     training_gpu_id = roles.training
     gpu_ids = roles.generation
+    # Training and rollout phases alternate residency, so every rollout card
+    # can also hold a shard of the trainable model. In gpu_mode the exclusive
+    # evaluation card is absent from roles.generation and remains untouched.
+    training_gpu_ids = list(gpu_ids)
     evaluation_gpu_id = roles.evaluation
 
     # Explicit CLI role flags are accepted only as assertions. They may not
@@ -562,6 +645,9 @@ def load_config():
             f"{inventory_source}; derived evaluation GPU is {evaluation_gpu_id}")
 
     merged["training_gpu_id"] = training_gpu_id
+    merged["training_gpu_ids"] = ",".join(
+        str(x) for x in training_gpu_ids)
+    merged["num_training_gpus"] = len(training_gpu_ids)
     merged["available_gpu_ids"] = ",".join(str(x) for x in roles.available)
     merged["gpu_ids"] = ",".join(str(x) for x in gpu_ids)
     merged["num_gpus"] = len(gpu_ids)
@@ -583,6 +669,23 @@ def load_config():
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
+
+    merged["training_model_name"] = _resolve_training_model_name(
+        merged.get("model_name", ""), merged.get("training_model_name"),
+        merged.get("load_in_4bit", False),
+    )
+    if merged["training_model_name"] != merged.get("model_name"):
+        print(f"[precision] trainable checkpoint: "
+              f"{merged['training_model_name']} (generation remains "
+              f"{merged.get('model_name')})")
+    training_budgets = _resolve_training_memory_budgets(
+        training_gpu_ids, memory)
+    _validate_known_training_capacity(
+        merged["training_model_name"], training_budgets)
+    merged["training_max_memory_gib"] = training_budgets
+    if training_budgets:
+        print(f"[memory] training weight budgets by logical GPU: "
+              f"{training_budgets} GiB")
 
     # Consume every rollout GPU. Prefer compatible TP replicas for throughput.
     # If a complete model plus one full-context request would not fit per
@@ -615,12 +718,12 @@ def load_config():
         print(f"[memory] auto: {note}")
 
     print(f"[config] AVAILABLE_GPUS={roles.available} ({inventory_source})")
-    print(f"[config] GPU roles: train={training_gpu_id}, "
+    print(f"[config] GPU roles: train={training_gpu_ids}, "
           f"generation={gpu_ids}, evaluation={evaluation_gpu_id}; "
           f"sharing={'sequential' if roles.sequential_generation else 'isolated'}")
 
-    # 4) Provide attribute access without duplicating a Python config schema.
-    # Problem-specific YAML keys are harmless here and remain in `merged` too.
+    # 4) Provide attribute access after the YAML's shared and problem-specific
+    # keys have passed their ownership contract.
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
     if cfg.generation_backend == "vllm" and int(cfg.num_gpus or 0) < 1:
@@ -646,13 +749,19 @@ def load_config():
     return cfg, merged
 
 
-def _pin_training_process(training_gpu_id: int) -> None:
-    """Expose one physical GPU before importing torch, Transformers or Unsloth."""
+def _pin_training_process(training_gpu_ids) -> None:
+    """Expose the ordered training/model-parallel group before CUDA imports."""
+    ids = _parse_gpu_ids(training_gpu_ids)
+    if not ids:
+        raise ValueError("training_gpu_ids must contain at least one GPU")
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(training_gpu_id))
-    os.environ["TTT_TRAINING_GPU_ID"] = str(int(training_gpu_id))
-    print(f"[gpu] trainer isolated on physical GPU {training_gpu_id} "
-          f"(logical cuda:0)")
+    visible = ",".join(str(gpu_id) for gpu_id in ids)
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    os.environ["TTT_TRAINING_GPU_ID"] = str(ids[0])
+    os.environ["TTT_TRAINING_GPU_IDS"] = visible
+    logical = ",".join(f"cuda:{idx}" for idx in range(len(ids)))
+    print(f"[gpu] trainer model-parallel group: physical {ids} "
+          f"(logical {logical})")
 
 
 def _move_optimizer_state(optimizer, device) -> None:
@@ -672,6 +781,25 @@ def _move_optimizer_state(optimizer, device) -> None:
 
     for parameter, state in list(optimizer.state.items()):
         optimizer.state[parameter] = move(state)
+
+
+def _restore_optimizer_state_to_parameters(optimizer) -> None:
+    """Return each optimizer tensor to the device of its sharded parameter."""
+    import torch
+
+    def move(value, device):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item, device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item, device) for item in value)
+        return value
+
+    for parameter, state in list(optimizer.state.items()):
+        optimizer.state[parameter] = move(state, parameter.device)
 
 
 def _attention_head_count(model) -> int:
@@ -876,7 +1004,7 @@ def _adapter_exists(exp_dir):
     return any(p.glob("adapter_step*"))
 
 
-def _save_adapter(model, exp_dir, step_idx):
+def _save_adapter(model, exp_dir, step_idx, generation_model_name=None):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
     Adapters are retained because completed checkpoints refer to their matching
@@ -886,6 +1014,16 @@ def _save_adapter(model, exp_dir, step_idx):
     out_dir = _adapter_dir(exp_dir, step_idx)
     # PEFT/Unsloth models support save_pretrained, which writes just the adapter
     model.save_pretrained(out_dir)
+    # The trainable GPT-OSS copy may be a BnB conversion while vLLM hosts the
+    # original MXFP4 checkpoint. Their module names are identical; advertise
+    # the actual rollout base so vLLM does not reject the adapter as mismatched.
+    config_path = Path(out_dir) / "adapter_config.json"
+    if generation_model_name and config_path.is_file():
+        adapter_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if adapter_config.get("base_model_name_or_path") != generation_model_name:
+            adapter_config["base_model_name_or_path"] = generation_model_name
+            config_path.write_text(
+                json.dumps(adapter_config, indent=2) + "\n", encoding="utf-8")
     return out_dir
 
 
@@ -1034,8 +1172,23 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
 # thread pool WHILE the GPUs keep generating.
 #
 # `reward_workers` is configured in YAML (0 = auto). Auto
-# leaves ~one CPU core per GPU worker for the generation loop.
+# leaves ~one CPU core per GPU worker for the generation loop and divides the
+# remainder by the CPU allocation of each candidate evaluation.
 # ======================================================================
+def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
+    requested = int(getattr(cfg, "reward_workers", 0) or 0)
+    if requested < 0:
+        raise ValueError("reward_workers must be >= 0")
+    if requested:
+        return requested
+
+    available = int(cpu_count if cpu_count is not None else (os.cpu_count() or 8))
+    generation_workers = max(0, int(getattr(cfg, "num_gpus", 0) or 0))
+    per_evaluation = max(1, int(getattr(problem, "eval_cpus", 1)))
+    cpu_budget = max(1, available - generation_workers)
+    return max(1, cpu_budget // per_evaluation)
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
@@ -1122,7 +1275,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # way, so this only moves the write earlier.
     adapter_path = None
     if gen_pool is not None:
-        adapter_path = _save_adapter(model, exp_dir, step_idx)
+        adapter_path = _save_adapter(
+            model, exp_dir, step_idx, cfg.model_name)
 
     # ---- memory lookup (replaces the Eq. 7 retrieval) ----------------
     # One call covering every parent. An empty bank makes no call at all, so
@@ -1201,9 +1355,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
-    n_reward_workers = getattr(cfg, "reward_workers", 0)
-    if not n_reward_workers:
-        n_reward_workers = max(1, (os.cpu_count() or 8) - max(0, cfg.num_gpus))
+    n_reward_workers = _resolve_reward_workers(cfg, problem)
+    print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
+          f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
     # (text, token_ids, prompt_job_index), arrival order under each parent.
@@ -1284,7 +1438,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             try:
                 torch.cuda.synchronize()
                 _move_optimizer_state(optimizer, "cpu")
-                model.to("cpu")
+                backend.offload_for_generation()
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1292,8 +1446,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 evaluation_trainer_offloaded = True
             except Exception as exc:
                 try:
-                    model.to("cuda:0")
-                    _move_optimizer_state(optimizer, "cuda:0")
+                    backend.restore_after_generation()
+                    _restore_optimizer_state_to_parameters(optimizer)
                 except Exception:
                     pass
                 raise RuntimeError(
@@ -1320,8 +1474,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             import gc
             gc.collect()
             torch.cuda.empty_cache()
-            model.to("cuda:0")
-            _move_optimizer_state(optimizer, "cuda:0")
+            backend.restore_after_generation()
+            _restore_optimizer_state_to_parameters(optimizer)
             backend.set_training_mode()
 
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
@@ -1789,7 +1943,7 @@ def main():
     # This must precede every import path that can initialize CUDA. Worker and
     # evaluation children replace CUDA_VISIBLE_DEVICES with their own physical
     # groups before importing their CUDA stacks.
-    _pin_training_process(cfg.training_gpu_id)
+    _pin_training_process(cfg.training_gpu_ids)
     if cfg.evaluation_gpu_id is not None:
         os.environ["TTT_EVALUATION_GPU_ID"] = str(cfg.evaluation_gpu_id)
 
@@ -1802,6 +1956,7 @@ def main():
         cfg, resume_dir=resume_dir, config_dict=merged
     )
     vllm_log_path = None
+    dependency_log_path = None
     if cfg.generation_backend == "vllm":
         vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
         with open(vllm_log_path, "a", encoding="utf-8") as log_handle:
@@ -1809,6 +1964,15 @@ def main():
                 f"\n=== TTT vLLM log parent_pid={os.getpid()} "
                 f"run_dir={Path(exp_dir).resolve()} ===\n")
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
+        dependency_log_path = vllm_log_path
+    else:
+        dependency_log_path = str(
+            Path(exp_dir).resolve() / "dependency_warnings.log")
+        with open(dependency_log_path, "a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"\n=== TTT dependency warnings parent_pid={os.getpid()} "
+                f"run_dir={Path(exp_dir).resolve()} ===\n")
+        print(f"[logs] dependency warnings: {dependency_log_path}", flush=True)
 
     # One effective seed for every generation stream. None => not seeded, which
     # is the original behaviour. Set once here and threaded through unchanged.
@@ -1838,15 +2002,18 @@ def main():
     print("=" * 70)
     print("TTT-Discover — local multi-problem implementation")
     print("=" * 70)
+    problem_type = getattr(cfg, "problem_type", "")
     print(f"Problem:            {cfg.problem}"
-          + (f" ({cfg.problem_type})" if cfg.problem_type else ""))
+          + (f" ({problem_type})" if problem_type else ""))
     print(f"Entrypoint:         {getattr(problem, 'entrypoint', '?')}")
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
+    if cfg.training_model_name != cfg.model_name:
+        print(f"Training model:     {cfg.training_model_name}")
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
-    print(f"Training GPU:       physical {cfg.training_gpu_id}")
+    print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
@@ -1880,7 +2047,7 @@ def main():
 
     # ---- backend + model ----
     # Load backend FIRST so Unsloth can patch transformers if used.
-    with _route_dependency_notices(vllm_log_path):
+    with _route_dependency_notices(dependency_log_path):
         from model_backend import load_backend
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()
@@ -1966,12 +2133,13 @@ def main():
 
     # ---- generation pool ----
     gen_pool = None
-    # HF keeps the live trainer as rollout rank zero and adds persistent workers
-    # only on the other cards. vLLM forms one exact-TP engine over every rollout
-    # card; because that includes the trainer card, the two runtimes alternate
-    # residency instead of competing for memory.
+    # A multi-GPU HF/Unsloth model already spans every rollout card, so its
+    # cross-prompt batches run in-process without duplicate worker copies. vLLM
+    # forms exact TP/PP engines over every rollout card; because those cards also
+    # hold training shards, the two runtimes alternate residency.
     use_gen_pool = bool(cfg.num_gpus) and (
-        cfg.num_gpus > 1 or cfg.generation_backend == "vllm")
+        cfg.generation_backend == "vllm"
+        or (cfg.num_gpus > 1 and cfg.num_training_gpus == 1))
     if use_gen_pool:
         from gen_workers import (GenerationPool, HybridHFGenerationPool,
                                  PhasedVLLMGenerationPool, worker_seed)
@@ -1981,7 +2149,8 @@ def main():
             num_workers=cfg.num_gpus,
             gpu_ids=gpu_ids,
             max_seq_length=cfg.max_seq_length,
-            load_in_4bit=effective_4bit,
+            load_in_4bit=(effective_4bit
+                          and cfg.training_model_name == cfg.model_name),
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
@@ -2008,7 +2177,7 @@ def main():
                 try:
                     torch.cuda.synchronize()
                     _move_optimizer_state(optimizer, "cpu")
-                    model.to("cpu")
+                    backend.offload_for_generation()
                     import gc
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -2016,8 +2185,8 @@ def main():
                     trainer_offloaded = True
                 except Exception as exc:
                     try:
-                        model.to("cuda:0")
-                        _move_optimizer_state(optimizer, "cuda:0")
+                        backend.restore_after_generation()
+                        _restore_optimizer_state_to_parameters(optimizer)
                     except Exception:
                         pass
                     raise RuntimeError(
@@ -2034,8 +2203,8 @@ def main():
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-                model.to("cuda:0")
-                _move_optimizer_state(optimizer, "cuda:0")
+                backend.restore_after_generation()
+                _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
                 trainer_offloaded = False
 
@@ -2088,7 +2257,11 @@ def main():
         else:
             print("[init] generation pool ready")
     else:
-        print("[init] single-GPU generation (no worker pool)")
+        if cfg.num_training_gpus > 1:
+            print(f"[init] model-parallel HF generation across training GPUs "
+                  f"{cfg.training_gpu_ids}; prompts remain cross-batched")
+        else:
+            print("[init] single-GPU generation (no worker pool)")
 
     # ---- memory (Sec. 2.2) ----
     from memory import setup_memory
@@ -2201,7 +2374,8 @@ def main():
             if memory is not None:
                 memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
                 memory.save(memory_path)
-            adapter_path = _save_adapter(model, exp_dir, step)
+            adapter_path = _save_adapter(
+                model, exp_dir, step, cfg.model_name)
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
                 next_g=cur_g, next_k=cur_k, memory_path=memory_path,

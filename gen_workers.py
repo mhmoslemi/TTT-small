@@ -258,7 +258,7 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # left-pad for decoder-only batched generation
 
-    model_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=True)
+    model_kwargs = dict(dtype=torch.bfloat16, trust_remote_code=True)
     if load_in_4bit:
         try:
             from transformers import BitsAndBytesConfig

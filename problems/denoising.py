@@ -95,6 +95,8 @@ Write code to implement a denoising algorithm.
 """
 
         user = f"""{prompt}
+
+Evaluation resources: you can use up to {self.eval_cpus} CPUs.
 {code_section}
 Write your improved `magic_denoise` function."""
         return [{"role": "user", "content": user}]

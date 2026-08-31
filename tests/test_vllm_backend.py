@@ -46,9 +46,9 @@ class _Queue:
 def _fake_complete_yaml(stream):
     values = {
         "problem": "circle_packing",
-        "problem_type": "",
         "model_name": "Qwen/Qwen3-8B",
         "backend": "auto",
+        "load_in_4bit": True,
         "generation_backend": "hf",
         "vllm_gpu_memory_utilization": 0.9,
         "vllm_tensor_parallel_size": 0,
@@ -67,11 +67,188 @@ def _fake_complete_yaml(stream):
         "thinking": False,
     }
     if "problem: gpu_mode" in stream.read():
-        values["problem"] = "gpu_mode"
+        values.update({
+            "problem": "gpu_mode",
+            "problem_type": "trimul",
+            "gpu_type": "H100",
+            "reward_workers": 1,
+        })
     return values
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
+        from train_multy import _resolve_training_model_name
+
+        self.assertEqual(
+            _resolve_training_model_name(
+                "openai/gpt-oss-120b", None, load_in_4bit=True),
+            "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
+        )
+        self.assertEqual(
+            _resolve_training_model_name(
+                "/models/openai/gpt-oss-20b/", None, load_in_4bit=True),
+            "unsloth/gpt-oss-20b-unsloth-bnb-4bit",
+        )
+        self.assertEqual(
+            _resolve_training_model_name(
+                "openai/gpt-oss-120b", "local/trainable", True),
+            "local/trainable",
+        )
+        self.assertEqual(
+            _resolve_training_model_name(
+                "openai/gpt-oss-120b", None, load_in_4bit=False),
+            "openai/gpt-oss-120b",
+        )
+
+    def test_multi_gpu_training_uses_balanced_model_parallel_map(self):
+        from model_backend import (_quantization_method, _training_device_map,
+                                   _training_max_memory)
+
+        self.assertEqual(
+            _training_device_map(types.SimpleNamespace(num_training_gpus=3)),
+            "balanced",
+        )
+        self.assertEqual(
+            _training_device_map(types.SimpleNamespace(num_training_gpus=1)),
+            {"": 0},
+        )
+        self.assertEqual(
+            _training_max_memory(types.SimpleNamespace(
+                training_max_memory_gib=[39.0, 38.5, 40.0])),
+            {0: "39.0GiB", 1: "38.5GiB", 2: "40.0GiB"},
+        )
+        self.assertEqual(
+            _quantization_method(types.SimpleNamespace(
+                quantization_config={
+                    "quant_method": "bitsandbytes", "_load_in_4bit": True,
+                })),
+            "bitsandbytes-4bit",
+        )
+        self.assertEqual(
+            _quantization_method(types.SimpleNamespace(
+                quantization_config={"quant_method": "mxfp4"})),
+            "mxfp4",
+        )
+
+    def test_three_l40s_pass_gpt_oss_training_capacity_preflight(self):
+        from train_multy import (_resolve_training_memory_budgets,
+                                 _validate_known_training_capacity)
+
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "L40S", 45.0, 44.0)
+            for gpu_id in (0, 1, 2)
+        }
+        budgets = _resolve_training_memory_budgets([0, 1, 2], memory)
+
+        self.assertEqual(budgets, [38.0, 38.0, 38.0])
+        _validate_known_training_capacity(
+            "unsloth/gpt-oss-120b-unsloth-bnb-4bit", budgets)
+        with self.assertRaisesRegex(ValueError, "safe aggregate"):
+            _validate_known_training_capacity(
+                "unsloth/gpt-oss-120b-unsloth-bnb-4bit", [38.0])
+
+    def test_three_gpu_gpt_oss_config_uses_all_cards_for_both_phases(self):
+        fake_numpy = types.ModuleType("numpy")
+        fake_yaml = types.ModuleType("yaml")
+        fake_yaml.safe_load = _fake_complete_yaml
+        sys.modules.pop("train_multy", None)
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "L40S", 45.0, 44.0)
+            for gpu_id in (0, 1, 2)
+        }
+
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            from train_multy import load_config
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "config.yaml"
+                config_path.write_text("problem: circle_packing\n")
+                argv = [
+                    "train_multy.py", "--config", str(config_path),
+                    "--model-name", "openai/gpt-oss-120b",
+                    "--backend", "vllm",
+                ]
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
+                        "gpu_runtime.query_gpu_memory", return_value=memory):
+                    cfg, _ = load_config()
+
+        self.assertEqual(cfg.training_gpu_ids, "0,1,2")
+        self.assertEqual(cfg.gpu_ids, "0,1,2")
+        self.assertEqual(cfg.num_training_gpus, 3)
+        self.assertEqual(
+            cfg.training_model_name,
+            "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
+        )
+        self.assertEqual(cfg.training_max_memory_gib, [38.0, 38.0, 38.0])
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+        self.assertEqual(cfg.vllm_pipeline_parallel_size, 3)
+
+    def test_training_process_exposes_every_ordered_training_gpu(self):
+        from train_multy import _pin_training_process
+
+        env = {}
+        with patch.dict(os.environ, env, clear=True):
+            _pin_training_process("7,2,5")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "7,2,5")
+            self.assertEqual(os.environ["TTT_TRAINING_GPU_ID"], "7")
+            self.assertEqual(os.environ["TTT_TRAINING_GPU_IDS"], "7,2,5")
+
+    def test_sharded_backend_restores_original_device_map(self):
+        from model_backend import _ModelPlacementBackend
+
+        events = []
+
+        class Model:
+            hf_device_map = {"layer0": 0, "layer1": 1, "layer2": 2}
+
+            def to(self, device):
+                events.append(("to", device))
+                return self
+
+        class Backend(_ModelPlacementBackend):
+            pass
+
+        accelerate = types.ModuleType("accelerate")
+        hooks = types.ModuleType("accelerate.hooks")
+        accelerate.dispatch_model = lambda model, **kwargs: events.append(
+            ("dispatch", model, kwargs))
+        hooks.remove_hook_from_submodules = lambda model: events.append(
+            ("remove_hooks", model))
+
+        backend = Backend()
+        backend.model = Model()
+        backend._remember_training_placement(backend.model)
+        with patch.dict(sys.modules, {
+                "accelerate": accelerate, "accelerate.hooks": hooks}):
+            backend.offload_for_generation()
+            backend.restore_after_generation()
+
+        self.assertEqual(events[0][0], "remove_hooks")
+        self.assertEqual(events[1], ("to", "cpu"))
+        self.assertEqual(events[2][0], "dispatch")
+        self.assertEqual(events[2][2]["device_map"], Model.hf_device_map)
+        self.assertTrue(events[2][2]["force_hooks"])
+
+    def test_saved_adapter_names_the_generation_base(self):
+        from train_multy import _save_adapter
+
+        class Model:
+            def save_pretrained(self, path):
+                Path(path).mkdir(parents=True)
+                (Path(path) / "adapter_config.json").write_text(
+                    '{"base_model_name_or_path": "train/bnb"}\n')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter_dir = _save_adapter(
+                Model(), tmp, 0, "openai/gpt-oss-120b")
+            saved = __import__("json").loads(
+                (Path(adapter_dir) / "adapter_config.json").read_text())
+
+        self.assertEqual(
+            saved["base_model_name_or_path"], "openai/gpt-oss-120b")
+
     def test_large_moe_lora_avoids_expert_wide_adapters(self):
         from model_backend import _resolve_lora_target_modules
 
@@ -209,12 +386,24 @@ class VLLMBackendTests(unittest.TestCase):
         stream.write(" Please upgrade torch.\n")
         stream.write(
             "No prebuilt binary for CUDA 12.9, loading CUDA 12.8 instead.\n")
+        stream.write(
+            "Warning: You are sending unauthenticated requests to the HF Hub. "
+            "Please set a HF_TOKEN.\n")
+        stream.write(
+            "W0831 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an "
+            "Enum subclass and is now natively supported by torch.compile as "
+            "an opaque value type.\n")
+        stream.write(
+            "[transformers] `torch_dtype` is deprecated! Use `dtype` instead!\n")
 
         self.assertEqual(visible.getvalue(), "ordinary model loading output\n")
         routed = diagnostic.getvalue()
         self.assertIn("Skipping import of cpp extensions", routed)
         self.assertIn("Please upgrade torch.", routed)
         self.assertIn("No prebuilt binary for CUDA 12.9", routed)
+        self.assertIn("unauthenticated requests to the HF Hub", routed)
+        self.assertIn("KernelPreference", routed)
+        self.assertIn("`torch_dtype` is deprecated", routed)
 
     def test_notice_router_restores_logging_handlers_before_closing(self):
         from train_multy import _route_dependency_notices
@@ -243,26 +432,109 @@ class VLLMBackendTests(unittest.TestCase):
             logger.handlers.clear()
             logging.Logger.manager.loggerDict.pop(logger.name, None)
 
-    def test_every_problem_yaml_is_standalone(self):
+    def test_every_problem_yaml_matches_its_problem_contract(self):
+        import yaml
+
+        from config_validation import validate_problem_config
+
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         self.assertFalse((config_dir / "defaults.yaml").exists())
-
-        def top_level_keys(path):
-            keys = set()
-            for line in path.read_text().splitlines():
-                if (not line or line[0].isspace() or line.startswith("#")
-                        or ":" not in line):
-                    continue
-                keys.add(line.split(":", 1)[0])
-            return keys
-
         paths = sorted(config_dir.glob("*.yaml"))
-        required = top_level_keys(config_dir / "circle_packing.yaml")
-        required.discard("reranker_enabled")
-        self.assertGreaterEqual(len(required), 100)
+        self.assertGreaterEqual(len(paths), 8)
         for path in paths:
-            missing = required - top_level_keys(path)
-            self.assertFalse(missing, f"{path.name} missing keys: {sorted(missing)}")
+            data = yaml.safe_load(path.read_text())
+            validate_problem_config(data, source=path)
+
+            if data["problem"] == "gpu_mode":
+                self.assertEqual(data["gpu_type"], "H100", path.name)
+                self.assertEqual(data["reward_workers"], 1, path.name)
+                self.assertTrue(
+                    (path.parents[1] / data["task_yaml"]).is_file(), path.name)
+                self.assertTrue(
+                    (path.parents[1] / data["lib_dir"]).is_dir(), path.name)
+            else:
+                self.assertGreaterEqual(data["eval_cpus"], 1, path.name)
+                self.assertNotIn("gpu_type", data, path.name)
+                self.assertNotIn("gpu_lease_timeout_s", data, path.name)
+
+            if data["problem"] == "circle_packing":
+                self.assertIn("num_circles", data, path.name)
+            else:
+                self.assertNotIn("num_circles", data, path.name)
+
+    def test_problem_yaml_contract_rejects_cross_problem_fields(self):
+        from config_validation import validate_problem_config
+
+        with self.assertRaisesRegex(ValueError, "num_circles is not valid"):
+            validate_problem_config({
+                "problem": "erdos",
+                "num_circles": 26,
+            }, require_complete=False)
+
+    def test_auto_reward_workers_accounts_for_cpus_per_evaluation(self):
+        from train_multy import _resolve_reward_workers
+
+        cfg = types.SimpleNamespace(reward_workers=0, num_gpus=3)
+        problem = types.SimpleNamespace(eval_cpus=10)
+        self.assertEqual(
+            _resolve_reward_workers(cfg, problem, cpu_count=64), 6)
+
+        cfg.reward_workers = 7
+        self.assertEqual(
+            _resolve_reward_workers(cfg, problem, cpu_count=64), 7)
+
+    def test_cpu_sandbox_hides_gpus_and_enforces_thread_budget(self):
+        import sandbox
+
+        proc = types.SimpleNamespace(
+            pid=123456789,
+            returncode=1,
+            communicate=lambda timeout=None: (b"", b""),
+        )
+        with patch("sandbox.subprocess.Popen", return_value=proc) as popen, \
+                patch("sandbox._kill_tree"):
+            sandbox.run_code(
+                "def run():\n    return 1\n",
+                entrypoint="run",
+                timeout_s=1,
+                max_cpus=6,
+            )
+
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "")
+        self.assertEqual(env["HIP_VISIBLE_DEVICES"], "")
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"):
+            self.assertEqual(env[key], "6")
+
+    def test_problem_passes_eval_cpu_budget_to_sandbox(self):
+        from problems.base import (ParentContext, Problem, RewardResult,
+                                   SeedState)
+
+        class ExampleProblem(Problem):
+            def build_prompt(self, parent, memory=""):
+                return []
+
+            def preprocess(self, code, parent):
+                return code
+
+            def score(self, output, stdout):
+                return RewardResult(reward=1.0, valid=True)
+
+            def seed_states(self):
+                return [SeedState()]
+
+        problem = ExampleProblem({"eval_cpus": 6})
+        with patch("problems.base.extract_python_code", return_value="pass"), \
+                patch("problems.base.run_code", return_value={
+                    "ok": True, "value": 1, "stdout": "",
+                }) as run_code:
+            result = problem.compute_reward("response", ParentContext(), 12)
+
+        self.assertTrue(result.valid)
+        run_code.assert_called_once_with(
+            "pass", entrypoint="run", timeout_s=12, max_cpus=6)
 
     def test_offline_auto_backend_selects_hf_without_importing_unsloth(self):
         fake_torch = types.ModuleType("torch")
@@ -772,6 +1044,8 @@ class VLLMBackendTests(unittest.TestCase):
                     cfg, _ = load_config()
 
         self.assertEqual(cfg.training_gpu_id, 0)
+        self.assertEqual(cfg.training_gpu_ids, "0,1,2,3")
+        self.assertEqual(cfg.num_training_gpus, 4)
         self.assertEqual(cfg.gpu_ids, "0,1,2,3")
         self.assertEqual(cfg.evaluation_gpu_id, 6)
         self.assertEqual(cfg.vllm_tensor_parallel_size, 4)

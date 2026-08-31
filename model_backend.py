@@ -14,12 +14,57 @@ def _ensure_pad_token(tokenizer):
     return tokenizer
 
 
-def _use_training_4bit(cfg, *, native_quantization=False):
+def _training_model_name(cfg):
+    return str(getattr(cfg, "training_model_name",
+                       getattr(cfg, "model_name", "")))
+
+
+def _training_device_map(cfg):
+    """Use every visible training GPU for single-process model parallelism."""
+    count = int(getattr(cfg, "num_training_gpus", 1) or 1)
+    return "balanced" if count > 1 else {"": 0}
+
+
+def _training_max_memory(cfg):
+    budgets = list(getattr(cfg, "training_max_memory_gib", None) or [])
+    if not budgets:
+        return None
+    return {logical_id: f"{float(gib):.1f}GiB"
+            for logical_id, gib in enumerate(budgets)}
+
+
+def _quantization_method(model_config):
+    quantization = getattr(model_config, "quantization_config", None)
+    if not quantization:
+        return ""
+    if isinstance(quantization, dict):
+        method = quantization.get("quant_method", "")
+        load_4bit = quantization.get("load_in_4bit",
+                                     quantization.get("_load_in_4bit", False))
+    else:
+        method = getattr(quantization, "quant_method", "")
+        load_4bit = getattr(quantization, "load_in_4bit",
+                            getattr(quantization, "_load_in_4bit", False))
+    method = str(method or "").lower()
+    if method == "bitsandbytes" and load_4bit:
+        return "bitsandbytes-4bit"
+    return method
+
+
+def _use_training_4bit(
+        cfg, *, native_quantization=False, prequantized_bnb=False):
     """Resolve the requested QLoRA mode without affecting vLLM."""
+    model_name = _training_model_name(cfg)
+    if prequantized_bnb:
+        if importlib.util.find_spec("bitsandbytes") is None:
+            raise RuntimeError(
+                f"{model_name} is a trainable BitsAndBytes checkpoint, but "
+                "bitsandbytes is not installed")
+        print(f"[precision] {model_name} is already BitsAndBytes 4-bit")
+        return True
     if not bool(getattr(cfg, "load_in_4bit", False)):
         return False
-    model_name = str(getattr(cfg, "model_name", ""))
-    if native_quantization or "gpt-oss" in model_name.lower():
+    if native_quantization:
         print(f"[precision] {model_name} has checkpoint-native quantization; "
               "not applying BitsAndBytes 4-bit again")
         return False
@@ -28,6 +73,64 @@ def _use_training_4bit(cfg, *, native_quantization=False):
               "precision instead of requested 4-bit")
         return False
     return True
+
+
+class _ModelPlacementBackend:
+    """Move a possibly sharded trainer out for an all-GPU vLLM phase."""
+
+    def _remember_training_placement(self, loaded_model):
+        self._placement_model = loaded_model
+        device_map = getattr(loaded_model, "hf_device_map", None) or {}
+        self._training_device_map = dict(device_map)
+        cpu_targets = [name for name, target in self._training_device_map.items()
+                       if str(target).lower() in ("cpu", "disk")]
+        if cpu_targets:
+            raise RuntimeError(
+                "the balanced training device map spilled model modules to "
+                f"CPU/disk ({cpu_targets[:4]}). Reduce context/batch memory or "
+                "provide more training GPUs; silent spill would be unstable")
+        self._trainer_is_offloaded = False
+
+    def offload_for_generation(self):
+        if getattr(self, "_trainer_is_offloaded", False):
+            return
+        placement_model = getattr(self, "_placement_model", self.model)
+        if getattr(self, "_training_device_map", None):
+            # Remove Accelerate's routing hooks before collapsing the sharded
+            # model to host memory. They are reconstructed during restore.
+            try:
+                from accelerate.hooks import remove_hook_from_submodules
+                remove_hook_from_submodules(placement_model)
+            except (ImportError, AttributeError):
+                pass
+        try:
+            self.model.to("cpu")
+            self._trainer_is_offloaded = True
+        except Exception:
+            # A quantized module can fail after earlier layers already moved.
+            # Mark it offloaded so the normal placement restore can repair the
+            # partially moved model before the original exception propagates.
+            self._trainer_is_offloaded = True
+            try:
+                self.restore_after_generation()
+            except Exception:
+                pass
+            raise
+
+    def restore_after_generation(self):
+        if not getattr(self, "_trainer_is_offloaded", False):
+            return
+        device_map = getattr(self, "_training_device_map", None) or {}
+        placement_model = getattr(self, "_placement_model", self.model)
+        devices = {str(target) for target in device_map.values()
+                   if str(target).lower() not in ("cpu", "disk")}
+        if len(devices) > 1:
+            from accelerate import dispatch_model
+            dispatch_model(
+                placement_model, device_map=device_map, force_hooks=True)
+        else:
+            self.model.to("cuda:0")
+        self._trainer_is_offloaded = False
 
 
 def _offline_mode() -> bool:
@@ -66,7 +169,7 @@ def _resolve_lora_target_modules(cfg, model_config):
 # ======================================================================
 # Unsloth backend
 # ======================================================================
-class UnslothBackend:
+class UnslothBackend(_ModelPlacementBackend):
     name = "unsloth"
 
     def __init__(self, cfg):
@@ -80,13 +183,18 @@ class UnslothBackend:
         from unsloth import FastLanguageModel
         self._FastLanguageModel = FastLanguageModel
 
-        use_4bit = _use_training_4bit(self.cfg)
+        training_name = _training_model_name(self.cfg)
+        prequantized_bnb = "bnb-4bit" in training_name.lower()
+        use_4bit = _use_training_4bit(
+            self.cfg, prequantized_bnb=prequantized_bnb)
         self.cfg.effective_load_in_4bit = use_4bit
 
-        print(f"[backend=unsloth] loading {self.cfg.model_name} ...")
+        device_map = _training_device_map(self.cfg)
+        print(f"[backend=unsloth] loading {training_name} across "
+              f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
         offline = _offline_mode()
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=self.cfg.model_name,
+            model_name=training_name,
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
@@ -95,11 +203,11 @@ class UnslothBackend:
             # requested repo and let BitsAndBytes quantize its cached weights.
             use_exact_model_name=offline,
             local_files_only=offline,
-            # The trainer process is restricted to its configured CUDA device,
-            # and the explicit map prevents Accelerate/Unsloth from rediscovering
-            # and replicating/sharding the policy over every visible card.
-            device_map={"": 0},
+            device_map=device_map,
+            **({"max_memory": _training_max_memory(self.cfg)}
+               if _training_max_memory(self.cfg) else {}),
         )
+        self._remember_training_placement(model)
         target_modules = _resolve_lora_target_modules(
             self.cfg, getattr(model, "config", None))
         print("[backend=unsloth] attaching LoRA ...")
@@ -136,7 +244,7 @@ class UnslothBackend:
 # ======================================================================
 # Plain HF + PEFT backend (fallback)
 # ======================================================================
-class HFBackend:
+class HFBackend(_ModelPlacementBackend):
     name = "hf"
 
     def __init__(self, cfg):
@@ -148,27 +256,42 @@ class HFBackend:
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-        print(f"[backend=hf] loading {self.cfg.model_name} ...")
-        tokenizer = AutoTokenizer.from_pretrained(self.cfg.model_name, trust_remote_code=True)
+        training_name = _training_model_name(self.cfg)
+        device_map = _training_device_map(self.cfg)
+        print(f"[backend=hf] loading {training_name} across "
+              f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            training_name, trust_remote_code=True)
         hf_config = AutoConfig.from_pretrained(
-            self.cfg.model_name, trust_remote_code=True)
-        native_quantization = bool(getattr(hf_config, "quantization_config", None))
+            training_name, trust_remote_code=True)
+        quantization_method = _quantization_method(hf_config)
+        if quantization_method == "mxfp4":
+            raise RuntimeError(
+                f"{training_name} uses inference-only MXFP4 weights. Native "
+                "MXFP4 cannot be LoRA-trained by Transformers; enable "
+                "load_in_4bit so GPT-OSS selects its trainable BitsAndBytes "
+                "checkpoint, or set training_model_name explicitly.")
+        prequantized_bnb = quantization_method == "bitsandbytes-4bit"
+        native_quantization = bool(
+            getattr(hf_config, "quantization_config", None)
+            and not prequantized_bnb)
         use_4bit = _use_training_4bit(
-            self.cfg, native_quantization=native_quantization)
+            self.cfg, native_quantization=native_quantization,
+            prequantized_bnb=prequantized_bnb)
         self.cfg.effective_load_in_4bit = use_4bit
 
-        # Pinned to one device, NOT "auto". With two visible GPUs, "auto" shards
-        # the model across both and puts training weights on the card that
-        # kernel_gpu_id reserves for benchmarking, so the measured runtime
-        # reflects contention with the backward pass instead of the kernel.
-        # Index is into CUDA_VISIBLE_DEVICES, i.e. the first device this process
-        # can see; the benchmark child re-sets CUDA_VISIBLE_DEVICES itself.
+        # GPU-mode's exclusive evaluation card was removed from visibility by
+        # role allocation. "balanced" therefore uses every rollout/training GPU
+        # without ever placing weights on the benchmark card.
         model_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            device_map={"": 0},
+            dtype=torch.bfloat16,
+            device_map=device_map,
             trust_remote_code=True,
         )
-        if use_4bit:
+        max_memory = _training_max_memory(self.cfg)
+        if max_memory:
+            model_kwargs["max_memory"] = max_memory
+        if use_4bit and not prequantized_bnb:
             try:
                 from transformers import BitsAndBytesConfig
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -182,7 +305,9 @@ class HFBackend:
                 self.cfg.effective_load_in_4bit = False
                 print("[backend=hf] bitsandbytes not available; using default precision")
 
-        model = AutoModelForCausalLM.from_pretrained(self.cfg.model_name, **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            training_name, **model_kwargs)
+        self._remember_training_placement(model)
 
         if use_4bit:
             model = prepare_model_for_kbit_training(model)
@@ -284,3 +409,9 @@ class _AutoFallbackBackend:
 
     def disable_adapter(self):
         return self._inner.disable_adapter()
+
+    def offload_for_generation(self):
+        return self._inner.offload_for_generation()
+
+    def restore_after_generation(self):
+        return self._inner.restore_after_generation()

@@ -8,16 +8,27 @@ Run with `sh run.sh`. Select another problem with, for example,
 Every problem YAML is self-contained and repeats the complete configuration.
 There is no shared defaults file or implicit default-value merge. Resume state
 and explicitly supplied CLI flags are the only overlays on the selected YAML.
+The checked-in presets are validated against problem-aware contracts at load
+time: shared trainer settings must be complete, while fields such as
+`num_circles`, `eval_seed`, and GPU-kernel settings are accepted only by the
+problems that consume them.
+
+CPU-evaluated presets declare `eval_cpus`, the number of CPU threads available
+to each candidate. The sandbox hides CUDA devices and applies that count to
+BLAS/thread-pool environment variables. With `reward_workers: 0`, the trainer
+divides the host CPU budget by `eval_cpus` instead of launching a full set of
+multi-threaded candidates and oversubscribing the machine. Use `--eval-cpus`
+to override the selected preset deliberately.
 
 `AVAILABLE_GPUS` in `run.sh` is the single authoritative, ordered list of
 physical GPU ids. YAML and resumed role fields do not override it. The derived
 roles are:
 
-| Problem | Inventory size | Training | Generation | Evaluation |
+| Problem | Inventory size | Training model | Generation | Evaluation |
 |---|---:|---|---|---|
-| CPU-evaluated | any | first | every id, including first | CPU |
+| CPU-evaluated | any | every id, model-sharded | every id | CPU |
 | GPU-mode | 1 | first | first | first, sequential |
-| GPU-mode | 2+ | first | every id except last | last, exclusive |
+| GPU-mode | 2+ | every id except last, model-sharded | every id except last | last, exclusive |
 
 For vLLM, every derived generation GPU is consumed exactly once. The runtime
 chooses the largest tensor-parallel factor that divides both the GPU count and
@@ -31,12 +42,13 @@ engine while reserving physical GPU 6. Unknown local checkpoints have their
 attention-head count read directly from `config.json`; other unknown model
 families retain all-card TP and are validated before worker startup.
 
-The first card is phase-shared instead of being stranded as training-only.
-With HF/Unsloth, its live training model generates one share while persistent
-HF workers generate concurrently on the other rollout cards. With vLLM, the
-training model and optimizer are offloaded before the all-card tensor-parallel
-engine wakes; the engine sleeps and releases GPU allocations before training is
-restored. If the installed vLLM lacks sleep mode, the safe fallback is a
+No rollout card is stranded as training-only. The trainer sees the complete
+ordered generation group and uses a balanced device map when it has multiple
+cards, so a model too large for GPU 0 is sharded across the group. HF/Unsloth
+generation uses that live model with cross-prompt batches. With vLLM, the
+training shards and optimizer are offloaded before the all-card TP/PP engines
+wake; the engines sleep and release GPU allocations before the original shard
+map is restored. If the installed vLLM lacks sleep mode, the safe fallback is a
 transient rollout engine. GPU-mode evaluation uses a physical-device file
 lease, and `reward_workers` is forced to one, so two candidate benchmarks
 cannot contend on the evaluation card. On a one-card GPU-mode run, the trainer
@@ -57,19 +69,24 @@ an OOM, preserving concurrency without retrying an unsafe batch size.
 When vLLM is selected, the launcher announces `<run-dir>/vllm.log` near the
 start of the run. Every vLLM worker and engine-core descendant appends stdout
 and stderr there instead of flooding the training console. The known Torch
-extension-version and BitsAndBytes CUDA-fallback notices emitted while loading
-the trainer are routed there as well; normal trainer progress remains visible.
+extension-version, PyTree enum deprecation, unauthenticated Hub, and
+BitsAndBytes CUDA-fallback notices emitted while loading the trainer are routed
+there as well; normal trainer progress remains visible. HF-only runs route the
+same notices to `<run-dir>/dependency_warnings.log`. Current Transformers loads
+use `dtype` directly, so they do not emit the deprecated `torch_dtype` warning.
 
 `load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
-available and appropriate; checkpoint-native quantization such as GPT-OSS
-MXFP4 is not quantized again. On large MoE checkpoints, expert-wide MLP LoRA
-targets are removed automatically while attention LoRA remains enabled; this
-prevents hundreds of experts from turning a rank-32 adapter into billions of
-trainable parameters. vLLM quantization remains independent. GPU memory is
-inspected at startup to resolve TP/PP layout, vLLM utilization, sequence
-admission, prefill batching, and exact log-probability chunking. FlashInfer
-sampling is off by default to avoid an nvcc runtime dependency; set
-`VLLM_USE_FLASHINFER_SAMPLER=1` to opt in.
+available and appropriate. GPT-OSS QLoRA automatically trains against the
+trainable `unsloth/*-unsloth-bnb-4bit` conversion while generation keeps the
+configured original MXFP4 checkpoint; saved adapters name that original vLLM
+base. Set `training_model_name` explicitly to override this split. On large MoE
+checkpoints, expert-wide MLP LoRA targets are removed automatically while
+attention LoRA remains enabled; this prevents hundreds of experts from turning
+a rank-32 adapter into billions of trainable parameters. vLLM quantization
+remains independent. GPU memory is inspected at startup to resolve TP/PP
+layout, vLLM utilization, sequence admission, prefill batching, and exact
+log-probability chunking. FlashInfer sampling is off by default to avoid an
+nvcc runtime dependency; set `VLLM_USE_FLASHINFER_SAMPLER=1` to opt in.
 
 In offline mode, `backend: auto` selects plain HF before importing Unsloth.
 This prevents a failed Unsloth checkpoint remap from leaving Transformers

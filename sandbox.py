@@ -109,10 +109,15 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1):
 
     # Limit BLAS threads in the child so generated code can't fork 200 threads
     env = os.environ.copy()
+    # Ordinary problem evaluation is CPU-only. The GPU-mode evaluator has its
+    # own leased subprocess path and never calls this sandbox.
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["HIP_VISIBLE_DEVICES"] = ""
+    env["ROCR_VISIBLE_DEVICES"] = ""
     t = str(max(1, int(max_cpus)))
     for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
-        env.setdefault(key, t)
+        env[key] = t
 
     proc = subprocess.Popen(
         [sys.executable, runner_path],

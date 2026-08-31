@@ -137,6 +137,7 @@ Rules:
 - You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
 - Returns (centers, radii, sum_radii) where centers has shape ({n}, 2) and radii has shape ({n},).
 - You can use scientific libraries like scipy, numpy, cvxpy, math.
+- You can use up to {self.eval_cpus} CPUs.
 - Centers must lie within [0,1]^2 and radii must be nonnegative.
 - The pair (centers, radii) must satisfy non-overlap and boundary constraints.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.

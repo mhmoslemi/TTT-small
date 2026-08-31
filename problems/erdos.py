@@ -122,7 +122,6 @@ class ErdosMinOverlap(Problem):
         # killed by its own clock rather than by the harness, which produces a
         # returned best-so-far instead of a lost rollout.
         self.budget_s = float(cfg.get("budget_s", 60.0))
-        self.n_cpus = int(cfg.get("eval_cpus", 2))
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
@@ -194,7 +193,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 ## Budget & Resources
 - **Time budget**: {self.budget_s:.0f}s for your code to run
-- **CPUs**: {self.n_cpus} available
+- **CPUs**: {self.eval_cpus} available
 
 ## Rules
 - Define `run(seed=42, budget_s={self.budget_s:.0f}, **kwargs)` that returns `(h_values, c5_bound, n_points)`

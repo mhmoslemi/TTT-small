@@ -97,6 +97,9 @@ class Problem(ABC):
         self.fail_score = float(self.cfg.get("fail_score", 0.0))
         self.num_seed_states = int(self.cfg.get("num_seed_states", 8))
         self.seed = int(self.cfg.get("seed", 42))
+        self.eval_cpus = int(self.cfg.get("eval_cpus", 1))
+        if self.eval_cpus < 1:
+            raise ValueError("eval_cpus must be >= 1")
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
@@ -139,7 +142,12 @@ class Problem(ABC):
         res.code = code
 
         full_code = self.preprocess(code, parent)
-        out = run_code(full_code, entrypoint=self.entrypoint, timeout_s=timeout_s)
+        out = run_code(
+            full_code,
+            entrypoint=self.entrypoint,
+            timeout_s=timeout_s,
+            max_cpus=self.eval_cpus,
+        )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]
         res.stdout = "\n".join(str(x).strip() for x in diagnostics if x).strip()
