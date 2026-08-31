@@ -8,6 +8,7 @@ mean what the operator wrote in AVAILABLE_GPUS.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 import subprocess
 from typing import Dict, Iterable, List, Optional
@@ -52,22 +53,24 @@ class GPURoles:
 
 
 def allocate_gpu_roles(available: Iterable[int], problem: str) -> GPURoles:
-    """Apply the role table defined by the launcher contract."""
+    """Apply the phase-sharing role table defined by the launcher contract.
+
+    The first card owns the differentiable trainer, but it is not a
+    training-only card: it rejoins every rollout phase.  GPU-mode keeps only
+    the last card out of generation when a distinct evaluator is available.
+    """
     ids = parse_gpu_ids(list(available))
     gpu_problem = str(problem or "").strip().lower() in GPU_PROBLEM_NAMES
     training = ids[0]
 
     if not gpu_problem:
-        generation = [training] if len(ids) == 1 else ids[1:]
+        generation = list(ids)
         evaluation = None
     elif len(ids) == 1:
         generation = [training]
         evaluation = training
-    elif len(ids) == 2:
-        generation = [training]
-        evaluation = ids[-1]
     else:
-        generation = ids[1:-1]
+        generation = ids[:-1]
         evaluation = ids[-1]
 
     return GPURoles(
@@ -188,7 +191,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             and bool(cfg.get("memory_grant_context", True))):
         max_len += max(0, int(cfg.get("memory_token_budget", 0) or 0))
     size_b = _model_size_billions(cfg.get("model_name", ""))
-    tp = max(1, len(roles.generation))
+    tp = max(1, int(cfg.get("vllm_tensor_parallel_size")
+                    or len(roles.generation)))
     quant = str(cfg.get("vllm_quantization", "") or "").lower()
     weight_bytes = (0.65 if quant not in ("", "auto", "none")
                     else _native_weight_bytes(cfg.get("model_name", "")))
@@ -268,9 +272,24 @@ def validate_attention_heads(num_attention_heads: Optional[int], tp: int,
         raise ValueError(
             f"{model_name} has {num_attention_heads} attention heads, which "
             f"cannot be divided across vLLM tensor_parallel_size={tp}. "
-            "AVAILABLE_GPUS is authoritative, so list a compatible subset "
-            "(the first id remains training and, for gpu_mode, the last remains "
-            "evaluation).")
+            "Choose a compatible tensor-parallel factor for this checkpoint.")
+
+
+def derive_vllm_tensor_parallel_size(num_gpus: int,
+                                     num_attention_heads: Optional[int]) -> int:
+    """Use every GPU while keeping each vLLM TP group model-compatible.
+
+    Known model families use the largest factor that divides both the GPU count
+    and attention-head count.  The remaining factor becomes inference replicas,
+    so ``replicas * TP == num_gpus`` exactly. Unknown families retain the strict
+    all-card TP choice and are validated after the checkpoint loads.
+    """
+    num_gpus = int(num_gpus)
+    if num_gpus < 1:
+        raise ValueError("vLLM generation requires at least one GPU")
+    if not num_attention_heads:
+        return num_gpus
+    return max(1, math.gcd(num_gpus, int(num_attention_heads)))
 
 
 def known_attention_heads(model_name: str) -> Optional[int]:

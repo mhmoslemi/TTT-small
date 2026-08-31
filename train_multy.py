@@ -427,8 +427,9 @@ def load_config():
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
-    from gpu_runtime import (allocate_gpu_roles, known_attention_heads,
-                             parse_gpu_ids,
+    from gpu_runtime import (allocate_gpu_roles,
+                             derive_vllm_tensor_parallel_size,
+                             known_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
                              validate_attention_heads, validate_selected_gpus)
 
@@ -496,16 +497,24 @@ def load_config():
                   "stable benchmark measurements")
         merged["reward_workers"] = 1
 
-    # One vLLM engine consumes the entire derived generation group. TP therefore
-    # exactly matches its GPU count; PP and inference replicas are not inferred.
+    # Consume every rollout GPU. Prefer one all-card TP engine when the model's
+    # heads permit it; otherwise split into the largest compatible TP groups and
+    # run those groups as parallel inference replicas.
     if generation_backend == "vllm":
-        merged["vllm_tensor_parallel_size"] = len(gpu_ids)
+        known_heads = known_attention_heads(merged.get("model_name", ""))
+        merged["vllm_tensor_parallel_size"] = (
+            derive_vllm_tensor_parallel_size(len(gpu_ids), known_heads))
         merged["vllm_pipeline_parallel_size"] = 1
         validate_attention_heads(
-            known_attention_heads(merged.get("model_name", "")),
-            len(gpu_ids),
+            known_heads,
+            merged["vllm_tensor_parallel_size"],
             merged.get("model_name", ""),
         )
+        replicas = len(gpu_ids) // merged["vllm_tensor_parallel_size"]
+        if replicas > 1:
+            print(f"[config] {len(gpu_ids)} rollout GPUs form {replicas} "
+                  f"parallel vLLM replicas at compatible "
+                  f"TP={merged['vllm_tensor_parallel_size']}")
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
@@ -661,6 +670,33 @@ def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg)
             print(f"  [oom] halving generation batch size to {batch}")
 
     return responses, input_len
+
+
+def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
+                         cfg, *, max_new_tokens=None, temperature=None,
+                         top_p=None, cap_state=None):
+    """Stream locally generated rollouts from cross-prompt HF batches."""
+    from gen_workers import _iter_hf_job_batches
+
+    if len(prompts_by_group) != len(counts_by_group):
+        raise ValueError("counts_by_group must align with prompts_by_group")
+    jobs = [
+        (group_idx, prompt, int(count))
+        for group_idx, (prompt, count)
+        in enumerate(zip(prompts_by_group, counts_by_group))
+        if int(count) > 0
+    ]
+    gen_kwargs = {
+        "max_new_tokens": int(max_new_tokens if max_new_tokens is not None
+                              else cfg.max_new_tokens),
+        "temperature": float(temperature if temperature is not None
+                             else cfg.temperature),
+        "top_p": float(top_p if top_p is not None else cfg.top_p),
+        "micro_batch": int(getattr(cfg, "gen_micro_batch", 0) or 0),
+    }
+    yield from _iter_hf_job_batches(
+        model, tokenizer, jobs, model.device, int(cfg.max_seq_length),
+        gen_kwargs, cap_state=cap_state, log_prefix="trainer rollout")
 
 
 # ======================================================================
@@ -1101,6 +1137,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
+    evaluation_trainer_offloaded = False
     try:
         try:
             if gen_pool is not None:
@@ -1121,21 +1158,26 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     for (text, token_ids) in job_results:
                         _queue_rollout(job_idx, text, token_ids)
             else:
-                # In-process generation. Ordinary CPU verification overlaps the
-                # next group; one-card GPU-mode verification is deferred.
+                # In-process generation uses cross-prompt micro-batches rather
+                # than draining one parent at a time. Ordinary CPU verification
+                # overlaps later batches; one-card GPU-mode verification waits.
                 backend.set_inference_mode()
                 if cfg.deterministic:
                     torch.manual_seed((int(cfg.seed) * 1_000_003
                                        + step_idx * 1009 + 13) % (2**31 - 1))
                 gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
                 try:
-                    for job_idx, job in enumerate(prompt_jobs):
-                        responses, _ = generate_responses(
-                            model, tokenizer, job["prompt_text"], job["count"], cfg
-                        )
+                    cap_state = {"value": int(
+                        getattr(cfg, "_local_generation_cap", 0) or 0)}
+                    for job_idx, responses in generate_prompt_jobs(
+                            model, tokenizer,
+                            [job["prompt_text"] for job in prompt_jobs],
+                            [job["count"] for job in prompt_jobs], cfg,
+                            cap_state=cap_state):
                         for (text, token_ids) in responses:
                             _queue_rollout(job_idx, text, token_ids)
                         gen_bar.update(len(responses))
+                    cfg._local_generation_cap = int(cap_state["value"])
                 finally:
                     gen_bar.close()
         finally:
@@ -1143,8 +1185,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 gen_pool.release()
 
         if deferred_rollouts:
-            print(f"[step {step_idx}] generation released shared evaluation GPU; "
-                  f"starting {len(deferred_rollouts)} serialized benchmark(s)")
+            print(f"[step {step_idx}] releasing trainer memory on the shared "
+                  f"evaluation GPU before {len(deferred_rollouts)} serialized "
+                  "benchmark(s)")
+            try:
+                torch.cuda.synchronize()
+                _move_optimizer_state(optimizer, "cpu")
+                model.to("cpu")
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                evaluation_trainer_offloaded = True
+            except Exception as exc:
+                try:
+                    model.to("cuda:0")
+                    _move_optimizer_state(optimizer, "cuda:0")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    "one-GPU gpu_mode requires the trainer to offload before "
+                    "candidate benchmark evaluation, but this model/runtime "
+                    "cannot move the training state to CPU") from exc
             for job_idx, text, token_ids in deferred_rollouts:
                 _submit_rollout(job_idx, text, token_ids)
 
@@ -1159,6 +1221,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             eval_bar.close()
     finally:
         reward_pool.shutdown(wait=True)
+        if evaluation_trainer_offloaded:
+            print(f"[step {step_idx}] restoring trainer after shared-GPU "
+                  "benchmark evaluation")
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            model.to("cuda:0")
+            _move_optimizer_state(optimizer, "cuda:0")
+            backend.set_training_mode()
 
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
     # ---- signals for adaptive batch growth ----
@@ -1793,13 +1864,15 @@ def main():
 
     # ---- generation pool ----
     gen_pool = None
-    # The original HF path stays in-process for one GPU. vLLM uses an isolated
-    # worker. When that worker shares the trainer's physical card, its pool is
-    # transient and the trainer/optimizer are offloaded before vLLM starts.
+    # HF keeps the live trainer as rollout rank zero and adds persistent workers
+    # only on the other cards. vLLM forms one exact-TP engine over every rollout
+    # card; because that includes the trainer card, the two runtimes alternate
+    # residency instead of competing for memory.
     use_gen_pool = bool(cfg.num_gpus) and (
         cfg.num_gpus > 1 or cfg.generation_backend == "vllm")
     if use_gen_pool:
-        from gen_workers import GenerationPool, OnDemandGenerationPool
+        from gen_workers import (GenerationPool, HybridHFGenerationPool,
+                                 PhasedVLLMGenerationPool, worker_seed)
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
         pool_options = dict(
             model_name=cfg.model_name,
@@ -1820,7 +1893,7 @@ def main():
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
         )
-        if cfg.sequential_generation:
+        if cfg.generation_backend == "vllm":
             trainer_offloaded = False
 
             def _offload_trainer_for_generation():
@@ -1845,9 +1918,9 @@ def main():
                     except Exception:
                         pass
                     raise RuntimeError(
-                        "the training model could not be offloaded for "
-                        "sequential vLLM sharing; use generation_backend=hf "
-                        "for this model/runtime or add a generation GPU") from exc
+                        "the training model could not be offloaded for the "
+                        "shared vLLM rollout phase; use generation_backend=hf "
+                        "for live-model generation on this runtime") from exc
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
@@ -1863,17 +1936,45 @@ def main():
                 backend.set_training_mode()
                 trainer_offloaded = False
 
-            gen_pool = OnDemandGenerationPool(
+            gen_pool = PhasedVLLMGenerationPool(
                 before_start=_offload_trainer_for_generation,
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
-            print(f"[init] sequential vLLM pool configured on shared physical "
-                  f"GPU {gpu_ids[0]} (started only during rollouts)")
+            print(f"[init] phase-shared vLLM pool configured across all "
+                  f"rollout GPUs {gpu_ids}")
         else:
-            print(f"[init] starting {cfg.generation_backend} generation pool: "
-                  f"{cfg.num_gpus} GPUs {gpu_ids}")
-            gen_pool = GenerationPool(**pool_options)
+            # Do not load a duplicate base model beside the trainer. Rank zero
+            # is the live HF/Unsloth training model; only the remaining cards
+            # need worker processes.
+            remote_options = dict(pool_options)
+            remote_options["num_workers"] = len(gpu_ids) - 1
+            remote_options["gpu_ids"] = gpu_ids[1:]
+            remote_pool = GenerationPool(**remote_options)
+            local_cap = {"value": 0}
+
+            def _local_hf_rollouts(prompts_by_group, counts_by_group,
+                                   max_new_tokens, temperature, top_p,
+                                   step_idx):
+                backend.set_inference_mode()
+                if run_seed is not None:
+                    local_seed = worker_seed(run_seed, step_idx, 0)
+                    torch.manual_seed(local_seed)
+                    torch.cuda.manual_seed_all(local_seed)
+                try:
+                    yield from generate_prompt_jobs(
+                        model, tokenizer, prompts_by_group, counts_by_group,
+                        cfg, max_new_tokens=max_new_tokens,
+                        temperature=temperature, top_p=top_p,
+                        cap_state=local_cap)
+                finally:
+                    backend.set_training_mode()
+
+            gen_pool = HybridHFGenerationPool(
+                remote_pool=remote_pool, local_iter=_local_hf_rollouts)
+            print(f"[init] hybrid HF rollout pool: live trainer on "
+                  f"physical GPU {gpu_ids[0]} plus persistent workers "
+                  f"{gpu_ids[1:]}")
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
                           else "micro-batch")
@@ -1891,10 +1992,11 @@ def main():
     mem_cfg, memory, extractor, lookup, curator = setup_memory(
         merged, problem, cfg, mem_cfg=mem_cfg,
         backend=backend, model=model, tokenizer=tokenizer,
-        # Shared-card vLLM is deliberately transient. Memory selection and
-        # extraction use the in-process policy so the engine only loads once
-        # per rollout phase, not once per auxiliary call.
-        gen_pool=(None if cfg.sequential_generation else gen_pool),
+        # A sleeping/shared vLLM pool cannot wake beside the trainer. The
+        # hybrid HF pool is safe and lets small memory calls rotate over all
+        # rollout cards too.
+        gen_pool=(gen_pool if gen_pool is not None
+                  and not getattr(gen_pool, "sequential", False) else None),
         exp_dir=exp_dir, seed=run_seed,
     )
     if resume_payload is not None and memory is not None:

@@ -45,6 +45,7 @@ Protocol (per step):
 
 import os
 import queue
+import threading
 import traceback
 import multiprocessing as mp
 
@@ -96,7 +97,9 @@ def distribute_jobs(prompts_by_group, group_size, num_workers,
     Returns worker_jobs: list (len num_workers) of lists of
         (group_idx, prompt_text, count)
     so that across workers each group gets exactly group_size samples and
-    every worker participates in every group (max GPU utilization).
+    large groups use every worker. For groups smaller than the worker count,
+    the remainder rotates by group index so small jobs do not all land on rank
+    zero and leave the other GPUs idle.
     """
     worker_jobs = [[] for _ in range(num_workers)]
     counts = ([int(group_size)] * len(prompts_by_group)
@@ -109,7 +112,8 @@ def distribute_jobs(prompts_by_group, group_size, num_workers,
         base = count // num_workers
         rem = count % num_workers
         for w in range(num_workers):
-            worker_count = base + (1 if w < rem else 0)
+            worker_count = base + (
+                1 if ((w - g) % num_workers) < rem else 0)
             if worker_count > 0:
                 worker_jobs[w].append((g, prompt, worker_count))
     return worker_jobs
@@ -121,6 +125,110 @@ def worker_seed(seed, step, rank):
     so the trainer's single-GPU path can key its own reseed the same way.
     """
     return (int(seed) * 1_000_003 + int(step) * 1009 + int(rank) * 7 + 13) % (2 ** 31 - 1)
+
+
+def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
+                         max_seq_length, gen_kwargs, cap_state=None,
+                         log_prefix="hf"):
+    """Generate assigned HF rollouts in cross-prompt micro-batches.
+
+    Each expanded batch contains requests from as many prompt jobs as fit, so
+    one GPU does not finish an entire parent before starting the next.  The
+    mutable cap_state makes an OOM-reduced batch ceiling sticky across steps.
+    """
+    import torch
+
+    if cap_state is None:
+        cap_state = {"value": 0}
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id or eos_id
+    mb = int(gen_kwargs.get("micro_batch", 0) or 0)
+
+    pending = []
+    for group_idx, prompt, count in jobs:
+        count = int(count)
+        prompt_len = len(tokenizer.encode(prompt))
+        if prompt_len >= int(max_seq_length):
+            print(f"[{log_prefix}] group {group_idx} prompt is {prompt_len} "
+                  f"tokens, at/over max_seq_length={max_seq_length}; dropping "
+                  f"{count} rollout(s)", flush=True)
+            yield group_idx, [("", []) for _ in range(count)]
+            continue
+        pending.extend((group_idx, prompt, prompt_len) for _ in range(count))
+
+    # Similar-length requests minimize left-padding and keep more of the token
+    # budget useful while still mixing prompt jobs in every micro-batch.
+    pending.sort(key=lambda item: item[2])
+    while pending:
+        limit = len(pending)
+        if mb > 0:
+            limit = min(limit, mb)
+        learned_cap = int(cap_state.get("value", 0) or 0)
+        if learned_cap > 0:
+            limit = min(limit, learned_cap)
+        n = max(1, limit)
+        batch_items = pending[:n]
+        prompts = [item[1] for item in batch_items]
+        enc = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
+        input_width = int(enc.input_ids.shape[1])
+        max_new_tokens = min(
+            int(gen_kwargs["max_new_tokens"]),
+            int(max_seq_length) - input_width,
+        )
+        if max_new_tokens < 1:
+            by_group = {}
+            for group_idx, _prompt, _prompt_len in batch_items:
+                by_group.setdefault(group_idx, []).append(("", []))
+            del pending[:n]
+            del enc
+            for group_idx, results in by_group.items():
+                yield group_idx, results
+            continue
+
+        try:
+            with torch.inference_mode():
+                out = gen_model.generate(
+                    **enc,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=gen_kwargs["temperature"],
+                    top_p=gen_kwargs["top_p"],
+                    pad_token_id=pad_id,
+                )
+        except torch.cuda.OutOfMemoryError:
+            del enc
+            torch.cuda.empty_cache()
+            if n == 1:
+                group_idx, _prompt, prompt_len = pending.pop(0)
+                print(f"[{log_prefix}] OOM at one sequence (prompt "
+                      f"{prompt_len} tok); dropping one rollout", flush=True)
+                yield group_idx, [("", [])]
+                continue
+            cap_state["value"] = max(1, n // 2)
+            print(f"[{log_prefix}] OOM at cross-prompt batch n={n}; halving "
+                  f"the sticky per-call ceiling to {cap_state['value']} and "
+                  "retrying", flush=True)
+            continue
+
+        by_group = {}
+        rows = int(out.shape[0])
+        for row, (group_idx, _prompt, _prompt_len) in enumerate(batch_items):
+            if row >= rows:
+                item = ("", [])
+            else:
+                gen_ids = out[row, input_width:].tolist()
+                if eos_id is not None and eos_id in gen_ids:
+                    gen_ids = gen_ids[:gen_ids.index(eos_id) + 1]
+                item = (tokenizer.decode(gen_ids, skip_special_tokens=True),
+                        gen_ids)
+            by_group.setdefault(group_idx, []).append(item)
+        del pending[:n]
+        del out, enc
+        for group_idx, results in by_group.items():
+            yield group_idx, results
 
 
 def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
@@ -192,9 +300,6 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             current_adapter = adapter_path
         return peft_model
 
-    eos_id = tokenizer.eos_token_id
-    pad_id = tokenizer.pad_token_id or eos_id
-
     # Persistent per-worker ceiling on sequences per generate() call. 0 means
     # "no learned limit yet"; the effective cap is then the configured
     # micro-batch (or the whole job). It ONLY ever shrinks: once this worker
@@ -229,94 +334,14 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 
         gen_model = ensure_adapter(adapter_path)
 
-        # Micro-batch cap: hold at most `mb` sequences in flight per generate()
-        # call, looping until this job's `count` is done. This bounds KV memory
-        # by `mb` regardless of how big group_size is. mb <= 0 (or >= count)
-        # means one shot. NOTE: mb bounds the number of sequences, NOT the
-        # per-sequence prefill cost, which is O(prompt_len^2) in eager attention
-        # and grows as parents get longer. The OOM-halving loop below is what
-        # keeps that spike from killing the worker.
-        mb = int(gen_kwargs.get("micro_batch", 0) or 0)
-
-        for (group_idx, prompt, count) in jobs:
-            enc = tokenizer([prompt], return_tensors="pt").to(device)
-            input_len = enc.input_ids.shape[1]
-            max_new_tokens = min(
-                int(gen_kwargs["max_new_tokens"]),
-                int(max_seq_length) - int(input_len),
-            )
-            if max_new_tokens < 1:
-                print(f"[worker {rank}] group {group_idx} prompt is "
-                      f"{input_len} tokens, at/over max_seq_length="
-                      f"{max_seq_length}; dropping {count} rollout(s)",
-                      flush=True)
-                result_queue.put(
-                    (rank, group_idx, [("", []) for _ in range(count)]))
-                continue
-
-            remaining = count
-            while remaining > 0:
-                # Effective per-call ceiling: the smaller of the configured
-                # micro-batch and any limit learned from a past OOM. Both unset
-                # means the whole remaining job in one call.
-                limit = count
-                if mb > 0:
-                    limit = mb
-                if gen_cap > 0:
-                    limit = min(limit, gen_cap)
-                n = min(limit, remaining)
-
-                try:
-                    with torch.inference_mode():
-                        out = gen_model.generate(
-                            **enc,
-                            num_return_sequences=n,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=True,
-                            temperature=gen_kwargs["temperature"],
-                            top_p=gen_kwargs["top_p"],
-                            pad_token_id=pad_id,
-                        )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    if n <= 1:
-                        # Cannot fit even one sequence for this prompt. Emit
-                        # empty placeholders for the rest of the job so the main
-                        # process's rollout counter still reaches total_expected
-                        # and the step does not hang on result_queue.get().
-                        # These land as empty (invalid) rollouts and are skipped
-                        # in training (len(token_ids) == 0). They are lost, not
-                        # fatal.
-                        print(f"[worker {rank}] OOM at n=1 on group {group_idx} "
-                              f"(prompt {input_len} tok); dropping {remaining} "
-                              f"rollout(s) this step", flush=True)
-                        result_queue.put(
-                            (rank, group_idx, [("", []) for _ in range(remaining)]))
-                        remaining = 0
-                        break
-                    gen_cap = max(1, n // 2)
-                    print(f"[worker {rank}] OOM on group {group_idx} at n={n} "
-                          f"(prompt {input_len} tok); halving per-call to "
-                          f"{gen_cap} and retrying (sticky for the run)",
-                          flush=True)
-                    continue
-
-                # out shape: (n, input_len + gen_len)
-                job_results = []
-                for i in range(out.shape[0]):
-                    gen_ids = out[i, input_len:].tolist()
-                    if eos_id is not None and eos_id in gen_ids:
-                        gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-                    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-                    job_results.append((text, gen_ids))
-
-                # Report each chunk immediately so the main process can advance
-                # the progress bar AND start evaluating these rollouts while the
-                # GPUs keep generating the rest. The consumer counts rollouts,
-                # not messages, so several messages per group are fine.
-                result_queue.put((rank, group_idx, job_results))
-                remaining -= n
-                del out
+        cap_state = {"value": gen_cap}
+        for group_idx, job_results in _iter_hf_job_batches(
+                gen_model, tokenizer, jobs, device, max_seq_length, gen_kwargs,
+                cap_state=cap_state, log_prefix=f"worker {rank}"):
+            # Report every completed micro-batch so evaluation can overlap the
+            # remaining GPU work.
+            result_queue.put((rank, group_idx, job_results))
+        gen_cap = int(cap_state["value"])
 
     print(f"[worker {rank}] shutting down", flush=True)
 
@@ -327,7 +352,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         max_num_seqs=0, seed=None, quantization=None,
                         tensor_parallel_size=1, pipeline_parallel_size=1,
                         max_num_batched_tokens=0,
-                        enable_expert_parallel=False):
+                        enable_expert_parallel=False,
+                        enable_sleep_mode=False):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -368,6 +394,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         kwargs["distributed_executor_backend"] = "mp"
     if bool(enable_expert_parallel):
         kwargs["enable_expert_parallel"] = True
+    if bool(enable_sleep_mode):
+        kwargs["enable_sleep_mode"] = True
     if int(max_num_seqs or 0) > 0:
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if int(max_num_batched_tokens or 0) > 0:
@@ -402,7 +430,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       gen_micro_batch=0, quantization=None,
                       tensor_parallel_size=1, pipeline_parallel_size=1,
                       max_num_batched_tokens=0,
-                      enable_expert_parallel=False):
+                      enable_expert_parallel=False, enable_sleep_mode=False,
+                      control_queue=None):
     """Persistent vLLM engine spanning one physical GPU group."""
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
@@ -418,6 +447,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     try:
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
+        sleep_api_available = bool(
+            hasattr(LLM, "sleep") and hasattr(LLM, "wake_up"))
 
         engine_seed = (worker_seed(seed, 0, rank) if seed is not None
                        else int.from_bytes(os.urandom(4), "little") % (2 ** 31 - 1))
@@ -436,6 +467,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             pipeline_parallel_size=pipeline_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_expert_parallel=enable_expert_parallel,
+            # Older vLLM builds do not accept this constructor option. They
+            # start normally and report no sleep capability so the parent can
+            # select its transient compatibility path.
+            enable_sleep_mode=(enable_sleep_mode and sleep_api_available),
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
@@ -449,12 +484,33 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # path a unique positive id prevents vLLM from serving a stale cached LoRA.
     adapter_ids = {}
     next_adapter_id = 1
-    ready_queue.put(("ready", rank, ""))
+    can_sleep = bool(hasattr(llm, "sleep") and hasattr(llm, "wake_up"))
+    ready_queue.put(("ready", rank, "sleep" if can_sleep else ""))
 
     while True:
         task = task_queue.get()
         if task is None:
             break
+        if (isinstance(task, tuple) and len(task) >= 2
+                and task[0] == "__control__"):
+            command = task[1]
+            try:
+                if not can_sleep:
+                    raise RuntimeError(
+                        "installed vLLM does not expose LLM.sleep/wake_up")
+                if command == "sleep":
+                    llm.sleep(level=1)
+                elif command == "wake_up":
+                    llm.wake_up()
+                else:
+                    raise ValueError(f"unknown vLLM control command {command!r}")
+                if control_queue is not None:
+                    control_queue.put(("ok", rank, command, ""))
+            except Exception:
+                if control_queue is not None:
+                    control_queue.put(
+                        ("error", rank, command, traceback.format_exc()))
+            continue
         step, adapter_path, jobs, gen_kwargs = task
         if not jobs:
             continue
@@ -557,13 +613,16 @@ class GenerationPool:
                  vllm_tensor_parallel_size=0,
                  vllm_pipeline_parallel_size=1,
                  vllm_max_num_batched_tokens=0,
-                 vllm_enable_expert_parallel=False):
+                 vllm_enable_expert_parallel=False,
+                 vllm_enable_sleep_mode=False):
         self.model_name = model_name
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
         self.gen_micro_batch = int(gen_micro_batch or 0)
         self.backend = str(backend).lower()
+        self.sleep_requested = bool(vllm_enable_sleep_mode)
+        self.sleep_supported = False
         if self.backend not in ("hf", "vllm"):
             raise ValueError(
                 f"unknown generation backend {backend!r}; expected hf|vllm")
@@ -602,6 +661,7 @@ class GenerationPool:
         self.task_queues = [ctx.Queue() for _ in range(self.num_workers)]
         self.result_queue = ctx.Queue()
         ready_queue = ctx.Queue()
+        self.control_queue = ctx.Queue()
 
         self.procs = []
         worker_target = (_vllm_worker_loop
@@ -617,6 +677,8 @@ class GenerationPool:
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
+            "enable_sleep_mode": self.sleep_requested,
+            "control_queue": self.control_queue,
         }
         for r in range(self.num_workers):
             p = ctx.Process(
@@ -637,6 +699,7 @@ class GenerationPool:
         print(f"[pool] waiting for {self.num_workers} {self.backend} engine(s) "
               f"on {requested_num_gpus} GPU(s) to load ...", flush=True)
         loaded = 0
+        sleep_capable = 0
         while loaded < self.num_workers:
             try:
                 status, rank, detail = ready_queue.get(timeout=1.0)
@@ -653,8 +716,47 @@ class GenerationPool:
                 raise RuntimeError(
                     f"{self.backend} generation worker {rank} failed to start:\n"
                     f"{detail}")
+            if detail == "sleep":
+                sleep_capable += 1
             loaded += 1
             print(f"[pool] {loaded}/{self.num_workers} workers ready", flush=True)
+        self.sleep_supported = bool(
+            self.backend == "vllm" and self.sleep_requested
+            and sleep_capable == self.num_workers)
+
+    def _vllm_control(self, command):
+        if self.backend != "vllm":
+            raise RuntimeError("sleep/wake controls are only valid for vLLM")
+        if not self.sleep_supported:
+            raise RuntimeError("the installed vLLM engine lacks sleep mode")
+        for task_queue in self.task_queues:
+            task_queue.put(("__control__", command))
+        completed = 0
+        while completed < self.num_workers:
+            try:
+                status, rank, got_command, detail = self.control_queue.get(
+                    timeout=1.0)
+            except queue.Empty:
+                dead = [(idx, proc.exitcode)
+                        for idx, proc in enumerate(self.procs)
+                        if proc.exitcode is not None]
+                if dead:
+                    raise RuntimeError(
+                        f"vLLM worker(s) exited during {command}: {dead}")
+                continue
+            if status == "error":
+                raise RuntimeError(
+                    f"vLLM worker {rank} failed to {got_command}:\n{detail}")
+            if got_command != command:
+                raise RuntimeError(
+                    f"unexpected vLLM control acknowledgement {got_command!r}")
+            completed += 1
+
+    def sleep(self):
+        self._vllm_control("sleep")
+
+    def wake_up(self):
+        self._vllm_control("wake_up")
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
@@ -753,6 +855,224 @@ class GenerationPool:
             if p.is_alive():
                 p.kill()
                 p.join(timeout=5)
+
+
+class HybridHFGenerationPool:
+    """Use the live trainer plus persistent HF workers at the same time.
+
+    The trainer GPU receives one fair share of every prompt.  Remaining shares
+    are dispatched to workers on the other physical GPUs before local
+    generation starts, so all cards generate concurrently without placing a
+    duplicate base model beside the trainer.
+    """
+
+    sequential = False
+
+    def __init__(self, remote_pool, local_iter):
+        if remote_pool.backend != "hf":
+            raise ValueError("HybridHFGenerationPool requires an HF worker pool")
+        self._remote = remote_pool
+        self._local_iter = local_iter
+        self.num_workers = 1 + int(remote_pool.num_workers)
+
+    def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
+                        max_new_tokens, temperature, top_p, step_idx=0,
+                        show_progress=True, counts_by_group=None):
+        counts = ([int(group_size)] * len(prompts_by_group)
+                  if counts_by_group is None
+                  else [int(value) for value in counts_by_group])
+        if len(counts) != len(prompts_by_group):
+            raise ValueError("counts_by_group must align with prompts_by_group")
+
+        # This is the same fair split as distribute_jobs with local rank zero;
+        # the remote pool then divides the remainder over its ranks.
+        local_counts = []
+        for group_idx, count in enumerate(counts):
+            base, remainder = divmod(count, self.num_workers)
+            local_counts.append(
+                base + (1 if ((-group_idx) % self.num_workers) < remainder
+                        else 0))
+        remote_counts = [count - local for count, local
+                         in zip(counts, local_counts)]
+        events = queue.Queue()
+
+        def run_remote():
+            try:
+                for item in self._remote.iter_group_jobs(
+                        prompts_by_group, group_size, adapter_path,
+                        max_new_tokens, temperature, top_p,
+                        step_idx=step_idx, show_progress=False,
+                        counts_by_group=remote_counts):
+                    events.put(("result", item))
+            except BaseException as exc:
+                events.put(("error", exc))
+            finally:
+                events.put(("done", None))
+
+        remote_thread = threading.Thread(
+            target=run_remote, name="hf-rollout-workers", daemon=True)
+        remote_thread.start()
+        total_expected = sum(counts)
+        bar = (make_progress_bar(total_expected, desc="rollouts")
+               if show_progress else None)
+        remote_done = False
+
+        def drain_remote(block=False):
+            nonlocal remote_done
+            while not remote_done:
+                try:
+                    kind, payload = events.get(
+                        timeout=1.0 if block else None,
+                        block=block,
+                    )
+                except queue.Empty:
+                    return
+                if kind == "done":
+                    remote_done = True
+                    return
+                if kind == "error":
+                    raise payload
+                group_idx, results = payload
+                if bar is not None:
+                    bar.update(len(results))
+                yield group_idx, results
+                block = False
+
+        try:
+            local_kwargs = {
+                "prompts_by_group": prompts_by_group,
+                "counts_by_group": local_counts,
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "step_idx": step_idx,
+            }
+            for group_idx, results in self._local_iter(**local_kwargs):
+                yield from drain_remote(block=False)
+                if bar is not None:
+                    bar.update(len(results))
+                yield group_idx, results
+            while not remote_done:
+                yield from drain_remote(block=True)
+        finally:
+            remote_thread.join()
+            if bar is not None:
+                bar.close()
+
+    def generate_groups(self, prompts_by_group, group_size, adapter_path,
+                        max_new_tokens, temperature, top_p, step_idx=0,
+                        counts_by_group=None):
+        by_group = {idx: [] for idx in range(len(prompts_by_group))}
+        for group_idx, results in self.iter_group_jobs(
+                prompts_by_group, group_size, adapter_path,
+                max_new_tokens, temperature, top_p, step_idx=step_idx,
+                counts_by_group=counts_by_group):
+            by_group[group_idx].extend(
+                (text, token_ids, None) for text, token_ids in results)
+        return by_group
+
+    def shutdown(self):
+        self._remote.shutdown()
+
+
+class PhasedVLLMGenerationPool:
+    """Keep shared-card vLLM alive but asleep during differentiable updates.
+
+    Level-1 sleep offloads vLLM weights and discards its KV cache.  If sleep
+    mode is unavailable, generation safely falls back to a transient engine;
+    in either mode, the trainer is never resident on the generation cards at
+    the same time as an awake vLLM engine.
+    """
+
+    sequential = True
+
+    def __init__(self, before_start, after_stop, **pool_kwargs):
+        self._before_start = before_start
+        self._after_stop = after_stop
+        self._pool_kwargs = dict(pool_kwargs)
+        self._pool = None
+        self._persistent = False
+        self._awake = False
+        self.num_workers = 1
+
+        self._before_start()
+        candidate = None
+        try:
+            candidate = GenerationPool(
+                **self._pool_kwargs, vllm_enable_sleep_mode=True)
+            self.num_workers = candidate.num_workers
+            if candidate.sleep_supported:
+                candidate.sleep()
+                self._pool = candidate
+                self._persistent = True
+                print("[pool] vLLM sleep mode ready; engine will persist "
+                      "between rollout phases", flush=True)
+            else:
+                candidate.shutdown()
+                print("[pool] installed vLLM lacks sleep mode; using a "
+                      "transient engine for safe phase sharing", flush=True)
+        except Exception:
+            # Startup errors such as an invalid checkpoint or an engine OOM
+            # must remain fatal; they are not a sleep-mode compatibility issue.
+            if candidate is not None:
+                candidate.shutdown()
+            self._after_stop()
+            raise
+        self._after_stop()
+
+    @property
+    def active(self):
+        return self._awake
+
+    def _ensure_started(self):
+        if self._awake:
+            return self._pool
+        self._before_start()
+        try:
+            if self._persistent:
+                self._pool.wake_up()
+            else:
+                self._pool = GenerationPool(**self._pool_kwargs)
+                self.num_workers = self._pool.num_workers
+            self._awake = True
+            return self._pool
+        except Exception:
+            self._after_stop()
+            raise
+
+    def iter_group_jobs(self, *args, **kwargs):
+        yield from self._ensure_started().iter_group_jobs(*args, **kwargs)
+
+    def generate_groups(self, *args, **kwargs):
+        return self._ensure_started().generate_groups(*args, **kwargs)
+
+    def release(self):
+        if not self._awake:
+            return
+        try:
+            if self._persistent:
+                try:
+                    self._pool.sleep()
+                except Exception:
+                    # Do not restore the trainer next to an engine whose GPU
+                    # allocations may still be live.
+                    self._pool.shutdown()
+                    self._pool = None
+                    self._persistent = False
+                    raise
+            else:
+                pool, self._pool = self._pool, None
+                pool.shutdown()
+        finally:
+            self._awake = False
+            self._after_stop()
+
+    def shutdown(self):
+        if self._awake:
+            self.release()
+        if self._pool is not None:
+            self._pool.shutdown()
+            self._pool = None
 
 
 class OnDemandGenerationPool:

@@ -15,23 +15,34 @@ roles are:
 
 | Problem | Inventory size | Training | Generation | Evaluation |
 |---|---:|---|---|---|
-| CPU-evaluated | 1 | first | first, sequential | CPU |
-| CPU-evaluated | 2+ | first | every remaining id | CPU |
-| GPU-mode | 1 | first | first, sequential | first, sequential |
-| GPU-mode | 2 | first | first, sequential | last, exclusive |
-| GPU-mode | 3+ | first | every middle id | last, exclusive |
+| CPU-evaluated | any | first | every id, including first | CPU |
+| GPU-mode | 1 | first | first | first, sequential |
+| GPU-mode | 2+ | first | every id except last | last, exclusive |
 
-For vLLM, the tensor-parallel size is exactly the number of derived generation
-GPUs and all of them form one engine. The model's attention-head count must be
-divisible by that size. If a seven-card machine would derive an incompatible
-TP size, list a compatible ordered subset; for example,
-`AVAILABLE_GPUS=0,1,2,3,4,6` gives GPU-mode TP=4 and reserves physical GPU 6.
+For vLLM, every derived generation GPU is consumed exactly once. The runtime
+chooses the largest tensor-parallel factor that divides both the GPU count and
+the known model attention-head count; any remaining factor becomes parallel
+inference replicas. Thus Qwen3-8B on three ordinary GPUs runs three TP=1
+engines, while `AVAILABLE_GPUS=0,1,2,3,6` in GPU-mode runs one TP=4 engine and
+reserves physical GPU 6. Unknown model families retain all-card TP and are
+validated against the loaded checkpoint before worker startup.
 
-On a shared card, HF/Unsloth generates in-process. vLLM is started only for the
-rollout phase: the training model and optimizer are offloaded to CPU, vLLM
-generates, the engine exits, and training is restored. GPU-mode evaluation uses
-a physical-device file lease, and `reward_workers` is forced to one, so two
-candidate benchmarks cannot contend on the evaluation card.
+The first card is phase-shared instead of being stranded as training-only.
+With HF/Unsloth, its live training model generates one share while persistent
+HF workers generate concurrently on the other rollout cards. With vLLM, the
+training model and optimizer are offloaded before the all-card tensor-parallel
+engine wakes; the engine sleeps and releases GPU allocations before training is
+restored. If the installed vLLM lacks sleep mode, the safe fallback is a
+transient rollout engine. GPU-mode evaluation uses a physical-device file
+lease, and `reward_workers` is forced to one, so two candidate benchmarks
+cannot contend on the evaluation card. On a one-card GPU-mode run, the trainer
+is also offloaded during the benchmark phase, so training, generation, and
+candidate evaluation never hold that GPU concurrently.
+
+Rollouts are never submitted prompt-by-prompt to vLLM: every engine receives
+its full assigned prompt set in one scheduler call. HF similarly forms
+cross-prompt micro-batches on each card and halves a sticky batch ceiling after
+an OOM, preserving concurrency without retrying an unsafe batch size.
 
 `load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
 available and appropriate; checkpoint-native quantization such as GPT-OSS

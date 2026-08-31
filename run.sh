@@ -8,8 +8,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 # Authoritative ordered physical GPU inventory. Edit this one list (or export
 # it before invoking the script); Python derives every role from it. The first
-# card always trains. GPU-mode reserves the last card for evaluation when a
-# separate card exists.
+# card trains and also rejoins rollout generation. GPU-mode reserves only the
+# last card for evaluation when a separate card exists. vLLM derives compatible
+# TP groups/replicas that consume this complete list without dropping a card.
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2}"
 
 # FlashInfer sampling can trigger runtime compilation and require nvcc. vLLM's

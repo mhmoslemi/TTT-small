@@ -8,7 +8,10 @@ from unittest.mock import patch
 
 from gen_workers import (
     GenerationPool,
+    HybridHFGenerationPool,
     OnDemandGenerationPool,
+    PhasedVLLMGenerationPool,
+    distribute_jobs,
     _vllm_engine_kwargs,
     _vllm_job_seed,
     _vllm_worker_loop,
@@ -17,6 +20,7 @@ from feedback import FeedbackConfig, is_code_failure, render_chat
 from gpu_runtime import (
     GPUMemory,
     allocate_gpu_roles,
+    derive_vllm_tensor_parallel_size,
     resolve_memory_settings,
     validate_attention_heads,
 )
@@ -186,6 +190,7 @@ class VLLMBackendTests(unittest.TestCase):
             tensor_parallel_size=4,
             pipeline_parallel_size=2,
             max_num_batched_tokens=4096,
+            enable_sleep_mode=True,
         )
 
         self.assertEqual(kwargs["model"], "org/model")
@@ -203,6 +208,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIs(kwargs["fully_sharded_loras"], True)
         self.assertEqual(kwargs["max_num_batched_tokens"], 4096)
         self.assertIs(kwargs["enable_chunked_prefill"], True)
+        self.assertIs(kwargs["enable_sleep_mode"], True)
 
     def test_vllm_engine_kwargs_omit_optional_limits(self):
         kwargs = _vllm_engine_kwargs(
@@ -248,6 +254,12 @@ class VLLMBackendTests(unittest.TestCase):
     def test_generation_pool_rejects_unknown_backend_before_spawning(self):
         with self.assertRaisesRegex(ValueError, r"expected hf\|vllm"):
             GenerationPool("org/model", 1, backend="vision")
+
+    def test_small_prompt_jobs_rotate_across_all_workers(self):
+        jobs = distribute_jobs(["a", "b", "c", "d"], 1, 3)
+        assigned = [[group_idx for group_idx, _prompt, _count in worker]
+                    for worker in jobs]
+        self.assertEqual(assigned, [[0, 3], [1], [2]])
 
     def test_generation_pool_surfaces_worker_errors(self):
         pool = GenerationPool.__new__(GenerationPool)
@@ -297,6 +309,86 @@ class VLLMBackendTests(unittest.TestCase):
             ("offload", None), ("start", [7]),
             ("shutdown", None), ("restore", None),
         ])
+
+    def test_phased_vllm_pool_sleeps_between_rollouts(self):
+        events = []
+
+        class FakePool:
+            num_workers = 1
+            sleep_supported = True
+
+            def __init__(self, **kwargs):
+                events.append(("start", kwargs["vllm_enable_sleep_mode"]))
+
+            def sleep(self):
+                events.append(("sleep", None))
+
+            def wake_up(self):
+                events.append(("wake", None))
+
+            def iter_group_jobs(self, *args, **kwargs):
+                events.append(("generate", None))
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", None))
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: events.append(("offload", None)),
+                after_stop=lambda: events.append(("restore", None)),
+                model_name="org/model", num_workers=1, gpu_ids=[7],
+            )
+            got = list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(got, [(0, [("ok", [1])])])
+        self.assertEqual(events, [
+            ("offload", None), ("start", True), ("sleep", None),
+            ("restore", None), ("offload", None), ("wake", None),
+            ("generate", None), ("sleep", None), ("restore", None),
+            ("shutdown", None),
+        ])
+
+    def test_hybrid_hf_pool_splits_every_prompt_across_all_cards(self):
+        calls = {}
+
+        class FakeRemote:
+            backend = "hf"
+            num_workers = 2
+
+            def iter_group_jobs(self, prompts_by_group, _group_size,
+                                _adapter_path, _max_new_tokens, _temperature,
+                                _top_p, **kwargs):
+                counts = kwargs["counts_by_group"]
+                calls["remote"] = list(counts)
+                for idx, count in enumerate(counts):
+                    if count:
+                        yield idx, [("remote", [2])] * count
+
+            def shutdown(self):
+                calls["shutdown"] = True
+
+        def local_iter(**kwargs):
+            counts = kwargs["counts_by_group"]
+            calls["local"] = list(counts)
+            for idx, count in enumerate(counts):
+                if count:
+                    yield idx, [("local", [1])] * count
+
+        pool = HybridHFGenerationPool(FakeRemote(), local_iter)
+        got = list(pool.iter_group_jobs(
+            ["a", "b"], 0, "/tmp/adapter", 4, 1.0, 1.0,
+            counts_by_group=[8, 2], show_progress=False,
+        ))
+
+        totals = {0: 0, 1: 0}
+        for group_idx, results in got:
+            totals[group_idx] += len(results)
+        self.assertEqual(calls["local"], [3, 0])
+        self.assertEqual(calls["remote"], [5, 2])
+        self.assertEqual(totals, {0: 8, 1: 2})
 
     def test_gpu_evaluation_lease_is_per_physical_device(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -398,7 +490,7 @@ class VLLMBackendTests(unittest.TestCase):
                 argv = [
                     "train_multy.py", "--config", str(config_path),
                     "--backend", "vllm",
-                    "--training-gpu-id", "0", "--gpu-ids", "1",
+                    "--training-gpu-id", "0", "--gpu-ids", "0,1",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1"}):
@@ -424,7 +516,7 @@ class VLLMBackendTests(unittest.TestCase):
                 argv = [
                     "train_multy.py", "--config", str(config_path),
                     "--groups-per-step", "5", "--group-size", "16",
-                    "--gpu-ids", "0,2,4,6,7", "--thinking",
+                    "--gpu-ids", "1,0,2,4,6,7", "--thinking",
                     "--training-gpu-id", "1",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
@@ -433,10 +525,10 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertEqual(cfg.max_groups_per_step, 5)
         self.assertEqual(cfg.max_group_size, 16)
-        self.assertEqual(cfg.num_gpus, 5)
-        self.assertEqual(cfg.gpu_ids, "0,2,4,6,7")
+        self.assertEqual(cfg.num_gpus, 6)
+        self.assertEqual(cfg.gpu_ids, "1,0,2,4,6,7")
         self.assertIs(cfg.thinking, True)
-        self.assertEqual(merged["num_gpus"], 5)
+        self.assertEqual(merged["num_gpus"], 6)
 
     def test_authoritative_gpu_role_table(self):
         ordinary_one = allocate_gpu_roles([7], "erdos")
@@ -446,8 +538,9 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertTrue(ordinary_one.sequential_generation)
 
         ordinary_many = allocate_gpu_roles([7, 2, 5], "denoising")
-        self.assertEqual(ordinary_many.generation, [2, 5])
+        self.assertEqual(ordinary_many.generation, [7, 2, 5])
         self.assertIsNone(ordinary_many.evaluation)
+        self.assertTrue(ordinary_many.sequential_generation)
 
         gpu_one = allocate_gpu_roles([4], "gpu_mode")
         self.assertEqual(gpu_one.generation, [4])
@@ -460,13 +553,19 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertFalse(gpu_two.evaluation_shares_generation)
 
         gpu_many = allocate_gpu_roles([4, 1, 3, 8], "gpu_mode")
-        self.assertEqual(gpu_many.generation, [1, 3])
+        self.assertEqual(gpu_many.generation, [4, 1, 3])
         self.assertEqual(gpu_many.evaluation, 8)
 
     def test_tensor_parallel_head_divisibility_is_checked_early(self):
         validate_attention_heads(32, 4, "Qwen/Qwen3-8B")
         with self.assertRaisesRegex(ValueError, "32 attention heads"):
             validate_attention_heads(32, 6, "Qwen/Qwen3-8B")
+
+    def test_tensor_parallel_factor_uses_every_gpu_via_replicas(self):
+        self.assertEqual(derive_vllm_tensor_parallel_size(3, 32), 1)
+        self.assertEqual(derive_vllm_tensor_parallel_size(6, 32), 2)
+        self.assertEqual(derive_vllm_tensor_parallel_size(8, 32), 8)
+        self.assertEqual(derive_vllm_tensor_parallel_size(7, None), 7)
 
     def test_gpu_mode_roles_type_and_tp_come_from_inventory(self):
         fake_numpy = types.ModuleType("numpy")
@@ -485,17 +584,17 @@ class VLLMBackendTests(unittest.TestCase):
                     "--problem", "gpu_mode", "--backend", "vllm",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
-                        os.environ, {"AVAILABLE_GPUS": "0,1,2,3,4,6"}):
+                        os.environ, {"AVAILABLE_GPUS": "0,1,2,3,6"}):
                     cfg, _ = load_config()
 
         self.assertEqual(cfg.training_gpu_id, 0)
-        self.assertEqual(cfg.gpu_ids, "1,2,3,4")
+        self.assertEqual(cfg.gpu_ids, "0,1,2,3")
         self.assertEqual(cfg.evaluation_gpu_id, 6)
         self.assertEqual(cfg.vllm_tensor_parallel_size, 4)
         self.assertEqual(cfg.gpu_type, "H100")
         self.assertEqual(cfg.reward_workers, 1)
 
-    def test_incompatible_inventory_is_rejected_before_model_load(self):
+    def test_incompatible_all_card_tp_becomes_compatible_replicas(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
@@ -513,8 +612,11 @@ class VLLMBackendTests(unittest.TestCase):
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1,2,3,4,5,6"}):
-                    with self.assertRaisesRegex(ValueError, "cannot be divided"):
-                        load_config()
+                    cfg, _ = load_config()
+
+        self.assertEqual(cfg.gpu_ids, "0,1,2,3,4,5")
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 2)
+        self.assertEqual(cfg.num_gpus, 6)
 
 
 if __name__ == "__main__":
