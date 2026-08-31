@@ -182,6 +182,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Multiply G and K by this when both signals clear.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--adam-beta1", type=float, default=None)
+    p.add_argument("--adam-beta2", type=float, default=None)
+    p.add_argument("--adam-epsilon", type=float, default=None)
+    p.add_argument("--weight-decay", type=float, default=None)
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--logprob-chunk", type=int, default=None,
@@ -2098,9 +2102,9 @@ def main():
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.learning_rate,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=0.0
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_epsilon,
+        weight_decay=cfg.weight_decay,
     )
     if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer"])
@@ -2296,38 +2300,13 @@ def main():
     if fb_cfg.enabled and fb_cfg.anneal_steps > 0:
         print(f"[init] lambda schedule: {fb_cfg.schedule_preview()}")
 
-    # ---- Elo re-ranker (optional, background thread) ----
+    # ---- Elo re-ranker (retired and explicitly disabled) ----
     reranker = None
-    try:
-        from reranker.config import RerankerConfig
-        rcfg = RerankerConfig.from_dict(merged)
-        if rcfg.enabled:
-            from reranker.judges import make_judge
-            from reranker.reranker import MultiAgentReRanker
-            judge = make_judge(rcfg)
-            if judge is not None:
-                reranker = MultiAgentReRanker(
-                    sampler=sampler,
-                    judge=judge,
-                    cfg=rcfg,
-                    metric_name=getattr(problem, "metric_name", "score"),
-                    maximize=getattr(problem, "maximize", True),
-                    target=getattr(problem, "target", None),
-                    exp_dir=exp_dir,
-                )
-                reranker.start()
-                print(f"[init] Elo re-ranker started "
-                      f"(backend={rcfg.backend}, model={rcfg.model}, "
-                      f"top_k={rcfg.top_k}, debate={rcfg.debate})")
-            else:
-                print("[init] Elo re-ranker enabled but judge unavailable; "
-                      "continuing with rank-based prior")
-        else:
-            print("[init] Elo re-ranker disabled")
-    except Exception as e:
-        print(f"[init] Elo re-ranker setup failed ({e!r}); "
-              f"continuing with rank-based prior")
-        reranker = None
+    if bool(merged.get("reranker_enabled", False)):
+        print("[init] saved config requested the retired Elo re-ranker; "
+              "forcing it off")
+    else:
+        print("[init] Elo re-ranker disabled")
 
     # ---- adaptive batch growth: start from the configured (G, K) ----
     if resume_payload is not None:

@@ -579,12 +579,14 @@ Rules:
             if self.gpu_type.strip().lower() not in ("h200",):
                 seed_us = self.cfg.get("mla_seed_runtime_us")
                 if seed_us is None:
-                    raise ValueError(
-                        f"problem_type=mla_decode_nvidia seeds the tree with an "
-                        f"H200 runtime ({abs(float(MLA_DECODE_INITIAL_VALUE))} us) "
-                        f"but gpu_type={self.gpu_type}. Benchmark the initial "
-                        f"state on your hardware and set mla_seed_runtime_us, or "
-                        f"use problem_type=trimul, which seeds from empty code.")
+                    print(
+                        f"[gpu_mode] mla_seed_runtime_us is null for "
+                        f"gpu_type={self.gpu_type}; seeding with the reference "
+                        "code and an unmeasured neutral value")
+                    return [SeedState(
+                        code=MLA_DECODE_INITIAL_STATE, value=0.0,
+                        raw_score=None, construction=[],
+                    ) for _ in range(self.num_seed_states)]
                 us = abs(float(seed_us))
                 reward = float(self.score_scale / us) if us > 0 else 0.0
                 return [SeedState(code=MLA_DECODE_INITIAL_STATE, value=reward,

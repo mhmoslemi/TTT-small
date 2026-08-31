@@ -462,7 +462,9 @@ class VLLMBackendTests(unittest.TestCase):
     def test_every_problem_yaml_matches_its_problem_contract(self):
         import yaml
 
-        from config_validation import validate_problem_config
+        from config_validation import (
+            RERANKER_REQUIRED_KEYS, validate_problem_config,
+        )
 
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         self.assertFalse((config_dir / "defaults.yaml").exists())
@@ -471,6 +473,16 @@ class VLLMBackendTests(unittest.TestCase):
         for path in paths:
             data = yaml.safe_load(path.read_text())
             validate_problem_config(data, source=path)
+            self.assertFalse(data["reranker_enabled"], path.name)
+            self.assertTrue(
+                RERANKER_REQUIRED_KEYS <= set(data), path.name,
+            )
+            self.assertIn("memory_curate_max_new_tokens", data, path.name)
+            self.assertIn("memory_hygiene_profile", data, path.name)
+            self.assertIn("adam_beta1", data, path.name)
+            self.assertIn("adam_beta2", data, path.name)
+            self.assertIn("adam_epsilon", data, path.name)
+            self.assertIn("weight_decay", data, path.name)
 
             if data["problem"] == "gpu_mode":
                 self.assertEqual(data["gpu_type"], "H100", path.name)
@@ -486,8 +498,52 @@ class VLLMBackendTests(unittest.TestCase):
 
             if data["problem"] == "circle_packing":
                 self.assertIn("num_circles", data, path.name)
+                self.assertIn("degenerate_threshold", data, path.name)
             else:
                 self.assertNotIn("num_circles", data, path.name)
+
+            if data.get("problem_type") == "mla_decode_nvidia":
+                self.assertIn("mla_seed_runtime_us", data, path.name)
+
+    def test_memory_and_feedback_dataclasses_match_yaml_contract(self):
+        from dataclasses import fields
+
+        from config_validation import COMMON_REQUIRED_KEYS
+        from feedback import FeedbackConfig
+        from memory.config import MemoryConfig
+
+        memory_keys = {
+            "memory" if field.name == "enabled" else f"memory_{field.name}"
+            for field in fields(MemoryConfig)
+        }
+        feedback_keys = {
+            ("feedback" if field.name == "enabled" else
+             "feedback_lambda" if field.name == "lambda_f" else
+             f"feedback_{field.name}")
+            for field in fields(FeedbackConfig)
+        }
+
+        self.assertEqual(
+            {key for key in COMMON_REQUIRED_KEYS
+             if key == "memory" or key.startswith("memory_")},
+            memory_keys,
+        )
+        self.assertEqual(
+            {key for key in COMMON_REQUIRED_KEYS
+             if key == "feedback" or key.startswith("feedback_")},
+            feedback_keys,
+        )
+
+    def test_complete_yaml_rejects_missing_disabled_reranker_switch(self):
+        import yaml
+
+        from config_validation import validate_problem_config
+
+        path = Path(__file__).resolve().parents[1] / "configs" / "erdos.yaml"
+        data = yaml.safe_load(path.read_text())
+        data.pop("reranker_enabled")
+        with self.assertRaisesRegex(ValueError, "reranker_enabled"):
+            validate_problem_config(data, source=path)
 
     def test_problem_yaml_contract_rejects_cross_problem_fields(self):
         from config_validation import validate_problem_config

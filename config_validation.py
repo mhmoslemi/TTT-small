@@ -11,9 +11,23 @@ from pathlib import Path
 # memory, and feedback runtimes. Every checked-in preset carries them so a
 # selected YAML is self-contained, but that does not make problem-specific
 # fields interchangeable.
+RERANKER_REQUIRED_KEYS = frozenset("""
+reranker_enabled reranker_backend reranker_model reranker_base_url
+reranker_api_key reranker_api_key_env reranker_temperature
+reranker_max_tokens reranker_request_timeout_s reranker_judge_gpu
+reranker_judge_batch_size reranker_judge_load_in_4bit reranker_top_p
+reranker_max_seq_length reranker_top_k reranker_debate
+reranker_tournament_mode reranker_num_random_matches reranker_both_orders
+reranker_judge_concurrency reranker_max_code_chars reranker_elo_init
+reranker_elo_k reranker_elo_softmax_temp reranker_prior_weight
+reranker_poll_interval_s reranker_min_states_to_rank reranker_goal
+""".split())
+
+
 COMMON_REQUIRED_KEYS = frozenset("""
 problem target
-model_name backend max_seq_length load_in_4bit lora_rank lora_alpha
+fail_score model_name training_model_name backend max_seq_length load_in_4bit
+lora_rank lora_alpha
 lora_dropout target_modules
 training_gpu_id available_gpu_ids reserve_last_gpu_for_evaluation
 evaluation_gpu_id num_gpus gpu_ids sequential_generation
@@ -24,18 +38,20 @@ vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel
 num_steps groups_per_step group_size num_seed_states max_groups_per_step
 max_group_size growth_force_step growth_valid_yield growth_distinct_min
-growth_factor learning_rate kl_penalty_coef grad_clip
+growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
+kl_penalty_coef grad_clip
 train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
 max_new_tokens temperature top_p thinking deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
-memory memory_extract_mode memory_lessons_per_call
+memory memory_extract_mode memory_lessons_per_call memory_hygiene_profile
 memory_max_examples_per_call memory_max_chars_per_example
 memory_feedback_chars memory_max_new_tokens memory_forbid_constructions
 memory_max_code_lines memory_global_scope_allows_code memory_lookup_mode
 memory_lookup_max_select memory_lookup_fallback memory_lookup_max_new_tokens
 memory_lookup_temperature memory_catalog_max_lessons memory_catalog_chars
 memory_curate_every memory_curate_min_bank memory_curate_max_items
+memory_curate_max_new_tokens
 memory_curate_min_keep_frac memory_max_lessons memory_dedup_jaccard
 memory_reinforce_delta memory_persist memory_inject_mode memory_token_budget
 memory_grant_context memory_arm_control_fraction memory_arm_explore_fraction
@@ -48,18 +64,18 @@ feedback_auto_fraction feedback_include_constant_groups feedback_inject_mode
 feedback_normalize feedback_adaptive feedback_validity_floor
 feedback_validity_target feedback_max_reward_ratio feedback_reward_scale_floor
 feedback_max_per_signature feedback_auto_signature_fraction
-""".split())
+""".split()) | RERANKER_REQUIRED_KEYS
 
-COMMON_OPTIONAL_KEYS = frozenset({
-    "fail_score", "memory_hygiene_profile", "training_model_name",
-})
+COMMON_OPTIONAL_KEYS = frozenset()
 
 CPU_PROBLEMS = frozenset({
     "circle_packing", "erdos", "ac1", "ac2", "denoising",
 })
 
 PROBLEM_REQUIRED_KEYS = {
-    "circle_packing": frozenset({"num_circles", "eval_cpus"}),
+    "circle_packing": frozenset({
+        "num_circles", "degenerate_threshold", "eval_cpus",
+    }),
     "erdos": frozenset({"budget_s", "eval_cpus"}),
     "ac1": frozenset({"problem_type", "budget_s", "eval_cpus"}),
     "ac2": frozenset({"problem_type", "budget_s", "eval_cpus"}),
@@ -68,12 +84,11 @@ PROBLEM_REQUIRED_KEYS = {
         "problem_type", "score_scale", "gpu_type", "gpu_lease_timeout_s",
         "triton_version", "task_yaml", "lib_dir", "kernel_log_chars",
         "kernel_timeout_s", "show_launch_note", "seed_from_reference",
-        "memory_hygiene_profile",
     }),
 }
 
 PROBLEM_OPTIONAL_KEYS = {
-    "circle_packing": frozenset({"degenerate_threshold"}),
+    "circle_packing": frozenset(),
     "erdos": frozenset(),
     "ac1": frozenset(),
     "ac2": frozenset(),
@@ -168,6 +183,13 @@ def validate_problem_config(
             f"{_label(source)}: unsupported gpu_mode problem_type "
             f"{data.get('problem_type')!r}"
         )
+    if (problem == "gpu_mode"
+            and data.get("problem_type") == "mla_decode_nvidia"
+            and "mla_seed_runtime_us" not in data):
+        raise ValueError(
+            f"{_label(source)}: mla_decode_nvidia requires the explicit "
+            "mla_seed_runtime_us key (use null until measured on gpu_type)"
+        )
 
     for key in ("num_steps", "groups_per_step", "group_size",
                 "num_seed_states", "max_new_tokens", "max_seq_length"):
@@ -186,6 +208,18 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: top_p must be in (0, 1]")
     if "memory_top_p" in data and not 0 < float(data["memory_top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: memory_top_p must be in (0, 1]")
+    for key in ("adam_beta1", "adam_beta2"):
+        if key in data and not 0 <= float(data[key]) < 1:
+            raise ValueError(f"{_label(source)}: {key} must be in [0, 1)")
+    if "adam_epsilon" in data:
+        _positive_number(data, "adam_epsilon", source)
+    if "weight_decay" in data and float(data["weight_decay"]) < 0:
+        raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
+    if "reranker_enabled" in data and data["reranker_enabled"] is not False:
+        raise ValueError(
+            f"{_label(source)}: reranker_enabled must be false; the Elo "
+            "reranker implementation is not installed"
+        )
     if "reward_workers" in data and int(data["reward_workers"]) < 0:
         raise ValueError(f"{_label(source)}: reward_workers must be >= 0")
     if problem == "gpu_mode" and data.get("reward_workers") != 1:
