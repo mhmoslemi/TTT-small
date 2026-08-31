@@ -10,7 +10,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # it before invoking the script); Python derives every role from it. The first
 # card always trains. GPU-mode reserves the last card for evaluation when a
 # separate card exists.
-export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0}"
+export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2}"
 
 # FlashInfer sampling can trigger runtime compilation and require nvcc. vLLM's
 # native PyTorch/Triton sampler is the safe default; callers may explicitly opt
