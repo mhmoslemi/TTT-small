@@ -9,14 +9,68 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 import os
+import sys
 import argparse
 import json
 import random
 import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import yaml
+
+
+_ROUTED_DEPENDENCY_NOTICES = (
+    "Skipping import of cpp extensions due to incompatible torch version.",
+    "No prebuilt binary for CUDA",
+)
+
+
+class _NoticeRoutingStream:
+    """Keep ordinary model-loading output visible and route known noise."""
+
+    def __init__(self, visible, diagnostic, label):
+        self.visible = visible
+        self.diagnostic = diagnostic
+        self.label = label
+        self._routing_line = False
+
+    def write(self, value):
+        for piece in str(value).splitlines(keepends=True):
+            route = (self._routing_line
+                     or any(marker in piece
+                            for marker in _ROUTED_DEPENDENCY_NOTICES))
+            if route:
+                if not self._routing_line:
+                    self.diagnostic.write(f"[{self.label}] ")
+                self.diagnostic.write(piece)
+            else:
+                self.visible.write(piece)
+            self._routing_line = bool(
+                route and not piece.endswith(("\n", "\r")))
+        return len(value)
+
+    def flush(self):
+        self.visible.flush()
+        self.diagnostic.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.visible, name)
+
+
+@contextmanager
+def _route_dependency_notices(log_path):
+    if not log_path:
+        yield
+        return
+    with open(log_path, "a", buffering=1, encoding="utf-8") as diagnostic:
+        stdout = _NoticeRoutingStream(
+            sys.stdout, diagnostic, "trainer dependency stdout")
+        stderr = _NoticeRoutingStream(
+            sys.stderr, diagnostic, "trainer dependency stderr")
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            yield
 
 
 # ======================================================================
@@ -1708,6 +1762,14 @@ def main():
     exp_dir = make_experiment_dir(
         cfg, resume_dir=resume_dir, config_dict=merged
     )
+    vllm_log_path = None
+    if cfg.generation_backend == "vllm":
+        vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
+        with open(vllm_log_path, "a", encoding="utf-8") as log_handle:
+            log_handle.write(
+                f"\n=== TTT vLLM log parent_pid={os.getpid()} "
+                f"run_dir={Path(exp_dir).resolve()} ===\n")
+        print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
 
     # One effective seed for every generation stream. None => not seeded, which
     # is the original behaviour. Set once here and threaded through unchanged.
@@ -1779,9 +1841,10 @@ def main():
 
     # ---- backend + model ----
     # Load backend FIRST so Unsloth can patch transformers if used.
-    from model_backend import load_backend
-    backend = load_backend(cfg.backend, cfg)
-    model, tokenizer = backend.load()
+    with _route_dependency_notices(vllm_log_path):
+        from model_backend import load_backend
+        backend = load_backend(cfg.backend, cfg)
+        model, tokenizer = backend.load()
     effective_4bit = bool(getattr(cfg, "effective_load_in_4bit",
                                   cfg.load_in_4bit))
     print(f"[precision] training copy: "
@@ -1892,6 +1955,7 @@ def main():
             vllm_pipeline_parallel_size=cfg.vllm_pipeline_parallel_size,
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
+            vllm_log_path=vllm_log_path,
         )
         if cfg.generation_backend == "vllm":
             trainer_offloaded = False

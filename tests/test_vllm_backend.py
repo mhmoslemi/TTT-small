@@ -1,10 +1,11 @@
+import io
 import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, mock_open, patch
 
 from gen_workers import (
     GenerationPool,
@@ -12,6 +13,7 @@ from gen_workers import (
     OnDemandGenerationPool,
     PhasedVLLMGenerationPool,
     distribute_jobs,
+    _redirect_vllm_output,
     _vllm_engine_kwargs,
     _vllm_job_seed,
     _vllm_worker_loop,
@@ -67,6 +69,42 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_vllm_output_redirects_both_fds_to_append_log(self):
+        opened = mock_open()
+        opened.return_value.fileno.return_value = 73
+        with patch("gen_workers.open", opened, create=True), patch(
+                "gen_workers.os.makedirs") as makedirs, patch(
+                "gen_workers.os.dup2") as dup2, patch("builtins.print"):
+            handle = _redirect_vllm_output(
+                "/tmp/example-run/vllm.log", 2, [4, 5])
+
+        self.assertIs(handle, opened.return_value)
+        opened.assert_called_once_with(
+            "/tmp/example-run/vllm.log", "a", buffering=1,
+            encoding="utf-8")
+        makedirs.assert_called_once_with("/tmp/example-run", exist_ok=True)
+        self.assertEqual(dup2.call_args_list, [call(73, 1), call(73, 2)])
+
+    def test_known_dependency_notices_are_hidden_from_console(self):
+        from train_multy import _NoticeRoutingStream
+
+        visible = io.StringIO()
+        diagnostic = io.StringIO()
+        stream = _NoticeRoutingStream(visible, diagnostic, "dependency")
+        stream.write("ordinary model loading output\n")
+        stream.write(
+            "Skipping import of cpp extensions due to incompatible torch "
+            "version.")
+        stream.write(" Please upgrade torch.\n")
+        stream.write(
+            "No prebuilt binary for CUDA 12.9, loading CUDA 12.8 instead.\n")
+
+        self.assertEqual(visible.getvalue(), "ordinary model loading output\n")
+        routed = diagnostic.getvalue()
+        self.assertIn("Skipping import of cpp extensions", routed)
+        self.assertIn("Please upgrade torch.", routed)
+        self.assertIn("No prebuilt binary for CUDA 12.9", routed)
+
     def test_every_problem_yaml_is_standalone(self):
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         self.assertFalse((config_dir / "defaults.yaml").exists())
@@ -405,6 +443,7 @@ class VLLMBackendTests(unittest.TestCase):
     def test_vllm_worker_preserves_result_queue_contract(self):
         fake_vllm = types.ModuleType("vllm")
         fake_request = types.ModuleType("vllm.lora.request")
+        allocator_confs = []
 
         class SamplingParams:
             def __init__(self, **kwargs):
@@ -427,7 +466,8 @@ class VLLMBackendTests(unittest.TestCase):
 
         class LLM:
             def __init__(self, **_kwargs):
-                pass
+                allocator_confs.append(
+                    os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
 
             def get_tokenizer(self):
                 return types.SimpleNamespace(encode=lambda prompt: [1] * len(prompt))
@@ -455,7 +495,11 @@ class VLLMBackendTests(unittest.TestCase):
             "vllm.lora": types.ModuleType("vllm.lora"),
             "vllm.lora.request": fake_request,
         }
-        with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=False):
+        with patch.dict(sys.modules, modules), patch.dict(
+                os.environ, {
+                    "PYTORCH_CUDA_ALLOC_CONF":
+                    "max_split_size_mb:128,expandable_segments:True",
+                }, clear=False):
             _vllm_worker_loop(
                 rank=0,
                 gpu_id=3,
@@ -466,8 +510,10 @@ class VLLMBackendTests(unittest.TestCase):
                 result_queue=result_queue,
                 ready_queue=ready_queue,
                 seed=42,
+                enable_sleep_mode=True,
             )
 
+        self.assertEqual(allocator_confs, ["max_split_size_mb:128"])
         self.assertEqual(ready_queue.items, [("ready", 0, "")])
         self.assertEqual(result_queue.items, [
             (0, 7, [("prompt-0", [1]), ("prompt-1", [2])]),

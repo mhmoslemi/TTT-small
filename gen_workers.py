@@ -45,6 +45,7 @@ Protocol (per step):
 
 import os
 import queue
+import sys
 import threading
 import traceback
 import multiprocessing as mp
@@ -423,6 +424,48 @@ def _vllm_job_seed(seed, step, rank, group_idx):
     return (worker_seed(seed, step, rank) + int(group_idx) * 104_729) % (2 ** 31 - 1)
 
 
+def _prepare_vllm_sleep_allocator_env():
+    """Remove PyTorch's expandable allocator only inside sleep-mode workers.
+
+    vLLM's CuMemAllocator backs sleep/wake and explicitly rejects expandable
+    segments. The trainer remains in its parent process and keeps the setting.
+    """
+    for name in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        entries = [entry.strip() for entry in raw.split(",") if entry.strip()]
+        kept = [entry for entry in entries
+                if entry.lower() != "expandable_segments:true"]
+        if len(kept) == len(entries):
+            continue
+        if kept:
+            os.environ[name] = ",".join(kept)
+        else:
+            os.environ.pop(name, None)
+        print(f"[vllm] removed expandable_segments from {name}; sleep mode "
+              "requires vLLM's CuMemAllocator", flush=True)
+
+
+def _redirect_vllm_output(log_path, rank, gpu_group):
+    """Send this worker and all engine-core descendants to one append log."""
+    if not log_path:
+        return None
+    log_path = os.path.abspath(os.fspath(log_path))
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    handle = open(log_path, "a", buffering=1, encoding="utf-8")
+    os.dup2(handle.fileno(), 1)
+    os.dup2(handle.fileno(), 2)
+    print(f"\n=== vLLM worker {rank} pid={os.getpid()} "
+          f"physical_gpus={list(gpu_group)} ===", flush=True)
+    return handle
+
+
 def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       task_queue, result_queue, ready_queue, seed=None,
                       lora_rank=32, gpu_memory_utilization=0.9,
@@ -431,11 +474,19 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       tensor_parallel_size=1, pipeline_parallel_size=1,
                       max_num_batched_tokens=0,
                       enable_expert_parallel=False, enable_sleep_mode=False,
-                      control_queue=None):
+                      control_queue=None, vllm_log_path=None):
     """Persistent vLLM engine spanning one physical GPU group."""
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_group)
+    # Redirect before importing vLLM/torch. Engine-core subprocesses inherit
+    # stdout/stderr and therefore append to the same run-local file.
+    _worker_log_handle = _redirect_vllm_output(
+        vllm_log_path, rank, gpu_group)
+    # Must happen before importing vLLM (and therefore torch). Spawned engine
+    # core children inherit this worker-specific environment.
+    if enable_sleep_mode:
+        _prepare_vllm_sleep_allocator_env()
     # FlashInfer sampling defaults on in recent vLLM releases and may try to
     # compile at runtime with nvcc. Keep the dependency-free native sampler as
     # the default while preserving an explicit operator override.
@@ -477,7 +528,12 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
               f"PP={pipeline_parallel_size}) ...", flush=True)
         llm = LLM(**engine_kwargs)
     except Exception:
-        ready_queue.put(("error", rank, traceback.format_exc()))
+        detail = traceback.format_exc()
+        if vllm_log_path:
+            print(f"[vllm worker {rank}] startup failed:\n{detail}",
+                  file=sys.stderr, flush=True)
+            detail = f"details: {os.path.abspath(os.fspath(vllm_log_path))}"
+        ready_queue.put(("error", rank, detail))
         return
 
     # Paths are versioned (adapter_step000, adapter_step001, ...). Giving each
@@ -507,9 +563,15 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 if control_queue is not None:
                     control_queue.put(("ok", rank, command, ""))
             except Exception:
+                detail = traceback.format_exc()
+                if vllm_log_path:
+                    print(f"[vllm worker {rank}] {command} failed:\n{detail}",
+                          file=sys.stderr, flush=True)
+                    detail = ("details: "
+                              f"{os.path.abspath(os.fspath(vllm_log_path))}")
                 if control_queue is not None:
                     control_queue.put(
-                        ("error", rank, command, traceback.format_exc()))
+                        ("error", rank, command, detail))
             continue
         step, adapter_path, jobs, gen_kwargs = task
         if not jobs:
@@ -588,7 +650,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         except Exception:
             detail = traceback.format_exc()
             print(f"[vllm worker {rank}] generation failed:\n{detail}",
-                  flush=True)
+                  file=sys.stderr, flush=True)
+            if vllm_log_path:
+                detail = ("details: "
+                          f"{os.path.abspath(os.fspath(vllm_log_path))}")
             result_queue.put((rank, None, {"error": detail}))
 
     print(f"[vllm worker {rank}] shutting down", flush=True)
@@ -614,7 +679,8 @@ class GenerationPool:
                  vllm_pipeline_parallel_size=1,
                  vllm_max_num_batched_tokens=0,
                  vllm_enable_expert_parallel=False,
-                 vllm_enable_sleep_mode=False):
+                 vllm_enable_sleep_mode=False,
+                 vllm_log_path=None):
         self.model_name = model_name
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
@@ -623,6 +689,8 @@ class GenerationPool:
         self.backend = str(backend).lower()
         self.sleep_requested = bool(vllm_enable_sleep_mode)
         self.sleep_supported = False
+        self.vllm_log_path = (os.path.abspath(os.fspath(vllm_log_path))
+                              if vllm_log_path else None)
         if self.backend not in ("hf", "vllm"):
             raise ValueError(
                 f"unknown generation backend {backend!r}; expected hf|vllm")
@@ -679,6 +747,7 @@ class GenerationPool:
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             "enable_sleep_mode": self.sleep_requested,
             "control_queue": self.control_queue,
+            "vllm_log_path": self.vllm_log_path,
         }
         for r in range(self.num_workers):
             p = ctx.Process(

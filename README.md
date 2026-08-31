@@ -39,10 +39,22 @@ cannot contend on the evaluation card. On a one-card GPU-mode run, the trainer
 is also offloaded during the benchmark phase, so training, generation, and
 candidate evaluation never hold that GPU concurrently.
 
+The trainer keeps `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, but
+sleep-enabled vLLM workers remove only that allocator option before importing
+torch. vLLM's sleep-mode CuMem memory pool is incompatible with expandable
+segments; isolating the worker environment avoids the startup assertion without
+giving up the trainer-side fragmentation protection.
+
 Rollouts are never submitted prompt-by-prompt to vLLM: every engine receives
 its full assigned prompt set in one scheduler call. HF similarly forms
 cross-prompt micro-batches on each card and halves a sticky batch ceiling after
 an OOM, preserving concurrency without retrying an unsafe batch size.
+
+When vLLM is selected, the launcher announces `<run-dir>/vllm.log` near the
+start of the run. Every vLLM worker and engine-core descendant appends stdout
+and stderr there instead of flooding the training console. The known Torch
+extension-version and BitsAndBytes CUDA-fallback notices emitted while loading
+the trainer are routed there as well; normal trainer progress remains visible.
 
 `load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
 available and appropriate; checkpoint-native quantization such as GPT-OSS
