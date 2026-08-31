@@ -416,16 +416,30 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
                                 memory: Dict[int, GPUMemory],
                                 num_attention_heads: Optional[int]
                                 ) -> VLLMParallelLayout:
-    """Select compatible TP replicas, promoting replicas to PP if needed.
+    """Use the smallest fitting TP group so rollout replicas stay parallel.
 
-    A compatible TP factor is preferred because independent replicas maximize
-    rollout throughput. If one such engine cannot fit a request on a card, the
-    remaining GPU factor becomes pipeline parallelism instead. TP*PP then uses
-    the exact generation inventory while preserving head divisibility.
+    Every compatible TP divisor is considered from smallest to largest.  The
+    first one whose model and minimum KV-cache estimate fit becomes the engine
+    size; all remaining cards form independent replicas.  Only when no
+    compatible TP group fits do the remaining cards become pipeline stages.
+    In every case ``replicas * TP * PP`` consumes the exact GPU inventory.
     """
     num_gpus = len(roles.generation)
-    tp = derive_vllm_tensor_parallel_size(num_gpus, num_attention_heads)
-    candidate_replicas = num_gpus // tp
+    max_compatible_tp = derive_vllm_tensor_parallel_size(
+        num_gpus, num_attention_heads)
+
+    if num_attention_heads:
+        compatible_tp = [
+            factor for factor in range(1, max_compatible_tp + 1)
+            if num_gpus % factor == 0
+            and int(num_attention_heads) % factor == 0
+        ]
+    else:
+        # Without checkpoint head metadata, retain the strict all-card TP
+        # choice.  Splitting an unknown architecture into speculative replicas
+        # could otherwise discover an incompatible TP factor only after every
+        # engine has started loading.
+        compatible_tp = [max_compatible_tp]
 
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected), default=80.0)
@@ -433,13 +447,19 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)
     budget = min_total * util
-    required = _minimum_vllm_gib_per_gpu(cfg, tp)
 
-    pp = 1
-    replicas = candidate_replicas
-    if candidate_replicas > 1 and required > budget:
-        pp = candidate_replicas
-        replicas = 1
+    tp = compatible_tp[-1]
+    required = _minimum_vllm_gib_per_gpu(cfg, tp)
+    pp = num_gpus // tp
+    replicas = 1
+    for candidate_tp in compatible_tp:
+        candidate_required = _minimum_vllm_gib_per_gpu(cfg, candidate_tp)
+        if candidate_required <= budget:
+            tp = candidate_tp
+            required = candidate_required
+            pp = 1
+            replicas = num_gpus // candidate_tp
+            break
 
     return VLLMParallelLayout(
         tensor_parallel_size=tp,

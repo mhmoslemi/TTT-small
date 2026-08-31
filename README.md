@@ -47,9 +47,14 @@ ordered generation group and uses a balanced device map when it has multiple
 cards, so a model too large for GPU 0 is sharded across the group. HF/Unsloth
 generation uses that live model with cross-prompt batches. With vLLM, the
 training shards and optimizer are offloaded before the all-card TP/PP engines
-wake; the engines sleep and release GPU allocations before the original shard
-map is restored. If the installed vLLM lacks sleep mode, the safe fallback is a
-transient rollout engine. GPU-mode evaluation uses a physical-device file
+wake. Engines start lazily at the first rollout and use level-2 deep sleep
+between phases, discarding weights instead of retaining one full CPU-RAM backup
+per replica; wake reloads the unchanged base checkpoint before applying the
+next LoRA. If safe deep sleep is unavailable, the fallback is a transient
+rollout engine. Startup and sleep/wake controls have hard defaults of 900 and
+600 seconds, configurable through `TTT_VLLM_STARTUP_TIMEOUT_S` and
+`TTT_VLLM_CONTROL_TIMEOUT_S`, so a living wrapper around a dead engine core
+cannot hang indefinitely. GPU-mode evaluation uses a physical-device file
 lease, and `reward_workers` is forced to one, so two candidate benchmarks
 cannot contend on the evaluation card. On a one-card GPU-mode run, the trainer
 is also offloaded during the benchmark phase, so training, generation, and

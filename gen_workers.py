@@ -43,8 +43,10 @@ Protocol (per step):
        one message PER JOB, so the pool can stream results as they land.
 """
 
+import importlib.metadata
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -462,6 +464,60 @@ def _prepare_vllm_sleep_allocator_env():
               "requires vLLM's CuMemAllocator", flush=True)
 
 
+def _flashinfer_comm_guard_required(package_version, python_version=None):
+    """Return whether FlashInfer's comm package has the annotation bug."""
+    python_version = (sys.version_info[:2] if python_version is None
+                      else tuple(python_version[:2]))
+    if python_version not in ((3, 10), (3, 11)):
+        return False
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(package_version or ""))
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) < (0, 6, 17)
+
+
+def _prepare_flashinfer_comm_compat():
+    """Disable only broken FlashInfer communication in vLLM subprocesses.
+
+    FlashInfer before 0.6.17 evaluates ``array.array[int]`` while importing its
+    communication package. Python 3.10/3.11 reject that annotation, and vLLM
+    0.28 imports the optional module even when FlashInfer all-reduce is off.
+    Blocking that package makes vLLM use its regular NCCL/custom all-reduce.
+    A scoped ``sitecustomize`` path propagates the block into vLLM's freshly
+    spawned engine and tensor-parallel workers.
+    """
+    try:
+        package_version = importlib.metadata.version("flashinfer-python")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    if not _flashinfer_comm_guard_required(package_version):
+        return False
+
+    marker = "TTT_VLLM_DISABLE_BROKEN_FLASHINFER_COMM"
+    os.environ[marker] = "1"
+    os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"] = "0"
+    compat_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "vllm_compat")
+    python_path = [
+        entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if entry
+    ]
+    if compat_dir not in python_path:
+        os.environ["PYTHONPATH"] = os.pathsep.join([compat_dir, *python_path])
+
+    # Covers this worker and forked children. sitecustomize covers children
+    # created with multiprocessing's fresh-interpreter spawn method.
+    for module_name in tuple(sys.modules):
+        if (module_name == "flashinfer.comm"
+                or module_name.startswith("flashinfer.comm.")):
+            sys.modules.pop(module_name, None)
+    sys.modules["flashinfer.comm"] = None
+    print(f"[vllm] FlashInfer {package_version} communication disabled for "
+          f"Python {sys.version_info.major}.{sys.version_info.minor}; using "
+          "vLLM NCCL/custom all-reduce", flush=True)
+    return True
+
+
 def _redirect_vllm_output(log_path, rank, gpu_group):
     """Send this worker and all engine-core descendants to one append log."""
     if not log_path:
@@ -506,6 +562,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # compile at runtime with nvcc. Keep the dependency-free native sampler as
     # the default while preserving an explicit operator override.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    _prepare_flashinfer_comm_compat()
     if seed is not None:
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")

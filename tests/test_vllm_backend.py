@@ -14,6 +14,8 @@ from gen_workers import (
     OnDemandGenerationPool,
     PhasedVLLMGenerationPool,
     distribute_jobs,
+    _flashinfer_comm_guard_required,
+    _prepare_flashinfer_comm_compat,
     _redirect_vllm_output,
     _vllm_engine_kwargs,
     _vllm_job_seed,
@@ -357,6 +359,31 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(layout.pipeline_parallel_size, 1)
         self.assertEqual(layout.replicas, 3)
 
+    def test_four_l40s_run_keeps_four_qwen8b_rollout_replicas(self):
+        roles = allocate_gpu_roles([0, 1, 2, 3], "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "L40S", 45.0, 44.4)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "Qwen/Qwen3-8B",
+            "max_seq_length": 35400,
+            "memory": True,
+            "memory_grant_context": True,
+            "memory_token_budget": 3400,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+        }
+
+        layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, detect_attention_heads(cfg["model_name"]))
+
+        self.assertEqual(layout.tensor_parallel_size, 1)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 4)
+        self.assertLessEqual(
+            layout.unsharded_stage_required_gib, layout.budget_gib)
+
     def test_vllm_output_redirects_both_fds_to_append_log(self):
         opened = mock_open()
         opened.return_value.fileno.return_value = 73
@@ -698,6 +725,36 @@ class VLLMBackendTests(unittest.TestCase):
         first = _vllm_job_seed(42, 3, 1, 2)
         self.assertEqual(first, _vllm_job_seed(42, 3, 1, 2))
         self.assertNotEqual(first, _vllm_job_seed(42, 3, 1, 3))
+
+    def test_flashinfer_comm_guard_targets_only_affected_python_and_versions(self):
+        self.assertTrue(_flashinfer_comm_guard_required(
+            "0.6.16.post3", (3, 11)))
+        self.assertTrue(_flashinfer_comm_guard_required("0.6.15", (3, 10)))
+        self.assertFalse(_flashinfer_comm_guard_required("0.6.17", (3, 11)))
+        self.assertFalse(_flashinfer_comm_guard_required("0.6.16", (3, 12)))
+        self.assertFalse(_flashinfer_comm_guard_required("unknown", (3, 11)))
+
+    def test_flashinfer_comm_guard_propagates_to_vllm_children(self):
+        stale_module = types.ModuleType("flashinfer.comm.fd_exchange")
+        with patch("gen_workers.importlib.metadata.version",
+                   return_value="0.6.16.post3"), patch(
+                   "gen_workers._flashinfer_comm_guard_required",
+                   return_value=True), patch.dict(
+                   os.environ, {"PYTHONPATH": "/existing/path"},
+                   clear=False), patch.dict(
+                   sys.modules,
+                   {"flashinfer.comm.fd_exchange": stale_module},
+                   clear=False):
+            changed = _prepare_flashinfer_comm_compat()
+
+            self.assertTrue(changed)
+            self.assertEqual(
+                os.environ["TTT_VLLM_DISABLE_BROKEN_FLASHINFER_COMM"], "1")
+            self.assertEqual(os.environ["VLLM_ALLREDUCE_USE_FLASHINFER"], "0")
+            self.assertTrue(os.environ["PYTHONPATH"].split(os.pathsep)[0].endswith(
+                "vllm_compat"))
+            self.assertIsNone(sys.modules["flashinfer.comm"])
+            self.assertNotIn("flashinfer.comm.fd_exchange", sys.modules)
 
     def test_generation_pool_rejects_unknown_backend_before_spawning(self):
         with self.assertRaisesRegex(ValueError, r"expected hf\|vllm"):
@@ -1111,7 +1168,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(derive_vllm_tensor_parallel_size(8, 32), 8)
         self.assertEqual(derive_vllm_tensor_parallel_size(7, None), 7)
 
-    def test_gpu_mode_roles_type_and_tp_come_from_inventory(self):
+    def test_gpu_mode_roles_type_and_replica_count_come_from_inventory(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
@@ -1136,11 +1193,12 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(cfg.num_training_gpus, 4)
         self.assertEqual(cfg.gpu_ids, "0,1,2,3")
         self.assertEqual(cfg.evaluation_gpu_id, 6)
-        self.assertEqual(cfg.vllm_tensor_parallel_size, 4)
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+        self.assertEqual(cfg.vllm_pipeline_parallel_size, 1)
         self.assertEqual(cfg.gpu_type, "H100")
         self.assertEqual(cfg.reward_workers, 1)
 
-    def test_incompatible_all_card_tp_becomes_compatible_replicas(self):
+    def test_six_fitting_gpus_become_six_parallel_replicas(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
@@ -1161,7 +1219,8 @@ class VLLMBackendTests(unittest.TestCase):
                     cfg, _ = load_config()
 
         self.assertEqual(cfg.gpu_ids, "0,1,2,3,4,5")
-        self.assertEqual(cfg.vllm_tensor_parallel_size, 2)
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+        self.assertEqual(cfg.vllm_pipeline_parallel_size, 1)
         self.assertEqual(cfg.num_gpus, 6)
 
 
