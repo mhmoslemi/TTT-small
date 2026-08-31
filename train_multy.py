@@ -2268,11 +2268,10 @@ def main():
     mem_cfg, memory, extractor, lookup, curator = setup_memory(
         merged, problem, cfg, mem_cfg=mem_cfg,
         backend=backend, model=model, tokenizer=tokenizer,
-        # A sleeping/shared vLLM pool cannot wake beside the trainer. The
-        # hybrid HF pool is safe and lets small memory calls rotate over all
-        # rollout cards too.
-        gen_pool=(gen_pool if gen_pool is not None
-                  and not getattr(gen_pool, "sequential", False) else None),
+        # PoolMemoryLLM treats a shared-card vLLM call as its own phase: it
+        # offloads the trainer through the pool callback, generates, then
+        # releases the pool and restores training placement in a finally block.
+        gen_pool=gen_pool,
         exp_dir=exp_dir, seed=run_seed,
     )
     if resume_payload is not None and memory is not None:

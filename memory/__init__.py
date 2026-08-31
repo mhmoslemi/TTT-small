@@ -100,6 +100,7 @@ def setup_memory(merged: dict, problem, cfg, mem_cfg=None, backend=None,
 
     llm = make_memory_llm(mem_cfg, backend=backend, model=model,
                           tokenizer=tokenizer, gen_pool=gen_pool, seed=seed,
+                          max_seq_length=getattr(cfg, "max_seq_length", None),
                           verbose=verbose)
     meta = build_meta_description(problem, cfg)
     from memory.hygiene import resolve_profile
