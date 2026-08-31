@@ -766,7 +766,10 @@ class VLLMBackendTests(unittest.TestCase):
             sleep_supported = True
 
             def __init__(self, **kwargs):
-                events.append(("start", kwargs["vllm_enable_sleep_mode"]))
+                events.append(("start", (
+                    kwargs["vllm_enable_sleep_mode"],
+                    kwargs["vllm_sleep_level"],
+                )))
 
             def sleep(self):
                 events.append(("sleep", None))
@@ -789,13 +792,17 @@ class VLLMBackendTests(unittest.TestCase):
             )
             got = list(pool.iter_group_jobs())
             pool.release()
+            got_again = list(pool.iter_group_jobs())
+            pool.release()
             pool.shutdown()
 
         self.assertEqual(got, [(0, [("ok", [1])])])
+        self.assertEqual(got_again, [(0, [("ok", [1])])])
         self.assertEqual(events, [
-            ("offload", None), ("start", True), ("sleep", None),
-            ("restore", None), ("offload", None), ("wake", None),
+            ("offload", None), ("start", (True, 2)),
             ("generate", None), ("sleep", None), ("restore", None),
+            ("offload", None), ("wake", None), ("generate", None),
+            ("sleep", None), ("restore", None),
             ("shutdown", None),
         ])
 
@@ -928,6 +935,87 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(result_queue.items, [
             (0, 7, [("prompt-0", [1]), ("prompt-1", [2])]),
         ])
+
+    def test_vllm_worker_deep_sleep_discards_and_reloads_weights(self):
+        fake_vllm = types.ModuleType("vllm")
+        fake_request = types.ModuleType("vllm.lora.request")
+        events = []
+
+        class LLM:
+            def __init__(self, **_kwargs):
+                pass
+
+            def sleep(self, level):
+                events.append(("sleep", level))
+
+            def wake_up(self, tags=None):
+                events.append(("wake", tags))
+
+            def collective_rpc(self, method):
+                events.append(("rpc", method))
+
+        fake_vllm.LLM = LLM
+        fake_vllm.SamplingParams = object
+        fake_request.LoRARequest = object
+        task_queue = _Queue([
+            ("__control__", "sleep"),
+            ("__control__", "wake_up"),
+            None,
+        ])
+        result_queue = _Queue()
+        ready_queue = _Queue()
+        control_queue = _Queue()
+
+        with patch.dict(sys.modules, {
+                "vllm": fake_vllm,
+                "vllm.lora": types.ModuleType("vllm.lora"),
+                "vllm.lora.request": fake_request,
+                }):
+            _vllm_worker_loop(
+                rank=0,
+                gpu_id=3,
+                model_name="org/model",
+                max_seq_length=1024,
+                load_in_4bit=False,
+                task_queue=task_queue,
+                result_queue=result_queue,
+                ready_queue=ready_queue,
+                enable_sleep_mode=True,
+                sleep_level=2,
+                control_queue=control_queue,
+            )
+
+        self.assertEqual(ready_queue.items, [("ready", 0, "sleep:2")])
+        self.assertEqual(events, [
+            ("sleep", 2),
+            ("wake", ["weights"]),
+            ("rpc", "reload_weights"),
+            ("wake", ["kv_cache"]),
+        ])
+        self.assertEqual(control_queue.items, [
+            ("ok", 0, "sleep", ""),
+            ("ok", 0, "wake_up", ""),
+        ])
+
+    def test_vllm_control_has_a_hard_timeout(self):
+        import queue as queue_module
+
+        pool = GenerationPool.__new__(GenerationPool)
+        pool.backend = "vllm"
+        pool.sleep_supported = True
+        pool.num_workers = 1
+        pool.task_queues = [_Queue()]
+        pool.control_queue = queue_module.Queue()
+        pool.procs = [types.SimpleNamespace(exitcode=None)]
+        pool.vllm_log_path = "/tmp/run/vllm.log"
+
+        with patch.dict(
+                os.environ, {"TTT_VLLM_CONTROL_TIMEOUT_S": "0.01"}), patch.object(
+                pool, "shutdown") as shutdown:
+            with self.assertRaisesRegex(TimeoutError, "sleep exceeded"):
+                pool._vllm_control("sleep")
+
+        shutdown.assert_called_once_with()
 
     def test_backend_vllm_cli_expands_to_hf_training(self):
         # Config parsing itself does not need the heavy runtime dependencies.

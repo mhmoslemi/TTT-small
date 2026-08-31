@@ -47,6 +47,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import multiprocessing as mp
 
@@ -58,6 +59,20 @@ try:
 except Exception:
     tqdm = None
     _HAS_TQDM = False
+
+
+def _positive_env_timeout(name, default):
+    """Read a bounded-operation timeout without accepting infinite waits."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
 
 
 class _PrintBar:
@@ -474,7 +489,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       tensor_parallel_size=1, pipeline_parallel_size=1,
                       max_num_batched_tokens=0,
                       enable_expert_parallel=False, enable_sleep_mode=False,
-                      control_queue=None, vllm_log_path=None):
+                      sleep_level=1, control_queue=None, vllm_log_path=None):
     """Persistent vLLM engine spanning one physical GPU group."""
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
@@ -540,8 +555,16 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # path a unique positive id prevents vLLM from serving a stale cached LoRA.
     adapter_ids = {}
     next_adapter_id = 1
-    can_sleep = bool(hasattr(llm, "sleep") and hasattr(llm, "wake_up"))
-    ready_queue.put(("ready", rank, "sleep" if can_sleep else ""))
+    sleep_level = int(sleep_level)
+    basic_sleep = bool(hasattr(llm, "sleep") and hasattr(llm, "wake_up"))
+    # Level 2 avoids keeping another full copy of every replica's weights in
+    # host RAM. Waking it requires reloading the discarded base weights.
+    deep_sleep = bool(
+        basic_sleep and sleep_level == 2
+        and hasattr(llm, "collective_rpc"))
+    can_sleep = bool(basic_sleep and (sleep_level == 1 or deep_sleep))
+    ready_queue.put((
+        "ready", rank, f"sleep:{sleep_level}" if can_sleep else ""))
 
     while True:
         task = task_queue.get()
@@ -555,11 +578,21 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     raise RuntimeError(
                         "installed vLLM does not expose LLM.sleep/wake_up")
                 if command == "sleep":
-                    llm.sleep(level=1)
+                    print(f"[vllm worker {rank}] entering sleep level "
+                          f"{sleep_level}", flush=True)
+                    llm.sleep(level=sleep_level)
                 elif command == "wake_up":
-                    llm.wake_up()
+                    print(f"[vllm worker {rank}] waking from sleep level "
+                          f"{sleep_level}", flush=True)
+                    if sleep_level == 2:
+                        llm.wake_up(tags=["weights"])
+                        llm.collective_rpc("reload_weights")
+                        llm.wake_up(tags=["kv_cache"])
+                    else:
+                        llm.wake_up()
                 else:
                     raise ValueError(f"unknown vLLM control command {command!r}")
+                print(f"[vllm worker {rank}] {command} complete", flush=True)
                 if control_queue is not None:
                     control_queue.put(("ok", rank, command, ""))
             except Exception:
@@ -680,6 +713,7 @@ class GenerationPool:
                  vllm_max_num_batched_tokens=0,
                  vllm_enable_expert_parallel=False,
                  vllm_enable_sleep_mode=False,
+                 vllm_sleep_level=1,
                  vllm_log_path=None):
         self.model_name = model_name
         requested_num_gpus = int(num_workers)
@@ -688,6 +722,9 @@ class GenerationPool:
         self.gen_micro_batch = int(gen_micro_batch or 0)
         self.backend = str(backend).lower()
         self.sleep_requested = bool(vllm_enable_sleep_mode)
+        self.sleep_level = int(vllm_sleep_level)
+        if self.sleep_level not in (1, 2):
+            raise ValueError("vllm_sleep_level must be 1 or 2")
         self.sleep_supported = False
         self.vllm_log_path = (os.path.abspath(os.fspath(vllm_log_path))
                               if vllm_log_path else None)
@@ -746,6 +783,7 @@ class GenerationPool:
             "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             "enable_sleep_mode": self.sleep_requested,
+            "sleep_level": self.sleep_level,
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
@@ -769,9 +807,20 @@ class GenerationPool:
               f"on {requested_num_gpus} GPU(s) to load ...", flush=True)
         loaded = 0
         sleep_capable = 0
+        startup_timeout = _positive_env_timeout(
+            "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
+        startup_deadline = time.monotonic() + startup_timeout
         while loaded < self.num_workers:
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                self.shutdown()
+                raise TimeoutError(
+                    f"vLLM startup exceeded {startup_timeout:.0f}s while "
+                    f"waiting for {loaded}/{self.num_workers} engines; "
+                    f"details: {self.vllm_log_path or 'console'}")
             try:
-                status, rank, detail = ready_queue.get(timeout=1.0)
+                status, rank, detail = ready_queue.get(
+                    timeout=min(1.0, remaining))
             except queue.Empty:
                 dead = [(idx, proc.exitcode) for idx, proc in enumerate(self.procs)
                         if proc.exitcode is not None]
@@ -785,7 +834,7 @@ class GenerationPool:
                 raise RuntimeError(
                     f"{self.backend} generation worker {rank} failed to start:\n"
                     f"{detail}")
-            if detail == "sleep":
+            if str(detail).startswith("sleep:"):
                 sleep_capable += 1
             loaded += 1
             print(f"[pool] {loaded}/{self.num_workers} workers ready", flush=True)
@@ -801,10 +850,20 @@ class GenerationPool:
         for task_queue in self.task_queues:
             task_queue.put(("__control__", command))
         completed = 0
+        control_timeout = _positive_env_timeout(
+            "TTT_VLLM_CONTROL_TIMEOUT_S", 600.0)
+        control_deadline = time.monotonic() + control_timeout
         while completed < self.num_workers:
+            remaining = control_deadline - time.monotonic()
+            if remaining <= 0:
+                self.shutdown()
+                raise TimeoutError(
+                    f"vLLM {command} exceeded {control_timeout:.0f}s while "
+                    f"waiting for {completed}/{self.num_workers} engines; "
+                    f"details: {self.vllm_log_path or 'console'}")
             try:
                 status, rank, got_command, detail = self.control_queue.get(
-                    timeout=1.0)
+                    timeout=min(1.0, remaining))
             except queue.Empty:
                 dead = [(idx, proc.exitcode)
                         for idx, proc in enumerate(self.procs)
@@ -1062,32 +1121,8 @@ class PhasedVLLMGenerationPool:
         self._pool = None
         self._persistent = False
         self._awake = False
+        self._sleep_mode_announced = False
         self.num_workers = 1
-
-        self._before_start()
-        candidate = None
-        try:
-            candidate = GenerationPool(
-                **self._pool_kwargs, vllm_enable_sleep_mode=True)
-            self.num_workers = candidate.num_workers
-            if candidate.sleep_supported:
-                candidate.sleep()
-                self._pool = candidate
-                self._persistent = True
-                print("[pool] vLLM sleep mode ready; engine will persist "
-                      "between rollout phases", flush=True)
-            else:
-                candidate.shutdown()
-                print("[pool] installed vLLM lacks sleep mode; using a "
-                      "transient engine for safe phase sharing", flush=True)
-        except Exception:
-            # Startup errors such as an invalid checkpoint or an engine OOM
-            # must remain fatal; they are not a sleep-mode compatibility issue.
-            if candidate is not None:
-                candidate.shutdown()
-            self._after_stop()
-            raise
-        self._after_stop()
 
     @property
     def active(self):
@@ -1098,7 +1133,32 @@ class PhasedVLLMGenerationPool:
             return self._pool
         self._before_start()
         try:
-            if self._persistent:
+            if self._pool is None:
+                # Start lazily at the first real rollout. The old eager probe
+                # loaded every engine, immediately slept it, restored training,
+                # then reloaded the same weights for step 0. More importantly,
+                # a broken initial sleep could hang before the run even began.
+                self._pool = GenerationPool(
+                    **self._pool_kwargs,
+                    vllm_enable_sleep_mode=True,
+                    # Level 1 retains one full host-RAM backup per engine. Three
+                    # 8B replicas need ~46 GiB and can kill engine cores under a
+                    # scheduler memory limit. Level 2 discards base weights and
+                    # reloads them on wake instead.
+                    vllm_sleep_level=2,
+                )
+                self.num_workers = self._pool.num_workers
+                self._persistent = self._pool.sleep_supported
+                if not self._sleep_mode_announced:
+                    if self._persistent:
+                        print("[pool] vLLM deep-sleep mode ready; engines persist "
+                              "without host-RAM weight backups", flush=True)
+                    else:
+                        print("[pool] installed vLLM lacks safe deep sleep; "
+                              "using transient engines for phase sharing",
+                              flush=True)
+                    self._sleep_mode_announced = True
+            elif self._persistent:
                 self._pool.wake_up()
             else:
                 self._pool = GenerationPool(**self._pool_kwargs)
