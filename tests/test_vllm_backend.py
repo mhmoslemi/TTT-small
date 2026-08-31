@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import sys
 import tempfile
@@ -104,6 +105,33 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIn("Skipping import of cpp extensions", routed)
         self.assertIn("Please upgrade torch.", routed)
         self.assertIn("No prebuilt binary for CUDA 12.9", routed)
+
+    def test_notice_router_restores_logging_handlers_before_closing(self):
+        from train_multy import _route_dependency_notices
+
+        visible = io.StringIO()
+        logger = logging.getLogger(
+            "tests.notice_router_retained_handler")
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.setLevel(logging.WARNING)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "vllm.log"
+                with patch("sys.stderr", visible):
+                    with _route_dependency_notices(log_path):
+                        handler = logging.StreamHandler()
+                        logger.addHandler(handler)
+                    logger.warning("warning emitted after routing context")
+
+                self.assertIs(handler.stream, visible)
+                self.assertIn(
+                    "warning emitted after routing context",
+                    visible.getvalue())
+        finally:
+            logger.handlers.clear()
+            logging.Logger.manager.loggerDict.pop(logger.name, None)
 
     def test_every_problem_yaml_is_standalone(self):
         config_dir = Path(__file__).resolve().parents[1] / "configs"

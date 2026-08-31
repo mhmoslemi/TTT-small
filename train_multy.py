@@ -12,6 +12,7 @@ import os
 import sys
 import argparse
 import json
+import logging
 import random
 import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -59,6 +60,31 @@ class _NoticeRoutingStream:
         return getattr(self.visible, name)
 
 
+def _restore_logging_stream(routed_stream, visible_stream):
+    """Detach temporary routing streams retained by logging handlers."""
+    root = logging.getLogger()
+    loggers = [root]
+    loggers.extend(
+        logger for logger in logging.Logger.manager.loggerDict.values()
+        if isinstance(logger, logging.Logger)
+    )
+    handlers = [logging.lastResort]
+    for logger in loggers:
+        handlers.extend(logger.handlers)
+
+    seen = set()
+    for handler in handlers:
+        if handler is None or id(handler) in seen:
+            continue
+        seen.add(id(handler))
+        if getattr(handler, "stream", None) is not routed_stream:
+            continue
+        # setStream flushes the old stream first. This runs while the
+        # diagnostic file is still open, then points future warnings back to
+        # the original console stream.
+        handler.setStream(visible_stream)
+
+
 @contextmanager
 def _route_dependency_notices(log_path):
     if not log_path:
@@ -69,8 +95,12 @@ def _route_dependency_notices(log_path):
             sys.stdout, diagnostic, "trainer dependency stdout")
         stderr = _NoticeRoutingStream(
             sys.stderr, diagnostic, "trainer dependency stderr")
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            yield
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                yield
+        finally:
+            _restore_logging_stream(stdout, stdout.visible)
+            _restore_logging_stream(stderr, stderr.visible)
 
 
 # ======================================================================
