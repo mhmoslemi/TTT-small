@@ -512,8 +512,8 @@ def load_config():
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
     from gpu_runtime import (allocate_gpu_roles,
-                             derive_vllm_tensor_parallel_size,
-                             known_attention_heads, parse_gpu_ids,
+                             derive_vllm_parallel_layout,
+                             detect_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
                              validate_attention_heads, validate_selected_gpus)
 
@@ -581,27 +581,36 @@ def load_config():
                   "stable benchmark measurements")
         merged["reward_workers"] = 1
 
-    # Consume every rollout GPU. Prefer one all-card TP engine when the model's
-    # heads permit it; otherwise split into the largest compatible TP groups and
-    # run those groups as parallel inference replicas.
+    memory = query_gpu_memory()
+    validate_selected_gpus(roles, memory)
+
+    # Consume every rollout GPU. Prefer compatible TP replicas for throughput.
+    # If a complete model plus one full-context request would not fit per
+    # replica, turn the replica factor into PP so the weights and KV cache are
+    # sharded across the exact same GPU inventory.
     if generation_backend == "vllm":
-        known_heads = known_attention_heads(merged.get("model_name", ""))
-        merged["vllm_tensor_parallel_size"] = (
-            derive_vllm_tensor_parallel_size(len(gpu_ids), known_heads))
-        merged["vllm_pipeline_parallel_size"] = 1
+        known_heads = detect_attention_heads(merged.get("model_name", ""))
+        layout = derive_vllm_parallel_layout(
+            merged, roles, memory, known_heads)
+        merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
+        merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
         validate_attention_heads(
             known_heads,
             merged["vllm_tensor_parallel_size"],
             merged.get("model_name", ""),
         )
-        replicas = len(gpu_ids) // merged["vllm_tensor_parallel_size"]
-        if replicas > 1:
-            print(f"[config] {len(gpu_ids)} rollout GPUs form {replicas} "
+        if layout.pipeline_parallel_size > 1:
+            print(f"[config] compatible TP={layout.tensor_parallel_size} "
+                  f"replicas need about "
+                  f"{layout.unsharded_stage_required_gib:.1f} GiB/GPU, above "
+                  f"the {layout.budget_gib:.1f} GiB vLLM budget; using one "
+                  f"sharded engine with TP={layout.tensor_parallel_size}, "
+                  f"PP={layout.pipeline_parallel_size}")
+        elif layout.replicas > 1:
+            print(f"[config] {len(gpu_ids)} rollout GPUs form {layout.replicas} "
                   f"parallel vLLM replicas at compatible "
                   f"TP={merged['vllm_tensor_parallel_size']}")
 
-    memory = query_gpu_memory()
-    validate_selected_gpus(roles, memory)
     for note in resolve_memory_settings(merged, roles, memory):
         print(f"[memory] auto: {note}")
 

@@ -36,6 +36,33 @@ def _offline_mode() -> bool:
                for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
 
 
+def _expert_count(model_config) -> int:
+    for _ in range(2):
+        if model_config is None:
+            break
+        for name in ("num_experts", "num_local_experts", "n_routed_experts"):
+            value = getattr(model_config, name, None)
+            if value:
+                return int(value)
+        model_config = getattr(model_config, "text_config", None)
+    return 0
+
+
+def _resolve_lora_target_modules(cfg, model_config):
+    """Avoid allocating a separate large LoRA across every MoE expert."""
+    targets = list(cfg.target_modules)
+    experts = _expert_count(model_config)
+    expert_mlp_targets = {"gate_proj", "up_proj", "down_proj"}
+    removed = [name for name in targets if name in expert_mlp_targets]
+    kept = [name for name in targets if name not in expert_mlp_targets]
+    if experts >= 64 and removed and kept:
+        print(f"[memory] large MoE ({experts} experts): excluding expert-wide "
+              f"LoRA targets {removed}; keeping {kept} at rank {cfg.lora_rank}")
+        targets = kept
+    cfg.effective_target_modules = tuple(targets)
+    return targets
+
+
 # ======================================================================
 # Unsloth backend
 # ======================================================================
@@ -73,13 +100,15 @@ class UnslothBackend:
             # and replicating/sharding the policy over every visible card.
             device_map={"": 0},
         )
+        target_modules = _resolve_lora_target_modules(
+            self.cfg, getattr(model, "config", None))
         print("[backend=unsloth] attaching LoRA ...")
         model = FastLanguageModel.get_peft_model(
             model,
             r=self.cfg.lora_rank,
             lora_alpha=self.cfg.lora_alpha,
             lora_dropout=self.cfg.lora_dropout,
-            target_modules=list(self.cfg.target_modules),
+            target_modules=target_modules,
             bias="none",
             use_gradient_checkpointing="unsloth",
             random_state=self.cfg.seed,
@@ -165,12 +194,13 @@ class HFBackend:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
+        target_modules = _resolve_lora_target_modules(self.cfg, hf_config)
         print("[backend=hf] attaching LoRA ...")
         peft_cfg = LoraConfig(
             r=self.cfg.lora_rank,
             lora_alpha=self.cfg.lora_alpha,
             lora_dropout=self.cfg.lora_dropout,
-            target_modules=list(self.cfg.target_modules),
+            target_modules=target_modules,
             bias="none",
             task_type="CAUSAL_LM",
         )

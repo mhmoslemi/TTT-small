@@ -22,10 +22,14 @@ roles are:
 For vLLM, every derived generation GPU is consumed exactly once. The runtime
 chooses the largest tensor-parallel factor that divides both the GPU count and
 the known model attention-head count; any remaining factor becomes parallel
-inference replicas. Thus Qwen3-8B on three ordinary GPUs runs three TP=1
-engines, while `AVAILABLE_GPUS=0,1,2,3,6` in GPU-mode runs one TP=4 engine and
-reserves physical GPU 6. Unknown model families retain all-card TP and are
-validated against the loaded checkpoint before worker startup.
+inference replicas when a complete engine fits per card. If it does not, that
+replica factor becomes pipeline parallelism, so weights and KV cache are
+sharded while `TP * PP` still consumes the exact inventory. Thus Qwen3-8B on
+three ordinary GPUs runs three TP=1 engines, Qwen3-Coder-Next runs one
+TP=1/PP=3 engine, and `AVAILABLE_GPUS=0,1,2,3,6` in GPU-mode runs one TP=4
+engine while reserving physical GPU 6. Unknown local checkpoints have their
+attention-head count read directly from `config.json`; other unknown model
+families retain all-card TP and are validated before worker startup.
 
 The first card is phase-shared instead of being stranded as training-only.
 With HF/Unsloth, its live training model generates one share while persistent
@@ -58,10 +62,13 @@ the trainer are routed there as well; normal trainer progress remains visible.
 
 `load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
 available and appropriate; checkpoint-native quantization such as GPT-OSS
-MXFP4 is not quantized again. vLLM quantization remains independent. GPU memory
-is inspected at startup to resolve vLLM utilization, sequence admission,
-prefill batching, and exact log-probability chunking. FlashInfer sampling is
-off by default to avoid an nvcc runtime dependency; set
+MXFP4 is not quantized again. On large MoE checkpoints, expert-wide MLP LoRA
+targets are removed automatically while attention LoRA remains enabled; this
+prevents hundreds of experts from turning a rank-32 adapter into billions of
+trainable parameters. vLLM quantization remains independent. GPU memory is
+inspected at startup to resolve TP/PP layout, vLLM utilization, sequence
+admission, prefill batching, and exact log-probability chunking. FlashInfer
+sampling is off by default to avoid an nvcc runtime dependency; set
 `VLLM_USE_FLASHINFER_SAMPLER=1` to opt in.
 
 In offline mode, `backend: auto` selects plain HF before importing Unsloth.

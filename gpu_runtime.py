@@ -8,7 +8,9 @@ mean what the operator wrote in AVAILABLE_GPUS.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import math
+from pathlib import Path
 import re
 import subprocess
 from typing import Dict, Iterable, List, Optional
@@ -93,6 +95,15 @@ class GPUMemory:
     free_gib: float
 
 
+@dataclass(frozen=True)
+class VLLMParallelLayout:
+    tensor_parallel_size: int
+    pipeline_parallel_size: int
+    replicas: int
+    unsharded_stage_required_gib: float
+    budget_gib: float
+
+
 def query_gpu_memory() -> Dict[int, GPUMemory]:
     """Return physical-device memory from nvidia-smi, or {} when unavailable."""
     cmd = [
@@ -132,6 +143,13 @@ def _auto(value) -> bool:
 
 def _model_size_billions(model_name: str) -> float:
     name = str(model_name or "").lower()
+    # Some sparse models omit their total parameter count from the repository
+    # name. These totals matter for weight residency even though only a small
+    # fraction of experts is active for each token.
+    if "qwen3-coder-next" in name:
+        return 80.0
+    if "deepseek-v4" in name:
+        return 284.0
     # Prefer a size next to the conventional B suffix.  This handles 8B, 32B,
     # 30B-A3B and 120B without coupling to one repository naming scheme.
     matches = re.findall(r"(?:^|[-_/])(\d+(?:\.\d+)?)b(?:$|[-_/])", name)
@@ -141,7 +159,12 @@ def _model_size_billions(model_name: str) -> float:
 def _native_weight_bytes(model_name: str) -> float:
     # GPT-OSS checkpoints are natively MXFP4.  Passing the training QLoRA flag
     # through as vLLM BitsAndBytes quantization is both redundant and fragile.
-    return 0.55 if "gpt-oss" in str(model_name or "").lower() else 2.0
+    name = str(model_name or "").lower()
+    if "gpt-oss" in name or "deepseek-v4" in name:
+        return 0.55
+    if "fp8" in name:
+        return 1.0
+    return 2.0
 
 
 def _kv_bytes_per_token(model_name: str) -> int:
@@ -150,9 +173,71 @@ def _kv_bytes_per_token(model_name: str) -> int:
         # 36 layers, 8 KV heads, head_dim 64, BF16 K+V. Sliding attention makes
         # this estimate conservative for most layers.
         return 73_728
-    if "120b" in name or "32b" in name or "30b" in name:
+    if ("120b" in name or "32b" in name or "30b" in name
+            or "qwen3-coder-next" in name or "deepseek-v4" in name):
         return 262_144
     return 147_456
+
+
+def _checkpoint_weight_gib(model_name: str) -> Optional[float]:
+    """Read exact local checkpoint bytes when a shard index provides them."""
+    path = Path(str(model_name or "")).expanduser()
+    if not path.is_dir():
+        return None
+    for filename in ("model.safetensors.index.json",
+                     "pytorch_model.bin.index.json"):
+        try:
+            payload = json.loads((path / filename).read_text())
+            total_size = int(payload.get("metadata", {}).get("total_size", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if total_size > 0:
+            return total_size / (1024.0 ** 3)
+    return None
+
+
+def _estimated_weight_gib(model_name: str, quantization: str) -> float:
+    quant = str(quantization or "").strip().lower()
+    if quant in ("", "auto", "none"):
+        exact = _checkpoint_weight_gib(model_name)
+        if exact is not None:
+            return exact
+        weight_bytes = _native_weight_bytes(model_name)
+    else:
+        # Runtime 4/8-bit modes are conservatively budgeted above their raw
+        # packed weight size for scales and quantization metadata.
+        weight_bytes = 0.65
+    return (_model_size_billions(model_name) * weight_bytes
+            * (1e9 / (1024.0 ** 3)))
+
+
+def _effective_max_length(cfg: dict) -> int:
+    max_len = max(1, int(cfg.get("max_seq_length", 4096)))
+    if (bool(cfg.get("memory", False))
+            and bool(cfg.get("memory_grant_context", True))):
+        max_len += max(0, int(cfg.get("memory_token_budget", 0) or 0))
+    return max_len
+
+
+def _resolved_vllm_utilization(raw_value, total_gib: float,
+                               free_gib: float) -> float:
+    if _auto(raw_value):
+        util = min(0.90, (free_gib - 6.0) / max(total_gib, 1.0))
+        return max(0.50, util)
+    util = float(raw_value)
+    if not 0.0 < util <= 1.0:
+        raise ValueError("vllm_gpu_memory_utilization must be auto or in (0, 1]")
+    return util
+
+
+def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
+    parallel_size = max(1, int(parallel_size))
+    model_name = cfg.get("model_name", "")
+    weight_gib = _estimated_weight_gib(
+        model_name, cfg.get("vllm_quantization", "")) / parallel_size
+    kv_gib = (_kv_bytes_per_token(model_name) * _effective_max_length(cfg)
+              / parallel_size / (1024.0 ** 3))
+    return weight_gib + 4.0 + kv_gib
 
 
 def resolve_memory_settings(cfg: dict, roles: GPURoles,
@@ -170,41 +255,38 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
+    util = _resolved_vllm_utilization(raw_util, min_total, min_free)
     if _auto(raw_util):
         # Leave at least 6 GiB outside vLLM and never claim more than 90% of a
-        # card.  Account for memory already occupied before startup as well.
-        util = min(0.90, (min_free - 6.0) / max(min_total, 1.0))
-        util = max(0.50, util)
+        # card. Account for memory already occupied before startup as well.
         cfg["vllm_gpu_memory_utilization"] = round(util, 3)
         if using_vllm:
             notes.append(f"vLLM memory utilization={util:.3f} "
                          f"(minimum generation GPU free={min_free:.1f}/"
                          f"{min_total:.1f} GiB)")
     else:
-        util = float(raw_util)
-        if not 0.0 < util <= 1.0:
-            raise ValueError("vllm_gpu_memory_utilization must be auto or in (0, 1]")
         cfg["vllm_gpu_memory_utilization"] = util
 
-    max_len = max(1, int(cfg.get("max_seq_length", 4096)))
-    if (bool(cfg.get("memory", False))
-            and bool(cfg.get("memory_grant_context", True))):
-        max_len += max(0, int(cfg.get("memory_token_budget", 0) or 0))
+    max_len = _effective_max_length(cfg)
     size_b = _model_size_billions(cfg.get("model_name", ""))
     tp = max(1, int(cfg.get("vllm_tensor_parallel_size")
                     or len(roles.generation)))
-    quant = str(cfg.get("vllm_quantization", "") or "").lower()
-    weight_bytes = (0.65 if quant not in ("", "auto", "none")
-                    else _native_weight_bytes(cfg.get("model_name", "")))
-    weight_gib_per_gpu = size_b * weight_bytes / tp * (1e9 / (1024.0 ** 3))
+    pp = max(1, int(cfg.get("vllm_pipeline_parallel_size") or 1))
+    parallel_size = tp * pp
+    weight_gib_per_gpu = _estimated_weight_gib(
+        cfg.get("model_name", ""), cfg.get("vllm_quantization", "")
+    ) / parallel_size
     kv_gib_per_seq_gpu = (
         _kv_bytes_per_token(cfg.get("model_name", "")) * max_len
-        / tp / (1024.0 ** 3)
+        / parallel_size / (1024.0 ** 3)
     )
     kv_budget = max(0.0, min_total * float(cfg["vllm_gpu_memory_utilization"])
                     - weight_gib_per_gpu - 4.0)
     estimated_sequences = int(kv_budget / max(kv_gib_per_seq_gpu, 0.01))
-    if using_vllm and estimated_sequences < 1:
+    # A synthetic fallback keeps auto knobs deterministic on CPU-only hosts,
+    # but it is not evidence for rejecting a run. Hard admission failures are
+    # valid only when nvidia-smi reported the selected generation cards.
+    if using_vllm and selected and estimated_sequences < 1:
         required = weight_gib_per_gpu + 4.0 + kv_gib_per_seq_gpu
         raise ValueError(
             f"{cfg.get('model_name')} is estimated to require at least "
@@ -213,7 +295,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             f"{min_total * float(cfg['vllm_gpu_memory_utilization']):.1f} GiB. "
             "Use a checkpoint-native/explicit vllm_quantization, reduce "
             "max_seq_length, choose generation_backend=hf, or provide a "
-            "compatible larger tensor-parallel group.")
+            "larger compatible TP*PP group.")
 
     if _auto(cfg.get("gen_micro_batch", "auto")):
         # Keep CUDA graph/admission metadata bounded even when short responses
@@ -295,6 +377,8 @@ def derive_vllm_tensor_parallel_size(num_gpus: int,
 def known_attention_heads(model_name: str) -> Optional[int]:
     """Fast preflight for the model families explicitly supported here."""
     name = str(model_name or "").lower()
+    if "qwen3-coder-next" in name:
+        return 16
     if "qwen3-coder-30b" in name:
         return 32
     if "qwen3-32b" in name:
@@ -303,4 +387,64 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         return 32
     if "gpt-oss-120b" in name:
         return 64
+    if "deepseek-v4" in name:
+        return 64
     return None
+
+
+def detect_attention_heads(model_name: str) -> Optional[int]:
+    """Read local config.json without importing Transformers or initializing CUDA."""
+    known = known_attention_heads(model_name)
+    if known is not None:
+        return known
+    config_path = Path(str(model_name or "")).expanduser() / "config.json"
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    for candidate in (payload.get("text_config"), payload):
+        if not isinstance(candidate, dict):
+            continue
+        for name in ("num_attention_heads", "n_head", "num_heads"):
+            value = candidate.get(name)
+            if value:
+                return int(value)
+    return None
+
+
+def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
+                                memory: Dict[int, GPUMemory],
+                                num_attention_heads: Optional[int]
+                                ) -> VLLMParallelLayout:
+    """Select compatible TP replicas, promoting replicas to PP if needed.
+
+    A compatible TP factor is preferred because independent replicas maximize
+    rollout throughput. If one such engine cannot fit a request on a card, the
+    remaining GPU factor becomes pipeline parallelism instead. TP*PP then uses
+    the exact generation inventory while preserving head divisibility.
+    """
+    num_gpus = len(roles.generation)
+    tp = derive_vllm_tensor_parallel_size(num_gpus, num_attention_heads)
+    candidate_replicas = num_gpus // tp
+
+    selected = [memory[g] for g in roles.generation if g in memory]
+    min_total = min((item.total_gib for item in selected), default=80.0)
+    min_free = min((item.free_gib for item in selected), default=min_total)
+    util = _resolved_vllm_utilization(
+        cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)
+    budget = min_total * util
+    required = _minimum_vllm_gib_per_gpu(cfg, tp)
+
+    pp = 1
+    replicas = candidate_replicas
+    if candidate_replicas > 1 and required > budget:
+        pp = candidate_replicas
+        replicas = 1
+
+    return VLLMParallelLayout(
+        tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
+        replicas=replicas,
+        unsharded_stage_required_gib=required,
+        budget_gib=budget,
+    )

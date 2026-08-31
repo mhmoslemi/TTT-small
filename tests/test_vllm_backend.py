@@ -23,7 +23,9 @@ from feedback import FeedbackConfig, is_code_failure, render_chat
 from gpu_runtime import (
     GPUMemory,
     allocate_gpu_roles,
+    derive_vllm_parallel_layout,
     derive_vllm_tensor_parallel_size,
+    detect_attention_heads,
     resolve_memory_settings,
     validate_attention_heads,
 )
@@ -70,6 +72,114 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_large_moe_lora_avoids_expert_wide_adapters(self):
+        from model_backend import _resolve_lora_target_modules
+
+        cfg = types.SimpleNamespace(
+            target_modules=("q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"),
+            lora_rank=32,
+        )
+        model_config = types.SimpleNamespace(num_experts=512)
+
+        targets = _resolve_lora_target_modules(cfg, model_config)
+
+        self.assertEqual(targets, ["q_proj", "k_proj", "v_proj", "o_proj"])
+        self.assertEqual(cfg.effective_target_modules, tuple(targets))
+
+    def test_qwen_coder_next_uses_pipeline_when_replicas_do_not_fit(self):
+        roles = allocate_gpu_roles([0, 1, 2], "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "H200", 140.4, 139.8)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "/models/Qwen3-Coder-Next",
+            "generation_backend": "vllm",
+            "max_seq_length": 32000,
+            "memory": True,
+            "memory_grant_context": True,
+            "memory_token_budget": 3400,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_max_num_batched_tokens": "auto",
+            "gen_micro_batch": "auto",
+            "logprob_chunk": "auto",
+        }
+
+        heads = detect_attention_heads(cfg["model_name"])
+        layout = derive_vllm_parallel_layout(cfg, roles, memory, heads)
+
+        self.assertEqual(heads, 16)
+        self.assertEqual(layout.tensor_parallel_size, 1)
+        self.assertEqual(layout.pipeline_parallel_size, 3)
+        self.assertEqual(layout.replicas, 1)
+        self.assertGreater(
+            layout.unsharded_stage_required_gib, layout.budget_gib)
+
+        cfg["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
+        cfg["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
+        resolve_memory_settings(cfg, roles, memory)
+        self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
+
+    def test_load_config_resolves_qwen_coder_next_to_tp1_pp3(self):
+        fake_numpy = types.ModuleType("numpy")
+        fake_yaml = types.ModuleType("yaml")
+
+        def qwen_coder_config(stream):
+            values = _fake_complete_yaml(stream)
+            values.update({
+                "model_name": "/models/Qwen3-Coder-Next",
+                "generation_backend": "vllm",
+                "max_seq_length": 32000,
+                "memory": True,
+                "memory_grant_context": True,
+                "memory_token_budget": 3400,
+                "vllm_max_num_batched_tokens": "auto",
+                "gen_micro_batch": "auto",
+                "logprob_chunk": "auto",
+            })
+            return values
+
+        fake_yaml.safe_load = qwen_coder_config
+        sys.modules.pop("train_multy", None)
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            from train_multy import load_config
+
+            with tempfile.TemporaryDirectory() as tmp:
+                config_path = Path(tmp) / "qwen.yaml"
+                config_path.write_text("problem: erdos\n")
+                argv = ["train_multy.py", "--config", str(config_path)]
+                with patch.object(sys, "argv", argv), patch.dict(
+                        os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
+                        "gpu_runtime.query_gpu_memory", return_value={}):
+                    cfg, _ = load_config()
+
+        self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+        self.assertEqual(cfg.vllm_pipeline_parallel_size, 3)
+        self.assertEqual(cfg.num_gpus, 3)
+
+    def test_small_model_keeps_parallel_replicas(self):
+        roles = allocate_gpu_roles([0, 1, 2], "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "H100", 80.0, 79.0)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "Qwen/Qwen3-8B",
+            "max_seq_length": 8192,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+        }
+
+        layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, detect_attention_heads(cfg["model_name"]))
+
+        self.assertEqual(layout.tensor_parallel_size, 1)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 3)
+
     def test_vllm_output_redirects_both_fds_to_append_log(self):
         opened = mock_open()
         opened.return_value.fileno.return_value = 73
