@@ -404,6 +404,16 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         "tensor_parallel_size": int(tensor_parallel_size),
         "pipeline_parallel_size": int(pipeline_parallel_size),
     }
+    if "gpt-oss-120b" in str(model_name).lower():
+        # vLLM's default safetensors strategy prefetches the complete
+        # checkpoint into the OS page cache when the Hugging Face cache is on
+        # NFS/Lustre.  That adds roughly another 61 GiB of host-memory pressure
+        # while this model's QLoRA trainer is already offloaded to CPU, and the
+        # scheduler can SIGKILL the parent even though the TP=4 engine fits on
+        # the GPUs.  Lazy mmap loading keeps those cache pages reclaimable and
+        # disables the eager network-filesystem prefetch without changing the
+        # weights or quantization used by vLLM.
+        kwargs["safetensors_load_strategy"] = "lazy"
     if int(tensor_parallel_size) > 1:
         # LoRA work is otherwise repeated on every TP rank. Sharding it also
         # avoids a large adapter-side memory spike on wide models.

@@ -813,6 +813,27 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertNotIn("seed", kwargs)
         self.assertNotIn("quantization", kwargs)
 
+    def test_gpt_oss_120b_uses_host_memory_safe_checkpoint_loading(self):
+        kwargs = _vllm_engine_kwargs(
+            model_name="openai/gpt-oss-120b",
+            max_seq_length=35_400,
+            load_in_4bit=False,
+            lora_rank=32,
+            gpu_memory_utilization=0.86,
+            tensor_parallel_size=4,
+        )
+
+        self.assertEqual(kwargs["safetensors_load_strategy"], "lazy")
+
+        ordinary_kwargs = _vllm_engine_kwargs(
+            model_name="Qwen/Qwen3-8B",
+            max_seq_length=4096,
+            load_in_4bit=False,
+            lora_rank=32,
+            gpu_memory_utilization=0.9,
+        )
+        self.assertNotIn("safetensors_load_strategy", ordinary_kwargs)
+
     def test_training_4bit_does_not_force_vllm_quantization(self):
         kwargs = _vllm_engine_kwargs(
             model_name="org/model",
