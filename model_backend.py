@@ -19,6 +19,11 @@ def _training_model_name(cfg):
                        getattr(cfg, "model_name", "")))
 
 
+def _requires_unsloth_gpt_oss_loader(model_name):
+    name = str(model_name).strip().lower()
+    return "gpt-oss" in name and "unsloth-bnb-4bit" in name
+
+
 def _training_device_map(cfg):
     """Use every visible training GPU for single-process model parallelism."""
     count = int(getattr(cfg, "num_training_gpus", 1) or 1)
@@ -362,6 +367,18 @@ def load_backend(name: str, cfg):
     Importing Unsloth mutates Transformers classes globally, so a failed
     Unsloth load cannot safely fall back to HF in the same interpreter.
     """
+    requires_unsloth = _requires_unsloth_gpt_oss_loader(
+        _training_model_name(cfg))
+    if name == "hf" and requires_unsloth:
+        raise RuntimeError(
+            f"{_training_model_name(cfg)} uses Unsloth's split quantized "
+            "GPT-OSS expert layout and cannot be loaded safely by vanilla "
+            "Transformers. Select backend: unsloth; normal configuration "
+            "loading performs this routing automatically.")
+    if name == "auto" and requires_unsloth:
+        print("[backend=auto] GPT-OSS Unsloth BNB checkpoint requires the "
+              "patched Unsloth loader")
+        return UnslothBackend(cfg)
     if name == "hf":
         return HFBackend(cfg)
     if name == "unsloth":

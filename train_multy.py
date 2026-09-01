@@ -454,6 +454,27 @@ def _resolve_training_model_name(model_name, requested_name, load_in_4bit):
     return aliases.get(basename, generation_name)
 
 
+def _resolve_training_backend(backend, training_model_name):
+    """Use the loader that matches GPT-OSS's Unsloth BNB tensor layout.
+
+    The ``*-unsloth-bnb-4bit`` GPT-OSS conversions store every expert as a
+    separate quantized module.  Vanilla Transformers expects fused expert
+    tensors instead; it reports every checkpoint expert as unexpected,
+    initializes a second BF16 expert bank, and can OOM while PEFT casts those
+    replacement tensors.  Unsloth installs the matching model implementation
+    before loading the checkpoint.
+    """
+    resolved = str(backend).strip().lower()
+    checkpoint = str(training_model_name).strip().lower()
+    requires_unsloth = (
+        "gpt-oss" in checkpoint
+        and "unsloth-bnb-4bit" in checkpoint
+    )
+    if requires_unsloth and resolved in ("auto", "hf"):
+        return "unsloth"
+    return resolved
+
+
 def _resolve_training_memory_budgets(training_gpu_ids, memory):
     """Reserve host/runtime headroom and cap checkpoint placement per card."""
     if not memory or any(gpu_id not in memory for gpu_id in training_gpu_ids):
@@ -714,6 +735,13 @@ def load_config():
         print(f"[precision] trainable checkpoint: "
               f"{merged['training_model_name']} (generation remains "
               f"{merged.get('model_name')})")
+    requested_backend = str(merged["backend"]).strip().lower()
+    merged["backend"] = _resolve_training_backend(
+        requested_backend, merged["training_model_name"])
+    if merged["backend"] != requested_backend:
+        print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
+              f"expert loader; switching {requested_backend} -> "
+              f"{merged['backend']}")
     training_budgets = _resolve_training_memory_budgets(
         training_gpu_ids, memory)
     _validate_known_training_capacity(

@@ -80,7 +80,8 @@ def _fake_complete_yaml(stream):
 
 class VLLMBackendTests(unittest.TestCase):
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
-        from train_multy import _resolve_training_model_name
+        from train_multy import (_resolve_training_backend,
+                                 _resolve_training_model_name)
 
         self.assertEqual(
             _resolve_training_model_name(
@@ -101,6 +102,20 @@ class VLLMBackendTests(unittest.TestCase):
             _resolve_training_model_name(
                 "openai/gpt-oss-120b", None, load_in_4bit=False),
             "openai/gpt-oss-120b",
+        )
+        self.assertEqual(
+            _resolve_training_backend(
+                "hf", "unsloth/gpt-oss-120b-unsloth-bnb-4bit"),
+            "unsloth",
+        )
+        self.assertEqual(
+            _resolve_training_backend(
+                "auto", "unsloth/gpt-oss-20b-unsloth-bnb-4bit"),
+            "unsloth",
+        )
+        self.assertEqual(
+            _resolve_training_backend("hf", "Qwen/Qwen3-8B"),
+            "hf",
         )
 
     def test_multi_gpu_training_uses_balanced_model_parallel_map(self):
@@ -183,6 +198,7 @@ class VLLMBackendTests(unittest.TestCase):
             cfg.training_model_name,
             "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
         )
+        self.assertEqual(cfg.backend, "unsloth")
         self.assertEqual(cfg.training_max_memory_gib, [38.0, 38.0, 38.0])
         self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
         self.assertEqual(cfg.vllm_pipeline_parallel_size, 3)

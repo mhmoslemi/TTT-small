@@ -83,8 +83,12 @@ use `dtype` directly, so they do not emit the deprecated `torch_dtype` warning.
 `load_in_4bit` controls only the training copy. BitsAndBytes 4-bit is used when
 available and appropriate. GPT-OSS QLoRA automatically trains against the
 trainable `unsloth/*-unsloth-bnb-4bit` conversion while generation keeps the
-configured original MXFP4 checkpoint; saved adapters name that original vLLM
-base. Set `training_model_name` explicitly to override this split. On large MoE
+configured original MXFP4 checkpoint. Those conversions use Unsloth's split
+quantized expert layout, so configuration automatically selects the Unsloth
+training loader even if a preset requested plain HF; loading them through
+vanilla Transformers would silently initialize incompatible replacement expert
+weights. Saved adapters name the original vLLM base. Set `training_model_name`
+explicitly to override this split. On large MoE
 checkpoints, expert-wide MLP LoRA targets are removed automatically while
 attention LoRA remains enabled; this prevents hundreds of experts from turning
 a rank-32 adapter into billions of trainable parameters. vLLM quantization
