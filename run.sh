@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
-export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3}"
 config_path="${TTT_CONFIG:-configs/erdos.yaml}"
-memory_version="${MEMORY_VERSION:-}"
+memory_version="${MEMORY_VERSION:-V2}"
 
 
 
