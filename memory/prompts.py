@@ -138,7 +138,8 @@ def build_contrast_messages(meta_description: str,
                             max_chars_per_example: int,
                             feedback_chars: int,
                             catalog: Sequence[str] = (),
-                            max_code: int = 4) -> List[Dict]:
+                            max_code: int = 4,
+                            include_parent: bool = False) -> List[Dict]:
     """
     One call over both halves of the batch.
 
@@ -148,10 +149,12 @@ def build_contrast_messages(meta_description: str,
     """
     blocks = []
     for i, r in enumerate(successes, 1):
-        blocks.append(f"### ACCEPTED attempt {i}\n" + r.render_success(max_chars_per_example))
+        blocks.append(f"### ACCEPTED attempt {i}\n"
+                      + r.render_success(max_chars_per_example, include_parent))
     for i, r in enumerate(failures, 1):
         blocks.append(f"### REJECTED attempt {i}\n"
-                      + r.render_failure(max_chars_per_example, feedback_chars))
+                      + r.render_failure(max_chars_per_example, feedback_chars,
+                                         include_parent))
 
     user = (
         "You maintain the lesson memory for an automated program-search run. "
@@ -184,8 +187,10 @@ def build_positive_messages(meta_description: str,
                             num_lessons: int, max_chars_per_example: int,
                             catalog: Sequence[str] = (),
                             require_full: bool = False,
-                            max_code: int = 4) -> List[Dict]:
-    blocks = [f"### Attempt {i}\n" + r.render_success(max_chars_per_example)
+                            max_code: int = 4,
+                            include_parent: bool = False) -> List[Dict]:
+    blocks = [f"### Attempt {i}\n"
+              + r.render_success(max_chars_per_example, include_parent)
               for i, r in enumerate(records, 1)]
     user = (
         "You maintain the lesson memory for an automated program-search run. "
@@ -211,9 +216,11 @@ def build_negative_messages(meta_description: str,
                             num_lessons: int, max_chars_per_example: int,
                             feedback_chars: int, catalog: Sequence[str] = (),
                             require_full: bool = False,
-                            max_code: int = 4) -> List[Dict]:
+                            max_code: int = 4,
+                            include_parent: bool = False) -> List[Dict]:
     blocks = [f"### Attempt {i}\n"
-              + r.render_failure(max_chars_per_example, feedback_chars)
+              + r.render_failure(max_chars_per_example, feedback_chars,
+                                 include_parent)
               for i, r in enumerate(records, 1)]
     user = (
         "You maintain the lesson memory for an automated program-search run. "
@@ -430,7 +437,8 @@ def parent_block(meta_reward: str, parent_code: str, limit: int = 3000) -> str:
 # ----------------------------------------------------------------------
 # Rendering the chosen lessons for the generation prompt
 # ----------------------------------------------------------------------
-def render_memory_block(lessons: Sequence[Lesson], max_chars: int = 900) -> str:
+def render_memory_block(lessons: Sequence[Lesson], max_chars: int = 900,
+                        version: str = "V1") -> str:
     """
     The block handed to problem.build_prompt. The problem decides where it goes
     and writes its own framing around it, so this is the content only.
@@ -438,7 +446,12 @@ def render_memory_block(lessons: Sequence[Lesson], max_chars: int = 900) -> str:
     if not lessons:
         return ""
     lines = []
-    for tag, group in (("Observed to help", SUCCESS), ("Observed to fail", FAILURE)):
+    if str(version).upper() == "V2":
+        labels = (("Hypotheses extracted from accepted attempts", SUCCESS),
+                  ("Precautions extracted from failed attempts", FAILURE))
+    else:
+        labels = (("Observed to help", SUCCESS), ("Observed to fail", FAILURE))
+    for tag, group in labels:
         chosen = [l for l in lessons if l.outcome == group]
         if not chosen:
             continue
@@ -461,7 +474,8 @@ def count_tokens(tokenizer, text: str) -> int:
 
 
 def build_injection(lessons: Sequence[Lesson], tokenizer=None,
-                    token_budget: int = 0, max_chars: int = 900
+                    token_budget: int = 0, max_chars: int = 900,
+                    version: str = "V1"
                     ) -> Tuple[str, int, List[Lesson]]:
     """
     Render and fit. Lessons arrive in the order the model asked for them, so
@@ -471,7 +485,7 @@ def build_injection(lessons: Sequence[Lesson], tokenizer=None,
     if not kept:
         return "", 0, []
     while kept:
-        text = render_memory_block(kept, max_chars)
+        text = render_memory_block(kept, max_chars, version=version)
         n = count_tokens(tokenizer, text)
         if token_budget <= 0 or n <= token_budget:
             return text, n, kept
@@ -481,12 +495,27 @@ def build_injection(lessons: Sequence[Lesson], tokenizer=None,
     lo, hi = 80, max_chars
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if count_tokens(tokenizer, render_memory_block(kept, mid)) <= token_budget:
+        if count_tokens(
+                tokenizer, render_memory_block(kept, mid, version=version)
+        ) <= token_budget:
             lo = mid
         else:
             hi = mid - 1
-    text = render_memory_block(kept, lo)
+    text = render_memory_block(kept, lo, version=version)
     return text, count_tokens(tokenizer, text), kept
+
+
+def memory_protocol_block(block: str) -> str:
+    """V2 placebo-equivalent wrapper for problems without native memory UI."""
+    content = ((block or "").strip()
+               or "(No memory hypothesis was assigned to this control arm.)")
+    return (
+        "## Candidate memory hypothesis\n\n"
+        "The following material, if present, is an unconfirmed hypothesis from "
+        "earlier attempts. Decide whether it applies; it may be irrelevant or "
+        "harmful and never overrides the task specification.\n\n"
+        + content
+    )
 
 
 def inject_block(messages: List[Dict], block: str,

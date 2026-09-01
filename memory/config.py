@@ -16,6 +16,7 @@ unknown rather than silently ignored.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import math
 from typing import Any, Dict
 
 PREFIX = "memory_"
@@ -34,6 +35,9 @@ RETIRED = {
 @dataclass
 class MemoryConfig:
     enabled: bool = False
+    # V1 is the historical implementation. V2 gates the corrected causal
+    # design so old runs and ablations remain reproducible.
+    version: str = "V1"
 
     # --- lookup (replaces Eq. 7 retrieval) ---
     # select : show the model a catalog of the bank, it names the ids it wants.
@@ -65,6 +69,9 @@ class MemoryConfig:
     arm_explore_fraction: float = 0.0   # under-tested lesson share
     arm_max_lessons: int = 1            # causal credit is cleanest at one/arm
     arm_exploration_c: float = 0.5       # UCB uncertainty bonus
+    # V2 freezes one best-of-n estimand for the entire run. Zero derives n from
+    # the initial group size and arm fractions before the run is persisted.
+    arm_comparison_n: int = 0
     outcome_credit: bool = False         # update lessons from matched best@K uplift
     text_reinforce: bool = True          # legacy LLM "confirmations"
 
@@ -132,7 +139,10 @@ class MemoryConfig:
             if verbose and ignored:
                 print(f"[memory] disabled (--memory not set); ignoring "
                       f"{len(ignored)} memory_* key(s): {', '.join(ignored)}")
-            return cls(enabled=False)
+            cfg = cls(enabled=False,
+                      version=str(d.get("memory_version", "V1")).upper())
+            cfg.validate()
+            return cfg
 
         kwargs: Dict[str, Any] = {"enabled": True}
         known = {f.name: f for f in fields(cls)}
@@ -171,10 +181,42 @@ class MemoryConfig:
                   f"{', '.join(sorted(unknown))}")
 
         cfg = cls(**kwargs)
-        cfg.validate()
+        cfg.version = str(cfg.version).strip().upper()
+        cfg.validate(group_size=d.get("group_size"))
         return cfg
 
-    def validate(self) -> None:
+    @property
+    def is_v2(self) -> bool:
+        return self.version == "V2"
+
+    def resolve_comparison_n(self, group_size: int) -> int:
+        """Resolve and validate V2's fixed best-of-n comparison budget."""
+        if not self.is_v2 or not self.outcome_credit:
+            return int(self.arm_comparison_n)
+        k = int(group_size)
+        if k < 3:
+            raise ValueError(
+                "memory V2 causal arms require group_size >= 3")
+        n = int(self.arm_comparison_n)
+        if n <= 0:
+            selected_fraction = 1.0 - (
+                self.arm_control_fraction + self.arm_explore_fraction)
+            smallest = min(selected_fraction, self.arm_control_fraction,
+                           self.arm_explore_fraction)
+            n = max(1, int(math.floor(k * smallest + 0.5)))
+            n = min(n, k // 3)
+            self.arm_comparison_n = n
+        if n < 1 or 3 * n > k:
+            raise ValueError(
+                "memory_arm_comparison_n must be >= 1 and leave room for "
+                "selected, no-memory, and exploration arms "
+                f"(3*n <= group_size; got n={n}, group_size={k})")
+        return n
+
+    def validate(self, group_size=None) -> None:
+        self.version = str(self.version).strip().upper()
+        if self.version not in ("V1", "V2"):
+            raise ValueError("memory_version must be V1 or V2")
         if self.lessons_per_call < 1:
             raise ValueError("memory_lessons_per_call must be >= 1")
         if self.hygiene_profile not in ("auto", "geometry", "kernel", "generic"):
@@ -202,6 +244,8 @@ class MemoryConfig:
             raise ValueError("memory_arm_max_lessons must be >= 1")
         if self.arm_exploration_c < 0:
             raise ValueError("memory_arm_exploration_c must be >= 0")
+        if self.arm_comparison_n < 0:
+            raise ValueError("memory_arm_comparison_n must be >= 0")
         if self.outcome_credit and self.arm_control_fraction <= 0:
             raise ValueError(
                 "memory_outcome_credit requires memory_arm_control_fraction > 0")
@@ -214,6 +258,22 @@ class MemoryConfig:
             raise ValueError(
                 "memory_outcome_credit requires memory_lookup_mode=select and "
                 "memory_lookup_max_select=1")
+        if self.enabled and self.is_v2:
+            if not self.outcome_credit:
+                raise ValueError(
+                    "memory V2 requires memory_outcome_credit=true")
+            if self.arm_explore_fraction <= 0:
+                raise ValueError(
+                    "memory V2 requires memory_arm_explore_fraction > 0")
+            if self.arm_control_fraction + self.arm_explore_fraction >= 1.0:
+                raise ValueError(
+                    "memory V2 requires a positive selected-memory fraction")
+            if self.text_reinforce:
+                raise ValueError(
+                    "memory V2 requires memory_text_reinforce=false; textual "
+                    "repetition is not causal evidence")
+            if group_size is not None:
+                self.resolve_comparison_n(int(group_size))
 
     def describe(self) -> str:
         if not self.enabled:
@@ -225,12 +285,15 @@ class MemoryConfig:
         if self.arm_control_fraction > 0 or self.arm_explore_fraction > 0:
             arms = (f"  arms=null:{self.arm_control_fraction:.0%}/"
                     f"explore:{self.arm_explore_fraction:.0%}")
-        return (f"memory ON  extract={self.extract_mode}{src}{cur}  "
+        comparison = (f"  best@n={self.arm_comparison_n}"
+                      if self.is_v2 and self.outcome_credit else "")
+        label = "memory V2 ON" if self.is_v2 else "memory ON"
+        return (f"{label}  extract={self.extract_mode}{src}{cur}  "
                 f"lookup={self.lookup_mode}"
                 f"(<={self.lookup_max_select})  L<={self.lessons_per_call}  "
                 f"cap={self.max_lessons}  budget={self.token_budget}tok  "
                 f"constructions={'forbidden' if self.forbid_constructions else 'allowed'}  "
-                f"inject={self.inject_mode}{arms}")
+                f"inject={self.inject_mode}{arms}{comparison}")
 
 
 def _as_bool(v: Any) -> bool:

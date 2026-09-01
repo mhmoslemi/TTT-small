@@ -274,6 +274,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    action="store_const", const=False)
 
     # ---- memory (Sec. 2.2) ----
+    p.add_argument("--memory-version", type=lambda value: value.upper(),
+                   choices=["V1", "V2"], default=None,
+                   help="Memory implementation: V1 preserves historical "
+                        "behavior; V2 enables corrected causal memory.")
     p.add_argument("--memory", dest="memory", action="store_const",
                    const=True, default=None,
                    help="Master switch for the memory module. Every other "
@@ -299,6 +303,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Maximum lessons placed together in one causal arm.")
     p.add_argument("--memory-arm-exploration-c", type=float, default=None,
                    help="UCB uncertainty weight for the exploratory memory arm.")
+    p.add_argument("--memory-arm-comparison-n", type=int, default=None,
+                   help="V2 fixed best-of-n comparison budget. 0 derives it "
+                        "from the initial group size and arm fractions.")
     p.add_argument("--memory-outcome-credit", action="store_const",
                    const=True, default=None,
                    help="Credit lessons from matched best@K uplift vs null arms.")
@@ -589,6 +596,14 @@ def load_config():
         raise ValueError("max_groups_per_step cannot be below groups_per_step")
     if int(merged["max_group_size"]) < int(merged["group_size"]):
         raise ValueError("max_group_size cannot be below group_size")
+
+    # Resolve V2's fixed comparison budget before config.json is written. This
+    # makes resume semantics explicit and fails impossible arm designs before
+    # any GPU discovery or model loading.
+    from memory import MemoryConfig
+    memory_preview = MemoryConfig.from_dict(merged, verbose=False)
+    merged["memory_version"] = memory_preview.version
+    merged["memory_arm_comparison_n"] = memory_preview.arm_comparison_n
 
     # Resolve every physical role from one ordered inventory. run.sh exports
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
@@ -1208,7 +1223,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from gen_workers import make_progress_bar
 
     from memory import (MemoryArm, RolloutRecord, allocate_memory_arms,
-                        build_injection, credit_memory_arms, inject_block)
+                        build_injection, credit_memory_arms, inject_block,
+                        memory_protocol_block)
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           build_reprompt, feedback_advantage, format_feedback,
                           is_code_failure, render_chat, select_balanced)
@@ -1236,8 +1252,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # feedback path is skipped: no reprompts built, no teacher forwards, so the
     # annealed tail costs exactly what a no-feedback run costs.
     import inspect as _inspect
-    memory_aware_prompt = "memory" in _inspect.signature(
-        problem.build_prompt).parameters
+    prompt_parameters = _inspect.signature(problem.build_prompt).parameters
+    memory_aware_prompt = "memory" in prompt_parameters
+    memory_protocol_aware = "memory_protocol" in prompt_parameters
+    memory_v2 = bool(mem_cfg is not None and getattr(mem_cfg, "is_v2", False))
     # Only problems that declare it get their construction written to disk.
     save_ctor = (bool(getattr(problem, "saves_construction", False))
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
@@ -1290,6 +1308,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         chosen_by_group = lookup.select_batch(
             parent_ctxs, step_idx=step_idx, adapter_path=adapter_path)
 
+    # V2 accounts for every treatment already scheduled in this batch before
+    # assigning exploratory arms. This prevents stale UCB statistics from
+    # sending every parent to the same untested lesson.
+    memory_reservations = {}
+    if memory_v2:
+        for chosen in chosen_by_group.values():
+            for lesson in chosen:
+                memory_reservations[lesson.id] = (
+                    int(memory_reservations.get(lesson.id, 0)) + 1)
+
     def _render(messages):
         try:
             return tokenizer.apply_chat_template(
@@ -1308,8 +1336,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         pc = parent_ctxs[g]
         chosen = chosen_by_group.get(g, [])
         if memory is not None and mem_cfg is not None:
-            arms = allocate_memory_arms(
-                cfg.group_size, chosen, memory, mem_cfg, step_idx)
+            if memory_v2:
+                arms = allocate_memory_arms(
+                    cfg.group_size, chosen, memory, mem_cfg, step_idx,
+                    reservations=memory_reservations)
+            else:
+                arms = allocate_memory_arms(
+                    cfg.group_size, chosen, memory, mem_cfg, step_idx)
         else:
             arms = [MemoryArm("no_memory", [], int(cfg.group_size))]
 
@@ -1320,12 +1353,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             shift = (int(step_idx) + int(g)) % len(arms)
             arms = arms[shift:] + arms[:shift]
 
+        causal_protocol = bool(
+            memory_v2 and len(arms) > 1
+            and any(arm.lessons for arm in arms))
+
         for arm in arms:
             messages = base_messages[g]
             kept, n_tok = [], 0
+            block = ""
             if arm.lessons:
                 block, n_tok, kept = build_injection(
-                    arm.lessons, tokenizer, getattr(mem_cfg, "token_budget", 0))
+                    arm.lessons, tokenizer,
+                    getattr(mem_cfg, "token_budget", 0),
+                    version=getattr(mem_cfg, "version", "V1"))
+            if causal_protocol:
+                if memory_aware_prompt and memory_protocol_aware:
+                    messages = problem.build_prompt(
+                        pc, memory=block, memory_protocol=True)
+                else:
+                    messages = inject_block(
+                        messages, memory_protocol_block(block),
+                        mode=getattr(mem_cfg, "inject_mode", "append"))
+            elif arm.lessons:
                 if memory_aware_prompt:
                     messages = problem.build_prompt(pc, memory=block)
                 else:
@@ -1534,13 +1583,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             job = prompt_jobs[job_idx]
             obs = arm_observations.setdefault(job["arm"], {
                 "memory_ids": job["memory_ids"], "rewards": [], "valids": [],
+                "codes": [],
             })
             obs["rewards"].append(float(rewards[r_idx]))
             obs["valids"].append(bool(valids[r_idx]))
+            obs["codes"].append(codes[r_idx])
         if (memory is not None and mem_cfg is not None
                 and bool(getattr(mem_cfg, "outcome_credit", False))):
             updates = credit_memory_arms(
-                memory, arm_observations, parent_val, step_idx)
+                memory, arm_observations, parent_val, step_idx,
+                parent_id=parent.id)
             mem_arm_updates.extend({"group": g, **update} for update in updates)
             for update in updates:
                 print(f"    memory {update['arm']}: n={update['n']} "
@@ -1617,6 +1669,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
+            if memory_v2:
+                meta["memory_version"] = "V2"
+                meta["memory_comparison_n"] = int(
+                    getattr(mem_cfg, "arm_comparison_n", 0) or 0)
             save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
                          prompt_text=job["prompt_text"])
             saved_rollouts += 1
@@ -1803,6 +1859,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "memory_arm_rollouts": mem_arm_rollouts,
         "memory_arm_updates": mem_arm_updates,
     }
+    if memory_v2:
+        step_stats["memory_version"] = "V2"
+        step_stats["memory_comparison_n"] = int(
+            getattr(mem_cfg, "arm_comparison_n", 0) or 0)
 
     if not all_examples:
         print(f"[step {step_idx}] no training signal (all groups had constant reward)")

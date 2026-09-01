@@ -32,6 +32,10 @@ from memory.types import (FAILURE, GLOBAL, LOCAL, SUCCESS, Lesson,
 class MemoryBank:
     def __init__(self, cfg):
         self.cfg = cfg
+        if (bool(getattr(cfg, "is_v2", False))
+                and int(getattr(cfg, "arm_comparison_n", 0) or 0) <= 0):
+            raise ValueError(
+                "memory V2 bank requires a resolved arm_comparison_n")
         self.lessons: List[Lesson] = []
         self._by_id: Dict[str, Lesson] = {}
         self._path: Optional[Path] = None
@@ -59,6 +63,19 @@ class MemoryBank:
 
     def ids(self) -> List[str]:
         return [l.id for l in self.lessons]
+
+    @property
+    def comparison_n(self) -> Optional[int]:
+        if bool(getattr(self.cfg, "is_v2", False)):
+            value = int(getattr(self.cfg, "arm_comparison_n", 0) or 0)
+            return value if value > 0 else None
+        return None
+
+    def evidence_stats(self, lesson: Lesson) -> Dict:
+        return lesson.outcome_stats(self.comparison_n)
+
+    def evidence_mean(self, lesson: Lesson) -> float:
+        return lesson.mean_tail_uplift(self.comparison_n)
 
     def fetch(self, ids: Sequence[str], count_use: bool = True) -> List[Lesson]:
         """
@@ -93,12 +110,12 @@ class MemoryBank:
         items = self.lessons
         if limit > 0 and len(items) > limit:
             items = sorted(items, key=lambda l: (
-                l.mean_tail_uplift(), l.importance, l.step),
+                self.evidence_mean(l), l.importance, l.step),
                            reverse=True)[:limit]
         # Stable, readable order for the model: oldest first, so ids it has seen
         # before stay in the same place between steps.
         items = sorted(items, key=lambda l: (l.step, l.id))
-        return [l.catalog_line(chars) for l in items]
+        return [l.catalog_line(chars, self.comparison_n) for l in items]
 
     def catalog_ids(self, limit: Optional[int] = None) -> List[str]:
         """The ids that appear in catalog(), for validating a selection."""
@@ -106,7 +123,7 @@ class MemoryBank:
         items = self.lessons
         if limit > 0 and len(items) > limit:
             items = sorted(items, key=lambda l: (
-                l.mean_tail_uplift(), l.importance, l.step),
+                self.evidence_mean(l), l.importance, l.step),
                            reverse=True)[:limit]
         return [l.id for l in items]
 
@@ -146,8 +163,22 @@ class MemoryBank:
         return hit
 
     def record_outcome(self, ids: Sequence[str], rollouts: int, valid: int,
-                       improved: int, tail_uplift: float, step: int) -> int:
+                       improved: int, tail_uplift: float, step: int,
+                       comparison_n: Optional[int] = None, arm: str = "",
+                       context_id: str = "", parent_reward: Optional[float] = None,
+                       control_rollouts: int = 0,
+                       control_valid: int = 0, distinct_codes: int = 0,
+                       control_distinct_codes: int = 0) -> int:
         """Attach matched null-arm evidence to every lesson in one prompt arm."""
+        is_v2 = bool(getattr(self.cfg, "is_v2", False))
+        if is_v2 and (comparison_n is None or int(comparison_n) <= 0):
+            raise ValueError(
+                "memory V2 outcome records require comparison_n >= 1")
+        if (is_v2 and self.comparison_n is not None
+                and int(comparison_n) != self.comparison_n):
+            raise ValueError(
+                f"memory V2 expected best@n={self.comparison_n}, got "
+                f"best@n={comparison_n}")
         hit = 0
         for lesson_id in ids or ():
             lesson = self.by_id(lesson_id)
@@ -166,28 +197,77 @@ class MemoryBank:
             if tail_uplift > 0:
                 lesson.arm_tail_wins += 1
                 self.stats["tail_wins"] += 1
+            if is_v2:
+                lesson.causal_history.append({
+                    "n": int(comparison_n),
+                    "arm": str(arm),
+                    "step": int(step),
+                    "context_id": str(context_id or ""),
+                    "parent_reward": (float(parent_reward)
+                                      if parent_reward is not None else None),
+                    "rollouts": int(rollouts),
+                    "valid": int(valid),
+                    "improved": int(improved),
+                    "tail_uplift": float(tail_uplift),
+                    "control_rollouts": int(control_rollouts),
+                    "control_valid": int(control_valid),
+                    "distinct_codes": int(distinct_codes),
+                    "control_distinct_codes": int(control_distinct_codes),
+                })
             hit += 1
         self.stats["outcome_updates"] += hit
         return hit
 
     def exploration_lesson(self, excluded=(), step: int = 0,
-                           c: float = 0.5) -> Optional[Lesson]:
+                           c: float = 0.5,
+                           reservations: Optional[Dict[str, int]] = None
+                           ) -> Optional[Lesson]:
         """UCB choice for the under-tested memory arm, with novelty tie-breaks."""
         excluded = set(excluded or ())
         candidates = [l for l in self.lessons if l.id not in excluded]
         if not candidates:
             return None
-        total = sum(l.arm_trials for l in candidates) + 1
-        means = [abs(l.tail_uplift_sum / l.arm_trials) for l in candidates
-                 if l.arm_trials > 0]
-        reward_scale = max(means, default=1e-3)
+        if not bool(getattr(self.cfg, "is_v2", False)):
+            # Historical scoring is intentionally kept byte-for-byte equivalent
+            # for V1 reproducibility.
+            total = sum(l.arm_trials for l in candidates) + 1
+            means = [abs(l.tail_uplift_sum / l.arm_trials) for l in candidates
+                     if l.arm_trials > 0]
+            reward_scale = max(means, default=1e-3)
+
+            def v1_score(lesson):
+                if lesson.arm_trials <= 0:
+                    return (float("inf"), -lesson.uses, lesson.step)
+                mean = lesson.tail_uplift_sum / lesson.arm_trials
+                bonus = (float(c) * reward_scale
+                         * math.sqrt(math.log(total + 1) / lesson.arm_trials))
+                return (mean + bonus, -lesson.uses, lesson.step)
+
+            return max(candidates, key=v1_score)
+
+        reservations = dict(reservations or {})
+        target_n = self.comparison_n
+        # N covers the full bank, including a lesson excluded from this parent's
+        # exploration arm, and includes provisional assignments in this batch.
+        stats_by_id = {lesson.id: lesson.outcome_stats(target_n)
+                       for lesson in self.lessons}
+        total = (sum(stats["trials"] for stats in stats_by_id.values())
+                 + sum(max(0, int(value)) for value in reservations.values()) + 1)
+        means = [abs(stats["uplift_sum"] / stats["trials"])
+                 for stats in stats_by_id.values() if stats["trials"] > 0]
+        reward_scale = max([1e-3, *means])
 
         def score(lesson):
-            if lesson.arm_trials <= 0:
-                return (float("inf"), -lesson.uses, lesson.step)
-            mean = lesson.tail_uplift_sum / lesson.arm_trials
+            stats = stats_by_id[lesson.id]
+            reserved = max(0, int(reservations.get(lesson.id, 0)))
+            if stats["trials"] <= 0:
+                # Every genuinely untested lesson gets a path into the batch;
+                # pending reservations break ties so assignments spread out.
+                return (float("inf"), -reserved, -lesson.uses, lesson.step)
+            effective_trials = stats["trials"] + reserved
+            mean = stats["uplift_sum"] / stats["trials"]
             bonus = (float(c) * reward_scale
-                     * math.sqrt(math.log(total + 1) / lesson.arm_trials))
+                     * math.sqrt(math.log(total + 1) / effective_trials))
             return (mean + bonus, -lesson.uses, lesson.step)
 
         return max(candidates, key=score)
@@ -221,7 +301,7 @@ class MemoryBank:
         if cap <= 0 or len(self.lessons) <= cap:
             return
         order = sorted(range(len(self.lessons)),
-                       key=lambda i: (self.lessons[i].mean_tail_uplift(),
+                       key=lambda i: (self.evidence_mean(self.lessons[i]),
                                       self.lessons[i].importance,
                                       self.lessons[i].uses,
                                       self.lessons[i].step))
@@ -255,9 +335,14 @@ class MemoryBank:
         target = Path(path) if path is not None else self._path
         if target is None:
             return None
+        is_v2 = bool(getattr(self.cfg, "is_v2", False))
         payload = {"counts": self.counts(), "stats": self.stats,
                    "usage": self.usage_summary(),
-                   "lessons": [l.to_dict() for l in self.lessons]}
+                   "lessons": [l.to_dict(include_v2=is_v2)
+                               for l in self.lessons]}
+        if is_v2:
+            payload["memory_version"] = "V2"
+            payload["comparison_n"] = self.comparison_n
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2))
@@ -268,6 +353,14 @@ class MemoryBank:
         data = json.loads(Path(path).read_text())
         self.lessons = [Lesson.from_dict(d) for d in data.get("lessons", [])]
         self._by_id = {l.id: l for l in self.lessons}
+        if bool(getattr(self.cfg, "is_v2", False)):
+            legacy_trials = sum(
+                max(0, int(lesson.arm_trials) - len(lesson.causal_history))
+                for lesson in self.lessons)
+            if legacy_trials:
+                print(f"[memory] V2 loaded {legacy_trials} legacy causal "
+                      "trial(s) without an n/role/context ledger; they remain "
+                      "in archival counters but are treated as untested by V2")
         # Carry counters forward while remaining compatible with old banks.
         for key, value in (data.get("stats") or {}).items():
             if key in self.stats:

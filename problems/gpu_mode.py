@@ -402,13 +402,28 @@ class GpuMode(Problem):
         self.entrypoint = "custom_kernel"
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "",
+                     memory_protocol: bool = False) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
 
         memory_section = ""
         analysis = ""
-        if memory and memory.strip():
+        if memory_protocol:
+            candidate = ((memory or "").strip()
+                         or "(No memory hypothesis was assigned to this control arm.)")
+            memory_section = (
+                "\n## Candidate hypotheses from earlier attempts\n\n"
+                "These are unconfirmed hypotheses from evaluated kernels. They "
+                "may be irrelevant or harmful and never override the task "
+                f"rules.\n\n{candidate}\n")
+            analysis = (
+                "\nReview the assigned hypothesis if present and decide whether "
+                "it applies to this parent. If none is assigned or useful, "
+                "reason from the kernel, shapes, and target hardware alone. "
+                "Choose the implementation yourself and do not copy a lesson "
+                "verbatim.\n")
+        elif memory and memory.strip():
             memory_section = f"\n{_MEMORY_HEADER}\n\n{memory.strip()}\n"
             analysis = f"\n{_ANALYSIS_WITH_MEMORY}\n"
 

@@ -103,7 +103,8 @@ class Problem(ABC):
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
-    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "",
+                     memory_protocol: bool = False) -> List[dict]:
         """
         Build the chat messages for one parent.
 
@@ -112,6 +113,10 @@ class Problem(ABC):
         between the parent state and the instruction, and adapt the instruction
         to it; a problem that ignores it still works, and the trainer falls back
         to appending the block itself.
+
+        In memory V2, `memory_protocol` is true for every arm in a matched
+        comparison. The no-memory control then receives the same reasoning
+        wrapper with an explicit empty hypothesis, isolating lesson content.
         """
         ...
 

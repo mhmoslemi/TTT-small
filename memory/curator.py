@@ -20,6 +20,8 @@ memory in a single call:
     or shorter than `curate_min_keep_frac` of the input
   - ids are regenerated from content, and the usage/confirmation counters of any
     lesson whose text is unchanged are carried across
+  - in V2, direct causal counters survive only an exact, single-source prompt
+    intervention; rewritten and merged lessons keep lineage but start untested
   - the pre-curation bank is written to memory.pre-curate-<step>.json first
 """
 
@@ -96,11 +98,14 @@ def curation_entries(bank, body_chars: int = 400) -> List[str]:
     out = []
     for l in sorted(bank.lessons, key=lambda x: (-x.importance, x.step)):
         body = (l.lesson or l.summary).replace("\n", " ")[:body_chars]
-        tail = l.mean_tail_uplift()
+        evidence = bank.evidence_stats(l)
+        tail = bank.evidence_mean(l)
+        target = (f"@n={bank.comparison_n}"
+                  if bank.comparison_n is not None else "")
         out.append(f"[{l.id}] ({l.scope}/{l.outcome}, imp {l.importance:.1f}, "
                    f"step {l.step}, used {l.uses}x, confirmed {l.confirmations}x, "
-                   f"matched tail {tail:+.6g} over {l.arm_trials} trials, "
-                   f"wins {l.arm_tail_wins})\n"
+                   f"matched tail{target} {tail:+.6g} over "
+                   f"{evidence['trials']} trials, wins {evidence['wins']})\n"
                    f"  {l.title}\n  {body}")
     return out
 
@@ -214,8 +219,11 @@ class MemoryCurator:
                                            + max(0, before - len(new_lessons)))
 
         if verbose:
+            carry_label = ("lineage source(s) matched"
+                           if bool(getattr(self.cfg, "is_v2", False))
+                           else "counter(s) carried")
             print(f"[memory] curation at step {step}: {before} -> "
-                  f"{len(new_lessons)} lessons, {carried} counter(s) carried "
+                  f"{len(new_lessons)} lessons, {carried} {carry_label} "
                   f"over  {time.time() - t0:.1f}s")
         return {"step": step, "before": before, "after": len(new_lessons),
                 "applied": True, "carried": carried}
@@ -251,6 +259,31 @@ class MemoryCurator:
             claimed.update(l.id for l in sources)
             new.uses = sum(l.uses for l in sources)
             new.confirmations = sum(l.confirmations for l in sources)
+            if bool(getattr(self.cfg, "is_v2", False)):
+                # Usage and provenance may follow a rewrite. Causal evidence may
+                # follow only one byte-equivalent prompt intervention; a merge or
+                # semantic rewrite is an untested treatment.
+                new.lineage_ids = list(dict.fromkeys(
+                    value for source in sources
+                    for value in [source.id, *source.lineage_ids]))
+                if (len(sources) == 1
+                        and sources[0].intervention_key()
+                        == new.intervention_key()):
+                    source = sources[0]
+                    new.arm_trials = source.arm_trials
+                    new.arm_rollouts = source.arm_rollouts
+                    new.arm_valid = source.arm_valid
+                    new.arm_parent_improvements = source.arm_parent_improvements
+                    new.arm_tail_wins = source.arm_tail_wins
+                    new.tail_uplift_sum = source.tail_uplift_sum
+                    new.tail_uplift_best = source.tail_uplift_best
+                    new.last_outcome_step = source.last_outcome_step
+                    new.causal_history = [dict(row)
+                                          for row in source.causal_history]
+                carried += len(sources)
+                continue
+
+            # V1 intentionally retains the historical inheritance behavior.
             new.arm_trials = sum(l.arm_trials for l in sources)
             new.arm_rollouts = sum(l.arm_rollouts for l in sources)
             new.arm_valid = sum(l.arm_valid for l in sources)

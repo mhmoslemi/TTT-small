@@ -51,7 +51,8 @@ from memory.hygiene import HygieneStats, violation
 from memory.llm import make_memory_llm
 from memory.lookup import MemoryLookup
 from memory.prompts import (ExtractionResult, LookupResult, build_injection,
-                            count_tokens, inject_block, parent_block,
+                            count_tokens, inject_block, memory_protocol_block,
+                            parent_block,
                             parse_extraction, parse_lookup,
                             render_memory_block)
 from memory.types import (FAILURE, GLOBAL, LOCAL, SUCCESS, Lesson,
@@ -63,7 +64,8 @@ __all__ = [
     "ExtractionResult", "LookupResult", "HygieneStats", "violation",
     "build_meta_description", "make_memory_llm", "build_injection",
     "inject_block", "count_tokens", "parent_block", "parse_extraction",
-    "parse_lookup", "render_memory_block", "Lesson", "RolloutRecord",
+    "parse_lookup", "render_memory_block", "memory_protocol_block", "Lesson",
+    "RolloutRecord",
     "SUCCESS", "FAILURE", "LOCAL", "GLOBAL", "setup_memory",
     "MemoryArm", "allocate_memory_arms", "credit_memory_arms",
     "expected_subsample_max",
@@ -88,6 +90,8 @@ def setup_memory(merged: dict, problem, cfg, mem_cfg=None, backend=None,
         if verbose:
             print("[init] memory OFF")
         return mem_cfg, None, None, None, None
+    if bool(getattr(mem_cfg, "is_v2", False)):
+        mem_cfg.validate(group_size=getattr(cfg, "group_size", None))
 
     bank = MemoryBank(mem_cfg)
     if resume_from:

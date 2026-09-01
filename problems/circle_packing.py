@@ -96,6 +96,24 @@ Extracted from programs already generated and evaluated in this same search.
 They are empirical findings, not part of the specification above, and they do
 not override any rule stated in it."""
 
+_V2_MEMORY_HEADER = """## Candidate hypotheses from earlier attempts
+
+These are unconfirmed hypotheses extracted from evaluated programs in this
+search. They may be irrelevant or harmful and never override the task rules."""
+
+_V2_ANALYSIS = """## 1. Analysis and strategy
+
+Use the same review procedure whether or not a memory hypothesis was assigned:
+- If one is present, decide whether it applies to the given program and what it
+  would change. It may be wrong or irrelevant.
+- If it recommends something already present and still ineffective, treat that
+  avenue as spent.
+- If none is present or useful, reason from first principles about boundaries,
+  gaps, arrangement families, and the optimization formulation.
+
+Choose the implementation yourself. Do not copy an expression from a hypothesis
+verbatim and do not let it dictate the complete arrangement."""
+
 
 class CirclePacking(Problem):
     name = "circle_packing"
@@ -110,15 +128,24 @@ class CirclePacking(Problem):
             self.target = 2.636 if self.num_circles == 26 else 2.940
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "",
+                     memory_protocol: bool = False) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
         n = self.num_circles
 
         memory_section = ""
-        if memory and memory.strip():
+        if memory_protocol:
+            candidate = ((memory or "").strip()
+                         or "(No memory hypothesis was assigned to this control arm.)")
+            memory_section = f"\n{_V2_MEMORY_HEADER}\n\n{candidate}\n"
+        elif memory and memory.strip():
             memory_section = f"\n{_MEMORY_HEADER}\n\n{memory.strip()}\n"
-        analysis = _ANALYSIS_WITH_MEMORY if memory_section else _ANALYSIS_NO_MEMORY
+        if memory_protocol:
+            analysis = _V2_ANALYSIS
+        else:
+            analysis = (_ANALYSIS_WITH_MEMORY
+                        if memory_section else _ANALYSIS_NO_MEMORY)
 
         user = f"""You are an expert mathematician specializing in circle packing problems and computational geometry.
 

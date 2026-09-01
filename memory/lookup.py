@@ -50,7 +50,7 @@ class MemoryLookup:
             items = sorted(self.bank.lessons, key=lambda l: l.step, reverse=True)
         else:
             items = sorted(self.bank.lessons,
-                           key=lambda l: (l.mean_tail_uplift(),
+                           key=lambda l: (self.bank.evidence_mean(l),
                                           l.importance, l.step), reverse=True)
         return [l.id for l in items[:k]]
 
@@ -96,8 +96,12 @@ class MemoryLookup:
 
         t0 = time.time()
         try:
+            lookup_step = int(step_idx)
+            if bool(getattr(self.cfg, "is_v2", False)):
+                from memory.llm import LOOKUP_STEP_OFFSET
+                lookup_step += LOOKUP_STEP_OFFSET
             replies = self.llm.complete_many(
-                prompts, adapter_path=adapter_path, step_idx=step_idx,
+                prompts, adapter_path=adapter_path, step_idx=lookup_step,
                 max_new_tokens=int(self.cfg.lookup_max_new_tokens),
                 temperature=float(self.cfg.lookup_temperature))
         except Exception as e:

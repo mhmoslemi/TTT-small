@@ -1,7 +1,7 @@
 """
 The memory maker (Sec. 2.2), with two changes driven by the measurements.
 
-1. It sees the PARENT, not just the children. §4.3: "extraction should compare
+1. In memory V2 it sees the PARENT, not just the children. §4.3: "extraction should compare
    children with parents so that useful changes remain identifiable even when
    absolute rewards have plateaued." The median within-group reward spread was
    0.000000, with zero spread in 14 of 37 steps for MEM-B. Handed k
@@ -90,6 +90,7 @@ class LessonExtractor:
         catalog = self.bank.catalog() if self.bank is not None else []
         require_full = bool(getattr(self.cfg, "require_full_lessons", False))
         max_code = int(getattr(self.cfg, "max_code_lines", 4))
+        include_parent = bool(getattr(self.cfg, "is_v2", False))
 
         # `extract_from` decides which sides are called at all. With
         # "failure" the positive call is skipped entirely, so a step costs one
@@ -108,7 +109,8 @@ class LessonExtractor:
                 self._pick_successes(successes) if successes else [],
                 self._pick_failures(failures) if failures else [],
                 L, int(self.cfg.max_chars_per_example),
-                int(self.cfg.feedback_chars), catalog, max_code)
+                int(self.cfg.feedback_chars), catalog, max_code,
+                include_parent)
             result = ExtractionResult()
             self.last_raw = {}
             self._counts = (len(successes), len(failures))
@@ -121,13 +123,14 @@ class LessonExtractor:
             prompts.append(build_positive_messages(
                 self.meta_description, self._pick_successes(successes), L,
                 int(self.cfg.max_chars_per_example), catalog, require_full,
-                max_code))
+                max_code, include_parent))
             tags.append(SUCCESS)
         if failures and want_neg:
             prompts.append(build_negative_messages(
                 self.meta_description, self._pick_failures(failures), L,
                 int(self.cfg.max_chars_per_example),
-                int(self.cfg.feedback_chars), catalog, require_full, max_code))
+                int(self.cfg.feedback_chars), catalog, require_full, max_code,
+                include_parent))
             tags.append(FAILURE)
 
         result = ExtractionResult()

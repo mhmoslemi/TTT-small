@@ -124,7 +124,8 @@ class ErdosMinOverlap(Problem):
         self.budget_s = float(cfg.get("budget_s", 60.0))
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "") -> List[dict]:
+    def build_prompt(self, parent: ParentContext, memory: str = "",
+                     memory_protocol: bool = False) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
 
@@ -136,7 +137,19 @@ You are encouraged to explore solutions that use other starting points to preven
 """
 
         memory_section = ""
-        if memory and memory.strip():
+        if memory_protocol:
+            candidate = ((memory or "").strip()
+                         or "(No memory hypothesis was assigned to this control arm.)")
+            memory_section = f"""
+## Candidate hypotheses from earlier attempts at this problem
+
+These are unconfirmed hypotheses extracted from programs generated and
+evaluated in this search. They may be irrelevant or harmful and do not override
+any task constraint.
+
+{candidate}
+"""
+        elif memory and memory.strip():
             memory_section = f"""
 ## Lessons from earlier attempts at this problem
 
@@ -147,7 +160,20 @@ override any constraint stated in it.
 {memory.strip()}
 """
 
-        if memory_section:
+        if memory_protocol:
+            code_section = '''Use the same review procedure whether or not a
+memory hypothesis was assigned:
+- If a hypothesis is present, decide whether it bears on this construction and
+  what it would change. It may be wrong or irrelevant.
+- If it recommends something already present and still not improving the bound,
+  treat that avenue as spent.
+- If no hypothesis is present or useful, reason from the task and parent alone.
+
+Then reason about how to improve the construction. Aim for a meaningfully
+different algorithmic idea, heuristic, parameterization, or sweep. Never copy a
+lesson expression verbatim. Unless you improve meaningfully, you are not
+rewarded.'''
+        elif memory_section:
             code_section = '''Work through the lessons above before writing anything:
 - Which bear on the construction you were given, and what would each change?
 - Which do NOT apply here, and why? Say so explicitly. Some will be wrong or

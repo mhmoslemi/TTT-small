@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 SUCCESS = "success"
@@ -125,7 +125,8 @@ class RolloutRecord:
             parts.append("stdout tail:\n" + tail[-limit:])
         return "\n".join(parts)
 
-    def render_success(self, max_chars: int = 1500) -> str:
+    def render_success(self, max_chars: int = 1500,
+                       include_parent: bool = False) -> str:
         strategy = extract_strategy(self.response)
         d = self.delta()
         head = f"reward = {self.reward:.6f}"
@@ -137,16 +138,37 @@ class RolloutRecord:
         body = [head]
         if strategy:
             body.append("stated strategy:\n" + _clip(strategy, max_chars // 2))
-        body.append("program:\n```python\n"
-                    + _clip(self.code or "(no code captured)", max_chars) + "\n```")
+        if include_parent:
+            parent = self.parent_code or "(seed state; no parent program)"
+            child = self.code or "(no child code captured)"
+            body.append("parent program (before this attempt):\n```python\n"
+                        + _clip(parent, max(80, max_chars // 2)) + "\n```")
+            body.append("child program (after this attempt):\n```python\n"
+                        + _clip(child, max(80, max_chars // 2)) + "\n```")
+        else:
+            body.append("program:\n```python\n"
+                        + _clip(self.code or "(no code captured)", max_chars)
+                        + "\n```")
         return "\n".join(body)
 
-    def render_failure(self, max_chars: int = 1500, feedback_chars: int = 800) -> str:
+    def render_failure(self, max_chars: int = 1500, feedback_chars: int = 800,
+                       include_parent: bool = False) -> str:
         strategy = extract_strategy(self.response)
-        body = [f"reward = {self.reward:.6f}  (failed)"]
+        head = f"reward = {self.reward:.6f}  (failed)"
+        if include_parent and self.parent_reward is not None:
+            head += (f"  |  parent = {self.parent_reward:.6f}, "
+                     f"change = {self.delta():+.6f}")
+        body = [head]
         if strategy:
             body.append("stated strategy:\n" + _clip(strategy, max_chars // 3))
-        if self.code:
+        if include_parent:
+            parent = self.parent_code or "(seed state; no parent program)"
+            child = self.code or self.response or "(no parsable child program)"
+            body.append("parent program (before this attempt):\n```python\n"
+                        + _clip(parent, max(80, max_chars // 2)) + "\n```")
+            body.append("failed child (after this attempt):\n```python\n"
+                        + _clip(child, max(80, max_chars // 2)) + "\n```")
+        elif self.code:
             body.append("attempted program:\n```python\n"
                         + _clip(self.code, max_chars) + "\n```")
         else:
@@ -186,6 +208,11 @@ class Lesson:
     tail_uplift_sum: float = 0.0
     tail_uplift_best: float = 0.0
     last_outcome_step: int = -1
+    # V2 keeps the causal estimand and context attached to each matched trial.
+    # The aggregate fields above remain populated for V1 compatibility, but V2
+    # ranking reads this ledger at one configured comparison_n.
+    causal_history: List[Dict] = field(default_factory=list)
+    lineage_ids: List[str] = field(default_factory=list)
 
     @staticmethod
     def make_id(title: str, lesson: str, outcome: str) -> str:
@@ -213,30 +240,68 @@ class Lesson:
     def render(self, max_chars: int = 900) -> str:
         return f"{self.title}\n   {_clip(self.lesson or self.summary, max_chars)}"
 
-    def mean_tail_uplift(self) -> float:
-        """Matched max-seeking evidence; zero is the neutral untested prior."""
-        if self.arm_trials <= 0:
-            return 0.0
-        return float(self.tail_uplift_sum) / int(self.arm_trials)
+    def intervention_key(self):
+        """Exact text/protocol identity that receives causal outcome credit."""
+        return (self.outcome, self.scope, self.title.strip(),
+                (self.lesson or self.summary).strip())
 
-    def catalog_line(self, chars: int = 200) -> str:
+    def outcome_stats(self, comparison_n: Optional[int] = None) -> Dict:
+        """Aggregate either the V1 ledger or V2 trials at one exact best-of-n."""
+        if comparison_n is None:
+            return {
+                "trials": int(self.arm_trials),
+                "rollouts": int(self.arm_rollouts),
+                "valid": int(self.arm_valid),
+                "improved": int(self.arm_parent_improvements),
+                "wins": int(self.arm_tail_wins),
+                "uplift_sum": float(self.tail_uplift_sum),
+                "uplift_best": float(self.tail_uplift_best),
+            }
+        rows = [row for row in self.causal_history
+                if int(row.get("n", -1)) == int(comparison_n)]
+        uplifts = [float(row.get("tail_uplift", 0.0)) for row in rows]
+        return {
+            "trials": len(rows),
+            "rollouts": sum(int(row.get("rollouts", 0)) for row in rows),
+            "valid": sum(int(row.get("valid", 0)) for row in rows),
+            "improved": sum(int(row.get("improved", 0)) for row in rows),
+            "wins": sum(value > 0 for value in uplifts),
+            "uplift_sum": sum(uplifts),
+            "uplift_best": max(uplifts, default=0.0),
+        }
+
+    def mean_tail_uplift(self, comparison_n: Optional[int] = None) -> float:
+        """Matched max-seeking evidence; zero is the neutral untested prior."""
+        stats = self.outcome_stats(comparison_n)
+        if stats["trials"] <= 0:
+            return 0.0
+        return float(stats["uplift_sum"]) / int(stats["trials"])
+
+    def catalog_line(self, chars: int = 200,
+                     comparison_n: Optional[int] = None) -> str:
         """
         One line of the index the model reads when choosing. Carries enough to
         decide with, and nothing that could be copied: no body, no code.
         """
-        tag = "worked" if self.outcome == SUCCESS else "failed"
+        if comparison_n is not None:
+            tag = ("accepted-source" if self.outcome == SUCCESS
+                   else "failure-source")
+        else:
+            tag = "worked" if self.outcome == SUCCESS else "failed"
         text = (self.summary or self.lesson or "").replace("\n", " ")
         evidence = ""
-        if self.arm_trials:
-            evidence = (f", tail {self.mean_tail_uplift():+.3g}/"
-                        f"{self.arm_trials} trials, "
-                        f"wins {self.arm_tail_wins}")
+        stats = self.outcome_stats(comparison_n)
+        if stats["trials"]:
+            target = f"@n={comparison_n}" if comparison_n is not None else ""
+            evidence = (f", tail{target} "
+                        f"{self.mean_tail_uplift(comparison_n):+.3g}/"
+                        f"{stats['trials']} trials, wins {stats['wins']}")
         return (f"{self.id}  [{self.scope}/{tag}, imp {self.importance:.1f}, "
                 f"step {self.step}, used {self.uses}x{evidence}]  {self.title}"
                 f" :: {text[:chars]}")
 
-    def to_dict(self) -> Dict:
-        return {"id": self.id, "title": self.title, "summary": self.summary,
+    def to_dict(self, include_v2: bool = False) -> Dict:
+        out = {"id": self.id, "title": self.title, "summary": self.summary,
                 "lesson": self.lesson, "scope": self.scope,
                 "outcome": self.outcome, "step": self.step,
                 "importance": float(self.importance), "uses": self.uses,
@@ -249,6 +314,10 @@ class Lesson:
                 "tail_uplift_sum": float(self.tail_uplift_sum),
                 "tail_uplift_best": float(self.tail_uplift_best),
                 "last_outcome_step": self.last_outcome_step}
+        if include_v2:
+            out["causal_history"] = [dict(row) for row in self.causal_history]
+            out["lineage_ids"] = list(self.lineage_ids)
+        return out
 
     @classmethod
     def from_dict(cls, d: Dict) -> "Lesson":
@@ -267,7 +336,12 @@ class Lesson:
                    arm_tail_wins=int(d.get("arm_tail_wins", 0)),
                    tail_uplift_sum=float(d.get("tail_uplift_sum", 0.0)),
                    tail_uplift_best=float(d.get("tail_uplift_best", 0.0)),
-                   last_outcome_step=int(d.get("last_outcome_step", -1)))
+                   last_outcome_step=int(d.get("last_outcome_step", -1)),
+                   causal_history=[dict(row) for row in
+                                   (d.get("causal_history") or [])
+                                   if isinstance(row, dict)],
+                   lineage_ids=[str(value) for value in
+                                (d.get("lineage_ids") or [])])
 
 
 def clamp_importance(v) -> float:

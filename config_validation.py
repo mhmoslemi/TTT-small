@@ -44,7 +44,7 @@ train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
 max_new_tokens temperature top_p thinking deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
-memory memory_extract_mode memory_lessons_per_call memory_hygiene_profile
+memory memory_version memory_extract_mode memory_lessons_per_call memory_hygiene_profile
 memory_max_examples_per_call memory_max_chars_per_example
 memory_feedback_chars memory_max_new_tokens memory_forbid_constructions
 memory_max_code_lines memory_global_scope_allows_code memory_lookup_mode
@@ -55,7 +55,7 @@ memory_curate_max_new_tokens
 memory_curate_min_keep_frac memory_max_lessons memory_dedup_jaccard
 memory_reinforce_delta memory_persist memory_inject_mode memory_token_budget
 memory_grant_context memory_arm_control_fraction memory_arm_explore_fraction
-memory_arm_max_lessons memory_arm_exploration_c memory_outcome_credit
+memory_arm_max_lessons memory_arm_exploration_c memory_arm_comparison_n memory_outcome_credit
 memory_text_reinforce memory_extract_from memory_require_full_lessons
 memory_temperature memory_top_p memory_use_gen_pool
 feedback feedback_lambda feedback_anneal_steps feedback_anneal_shape
@@ -208,6 +208,13 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: top_p must be in (0, 1]")
     if "memory_top_p" in data and not 0 < float(data["memory_top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: memory_top_p must be in (0, 1]")
+    if "memory_version" in data and str(data["memory_version"]).upper() not in {
+            "V1", "V2"}:
+        raise ValueError(f"{_label(source)}: memory_version must be V1 or V2")
+    if ("memory_arm_comparison_n" in data
+            and int(data["memory_arm_comparison_n"]) < 0):
+        raise ValueError(
+            f"{_label(source)}: memory_arm_comparison_n must be >= 0")
     for key in ("adam_beta1", "adam_beta2"):
         if key in data and not 0 <= float(data[key]) < 1:
             raise ValueError(f"{_label(source)}: {key} must be in [0, 1)")
