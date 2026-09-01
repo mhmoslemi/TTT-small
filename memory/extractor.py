@@ -90,7 +90,8 @@ class LessonExtractor:
         catalog = self.bank.catalog() if self.bank is not None else []
         require_full = bool(getattr(self.cfg, "require_full_lessons", False))
         max_code = int(getattr(self.cfg, "max_code_lines", 4))
-        include_parent = bool(getattr(self.cfg, "is_v2", False))
+        is_v2 = bool(getattr(self.cfg, "is_v2", False))
+        include_parent = is_v2
 
         # `extract_from` decides which sides are called at all. With
         # "failure" the positive call is skipped entirely, so a step costs one
@@ -110,11 +111,19 @@ class LessonExtractor:
                 self._pick_failures(failures) if failures else [],
                 L, int(self.cfg.max_chars_per_example),
                 int(self.cfg.feedback_chars), catalog, max_code,
-                include_parent)
+                include_parent, strict_evidence=is_v2)
             result = ExtractionResult()
             self.last_raw = {}
             self._counts = (len(successes), len(failures))
-            self._one_call(messages, SUCCESS, step, L, adapter_path, result)
+            default_outcome = (FAILURE if is_v2 and not successes
+                               else SUCCESS)
+            allowed_outcomes = ({outcome for outcome, records in
+                                 ((SUCCESS, successes), (FAILURE, failures))
+                                 if records}
+                                if is_v2 else None)
+            self._one_call(
+                messages, default_outcome, step, L, adapter_path, result,
+                allowed_outcomes=allowed_outcomes)
             result.reinforce = list(dict.fromkeys(result.reinforce))
             return result
 
@@ -123,14 +132,14 @@ class LessonExtractor:
             prompts.append(build_positive_messages(
                 self.meta_description, self._pick_successes(successes), L,
                 int(self.cfg.max_chars_per_example), catalog, require_full,
-                max_code, include_parent))
+                max_code, include_parent, strict_evidence=is_v2))
             tags.append(SUCCESS)
         if failures and want_neg:
             prompts.append(build_negative_messages(
                 self.meta_description, self._pick_failures(failures), L,
                 int(self.cfg.max_chars_per_example),
                 int(self.cfg.feedback_chars), catalog, require_full, max_code,
-                include_parent))
+                include_parent, strict_evidence=is_v2))
             tags.append(FAILURE)
 
         result = ExtractionResult()
@@ -153,6 +162,8 @@ class LessonExtractor:
         for tag, raw in zip(tags, replies):
             self.last_raw[tag] = raw
             parsed = parse_extraction(raw, tag, step, L)
+            self._filter_supported_outcomes(
+                parsed, {tag} if is_v2 else None)
             if not parsed.lessons and not parsed.reinforce:
                 print(f"[memory] {tag} extraction returned nothing parsable "
                       f"({len(raw or '')} chars)")
@@ -163,7 +174,7 @@ class LessonExtractor:
         return result
 
     def _one_call(self, messages, tag, step, L, adapter_path,
-                  into: ExtractionResult) -> None:
+                  into: ExtractionResult, allowed_outcomes=None) -> None:
         from memory.llm import EXTRACT_STEP_OFFSET
         try:
             raw = self.llm.complete_many(
@@ -176,6 +187,7 @@ class LessonExtractor:
             return
         self.last_raw[tag] = raw
         parsed = parse_extraction(raw, tag, step, L)
+        self._filter_supported_outcomes(parsed, allowed_outcomes)
         if not parsed.lessons and not parsed.reinforce:
             print(f"[memory] extraction returned nothing parsable "
                   f"({len(raw or '')} chars)")
@@ -183,6 +195,21 @@ class LessonExtractor:
         into.reinforce.extend(parsed.reinforce)
         if parsed.reflection and not into.reflection:
             into.reflection = parsed.reflection
+
+    @staticmethod
+    def _filter_supported_outcomes(parsed: ExtractionResult,
+                                   allowed_outcomes) -> None:
+        if allowed_outcomes is None:
+            return
+        unsupported = [lesson for lesson in parsed.lessons
+                       if lesson.outcome not in allowed_outcomes]
+        if not unsupported:
+            return
+        allowed = "/".join(sorted(allowed_outcomes))
+        print(f"[memory] V2 discarded {len(unsupported)} lesson(s) "
+              f"without batch evidence (allowed outcome: {allowed})")
+        parsed.lessons = [lesson for lesson in parsed.lessons
+                          if lesson.outcome in allowed_outcomes]
 
     # ------------------------------------------------------------------
     def screen(self, lessons: Sequence[Lesson], hygiene: HygieneStats

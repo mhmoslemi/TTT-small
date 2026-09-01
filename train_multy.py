@@ -40,11 +40,16 @@ class _NoticeRoutingStream:
         self.label = label
         self._routing_line = False
 
+    def _diagnostic_is_open(self):
+        return (self.diagnostic is not None
+                and not bool(getattr(self.diagnostic, "closed", False)))
+
     def write(self, value):
         for piece in str(value).splitlines(keepends=True):
-            route = (self._routing_line
-                     or any(marker in piece
-                            for marker in _ROUTED_DEPENDENCY_NOTICES))
+            route = (self._diagnostic_is_open()
+                     and (self._routing_line
+                          or any(marker in piece
+                                 for marker in _ROUTED_DEPENDENCY_NOTICES)))
             if route:
                 if not self._routing_line:
                     self.diagnostic.write(f"[{self.label}] ")
@@ -57,7 +62,13 @@ class _NoticeRoutingStream:
 
     def flush(self):
         self.visible.flush()
-        self.diagnostic.flush()
+        if self._diagnostic_is_open():
+            self.diagnostic.flush()
+
+    def detach_diagnostic(self):
+        """Make a handler-retained wrapper safe after its file is closed."""
+        self._routing_line = False
+        self.diagnostic = None
 
     def __getattr__(self, name):
         return getattr(self.visible, name)
@@ -104,6 +115,12 @@ def _route_dependency_notices(log_path):
         finally:
             _restore_logging_stream(stdout, stdout.visible)
             _restore_logging_stream(stderr, stderr.visible)
+            # Some libraries cache a handler before attaching it to a logger,
+            # so it cannot always be found by _restore_logging_stream. Such a
+            # handler may retain this wrapper after the context closes. Leave
+            # that wrapper usable, but make every future write console-only.
+            stdout.detach_diagnostic()
+            stderr.detach_diagnostic()
 
 
 # ======================================================================

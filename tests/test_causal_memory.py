@@ -1,13 +1,20 @@
+import io
+import importlib.util
 import json
+import sys
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from memory.bandit import allocate_memory_arms, credit_memory_arms
 from memory.bank import MemoryBank
 from memory.config import MemoryConfig
 from memory.curator import MemoryCurator
+from memory.extractor import LessonExtractor
 from memory.llm import LOOKUP_STEP_OFFSET
 from memory.lookup import MemoryLookup
 from memory.prompts import memory_protocol_block, render_memory_block
@@ -39,6 +46,16 @@ def lesson(index, outcome=SUCCESS):
         title=f"method_{index}", summary=f"summary_{index}",
         lesson=f"operation_{index}", outcome=outcome, step=index,
     )
+
+
+class _ExtractionLLM:
+    def __init__(self, response):
+        self.response = response
+        self.prompts = []
+
+    def complete_many(self, prompts, **kwargs):
+        self.prompts.extend(prompts)
+        return [self.response for _ in prompts]
 
 
 class MemoryVersionConfigTests(unittest.TestCase):
@@ -254,6 +271,144 @@ class V2IdentityAndPromptTests(unittest.TestCase):
             self.assertEqual(payload["memory_version"], "V2")
             self.assertEqual(payload["comparison_n"], 2)
             self.assertEqual(payload["lessons"][0]["causal_history"][0]["n"], 2)
+
+
+class V2ExtractionEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _response():
+        return json.dumps({
+            "lessons": [
+                {
+                    "title": "unsupported strategy",
+                    "summary": "claim a successful method",
+                    "scope": "local",
+                    "kind": "heuristic",
+                    "lesson": "repeat the supposed successful change",
+                    "importance": 2,
+                    "closest_existing": "none",
+                    "new_because": "new claim",
+                },
+                {
+                    "title": "observed failure",
+                    "summary": "avoid the rejected operation",
+                    "scope": "local",
+                    "kind": "pitfall",
+                    "lesson": "check the verifier contract before returning",
+                    "importance": 2,
+                    "closest_existing": "none",
+                    "new_because": "new precaution",
+                },
+            ]
+        })
+
+    @staticmethod
+    def _failure_record():
+        return RolloutRecord(
+            parent_code="parent()", parent_reward=1.0,
+            code="rejected()", reward=0.0, valid=False,
+            msg="verification failed")
+
+    @staticmethod
+    def _success_record():
+        return RolloutRecord(
+            parent_code="parent()", parent_reward=1.0,
+            code="accepted()", reward=2.0, valid=True)
+
+    def test_v2_failure_only_batch_cannot_create_success_lesson(self):
+        cfg = causal_config("V2")
+        llm = _ExtractionLLM(self._response())
+        extractor = LessonExtractor(cfg, llm, "task")
+
+        notice = io.StringIO()
+        with redirect_stdout(notice):
+            result = extractor.extract([self._failure_record()], step=0)
+
+        self.assertEqual([item.outcome for item in result.lessons], [FAILURE])
+        self.assertIn("discarded 1 lesson", notice.getvalue())
+        prompt = llm.prompts[0][0]["content"]
+        self.assertIn("no accepted evidence", prompt)
+        self.assertIn('kind="pitfall"', prompt)
+        self.assertNotIn("why did the successes succeed", prompt)
+
+    def test_v2_success_only_batch_cannot_create_pitfall(self):
+        cfg = causal_config("V2")
+        llm = _ExtractionLLM(self._response())
+        extractor = LessonExtractor(cfg, llm, "task")
+
+        with redirect_stdout(io.StringIO()):
+            result = extractor.extract([self._success_record()], step=0)
+
+        self.assertEqual([item.outcome for item in result.lessons], [SUCCESS])
+        prompt = llm.prompts[0][0]["content"]
+        self.assertIn("no rejected evidence", prompt)
+
+    def test_v2_split_mode_also_enforces_source_outcome(self):
+        cfg = causal_config("V2", memory_extract_mode="split")
+        llm = _ExtractionLLM(self._response())
+        extractor = LessonExtractor(cfg, llm, "task")
+
+        with redirect_stdout(io.StringIO()):
+            result = extractor.extract([self._failure_record()], step=0)
+
+        self.assertEqual([item.outcome for item in result.lessons], [FAILURE])
+        prompt = llm.prompts[0][0]["content"]
+        self.assertNotIn("why did the successes succeed", prompt)
+        self.assertIn('kind="pitfall"', prompt)
+
+    def test_v1_keeps_historical_failure_only_parsing(self):
+        cfg = causal_config("V1")
+        llm = _ExtractionLLM(self._response())
+        extractor = LessonExtractor(cfg, llm, "task")
+
+        result = extractor.extract([self._failure_record()], step=0)
+
+        self.assertEqual(
+            [item.outcome for item in result.lessons], [SUCCESS, FAILURE])
+
+
+class DependencyNoticeRoutingTests(unittest.TestCase):
+    @staticmethod
+    def _module():
+        fake_numpy = types.ModuleType("numpy")
+        fake_numpy.random = SimpleNamespace()
+        fake_yaml = types.ModuleType("yaml")
+        module_name = "_train_multy_notice_test"
+        path = Path(__file__).parents[1] / "train_multy.py"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_retained_stream_falls_back_after_diagnostic_closes(self):
+        stream_type = self._module()._NoticeRoutingStream
+        visible = io.StringIO()
+        diagnostic = io.StringIO()
+        stream = stream_type(visible, diagnostic, "test")
+        diagnostic.close()
+
+        stream.write("ordinary warning\n")
+        stream.write("No prebuilt binary for CUDA\n")
+        stream.flush()
+
+        self.assertEqual(
+            visible.getvalue(),
+            "ordinary warning\nNo prebuilt binary for CUDA\n")
+
+    def test_context_retained_stream_is_safe_after_teardown(self):
+        module = self._module()
+        visible = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dependency.log"
+            with redirect_stderr(visible):
+                with module._route_dependency_notices(path):
+                    retained = sys.stderr
+                    retained.write("No prebuilt binary for CUDA\n")
+                retained.write("late transformers warning\n")
+                retained.flush()
+
+            self.assertIn("No prebuilt binary for CUDA", path.read_text())
+        self.assertEqual(visible.getvalue(), "late transformers warning\n")
 
 
 class _LookupLLM:

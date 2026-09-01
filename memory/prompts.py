@@ -104,6 +104,16 @@ better than a restatement.
   put that id in "reinforce" and drop it from "lessons"."""
 
 
+def _schema(num_lessons: int, reflection_question: str = "") -> str:
+    rendered = _SCHEMA.format(n=num_lessons)
+    if not reflection_question:
+        return rendered
+    return rendered.replace(
+        "why did the successes succeed and the failures\n"
+        "                 fail?",
+        reflection_question)
+
+
 def _index_section(catalog: Sequence[str]) -> str:
     if not catalog:
         return ("## Lessons already recorded\n"
@@ -139,7 +149,8 @@ def build_contrast_messages(meta_description: str,
                             feedback_chars: int,
                             catalog: Sequence[str] = (),
                             max_code: int = 4,
-                            include_parent: bool = False) -> List[Dict]:
+                            include_parent: bool = False,
+                            strict_evidence: bool = False) -> List[Dict]:
     """
     One call over both halves of the batch.
 
@@ -156,25 +167,64 @@ def build_contrast_messages(meta_description: str,
                       + r.render_failure(max_chars_per_example, feedback_chars,
                                          include_parent))
 
+    batch_intro = (
+        "Below is one batch of attempts at a single task. Some were accepted by "
+        "the verifier and some were rejected."
+    )
+    reflection_question = ""
+    if strict_evidence and not successes:
+        batch_intro = (
+            "Below is one batch of attempts at a single task. Every attempt was "
+            "rejected by the verifier."
+        )
+        reflection_question = (
+            "which observed failure causes generalize, and how can they be "
+            "prevented?"
+        )
+        analysis_instructions = (
+            "Every attempt in this batch was rejected; there is no accepted "
+            "evidence from which to infer a successful strategy. Analyze only "
+            "the observed failure causes and preventative measures. Every new "
+            "lesson must use kind=\"pitfall\". Do not create or reinforce a "
+            "positive strategy from this batch.\n"
+        )
+    elif strict_evidence and not failures:
+        batch_intro = (
+            "Below is one batch of attempts at a single task. Every attempt was "
+            "accepted by the verifier."
+        )
+        reflection_question = (
+            "which observed successful changes generalize to future attempts?"
+        )
+        analysis_instructions = (
+            "Every attempt in this batch was accepted; there is no rejected "
+            "evidence from which to infer a pitfall. Analyze only the observed "
+            "successful changes. Do not create a kind=\"pitfall\" lesson from "
+            "this batch.\n"
+        )
+    else:
+        analysis_instructions = (
+            "Compare and contrast these attempts. Think first: why did some "
+            "succeed while others failed, and what separates the "
+            "higher-scoring accepted ones from the lower-scoring ones?\n"
+            "- Identify strategies that consistently led to a better outcome.\n"
+            "- Identify mistakes or inefficiencies in the rejected attempts, "
+            "and state the preventative measure for each.\n"
+        )
+
     user = (
         "You maintain the lesson memory for an automated program-search run. "
-        "Below is one batch of attempts at a single task. Some were accepted by "
-        "the verifier and some were rejected.\n\n"
+        + batch_intro + "\n\n"
         f"## Task\n{meta_description}\n\n"
         + _index_section(catalog) + "\n"
         f"## This batch ({len(successes)} accepted, {len(failures)} rejected)\n\n"
         + "\n\n".join(blocks)
         + "\n\n## What to produce\n"
-        "Compare and contrast these attempts. Think first: why did some succeed "
-        "while others failed, and what separates the higher-scoring accepted ones "
-        "from the lower-scoring ones?\n"
-        "- Identify strategies that consistently led to a better outcome.\n"
-        "- Identify mistakes or inefficiencies in the rejected attempts, and "
-        "state the preventative measure for each.\n"
-        "- Prefer insights that hold beyond this particular batch.\n"
+        + analysis_instructions
+        + "- Prefer insights that hold beyond this particular batch.\n"
         + _delta_note(list(successes) + list(failures))
         + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
-        + _SCHEMA.format(n=num_lessons)
+        + _schema(num_lessons, reflection_question)
     )
     return [{"role": "user", "content": user}]
 
@@ -188,7 +238,8 @@ def build_positive_messages(meta_description: str,
                             catalog: Sequence[str] = (),
                             require_full: bool = False,
                             max_code: int = 4,
-                            include_parent: bool = False) -> List[Dict]:
+                            include_parent: bool = False,
+                            strict_evidence: bool = False) -> List[Dict]:
     blocks = [f"### Attempt {i}\n"
               + r.render_success(max_chars_per_example, include_parent)
               for i, r in enumerate(records, 1)]
@@ -203,10 +254,16 @@ def build_positive_messages(meta_description: str,
         "Think first about WHY these succeeded, then derive what separates the "
         "higher-scoring ones from the lower-scoring ones and what each changed "
         "relative to its parent."
+        + ("\nEvery new lesson must describe positive evidence from these "
+           "accepted attempts. Do not create a kind=\"pitfall\" lesson.\n"
+           if strict_evidence else "")
         + _delta_note(records)
         + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
         + ("Return exactly {n} lessons.\n\n".format(n=num_lessons) if require_full else "")
-        + _SCHEMA.format(n=num_lessons)
+        + _schema(
+            num_lessons,
+            "which observed successful changes generalize to future attempts?"
+            if strict_evidence else "")
     )
     return [{"role": "user", "content": user}]
 
@@ -217,7 +274,8 @@ def build_negative_messages(meta_description: str,
                             feedback_chars: int, catalog: Sequence[str] = (),
                             require_full: bool = False,
                             max_code: int = 4,
-                            include_parent: bool = False) -> List[Dict]:
+                            include_parent: bool = False,
+                            strict_evidence: bool = False) -> List[Dict]:
     blocks = [f"### Attempt {i}\n"
               + r.render_failure(max_chars_per_example, feedback_chars,
                                  include_parent)
@@ -239,9 +297,14 @@ def build_negative_messages(meta_description: str,
         "a memory full of defensive coding produces valid, worthless output. "
         "State what would make the computation correct, not how to survive it "
         "being wrong.\n"
+        + ("Every new lesson must use kind=\"pitfall\" because this call has "
+           "only rejected evidence.\n" if strict_evidence else "")
         + "\n" + GENERALIZATION_RULES.format(max_code=max_code) + "\n\n"
         + ("Return exactly {n} lessons.\n\n".format(n=num_lessons) if require_full else "")
-        + _SCHEMA.format(n=num_lessons)
+        + _schema(
+            num_lessons,
+            "which observed failure causes generalize, and how can they be "
+            "prevented?" if strict_evidence else "")
     )
     return [{"role": "user", "content": user}]
 
