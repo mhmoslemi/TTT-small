@@ -400,6 +400,47 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertLessEqual(
             layout.unsharded_stage_required_gib, layout.budget_gib)
 
+    def test_four_l40s_gpt_oss_120b_uses_one_tp4_engine(self):
+        """Regression for the measured vLLM 0.28 MXFP4 residency.
+
+        The packed checkpoint estimate previously selected two TP=2 replicas.
+        Actual startup used 36.55 GiB/rank before 2.63 GiB of CUDA graphs and
+        left a negative KV-cache budget.  One TP=4 engine fits with headroom
+        and also avoids loading two complete host-side model copies.
+        """
+        roles = allocate_gpu_roles([0, 1, 2, 3], "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "L40S", 45.0, 44.4)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "openai/gpt-oss-120b",
+            "generation_backend": "vllm",
+            "max_seq_length": 32000,
+            "memory": True,
+            "memory_grant_context": True,
+            "memory_token_budget": 3400,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_max_num_batched_tokens": "auto",
+            "gen_micro_batch": "auto",
+            "logprob_chunk": "auto",
+        }
+
+        layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, detect_attention_heads(cfg["model_name"]))
+
+        self.assertEqual(layout.tensor_parallel_size, 4)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 1)
+        self.assertLessEqual(
+            layout.unsharded_stage_required_gib, layout.budget_gib)
+
+        cfg["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
+        cfg["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
+        resolve_memory_settings(cfg, roles, memory)
+        self.assertEqual(cfg["gen_micro_batch"], 4)
+
     def test_vllm_output_redirects_both_fds_to_append_log(self):
         opened = mock_open()
         opened.return_value.fileno.return_value = 73

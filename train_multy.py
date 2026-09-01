@@ -777,6 +777,11 @@ def load_config():
             print(f"[config] {len(gpu_ids)} rollout GPUs form {layout.replicas} "
                   f"parallel vLLM replicas at compatible "
                   f"TP={merged['vllm_tensor_parallel_size']}")
+        elif layout.tensor_parallel_size > 1:
+            print(f"[config] using one vLLM engine with "
+                  f"TP={layout.tensor_parallel_size}; selected layout needs "
+                  f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
+                  f"within the {layout.budget_gib:.1f} GiB budget")
 
     for note in resolve_memory_settings(merged, roles, memory):
         print(f"[memory] auto: {note}")

@@ -167,6 +167,23 @@ def _native_weight_bytes(model_name: str) -> float:
     return 2.0
 
 
+def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
+    """Return an empirical lower bound for vLLM's on-device model residency.
+
+    Packed checkpoint bytes are not a sufficient estimate for every native
+    quantization format.  In particular, vLLM materializes additional
+    GPT-OSS expert metadata/scales and runtime buffers while loading MXFP4.
+    vLLM 0.28 reports 36.55 GiB per rank for GPT-OSS-120B at TP=2 on L40S,
+    or 73.1 GiB for one complete model.  Keep a small margin over that
+    measured value so the layout planner does not mistake two TP=2 replicas
+    for a valid four-card layout.
+    """
+    name = str(model_name or "").lower()
+    if "gpt-oss-120b" in name:
+        return 76.0
+    return None
+
+
 def _kv_bytes_per_token(model_name: str) -> int:
     name = str(model_name or "").lower()
     if "gpt-oss" in name:
@@ -200,9 +217,20 @@ def _estimated_weight_gib(model_name: str, quantization: str) -> float:
     quant = str(quantization or "").strip().lower()
     if quant in ("", "auto", "none"):
         exact = _checkpoint_weight_gib(model_name)
-        if exact is not None:
-            return exact
-        weight_bytes = _native_weight_bytes(model_name)
+        if exact is None:
+            weight_bytes = _native_weight_bytes(model_name)
+            estimated = (_model_size_billions(model_name) * weight_bytes
+                         * (1e9 / (1024.0 ** 3)))
+        else:
+            estimated = exact
+
+        # A shard index describes packed files on disk, not necessarily the
+        # representation vLLM holds after loading.  Apply known runtime floors
+        # to Hub ids and local checkpoint paths alike.
+        runtime_floor = _known_vllm_runtime_weight_floor_gib(model_name)
+        if runtime_floor is not None:
+            estimated = max(estimated, runtime_floor)
+        return estimated
     else:
         # Runtime 4/8-bit modes are conservatively budgeted above their raw
         # packed weight size for scales and quantization metadata.
@@ -302,6 +330,13 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # would permit hundreds of sequences.  One is retained as a safe floor;
         # vLLM will fail clearly at model load if the weights themselves do not fit.
         cap = max(1, min(32, estimated_sequences))
+        # Wide MoE models on sub-60-GiB cards rely on a comparatively tight
+        # tensor-parallel layout.  Bound scheduler/CUDA-graph concurrency even
+        # when the remaining paged-KV budget could theoretically admit many
+        # full-length requests.  Four still keeps the single TP engine busy
+        # without recreating the startup pressure seen with model replicas.
+        if using_vllm and size_b >= 100 and min_total < 60:
+            cap = min(cap, 4)
         if not using_vllm:
             cap = min(cap, 8 if size_b <= 10 else (2 if size_b <= 40 else 1))
         cfg["gen_micro_batch"] = cap
