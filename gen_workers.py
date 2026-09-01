@@ -451,6 +451,42 @@ def _vllm_job_seed(seed, step, rank, group_idx):
     return (worker_seed(seed, step, rank) + int(group_idx) * 104_729) % (2 ** 31 - 1)
 
 
+def _python_development_header_path():
+    """Return an installed Python.h path, or the expected path when absent."""
+    import sysconfig
+
+    candidates = []
+    paths = sysconfig.get_paths()
+    for key in ("include", "platinclude"):
+        if paths.get(key):
+            candidates.append(os.path.join(paths[key], "Python.h"))
+    for key in ("INCLUDEPY", "CONFINCLUDEPY"):
+        include_dir = sysconfig.get_config_var(key)
+        if include_dir:
+            candidates.append(os.path.join(include_dir, "Python.h"))
+
+    # Preserve order while avoiding repeated checks; sysconfig commonly maps
+    # all four entries to the same interpreter include directory.
+    candidates = list(dict.fromkeys(candidates))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate, True
+    expected = (candidates[0] if candidates else
+                f"Python.h for Python {sys.version_info.major}."
+                f"{sys.version_info.minor}")
+    return expected, False
+
+
+def _resolve_vllm_enforce_eager(requested, header_available=None):
+    """Avoid vLLM's TorchInductor startup path without Python dev headers."""
+    if bool(requested):
+        return True, False
+    if header_available is None:
+        _header_path, header_available = _python_development_header_path()
+    fallback = not bool(header_available)
+    return fallback, fallback
+
+
 def _prepare_vllm_sleep_allocator_env():
     """Remove PyTorch's expandable allocator only inside sleep-mode workers.
 
@@ -798,6 +834,22 @@ class GenerationPool:
         if self.backend not in ("hf", "vllm"):
             raise ValueError(
                 f"unknown generation backend {backend!r}; expected hf|vllm")
+
+        effective_enforce_eager = bool(vllm_enforce_eager)
+        if self.backend == "vllm":
+            effective_enforce_eager, eager_fallback = (
+                _resolve_vllm_enforce_eager(effective_enforce_eager))
+            if eager_fallback:
+                header_path, _available = _python_development_header_path()
+                python_dev_package = (
+                    f"python{sys.version_info.major}.{sys.version_info.minor}-dev")
+                print(
+                    f"[vllm] {header_path} is missing; enabling eager mode "
+                    "because vLLM TorchInductor cannot compile without "
+                    f"Python.h. Install {python_dev_package} to re-enable "
+                    "compiled execution.",
+                    flush=True,
+                )
         if len(self.gpu_ids) != requested_num_gpus:
             raise ValueError("gpu_ids must contain exactly num_workers entries")
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
@@ -841,7 +893,7 @@ class GenerationPool:
         worker_options = {
             "lora_rank": int(lora_rank),
             "gpu_memory_utilization": float(vllm_gpu_memory_utilization),
-            "enforce_eager": bool(vllm_enforce_eager),
+            "enforce_eager": effective_enforce_eager,
             "enable_prefix_caching": bool(vllm_enable_prefix_caching),
             "gen_micro_batch": self.gen_micro_batch,
             "quantization": vllm_quantization,

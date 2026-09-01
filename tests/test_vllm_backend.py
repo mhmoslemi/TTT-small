@@ -17,6 +17,7 @@ from gen_workers import (
     _flashinfer_comm_guard_required,
     _prepare_flashinfer_comm_compat,
     _redirect_vllm_output,
+    _resolve_vllm_enforce_eager,
     _vllm_engine_kwargs,
     _vllm_job_seed,
     _vllm_worker_loop,
@@ -812,6 +813,23 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertNotIn("max_num_seqs", kwargs)
         self.assertNotIn("seed", kwargs)
         self.assertNotIn("quantization", kwargs)
+
+    def test_vllm_uses_eager_fallback_without_python_headers(self):
+        self.assertEqual(
+            _resolve_vllm_enforce_eager(
+                requested=False, header_available=False),
+            (True, True),
+        )
+        self.assertEqual(
+            _resolve_vllm_enforce_eager(
+                requested=False, header_available=True),
+            (False, False),
+        )
+        self.assertEqual(
+            _resolve_vllm_enforce_eager(
+                requested=True, header_available=False),
+            (True, False),
+        )
 
     def test_gpt_oss_120b_uses_host_memory_safe_checkpoint_loading(self):
         kwargs = _vllm_engine_kwargs(
