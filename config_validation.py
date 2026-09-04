@@ -66,7 +66,7 @@ feedback_validity_target feedback_max_reward_ratio feedback_reward_scale_floor
 feedback_max_per_signature feedback_auto_signature_fraction
 """.split()) | RERANKER_REQUIRED_KEYS
 
-COMMON_OPTIONAL_KEYS = frozenset()
+COMMON_OPTIONAL_KEYS = frozenset({"advantage_mode", "cvar_alpha", "cvar_lambda"})
 
 CPU_PROBLEMS = frozenset({
     "circle_packing", "erdos", "ac1", "ac2", "denoising",

@@ -101,6 +101,69 @@ def entropic_adaptive_advantages(
     return advantages, beta
 
 
+def grpo_advantages(rewards: np.ndarray, eps: float = 1e-12, normalize_std: bool = True):
+    """
+    Standard GRPO group-relative advantages for one group.
+
+    A_n = (r_n - mean(r)) / (std(r) + eps)   (or just r_n - mean(r) when
+    normalize_std is False).
+
+    Returns:
+      advantages: shape (K,)
+      scale:      the std used for normalization (0.0 for degenerate groups)
+
+    All-equal-reward groups get a zero advantage vector (no gradient).
+    """
+    r = np.asarray(rewards, dtype=np.float64)
+    K = r.shape[0]
+    if K < 2 or float(r.max() - r.min()) < eps:
+        return np.zeros_like(r), 0.0
+    centered = r - r.mean()
+    std = float(r.std())
+    if not normalize_std:
+        return centered, std
+    return centered / (std + eps), std
+
+
+def upper_tail_advantages(
+    rewards: np.ndarray,
+    alpha: float = 0.2,
+    lam: float = 0.5,
+    eps: float = 1e-12,
+):
+    """
+    GRPO advantage blended with a sparse right-tail (upper VaR) term.
+
+    q      = Quantile(r, 1 - alpha)                       # upper VaR
+    A_up_n = (r_n - q) / (std + eps)   if r_n > q else 0  # tail-only bonus
+    A_n    = (1 - lam) * (r_n - mean) / (std + eps) + lam * A_up_n
+
+    alpha is the tail mass (0.2 -> 80th percentile cutoff, 0.1 -> 90th).
+    lam = 0 recovers plain GRPO; lam = 1 rewards only rollouts above the
+    cutoff and gives no gradient to the rest.
+
+    Returns:
+      advantages: shape (K,)
+      q:          the (1 - alpha)-quantile threshold used (0.0 for degenerate groups)
+
+    All-equal-reward groups get a zero advantage vector (no gradient).
+    """
+    r = np.asarray(rewards, dtype=np.float64)
+    K = r.shape[0]
+    if K < 2 or float(r.max() - r.min()) < eps:
+        return np.zeros_like(r), 0.0
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    if not (0.0 <= lam <= 1.0):
+        raise ValueError(f"lam must be in [0, 1], got {lam}")
+    std = float(r.std())
+    scale = std + eps
+    q = float(np.quantile(r, 1.0 - alpha))
+    base = (r - r.mean()) / scale
+    upper = np.where(r > q, (r - q) / scale, 0.0)
+    return (1.0 - lam) * base + lam * upper, q
+
+
 if __name__ == "__main__":
     # Case 1: all rewards equal -> zero advantage
     r = np.array([0.5, 0.5, 0.5, 0.5])

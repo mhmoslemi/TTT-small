@@ -3,7 +3,7 @@ set -eu
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3}"
-config_path="${TTT_CONFIG:-configs/erdos.yaml}"
+config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
 memory_version="${MEMORY_VERSION:-V2}"
 
 
@@ -75,4 +75,8 @@ case "$memory_version" in
         ;;
 esac
 
-exec python3 train_multy.py --config "$config_path" "$@"
+# exec python3 train_multy.py --config "$config_path" "$@"
+exec python3 train_multy_CVaR.py --config "$config_path" "$@" --advantage-mode cvar --cvar-alpha 0.1 --cvar-lambda 0.5
+
+
+
