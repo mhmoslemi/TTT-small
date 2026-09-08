@@ -1514,6 +1514,7 @@ def _is_attention_kernel_unavailable(error):
         "no available kernel" in message
         or "no viable backend for scaled_dot_product_attention" in message
         or "no suitable kernel" in message
+        or message.strip() == "invalid backend"
     )
 
 
@@ -3150,9 +3151,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 except Exception as error:
                     reference_scores = [None] * len(score_pairs)
                     print(f"[warn] vLLM reference scoring failed ({error!r}); "
-                          "missing values will fall back to HF", flush=True)
+                          "missing values will use their frozen rollout-policy "
+                          "scores", flush=True)
+                reference_behavior_fallbacks = 0
                 for record, values in zip(
                         vllm_logprob_records, reference_scores):
+                    behavior_values = record["behavior_logprobs"]
+                    if (values is None and behavior_values is not None
+                            and len(behavior_values)
+                            == len(record["token_ids"])):
+                        # Never send an extreme context back through the HF
+                        # trainer merely because a vLLM score payload was
+                        # incomplete. The rollout policy is frozen for this
+                        # update, so it is the stable conservative reference.
+                        values = list(behavior_values)
+                        reference_behavior_fallbacks += 1
                     record["reference_logprobs"] = values
                 behavior_count = sum(
                     record["behavior_logprobs"] is not None
@@ -3168,7 +3181,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       f"reference {reference_count}/"
                       f"{len(vllm_logprob_records)} in "
                       f"{time.time() - scoring_started:.1f}s "
-                      f"(CPU evaluations completed during scoring: "
+                      f"(rollout-policy fallbacks: "
+                      f"{reference_behavior_fallbacks}; "
+                      f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
@@ -3557,6 +3572,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             ex for ex in all_examples
             if rank_mode or not (ex["reward_constant"] and not ex.get("reprompt_text"))
         ]
+
+    if rank_mode and cfg.generation_backend == "vllm":
+        # Rank/PPO requires the frozen behavior probability. A malformed vLLM
+        # payload cannot be reconstructed safely after the adapter changes and
+        # must never force a full-context HF cache pass. Rollouts remain saved;
+        # only an unusable training record is omitted.
+        before = len(all_examples)
+        all_examples = [
+            example for example in all_examples
+            if _valid_example_token_logprobs(
+                example, "behavior_logprobs")
+        ]
+        unusable = before - len(all_examples)
+        if unusable:
+            print(f"[step {step_idx}] vLLM omitted behavior logprobs for "
+                  f"{unusable} rollout(s); saved them but excluded only those "
+                  "records from the rank update", flush=True)
 
     rollout_time = time.time() - rollout_t0
     print(f"[step {step_idx}] rollout+eval time: {rollout_time:.1f}s  "

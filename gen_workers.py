@@ -50,6 +50,7 @@ Protocol (per step):
 
 import importlib.metadata
 import os
+from array import array
 import queue
 import re
 import sys
@@ -745,20 +746,29 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             if not score_jobs:
                 continue
             try:
-                prompts = [
-                    {"prompt_token_ids": list(prompt_ids) + list(response_ids)}
-                    for _request_idx, prompt_ids, response_ids in score_jobs
-                ]
-                # prompt_logprobs=0 retains only the observed token at every
-                # position. One generated token is required by older offline
-                # vLLM APIs, but is discarded. No LoRARequest is supplied, so
-                # these are fixed base/reference-policy scores.
-                score_params = SamplingParams(
-                    max_tokens=1,
-                    temperature=0.0,
-                    prompt_logprobs=0,
-                    detokenize=False,
-                )
+                prompts = []
+                score_params = []
+                exact_limit = []
+                for _request_idx, prompt_ids, response_ids in score_jobs:
+                    tokens = list(prompt_ids) + list(response_ids)
+                    at_limit = len(tokens) == int(max_seq_length)
+                    # Offline vLLM requires at least one generated token. For
+                    # an exact-limit sequence, leave the observed final token
+                    # out of the prompt and request its full-vocabulary
+                    # logprobs as that one generated position. This scores all
+                    # 32k observed tokens without exceeding max_model_len.
+                    prompt_tokens = tokens[:-1] if at_limit else tokens
+                    prompts.append({"prompt_token_ids": prompt_tokens})
+                    kwargs = dict(
+                        max_tokens=1,
+                        temperature=0.0,
+                        prompt_logprobs=0,
+                        detokenize=False,
+                    )
+                    if at_limit:
+                        kwargs["logprobs"] = -1
+                    score_params.append(SamplingParams(**kwargs))
+                    exact_limit.append(at_limit)
                 outputs = llm.generate(
                     prompts,
                     sampling_params=score_params,
@@ -775,12 +785,33 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         prompt_logprobs = getattr(
                             request_output, "prompt_logprobs", None)
                         start = len(prompt_ids)
-                        end = start + len(response_ids)
+                        prompt_response_count = (
+                            len(response_ids) - 1
+                            if exact_limit[job_pos] else len(response_ids))
+                        end = start + prompt_response_count
                         if (prompt_logprobs is not None
                                 and len(prompt_logprobs) >= end):
                             values = _chosen_token_logprobs(
-                                response_ids, prompt_logprobs[start:end])
-                    scored.append((request_idx, values))
+                                response_ids[:prompt_response_count],
+                                prompt_logprobs[start:end])
+                        if values is not None and exact_limit[job_pos]:
+                            candidates = None
+                            generated = getattr(
+                                request_output, "outputs", None) or []
+                            if generated:
+                                generated_logprobs = getattr(
+                                    generated[0], "logprobs", None)
+                                if generated_logprobs:
+                                    candidates = generated_logprobs[:1]
+                            final_value = _chosen_token_logprobs(
+                                response_ids[-1:], candidates)
+                            values = (
+                                values + final_value
+                                if final_value is not None else None)
+                    scored.append((
+                        request_idx,
+                        array("f", values) if values is not None else None,
+                    ))
                 result_queue.put((rank, "__score__", scored))
             except Exception:
                 detail = traceback.format_exc()
@@ -868,7 +899,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                                 token_ids,
                                 getattr(candidate, "logprobs", None))
                             job_results.append(
-                                (candidate.text, token_ids, values))
+                                (candidate.text, token_ids,
+                                 array("f", values)
+                                 if values is not None else None))
                         else:
                             job_results.append((candidate.text, token_ids))
                 # Preserve the queue contract even if an engine/version returns
@@ -1190,9 +1223,9 @@ class GenerationPool:
         )
         for request_idx, (prompt_ids, response_ids) in ordered:
             total = len(prompt_ids) + len(response_ids)
-            # Older vLLM releases require at least one generated token after
-            # prompt scoring. Leave exact-limit sequences to the HF fallback.
-            if not response_ids or total >= self.max_seq_length:
+            # Exact-limit inputs are handled by the worker by moving their last
+            # observed token into the one generated scoring position.
+            if not response_ids or total > self.max_seq_length:
                 skipped += 1
                 continue
             worker = min(
