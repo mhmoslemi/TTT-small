@@ -1505,6 +1505,18 @@ def _is_cuda_oom(error):
             and "cuda" in str(error).lower())
 
 
+def _is_attention_kernel_unavailable(error):
+    """Recognize SDPA failures caused by excluding quadratic math attention."""
+    if not isinstance(error, RuntimeError):
+        return False
+    message = str(error).lower()
+    return (
+        "no available kernel" in message
+        or "no viable backend for scaled_dot_product_attention" in message
+        or "no suitable kernel" in message
+    )
+
+
 def _split_training_batches(batches):
     """Halve every non-singleton while preserving order and partitioning."""
     split = []
@@ -1553,7 +1565,9 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
                 result = attempt(active)
             return result, active, quarantined
         except BaseException as error:
-            if not _is_cuda_oom(error):
+            cuda_oom = _is_cuda_oom(error)
+            kernel_unavailable = _is_attention_kernel_unavailable(error)
+            if not cuda_oom and not kernel_unavailable:
                 raise
             model.zero_grad(set_to_none=True)
             gc.collect()
@@ -1563,11 +1577,13 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
             smaller, changed = _split_training_batches(active)
             if changed:
                 active = smaller
-                print(f"[train-oom] {device_label}: retrying with maximum "
+                reason = ("fused attention rejected the padded batch"
+                          if kernel_unavailable else "CUDA OOM")
+                print(f"[train-oom] {device_label}: {reason}; retrying with maximum "
                       f"microbatch {max(len(batch) for batch in active)}",
                       flush=True)
                 continue
-            if not activation_offload and hasattr(
+            if cuda_oom and not activation_offload and hasattr(
                     torch.autograd.graph, "save_on_cpu"):
                 activation_offload = True
                 print(f"[train-oom] {device_label}: singleton OOM; retrying "
@@ -1587,9 +1603,13 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
                 + victim["response_ids"].shape[1])
             quarantined.append(victim)
             activation_offload = False
+            if kernel_unavailable:
+                reason = "has no compatible linear-memory attention kernel"
+            else:
+                reason = "cannot fit even with activation offload"
             print(f"[train-oom] {device_label}: one {victim_tokens}-token "
-                  "rollout cannot fit even with activation offload; excluding "
-                  "only that rollout from this adapter update", flush=True)
+                  f"rollout {reason}; excluding only that rollout from this "
+                  "adapter update", flush=True)
     model.zero_grad(set_to_none=True)
     return None, [], quarantined
 
@@ -1772,7 +1792,10 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
         # Usually both loops are empty because vLLM supplied the frozen values.
         # They retain exact compatibility with HF generation and with any vLLM
         # sequence whose logprob payload was incomplete.
-        for batch in _training_microbatches(missing_old, cfg):
+        # Missing vLLM payloads are exceptional. Score them singly so one
+        # padded fallback batch cannot select an incompatible attention path
+        # or multiply the activation footprint of a near-limit sequence.
+        for batch in ([example] for example in missing_old):
             old_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=False, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
@@ -1783,7 +1806,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                 ex["rank_old_logprobs"] = old_lp.detach()
         if reference_fallback:
             with backend.disable_adapter(), torch.no_grad():
-                for batch in _training_microbatches(reference_fallback, cfg):
+                for batch in ([example] for example in reference_fallback):
                     reference_logprobs = compute_batched_token_logprobs(
                         model, batch, with_grad=False,
                         chunk=cfg.logprob_chunk,
@@ -2209,7 +2232,9 @@ class ReplicatedDataParallelTrainer:
             with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
                 missing_old, missing_reference = (
                     _initialize_rank_logprob_caches(shard))
-                for batch in _training_microbatches(missing_old, cfg):
+                # vLLM normally fills these caches. Singleton fallback keeps a
+                # rare incomplete payload from destabilizing all eight replicas.
+                for batch in ([example] for example in missing_old):
                     old_logprobs = compute_batched_token_logprobs(
                         model, batch, with_grad=False,
                         chunk=cfg.logprob_chunk,
@@ -2222,8 +2247,8 @@ class ReplicatedDataParallelTrainer:
                         example["rank_old_logprobs"] = old_lp.detach()
                 if kl_coef and missing_reference:
                     with backend.disable_adapter(), torch.no_grad():
-                        for batch in _training_microbatches(
-                                missing_reference, cfg):
+                        for batch in (
+                                [example] for example in missing_reference):
                             reference_logprobs = compute_batched_token_logprobs(
                                 model, batch, with_grad=False,
                                 chunk=cfg.logprob_chunk,
