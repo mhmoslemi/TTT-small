@@ -2,6 +2,22 @@
 TTT-Discover — multi-problem local runner.
 
 Configuration: self-contained problem YAML < resumed config < CLI flags
+
+Rank-selection mode (the proposed local surrogate):
+    python train_multy_CVaR.py --problem erdos --advantage-mode rank --no-feedback
+
+It uses exact reward midranks, KL-budgeted selection weights, A_i = G*q_i - 1,
+trajectory-level clipped ratios, a separate sampled reference KL, and sampled
+trajectory entropy on completely tied groups. Advantages and old/reference
+log-probabilities are frozen across --rank-update-epochs (default 1). No reward
+standardization, EVT fitting, or quantile cutoff is used in this mode.
+
+Rank mode sets rollout temperature=1 and top_p=1. Generation workers must use
+the synchronized policy with no additional top-k/repetition/logit filtering;
+they do not return behavior probabilities, so the trainer recomputes them.
+The built-in local generation path explicitly disables top-k sampling.
+--feedback remains an optional auxiliary repair loss; --no-feedback implements
+the standalone rank objective. Existing advantage modes retain their losses.
 """
 
 import warnings
@@ -13,6 +29,7 @@ import sys
 import argparse
 import json
 import logging
+import math
 import random
 import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -131,36 +148,89 @@ def _route_dependency_notices(log_path):
 # ======================================================================
 # CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
-ADVANTAGE_MODES = ("entropic", "grpo", "cvar")
+ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank")
 CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
 CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
+RANK_GAMMA_DEFAULT = math.log(2)
+RANK_CLIP_EPSILON_DEFAULT = 0.2
+RANK_ENTROPY_COEF_DEFAULT = 0.01
+RANK_UPDATE_EPOCHS_DEFAULT = 1
 
 
 def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
-                             cvar_lambda=None):
+                             cvar_lambda=None, *, rank_gamma=None,
+                             return_info=False):
     """
     Dispatch the per-group advantage estimator.
 
     Returns (advantages, scale, scale_label). `scale` is the estimator's
     scalar for logging: beta for entropic, reward std for grpo, and the
-    upper-VaR threshold q_{1-alpha} for cvar.
+    upper-VaR threshold q_{1-alpha} for cvar, or eta for rank (possibly +inf).
+    return_info=True appends a diagnostics dict (empty for legacy estimators).
     """
     mode = str(mode or "entropic").lower()
     if mode == "entropic":
         from advantage import entropic_adaptive_advantages
         adv, beta = entropic_adaptive_advantages(rewards_np)
-        return adv, beta, "beta"
-    if mode == "grpo":
+        result, info = (adv, beta, "beta"), {}
+    elif mode == "grpo":
         from advantage import grpo_advantages
         adv, std = grpo_advantages(rewards_np)
-        return adv, std, "std"
-    if mode == "cvar":
+        result, info = (adv, std, "std"), {}
+    elif mode == "cvar":
         from advantage import upper_tail_advantages
         alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
         lam = CVAR_LAMBDA_DEFAULT if cvar_lambda is None else float(cvar_lambda)
         adv, q = upper_tail_advantages(rewards_np, alpha=alpha, lam=lam)
-        return adv, q, "var"
-    raise ValueError(f"unknown advantage_mode {mode!r}; expected one of {ADVANTAGE_MODES}")
+        result, info = (adv, q, "var"), {}
+    elif mode == "rank":
+        from advantage import rank_adaptive_advantages
+        gamma = RANK_GAMMA_DEFAULT if rank_gamma is None else float(rank_gamma)
+        adv, eta, info = rank_adaptive_advantages(
+            rewards_np, gamma=gamma, return_info=True)
+        result = (adv, eta, "eta")
+    else:
+        raise ValueError(f"unknown advantage_mode {mode!r}; expected one of {ADVANTAGE_MODES}")
+    return (*result, info) if return_info else result
+
+
+def _resolve_rank_options(merged):
+    """Resolve trainer-owned rank options after YAML/resume/CLI overlays."""
+    defaults = {
+        "rank_gamma": RANK_GAMMA_DEFAULT,
+        "rank_clip_epsilon": RANK_CLIP_EPSILON_DEFAULT,
+        "rank_entropy_coef": RANK_ENTROPY_COEF_DEFAULT,
+    }
+    for name, default in defaults.items():
+        value = merged.get(name)
+        value = default if value is None else float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        merged[name] = value
+    if merged["rank_gamma"] <= 0.0:
+        raise ValueError("rank_gamma must be positive")
+    if not 0.0 < merged["rank_clip_epsilon"] < 1.0:
+        raise ValueError("rank_clip_epsilon must be in (0, 1)")
+    if merged["rank_entropy_coef"] < 0.0:
+        raise ValueError("rank_entropy_coef must be nonnegative")
+    epochs = merged.get("rank_update_epochs")
+    epochs = RANK_UPDATE_EPOCHS_DEFAULT if epochs is None else epochs
+    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer))
+            or epochs < 1):
+        raise ValueError("rank_update_epochs must be a positive integer")
+    merged["rank_update_epochs"] = int(epochs)
+    if merged.get("advantage_mode") == "rank":
+        if int(merged["group_size"]) < 2:
+            raise ValueError("rank mode requires group_size >= 2")
+        kl_coef = float(merged["kl_penalty_coef"])
+        if not math.isfinite(kl_coef) or kl_coef < 0.0:
+            raise ValueError("rank mode requires a finite nonnegative kl_penalty_coef")
+        if (float(merged["temperature"]) != 1.0
+                or float(merged["top_p"]) != 1.0):
+            print("[config] rank mode sets temperature=1 and top_p=1 "
+                  "to match the policy likelihood used by the loss")
+        merged["temperature"] = 1.0
+        merged["top_p"] = 1.0
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -240,7 +310,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Group advantage estimator: 'entropic' (adaptive-beta "
                         "entropic objective, default), 'grpo' (mean/std "
                         "normalized), or 'cvar' (grpo blended with an "
-                        "upper-tail term above the (1-alpha)-quantile).")
+                        "upper-tail term above the (1-alpha)-quantile), or "
+                        "'rank' (KL-budgeted midranks and clipped GRPO).")
+    p.add_argument("--rank-gamma", type=float, default=None,
+                   help="rank mode: selection KL budget (default log(2)); "
+                        "distinct from --kl-penalty-coef.")
+    p.add_argument("--rank-clip-epsilon", type=float, default=None,
+                   help="rank mode: trajectory ratio clipping width (default 0.2).")
+    p.add_argument("--rank-entropy-coef", type=float, default=None,
+                   help="rank mode: entropy coefficient for fully tied groups "
+                        "(default 0.01; 0 disables entropy).")
+    p.add_argument("--rank-update-epochs", type=int, default=None,
+                   help="rank mode: updates per rollout batch using a frozen "
+                        "old policy (default 1); clipping becomes active after "
+                        "the first update when this is greater than 1.")
     p.add_argument("--cvar-alpha", type=float, default=None,
                    help="cvar mode: tail mass alpha in (0,1); cutoff is the "
                         f"(1-alpha)-quantile (default {CVAR_ALPHA_DEFAULT}).")
@@ -669,6 +752,7 @@ def load_config():
     if not (0.0 <= cvar_lambda <= 1.0):
         raise ValueError("cvar_lambda must be in [0, 1]")
     merged["cvar_lambda"] = cvar_lambda
+    _resolve_rank_options(merged)
     raw_tp = merged["vllm_tensor_parallel_size"]
     tp = (0 if str(raw_tp or "").strip().lower() in ("", "auto")
           else int(raw_tp))
@@ -966,6 +1050,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
             do_sample=True,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
+            **({"top_k": 0, "repetition_penalty": 1.0}
+               if getattr(cfg, "advantage_mode", "entropic") == "rank" else {}),
             pad_token_id=pad_id,
             num_return_sequences=n_samples,
         )
@@ -1023,10 +1109,25 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
                          cfg, *, max_new_tokens=None, temperature=None,
                          top_p=None, cap_state=None):
     """Stream locally generated rollouts from cross-prompt HF batches."""
-    from gen_workers import _iter_hf_job_batches
-
     if len(prompts_by_group) != len(counts_by_group):
         raise ValueError("counts_by_group must align with prompts_by_group")
+    if getattr(cfg, "advantage_mode", "entropic") == "rank":
+        # This local path owns its sampling arguments, including top_k=0.
+        # Use the existing per-prompt OOM-aware micro-batcher instead of an
+        # external HF helper that may inherit a top-k generation default.
+        rank_cfg = SimpleNamespace(**vars(cfg))
+        rank_cfg.temperature = 1.0
+        rank_cfg.top_p = 1.0
+        if max_new_tokens is not None:
+            rank_cfg.max_new_tokens = int(max_new_tokens)
+        for group_idx, (prompt, count) in enumerate(zip(prompts_by_group, counts_by_group)):
+            if int(count) > 0:
+                responses, _ = generate_responses(
+                    model, tokenizer, prompt, int(count), rank_cfg)
+                yield group_idx, responses
+        return
+
+    from gen_workers import _iter_hf_job_batches
     jobs = [
         (group_idx, prompt, int(count))
         for group_idx, (prompt, count)
@@ -1050,13 +1151,15 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
 # Logprob computation
 # ======================================================================
 def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
-                           chunk: int = 0):
+                           chunk: int = 0, *, return_entropy: bool = False):
     """
     Per-token log-probabilities of the response under the model.
 
     prompt_ids:   (1, P) tensor
     response_ids: (1, R) tensor
     Output:       (R,) tensor of token logprobs
+    return_entropy=True returns (logprobs, token_entropies), both shape (R,).
+    Entropies integrate over the full vocabulary, not just sampled tokens.
 
     `chunk` caps the transient log_softmax allocation. The forward runs once (a
     single model(full_ids) call, needed for correct causal attention), but the
@@ -1085,16 +1188,246 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
 
         if chunk and 0 < chunk < R:
             parts = []
+            entropies = []
             for s in range(0, R, chunk):
                 e = min(s + chunk, R)
                 lp = F.log_softmax(pred_logits[:, s:e, :].float(), dim=-1)
                 g = lp.gather(2, response_ids[:, s:e].unsqueeze(-1)).squeeze(-1)
                 parts.append(g)          # keep only (1, e-s); lp freed next iter
+                if return_entropy:
+                    safe_lp = lp.masked_fill(~torch.isfinite(lp), 0.0)
+                    entropies.append(-(lp.exp() * safe_lp).sum(dim=-1))
             gathered = torch.cat(parts, dim=1)  # (1, R)
+            if return_entropy:
+                entropy = torch.cat(entropies, dim=1)
         else:
             log_probs = F.log_softmax(pred_logits.float(), dim=-1)
             gathered = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)  # (1, R)
+            if return_entropy:
+                safe_lp = log_probs.masked_fill(~torch.isfinite(log_probs), 0.0)
+                entropy = -(log_probs.exp() * safe_lp).sum(dim=-1)
+    if return_entropy:
+        return gathered.squeeze(0), entropy.squeeze(0)
     return gathered.squeeze(0)
+
+
+def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
+                   advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
+                   kl_coef=0.0, entropy_coef=0.0, token_entropies=None):
+    """One trajectory's loss; callers average equally within each parent.
+
+    rho = exp(sum(current_lp - old_lp)) is differentiable; old_lp and the
+    scalar group advantage are frozen. The reference-KL estimator is
+        rho * (log pi_theta(y) - log pi_ref(y)) - (rho - 1).
+    The zero-mean control variate (rho - 1) removes an unnecessary +1 score
+    term. This sample estimate may be negative even though true KL is >= 0.
+
+    If enabled, trajectory entropy is estimated by the chain rule:
+        H_hat = sum_l rho_prefix(l) * H(pi_theta(. | x, y_<l)).
+    Prefix ratios exclude token l and remain differentiable, accounting for
+    policy-dependent prefix probabilities. Thus entropy is not implemented as
+    -mean(sampled logprobs) on fixed old-policy samples. The vocabulary entropy
+    also supplies a gradient when all sampled completions are identical.
+
+    Reward clipping does not clip the separate KL/entropy terms. Accumulation
+    and exponentiation use float64, and nonfinite ratios fail explicitly rather
+    than silently changing the objective with a log-ratio clamp.
+    """
+    import torch
+
+    if not 0.0 < float(clip_epsilon) < 1.0:
+        raise ValueError("clip_epsilon must be in (0, 1)")
+    if (not math.isfinite(float(kl_coef)) or kl_coef < 0.0
+            or not math.isfinite(float(entropy_coef)) or entropy_coef < 0.0):
+        raise ValueError("KL and entropy coefficients must be finite and nonnegative")
+    cur = current_logprobs.to(dtype=torch.float64)
+    old = torch.as_tensor(old_logprobs, dtype=cur.dtype, device=cur.device).detach()
+    if cur.ndim != 1 or old.shape != cur.shape or cur.numel() == 0:
+        raise ValueError("current and old logprobs must be matching nonempty vectors")
+    adv = torch.as_tensor(advantage, dtype=cur.dtype, device=cur.device).detach()
+    if adv.numel() != 1 or not torch.isfinite(adv).all():
+        raise ValueError("rank advantage must be a finite scalar")
+    if not torch.isfinite(cur).all() or not torch.isfinite(old).all():
+        raise ValueError("rank policy logprobs must be finite")
+
+    log_ratios = cur - old
+    ratio = log_ratios.sum().exp()
+    clipped_ratio = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    policy_loss = -torch.minimum(ratio * adv, clipped_ratio * adv)
+    kl_estimate = cur.new_zeros(())
+    if kl_coef:
+        if reference_logprob is None:
+            raise ValueError("reference logprob is required for nonzero KL coefficient")
+        ref = torch.as_tensor(reference_logprob, dtype=cur.dtype,
+                              device=cur.device).detach()
+        if ref.numel() != 1 or not torch.isfinite(ref).all():
+            raise ValueError("reference logprob must be a finite scalar")
+        kl_estimate = ratio * (cur.sum() - ref) - (ratio - 1.0)
+
+    entropy_estimate = cur.new_zeros(())
+    prefix_ratio_max = cur.new_ones(())
+    if entropy_coef:
+        if token_entropies is None or token_entropies.shape != cur.shape:
+            raise ValueError("matching token entropies are required for entropy updates")
+        prefix_log_ratios = torch.cat((cur.new_zeros(1), log_ratios.cumsum(0)[:-1]))
+        prefix_ratios = prefix_log_ratios.exp()
+        entropy_estimate = (prefix_ratios * token_entropies.to(cur.dtype)).sum()
+        prefix_ratio_max = prefix_ratios.max()
+
+    loss = policy_loss + kl_coef * kl_estimate - entropy_coef * entropy_estimate
+    if not torch.isfinite(loss).all() or not torch.isfinite(ratio).all():
+        raise FloatingPointError(
+            "nonfinite rank objective/trajectory ratio; reduce learning rate or "
+            "rank_update_epochs and inspect model logprobs")
+    return loss, {
+        "policy_loss": float(policy_loss.detach().item()),
+        "kl_estimate": float(kl_estimate.detach().item()),
+        "entropy_estimate": float(entropy_estimate.detach().item()),
+        "ratio": float(ratio.detach().item()),
+        "prefix_ratio_max": float(prefix_ratio_max.detach().item()),
+        "clipped": bool((ratio.detach() != clipped_ratio.detach()).item()),
+    }
+
+
+@contextmanager
+def _rank_dropout_disabled(model):
+    """Disable dropout while retaining training/checkpointing mode."""
+    import torch
+    changed = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd):
+            changed.append((module, "p", module.p))
+            module.p = 0.0
+        # Common attention implementations use functional dropout instead of
+        # an nn.Dropout module. Generation is deterministic conditional on
+        # sampled tokens; old/current likelihood forwards must match it.
+        for name in ("attention_dropout", "attn_dropout", "dropout"):
+            value = getattr(module, name, None)
+            if isinstance(value, float) and value != 0.0:
+                changed.append((module, name, value))
+                setattr(module, name, 0.0)
+    try:
+        yield
+    finally:
+        for module, name, value in reversed(changed):
+            setattr(module, name, value)
+
+
+def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
+                         cfg, step_idx, *, fb_cfg=None, fb_on=False,
+                         fb_lambda=0.0):
+    """Cache the old/reference policies, then update the rank surrogate."""
+    import torch
+
+    epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
+    epsilon = float(getattr(cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
+    entropy_coef = float(getattr(cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
+    kl_coef = float(cfg.kl_penalty_coef)
+    fb_stats = None
+    if fb_on:
+        from feedback import (FeedbackStats, bound_feedback_advantage,
+                              feedback_advantage)
+        fb_stats = FeedbackStats()
+    backend.set_training_mode()
+    started = time.time()
+    print(f"[step {step_idx}] rank: caching old/reference logprobs for "
+          f"{len(examples)} examples before {epochs} update(s)", flush=True)
+
+    with _rank_dropout_disabled(model):
+        # No optimizer step may precede completion of this loop. CPU caches
+        # avoid retaining graphs or duplicating the entire model on the GPU.
+        for ex in examples:
+            pid, rid = ex["prompt_ids"], ex["response_ids"]
+            old_lp = compute_token_logprobs(
+                model, pid, rid, with_grad=False, chunk=cfg.logprob_chunk)
+            if not torch.isfinite(old_lp).all():
+                raise FloatingPointError("nonfinite old-policy logprobs")
+            ex["rank_old_logprobs"] = old_lp.detach().cpu()
+            ex["rank_reference_logprob"] = None
+            if kl_coef:
+                # Disabling the LoRA adapter is the runner's fixed reference.
+                # A failure must not silently remove the requested KL term.
+                with backend.disable_adapter(), torch.no_grad():
+                    ref_lp = compute_token_logprobs(
+                        model, pid, rid, with_grad=False, chunk=cfg.logprob_chunk)
+                if not torch.isfinite(ref_lp).all():
+                    raise FloatingPointError("nonfinite reference-policy logprobs")
+                ex["rank_reference_logprob"] = float(ref_lp.double().sum().item())
+                del ref_lp
+            ex["rank_feedback_advantage"] = None
+            if fb_on and ex.get("reprompt_text"):
+                fb_adv = feedback_advantage(
+                    compute_token_logprobs, model, tokenizer, ex["reprompt_text"],
+                    rid, old_lp.detach(), fb_cfg, lam=fb_lambda,
+                    chunk=cfg.logprob_chunk)
+                if fb_adv is None:
+                    fb_stats.skipped += 1
+                else:
+                    fb_adv, _ = bound_feedback_advantage(
+                        fb_adv, reward_advantage=ex["advantage"], cfg=fb_cfg)
+                    fb_stats.add(fb_adv)
+                    ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
+            del old_lp
+
+        history = []
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            totals = {key: 0.0 for key in (
+                "loss", "policy_loss", "kl_estimate", "entropy_estimate", "ratio",
+                "clipped_fraction")}
+            max_ratio = 0.0
+            max_prefix_ratio = 0.0
+            entropy_examples = 0
+            for ex in examples:
+                gate = bool(ex["rank_entropy_gate"] and entropy_coef > 0.0)
+                result = compute_token_logprobs(
+                    model, ex["prompt_ids"], ex["response_ids"], with_grad=True,
+                    chunk=cfg.logprob_chunk, return_entropy=gate)
+                cur_lp, token_entropy = result if gate else (result, None)
+                loss, metrics = rank_grpo_loss(
+                    cur_lp, ex["rank_old_logprobs"], ex["rank_reference_logprob"],
+                    ex["advantage"], clip_epsilon=epsilon, kl_coef=kl_coef,
+                    entropy_coef=entropy_coef if gate else 0.0,
+                    token_entropies=token_entropy)
+                # Optional existing feedback is a separate token-level repair
+                # objective. It does not alter or re-normalize rank advantages.
+                fb_adv = ex["rank_feedback_advantage"]
+                if fb_adv is not None:
+                    loss = loss - (fb_adv.to(cur_lp.device) * cur_lp).mean()
+                weight = float(ex["sample_weight"])
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError("nonfinite rank/feedback loss")
+                (weight * loss).backward()
+                totals["loss"] += weight * float(loss.detach().item())
+                for key in ("policy_loss", "kl_estimate", "entropy_estimate", "ratio"):
+                    totals[key] += weight * metrics[key]
+                totals["clipped_fraction"] += weight * float(metrics["clipped"])
+                max_ratio = max(max_ratio, metrics["ratio"])
+                max_prefix_ratio = max(max_prefix_ratio, metrics["prefix_ratio_max"])
+                entropy_examples += int(gate)
+                del result, cur_lp, token_entropy, loss
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                max_norm=cfg.grad_clip, error_if_nonfinite=True)
+            optimizer.step()
+            history.append({"epoch": epoch + 1, **totals,
+                            "ratio_max": max_ratio,
+                            "prefix_ratio_max": max_prefix_ratio,
+                            "entropy_examples": entropy_examples,
+                            "grad_norm": float(grad_norm.item())})
+            print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
+                  f"loss={totals['loss']:.6f} "
+                  f"KL estimate={totals['kl_estimate']:.6f} "
+                  f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+                  f"clipped={totals['clipped_fraction']:.1%} "
+                  f"entropy examples={entropy_examples}", flush=True)
+    if fb_stats is not None:
+        print(fb_stats.line(step_idx, fb_lambda))
+    for ex in examples:
+        for key in ("rank_old_logprobs", "rank_reference_logprob", "rank_feedback_advantage"):
+            ex.pop(key, None)
+    return {"rank_updates": history, "rank_train_seconds": time.time() - started}
 
 
 # ======================================================================
@@ -1374,6 +1707,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     reprompt_by_key = {}    # (group, rollout) -> reprompt for a code failure
 
     all_examples = []
+    rank_mode = getattr(cfg, "advantage_mode", "entropic") == "rank"
+    rank_group_stats = []
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
@@ -1436,7 +1771,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             )
 
     # One parent can now own several prompt arms, but their counts still sum to
-    # exactly cfg.group_size. Entropic advantages are computed over the union.
+    # exactly cfg.group_size. Advantages are computed over the parent union;
+    # each example's likelihood still conditions on its actual prompt arm.
     prompt_jobs = []
     for g, _parent in enumerate(parents):
         pc = parent_ctxs[g]
@@ -1665,11 +2001,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             outs.append(res)
 
         rewards_np = np.array(rewards, dtype=np.float64)
+        if rewards_np.size == 0:
+            print(f"  group {g}: no rollouts returned; no update for this group")
+            continue
         adv_mode = getattr(cfg, "advantage_mode", "entropic")
-        advantages, adv_scale, adv_scale_label = compute_group_advantages(
+        advantages, adv_scale, adv_scale_label, adv_info = compute_group_advantages(
             rewards_np, adv_mode,
             cvar_alpha=getattr(cfg, "cvar_alpha", None),
-            cvar_lambda=getattr(cfg, "cvar_lambda", None))
+            cvar_lambda=getattr(cfg, "cvar_lambda", None),
+            rank_gamma=getattr(cfg, "rank_gamma", None), return_info=True)
+        if rank_mode:
+            rank_diagnostics = {
+                k: v for k, v in adv_info.items() if k not in ("ranks", "weights")
+            }
+            rank_group_stats.append({"group": g, **rank_diagnostics})
 
         # growth signals for this group
         if len(valids):
@@ -1686,6 +2031,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
               f"valid={sum(valids)}/{len(valids)}  "
               f"{adv_scale_label}={adv_scale:.9f}")
+        if rank_mode:
+            print(f"    rank KL={adv_info['kl']:.6f} "
+                  f"ESS={adv_info['ess']:.2f}/{len(rewards)} "
+                  f"top ties={adv_info['top_count']} "
+                  f"saturated={adv_info['saturated']} "
+                  f"entropy gate={adv_info['all_tied']}")
 
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
@@ -1747,7 +2098,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
                 "beta": float(adv_scale) if adv_mode == "entropic" else 0.0,
                 "advantage_mode": adv_mode,
-                "advantage_scale": float(adv_scale),
+                "advantage_scale": (float(adv_scale)
+                                    if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
                 "sandbox_stdout": (res.stdout or "")[:2000],
                 "parent_value": float(parent.value) if parent.value is not None else None,
@@ -1782,6 +2134,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
+            if rank_mode:
+                meta["rank_selection"] = {
+                    **rank_diagnostics,
+                    "score": float(adv_info["ranks"][r_idx]),
+                    "weight": float(adv_info["weights"][r_idx]),
+                }
             if memory_v2:
                 meta["memory_version"] = "V2"
                 meta["memory_comparison_n"] = int(
@@ -1834,8 +2192,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # A^rew_i = 0 but A^fb is not, which is the whole point of Eq. 9. This
         # is where it pays most, since an all-failed group is exactly the case
         # the reward channel cannot score at all.
-        constant = float(rewards_np.max() - rewards_np.min()) < 1e-12
-        if constant and not (fb_candidate_on and fb_cfg.include_constant_groups):
+        # Rank mode uses exact equality and retains fully tied groups for
+        # entropy/reference updates; representable small gaps are informative.
+        constant = (bool(adv_info["all_tied"]) if rank_mode else
+                    float(rewards_np.max() - rewards_np.min()) < 1e-12)
+        if (constant and not rank_mode
+                and not (fb_candidate_on and fb_cfg.include_constant_groups)):
             continue
 
         for r_idx, ((text, token_ids, job_idx), adv) in enumerate(
@@ -1857,6 +2219,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "failure_signature": RolloutRecord(
                     msg=res.msg or "").failure_signature(),
                 "reward_constant": constant,
+                "rank_entropy_gate": bool(rank_mode and constant),
+                "group_id": g,
+                "prompt_job_id": job_idx,
+                # Implements mean_over_parents(mean_over_rollouts(loss)).
+                "sample_weight": 1.0 / (len(parents) * len(responses)),
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before
@@ -1883,7 +2250,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Constant groups only carry a feedback signal. Drop them when the adaptive
     # controller turns feedback off after seeing this step's code validity.
-    if not fb_on:
+    if not fb_on and not rank_mode:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     # Cap the teacher forwards. Applied to all_examples rather than to
@@ -1920,7 +2287,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # and reference forwards for a KL-only update and dilute the batch.
         all_examples = [
             ex for ex in all_examples
-            if not (ex["reward_constant"] and not ex.get("reprompt_text"))
+            if rank_mode or not (ex["reward_constant"] and not ex.get("reprompt_text"))
         ]
 
     rollout_time = time.time() - rollout_t0
@@ -1977,8 +2344,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["memory_comparison_n"] = int(
             getattr(mem_cfg, "arm_comparison_n", 0) or 0)
 
+    if rank_mode:
+        step_stats["rank_groups"] = rank_group_stats
+
     if not all_examples:
         print(f"[step {step_idx}] no training signal (all groups had constant reward)")
+        return step_stats
+
+    if rank_mode:
+        step_stats.update(_train_rank_examples(
+            backend, model, tokenizer, optimizer, all_examples, cfg, step_idx,
+            fb_cfg=fb_cfg, fb_on=fb_on, fb_lambda=fb_lambda))
         return step_stats
 
     # ----- TRAIN STEP -----
@@ -2207,6 +2583,11 @@ def main():
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
     if getattr(cfg, "advantage_mode", "entropic") == "cvar":
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
+    if getattr(cfg, "advantage_mode", "entropic") == "rank":
+        print(f"Rank gamma:         {cfg.rank_gamma}")
+        print(f"Rank clip epsilon:  {cfg.rank_clip_epsilon}")
+        print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
+        print(f"Rank update epochs: {cfg.rank_update_epochs}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")

@@ -1,5 +1,16 @@
-"""
-Entropic objective with adaptive \beta.
+r"""
+Group advantage estimators for discovery policy optimization.
+
+``rank_adaptive_advantages`` implements the proposed rank-selection surrogate:
+empirical midranks, a KL-constrained exponential tilt, and A_i = G*q_i - 1.
+Exact ties receive equal weights. Unattainable KL targets use the uniform
+distribution over all tied maxima. Completely tied groups return zero reward
+advantages; the trainer supplies their separate entropy exploration term.
+This is an ordinal policy-improvement surrogate, not an unbiased estimator of
+the gradient of expected best-of-G reward. The existing estimators below are
+retained for comparisons.
+
+Original entropic estimator:
 
 Paper section 3.2: instead of optimizing the expected reward, we optimize
 
@@ -19,6 +30,119 @@ under the `entropic_adaptive_beta` branch.
 
 import math
 import numpy as np
+
+
+def rank_adaptive_advantages(
+    rewards: np.ndarray,
+    gamma: float = math.log(2),
+    n_bisect: int = 80,
+    *,
+    return_info: bool = False,
+):
+    """KL-constrained rank weights for one parent group.
+
+    s_i = (count(r_j < r_i) + 0.5 * count(r_j == r_i)) / G
+    q*  = argmax_q <q, s> subject to KL(q || uniform) <= gamma
+    A_i = G * q*_i - 1
+
+    Higher rewards are better. Rewards must be a finite one-dimensional
+    array. Equality is exact: neither a reward-range tolerance nor random
+    tie breaking is used, so representable small improvements remain visible.
+    gamma is nonnegative; zero disables rank selection. No division by the
+    reward standard deviation or extra advantage normalization is applied.
+
+    Returns (advantages, eta). eta is +inf for saturated selection of the
+    tied maxima, and zero for uniform/all-tied/empty/singleton groups.
+    With return_info=True, also return a diagnostics dict. Its ``eta`` is
+    None at saturation so scalar diagnostics can be serialized as strict JSON;
+    ``ranks`` and ``weights`` are NumPy arrays.
+
+    With no ties and a fixed G and gamma, eta is identical across batches.
+    Adaptation is to tie structure, not to discarded reward spacings.
+    """
+    r = np.asarray(rewards, dtype=np.float64)
+    if r.ndim != 1 or not np.all(np.isfinite(r)):
+        raise ValueError("rank rewards must be a finite one-dimensional array")
+    gamma = float(gamma)
+    if not math.isfinite(gamma) or gamma < 0.0:
+        raise ValueError("rank gamma must be finite and nonnegative")
+    if isinstance(n_bisect, (bool, np.bool_)) or not isinstance(
+            n_bisect, (int, np.integer)) or n_bisect < 1:
+        raise ValueError("n_bisect must be a positive integer")
+
+    G = r.size
+    if G:
+        _, inverse, counts = np.unique(r, return_inverse=True, return_counts=True)
+        below = np.cumsum(counts) - counts
+        scores = (below[inverse] + 0.5 * counts[inverse]) / G
+        top = inverse == len(counts) - 1
+        n_top = int(counts[-1])
+        all_tied = len(counts) == 1
+        gamma_max = math.log(G / n_top)
+    else:
+        scores = np.empty(0, dtype=np.float64)
+        top = np.empty(0, dtype=bool)
+        n_top, all_tied, gamma_max = 0, True, 0.0
+
+    def distribution(eta):
+        logits = eta * (scores - scores.max())
+        log_q = logits - math.log(float(np.exp(logits).sum()))
+        q = np.exp(log_q)
+        positive = q > 0.0
+        kl = float(np.sum(q[positive] * (log_q[positive] + math.log(G))))
+        return q, max(0.0, kl)
+
+    eta = 0.0
+    saturated = False
+    if not G:
+        q = np.empty(0, dtype=np.float64)
+    elif all_tied or gamma == 0.0:
+        q = np.full(G, 1.0 / G, dtype=np.float64)
+    elif gamma >= gamma_max:
+        q = top.astype(np.float64) / n_top
+        eta = math.inf
+        saturated = True
+    else:
+        lo, hi = 0.0, 1.0
+        for _ in range(1024):
+            if distribution(hi)[1] >= gamma:
+                break
+            lo, hi = hi, 2.0 * hi
+        else:
+            raise RuntimeError("could not bracket the rank KL temperature")
+        for _ in range(n_bisect):
+            mid = 0.5 * (lo + hi)
+            if distribution(mid)[1] <= gamma:
+                lo = mid
+            else:
+                hi = mid
+        # Return the feasible side of the bracket, up to floating-point error.
+        eta = lo
+        q, _ = distribution(eta)
+
+    advantages = G * q - 1.0
+    if all_tied or gamma == 0.0:
+        advantages = np.zeros_like(r)
+    if not return_info:
+        return advantages, eta
+
+    positive = q > 0.0
+    entropy = -float(np.sum(q[positive] * np.log(q[positive])))
+    info = {
+        "eta": float(eta) if math.isfinite(eta) else None,
+        "gamma": gamma,
+        "gamma_max": gamma_max,
+        "kl": max(0.0, math.log(G) - entropy) if G else 0.0,
+        "ess": float(1.0 / np.dot(q, q)) if G else 0.0,
+        "entropy_effective_n": math.exp(entropy) if G else 0.0,
+        "top_count": n_top,
+        "all_tied": all_tied,
+        "saturated": saturated,
+        "active_fraction": float(np.mean(advantages > 0.0)) if G else 0.0,
+        "ranks": scores,
+        "weights": q,
+    }
+    return advantages, eta, info
 
 
 def _kl_to_uniform(beta: float, rewards: np.ndarray) -> float:
