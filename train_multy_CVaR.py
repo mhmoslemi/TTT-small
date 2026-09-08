@@ -1357,27 +1357,34 @@ def _training_microbatches(examples, cfg, *, partition_key=None):
     return batches
 
 
-def _initialize_rank_logprob_caches(examples):
-    """Use vLLM rollout/reference scores and identify any HF fallbacks."""
+def _valid_example_token_logprobs(example, key):
+    """Whether a cached vector is finite and aligned to the response."""
     import torch
 
+    value = example.get(key)
+    response_len = int(example["response_ids"].shape[1])
+    return bool(
+        torch.is_tensor(value)
+        and value.ndim == 1
+        and value.shape[0] == response_len
+        and torch.isfinite(value).all()
+    )
+
+
+def _initialize_rank_logprob_caches(examples):
+    """Use vLLM rollout/reference scores and identify any HF fallbacks."""
     missing_old = []
     missing_reference = []
     for example in examples:
-        response_len = int(example["response_ids"].shape[1])
         old = example.get("behavior_logprobs")
-        if (torch.is_tensor(old) and old.ndim == 1
-                and old.shape[0] == response_len
-                and torch.isfinite(old).all()):
+        if _valid_example_token_logprobs(example, "behavior_logprobs"):
             example["rank_old_logprobs"] = old.detach().cpu()
         else:
             example["rank_old_logprobs"] = None
             missing_old.append(example)
 
         reference = example.get("reference_logprobs")
-        if (torch.is_tensor(reference) and reference.ndim == 1
-                and reference.shape[0] == response_len
-                and torch.isfinite(reference).all()):
+        if _valid_example_token_logprobs(example, "reference_logprobs"):
             example["rank_reference_logprob"] = float(
                 reference.detach().double().sum().item())
         else:
@@ -1923,10 +1930,10 @@ class ReplicatedDataParallelTrainer:
               f"effective max={largest_batch}, "
               f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
         supplied_old = sum(
-            torch.is_tensor(example.get("behavior_logprobs"))
+            _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in examples)
         supplied_reference = sum(
-            torch.is_tensor(example.get("reference_logprobs"))
+            _valid_example_token_logprobs(example, "reference_logprobs")
             for example in examples) if kl_coef else len(examples)
         print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
@@ -2136,11 +2143,9 @@ class ReplicatedDataParallelTrainer:
                         for example in batch
                     ]
                     supplied_reference = all(
-                        torch.is_tensor(value)
-                        and value.ndim == 1
-                        and value.shape[0] == example["response_ids"].shape[1]
-                        and torch.isfinite(value).all()
-                        for example, value in zip(batch, base_logprobs)
+                        _valid_example_token_logprobs(
+                            example, "reference_logprobs")
+                        for example in batch
                     )
                     if not supplied_reference:
                         try:
@@ -2182,8 +2187,8 @@ class ReplicatedDataParallelTrainer:
                                 effective_advantage = (
                                     effective_advantage + fb_advantage)
                         behavior_lp = example.get("behavior_logprobs")
-                        if (behavior_lp is not None
-                                and behavior_lp.shape[0] == current_lp.shape[0]):
+                        if _valid_example_token_logprobs(
+                                example, "behavior_logprobs"):
                             importance_ratio = torch.exp(
                                 current_lp.detach() - behavior_lp)
                             ratio_sum += float(
@@ -3344,11 +3349,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             example.get("reference_logprobs") for example in batch
         ]
         supplied_reference = all(
-            torch.is_tensor(value)
-            and value.ndim == 1
-            and value.shape[0] == example["response_ids"].shape[1]
-            and torch.isfinite(value).all()
-            for example, value in zip(batch, base_logprobs)
+            _valid_example_token_logprobs(
+                example, "reference_logprobs")
+            for example in batch
         )
         if not supplied_reference:
             try:
@@ -3395,8 +3398,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     eff_adv = eff_adv + fb_adv
 
             behavior_lp = ex.get("behavior_logprobs")
-            if (behavior_lp is not None
-                    and behavior_lp.shape[0] == cur_lp.shape[0]):
+            if _valid_example_token_logprobs(
+                    ex, "behavior_logprobs"):
                 is_ratio = torch.exp(cur_lp.detach() - behavior_lp)
                 is_ratio_sum += float(is_ratio.mean().item())
                 is_ratio_max = max(
@@ -3405,9 +3408,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             else:
                 if (behavior_lp is not None
                         and not hasattr(train_step, "_is_len_warned")):
-                    print(f"[warn] behavior/current logprob length mismatch "
-                          f"({behavior_lp.shape[0]} vs {cur_lp.shape[0]}); "
-                          f"skipping IS for affected examples")
+                    print("[warn] invalid behavior logprobs; skipping IS for "
+                          "affected examples")
                     train_step._is_len_warned = True
                 is_ratio = 1.0
 

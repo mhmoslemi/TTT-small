@@ -118,6 +118,32 @@ class VLLMBackendTests(unittest.TestCase):
             for batch in batches
         ))
 
+    def test_rank_cache_uses_valid_vllm_values_and_marks_fallbacks(self):
+        import torch
+        from train_multy_CVaR import _initialize_rank_logprob_caches
+
+        valid = {
+            "response_ids": torch.tensor([[1, 2]]),
+            "behavior_logprobs": torch.tensor([-0.1, -0.2]),
+            "reference_logprobs": torch.tensor([-0.3, -0.4]),
+        }
+        invalid = {
+            "response_ids": torch.tensor([[1, 2]]),
+            "behavior_logprobs": torch.tensor([-0.1]),
+            "reference_logprobs": torch.tensor([-0.3, float("nan")]),
+        }
+
+        missing_old, missing_reference = _initialize_rank_logprob_caches(
+            [valid, invalid])
+
+        self.assertEqual(missing_old, [invalid])
+        self.assertEqual(missing_reference, [invalid])
+        self.assertTrue(torch.equal(
+            valid["rank_old_logprobs"], valid["behavior_logprobs"]))
+        self.assertAlmostEqual(valid["rank_reference_logprob"], -0.7)
+        self.assertIsNone(invalid["rank_old_logprobs"])
+        self.assertIsNone(invalid["rank_reference_logprob"])
+
     def test_batched_logprobs_match_single_example_path(self):
         import torch
         from train_multy_CVaR import (compute_batched_token_logprobs,
