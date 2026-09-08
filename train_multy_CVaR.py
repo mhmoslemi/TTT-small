@@ -1357,6 +1357,36 @@ def _training_microbatches(examples, cfg, *, partition_key=None):
     return batches
 
 
+def _initialize_rank_logprob_caches(examples):
+    """Use vLLM rollout/reference scores and identify any HF fallbacks."""
+    import torch
+
+    missing_old = []
+    missing_reference = []
+    for example in examples:
+        response_len = int(example["response_ids"].shape[1])
+        old = example.get("behavior_logprobs")
+        if (torch.is_tensor(old) and old.ndim == 1
+                and old.shape[0] == response_len
+                and torch.isfinite(old).all()):
+            example["rank_old_logprobs"] = old.detach().cpu()
+        else:
+            example["rank_old_logprobs"] = None
+            missing_old.append(example)
+
+        reference = example.get("reference_logprobs")
+        if (torch.is_tensor(reference) and reference.ndim == 1
+                and reference.shape[0] == response_len
+                and torch.isfinite(reference).all()):
+            example["rank_reference_logprob"] = float(
+                reference.detach().double().sum().item())
+        else:
+            example["rank_reference_logprob"] = None
+            missing_reference.append(example)
+        example["rank_feedback_advantage"] = None
+    return missing_old, missing_reference
+
+
 def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
                    advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
                    kl_coef=0.0, entropy_coef=0.0, token_entropies=None):
@@ -1476,62 +1506,67 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
         fb_stats = FeedbackStats()
     backend.set_training_mode()
     started = time.time()
-    cache_batches = _training_microbatches(examples, cfg)
     update_batches = _training_microbatches(
         examples, cfg,
         partition_key=lambda example: bool(
             example["rank_entropy_gate"] and entropy_coef > 0.0))
-    largest_batch = max((len(batch) for batch in cache_batches), default=0)
-    print(f"[train] LoRA microbatches={len(cache_batches)}; "
+    largest_batch = max((len(batch) for batch in update_batches), default=0)
+    print(f"[train] LoRA microbatches={len(update_batches)}; "
           f"configured max={int(cfg.train_examples_per_microbatch)}, "
           f"effective max={largest_batch}, "
           f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
-    print(f"[step {step_idx}] rank: caching old/reference logprobs for "
-          f"{len(examples)} examples before {epochs} update(s)", flush=True)
+    missing_old, missing_reference = _initialize_rank_logprob_caches(examples)
+    reference_fallback = missing_reference if kl_coef else []
+    print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+          f"{len(examples) - len(missing_old)}/{len(examples)}, reference="
+          f"{len(examples) - len(reference_fallback)}/{len(examples)}; "
+          f"HF fallback old={len(missing_old)}, "
+          f"reference={len(reference_fallback)} before {epochs} update(s)",
+          flush=True)
 
     with _rank_dropout_disabled(model):
-        # No optimizer step may precede completion of this loop. CPU caches
-        # avoid retaining graphs or duplicating the entire model on the GPU.
-        for batch in cache_batches:
+        # Usually both loops are empty because vLLM supplied the frozen values.
+        # They retain exact compatibility with HF generation and with any vLLM
+        # sequence whose logprob payload was incomplete.
+        for batch in _training_microbatches(missing_old, cfg):
             old_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=False, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
             if any(not torch.isfinite(value).all()
                    for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
-            reference_logprobs = [None] * len(batch)
-            if kl_coef:
-                # Disabling the LoRA adapter is the runner's fixed reference.
-                # A failure must not silently remove the requested KL term.
-                with backend.disable_adapter(), torch.no_grad():
+            for ex, old_lp in zip(batch, old_logprobs):
+                ex["rank_old_logprobs"] = old_lp.detach().cpu()
+        if reference_fallback:
+            with backend.disable_adapter(), torch.no_grad():
+                for batch in _training_microbatches(reference_fallback, cfg):
                     reference_logprobs = compute_batched_token_logprobs(
                         model, batch, with_grad=False,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id)
-                if any(not torch.isfinite(value).all()
-                       for value in reference_logprobs):
-                    raise FloatingPointError("nonfinite reference-policy logprobs")
-            for ex, old_lp, ref_lp in zip(
-                    batch, old_logprobs, reference_logprobs):
-                rid = ex["response_ids"]
-                ex["rank_old_logprobs"] = old_lp.detach().cpu()
-                ex["rank_reference_logprob"] = (
-                    float(ref_lp.double().sum().item())
-                    if ref_lp is not None else None)
-                ex["rank_feedback_advantage"] = None
-                if fb_on and ex.get("reprompt_text"):
-                    fb_adv = feedback_advantage(
-                        compute_token_logprobs, model, tokenizer,
-                        ex["reprompt_text"], rid, old_lp.detach(), fb_cfg,
-                        lam=fb_lambda, chunk=cfg.logprob_chunk)
-                    if fb_adv is None:
-                        fb_stats.skipped += 1
-                    else:
-                        fb_adv, _ = bound_feedback_advantage(
-                            fb_adv, reward_advantage=ex["advantage"],
-                            cfg=fb_cfg)
-                        fb_stats.add(fb_adv)
-                        ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
+                    if any(not torch.isfinite(value).all()
+                           for value in reference_logprobs):
+                        raise FloatingPointError(
+                            "nonfinite reference-policy logprobs")
+                    for ex, ref_lp in zip(batch, reference_logprobs):
+                        ex["rank_reference_logprob"] = float(
+                            ref_lp.double().sum().item())
+        if fb_on:
+            for ex in examples:
+                if not ex.get("reprompt_text"):
+                    continue
+                old_lp = ex["rank_old_logprobs"].to(ex["response_ids"].device)
+                fb_adv = feedback_advantage(
+                    compute_token_logprobs, model, tokenizer,
+                    ex["reprompt_text"], ex["response_ids"], old_lp,
+                    fb_cfg, lam=fb_lambda, chunk=cfg.logprob_chunk)
+                if fb_adv is None:
+                    fb_stats.skipped += 1
+                else:
+                    fb_adv, _ = bound_feedback_advantage(
+                        fb_adv, reward_advantage=ex["advantage"], cfg=fb_cfg)
+                    fb_stats.add(fb_adv)
+                    ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
 
         history = []
         for epoch in range(epochs):
@@ -1872,9 +1907,6 @@ class ReplicatedDataParallelTrainer:
                                      RANK_ENTROPY_COEF_DEFAULT))
         kl_coef = float(cfg.kl_penalty_coef)
         local_shards = self._prepare_shards(examples)
-        cache_batches = [
-            _training_microbatches(shard, cfg) for shard in local_shards
-        ]
         update_batches = [
             _training_microbatches(
                 shard, cfg,
@@ -1883,24 +1915,33 @@ class ReplicatedDataParallelTrainer:
             for shard in local_shards
         ]
         largest_batch = max(
-            (len(batch) for batches in cache_batches for batch in batches),
+            (len(batch) for batches in update_batches for batch in batches),
             default=0)
         print(f"[train-parallel] LoRA microbatches/GPU="
-              f"{[len(batches) for batches in cache_batches]}; "
+              f"{[len(batches) for batches in update_batches]}; "
               f"configured max={int(cfg.train_examples_per_microbatch)}, "
               f"effective max={largest_batch}, "
               f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
-        print(f"[step {step_idx}] rank: caching old/reference logprobs for "
-              f"{len(examples)} examples across {self.world_size} GPUs before "
-              f"{epochs} update(s)", flush=True)
+        supplied_old = sum(
+            torch.is_tensor(example.get("behavior_logprobs"))
+            for example in examples)
+        supplied_reference = sum(
+            torch.is_tensor(example.get("reference_logprobs"))
+            for example in examples) if kl_coef else len(examples)
+        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+              f"{supplied_old}/{len(examples)}, reference="
+              f"{supplied_reference}/{len(examples)}; HF fallback runs only "
+              f"for missing values before {epochs} update(s)", flush=True)
 
         def cache(item):
-            replica_index, batches = item
+            replica_index, shard = item
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             stats = FeedbackStats() if fb_on else None
             backend.set_training_mode()
             with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
-                for batch in batches:
+                missing_old, missing_reference = (
+                    _initialize_rank_logprob_caches(shard))
+                for batch in _training_microbatches(missing_old, cfg):
                     old_logprobs = compute_batched_token_logprobs(
                         model, batch, with_grad=False,
                         chunk=cfg.logprob_chunk,
@@ -1909,30 +1950,34 @@ class ReplicatedDataParallelTrainer:
                            for value in old_logprobs):
                         raise FloatingPointError(
                             "nonfinite old-policy logprobs")
-                    reference_logprobs = [None] * len(batch)
-                    if kl_coef:
-                        with backend.disable_adapter(), torch.no_grad():
+                    for example, old_lp in zip(batch, old_logprobs):
+                        example["rank_old_logprobs"] = old_lp.detach().cpu()
+                if kl_coef and missing_reference:
+                    with backend.disable_adapter(), torch.no_grad():
+                        for batch in _training_microbatches(
+                                missing_reference, cfg):
                             reference_logprobs = compute_batched_token_logprobs(
                                 model, batch, with_grad=False,
                                 chunk=cfg.logprob_chunk,
                                 pad_token_id=tokenizer.pad_token_id)
-                        if any(not torch.isfinite(value).all()
-                               for value in reference_logprobs):
-                            raise FloatingPointError(
-                                "nonfinite reference-policy logprobs")
-                    for example, old_lp, reference_lp in zip(
-                            batch, old_logprobs, reference_logprobs):
-                        response_ids = example["response_ids"]
-                        example["rank_old_logprobs"] = old_lp.detach().cpu()
-                        example["rank_reference_logprob"] = (
-                            float(reference_lp.double().sum().item())
-                            if reference_lp is not None else None)
-                        example["rank_feedback_advantage"] = None
-                        if fb_on and example.get("reprompt_text"):
+                            if any(not torch.isfinite(value).all()
+                                   for value in reference_logprobs):
+                                raise FloatingPointError(
+                                    "nonfinite reference-policy logprobs")
+                            for example, reference_lp in zip(
+                                    batch, reference_logprobs):
+                                example["rank_reference_logprob"] = float(
+                                    reference_lp.double().sum().item())
+                if fb_on:
+                    for example in shard:
+                        if example.get("reprompt_text"):
+                            old_lp = example["rank_old_logprobs"].to(
+                                example["response_ids"].device)
                             fb_advantage = feedback_advantage(
                                 compute_token_logprobs, model, tokenizer,
-                                example["reprompt_text"], response_ids,
-                                old_lp.detach(), fb_cfg, lam=fb_lambda,
+                                example["reprompt_text"],
+                                example["response_ids"], old_lp, fb_cfg,
+                                lam=fb_lambda,
                                 chunk=cfg.logprob_chunk)
                             if fb_advantage is None:
                                 stats.skipped += 1
@@ -1948,7 +1993,7 @@ class ReplicatedDataParallelTrainer:
             return stats
 
         cache_stats = self._run_replicas(
-            cache, list(enumerate(cache_batches)))
+            cache, list(enumerate(local_shards)))
         feedback_stats = self._merge_feedback_stats(cache_stats)
         history = []
         for epoch in range(epochs):
@@ -2086,21 +2131,34 @@ class ReplicatedDataParallelTrainer:
                         model, batch, with_grad=True,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id)
-                    try:
-                        with backend.disable_adapter(), torch.no_grad():
-                            base_logprobs = compute_batched_token_logprobs(
-                                model, batch, with_grad=False,
-                                chunk=cfg.logprob_chunk,
-                                pad_token_id=tokenizer.pad_token_id)
-                    except Exception as error:
-                        kl_error = repr(error)
-                        base_logprobs = [
-                            current_lp.detach()
-                            for current_lp in current_logprobs
-                        ]
+                    base_logprobs = [
+                        example.get("reference_logprobs")
+                        for example in batch
+                    ]
+                    supplied_reference = all(
+                        torch.is_tensor(value)
+                        and value.ndim == 1
+                        and value.shape[0] == example["response_ids"].shape[1]
+                        and torch.isfinite(value).all()
+                        for example, value in zip(batch, base_logprobs)
+                    )
+                    if not supplied_reference:
+                        try:
+                            with backend.disable_adapter(), torch.no_grad():
+                                base_logprobs = compute_batched_token_logprobs(
+                                    model, batch, with_grad=False,
+                                    chunk=cfg.logprob_chunk,
+                                    pad_token_id=tokenizer.pad_token_id)
+                        except Exception as error:
+                            kl_error = repr(error)
+                            base_logprobs = [
+                                current_lp.detach()
+                                for current_lp in current_logprobs
+                            ]
                     batch_losses = []
                     for example, current_lp, base_lp in zip(
                             batch, current_logprobs, base_logprobs):
+                        base_lp = base_lp.to(current_lp.device)
                         response_ids = example["response_ids"]
                         advantage = example["advantage"]
                         logp_difference = (current_lp - base_lp).detach()
@@ -2650,27 +2708,39 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
           f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
-    # (text, token_ids, prompt_job_index), arrival order under each parent.
+    # Mutable records preserve streamed arrival order while vLLM reference
+    # scoring fills its result concurrently with the CPU reward futures.
     group_responses = {g: [] for g in range(num_groups)}
     reward_futures = {g: [] for g in range(num_groups)}    # aligned RewardResult futures
     deferred_rollouts = []
+    vllm_logprob_records = []
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
 
-    def _submit_rollout(job_idx, text, token_ids):
-        job = prompt_jobs[job_idx]
+    def _submit_rollout(record):
+        job = prompt_jobs[record["job_idx"]]
         g = job["parent_group"]
-        group_responses[g].append((text, token_ids, job_idx))
+        group_responses[g].append(record)
         fut = reward_pool.submit(
-            problem.compute_reward, text, parent_ctxs[g], cfg.sandbox_timeout_s
+            problem.compute_reward, record["text"], parent_ctxs[g],
+            cfg.sandbox_timeout_s
         )
         reward_futures[g].append(fut)
 
-    def _queue_rollout(job_idx, text, token_ids):
+    def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
+        record = {
+            "job_idx": int(job_idx),
+            "text": text,
+            "token_ids": list(token_ids),
+            "behavior_logprobs": behavior_logprobs,
+            "reference_logprobs": None,
+        }
+        if cfg.generation_backend == "vllm" and token_ids:
+            vllm_logprob_records.append(record)
         if defer_gpu_evaluation:
-            deferred_rollouts.append((job_idx, text, token_ids))
+            deferred_rollouts.append(record)
         else:
-            _submit_rollout(job_idx, text, token_ids)
+            _submit_rollout(record)
 
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
@@ -2682,18 +2752,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # above). CPU rewards and rewards on a distinct evaluation GPU
                 # start immediately. A one-card GPU problem defers evaluation
                 # until generation releases that same physical card.
+                generation_options = {
+                    "prompts_by_group": [
+                        job["prompt_text"] for job in prompt_jobs],
+                    "group_size": cfg.group_size,
+                    "counts_by_group": [
+                        job["count"] for job in prompt_jobs],
+                    "adapter_path": adapter_path,
+                    "max_new_tokens": cfg.max_new_tokens,
+                    "temperature": cfg.temperature,
+                    "top_p": cfg.top_p,
+                    "step_idx": step_idx,
+                }
+                if cfg.generation_backend == "vllm":
+                    generation_options["return_logprobs"] = True
                 for job_idx, job_results in gen_pool.iter_group_jobs(
-                        prompts_by_group=[job["prompt_text"] for job in prompt_jobs],
-                        group_size=cfg.group_size,
-                        counts_by_group=[job["count"] for job in prompt_jobs],
-                        adapter_path=adapter_path,
-                        max_new_tokens=cfg.max_new_tokens,
-                        temperature=cfg.temperature,
-                        top_p=cfg.top_p,
-                        step_idx=step_idx,
-                    ):
-                    for (text, token_ids) in job_results:
-                        _queue_rollout(job_idx, text, token_ids)
+                        **generation_options):
+                    for result in job_results:
+                        text, token_ids = result[:2]
+                        behavior_logprobs = (
+                            result[2] if len(result) > 2 else None)
+                        _queue_rollout(
+                            job_idx, text, token_ids, behavior_logprobs)
             else:
                 # In-process generation uses cross-prompt micro-batches rather
                 # than draining one parent at a time. Ordinary CPU verification
@@ -2717,6 +2797,50 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg._local_generation_cap = int(cap_state["value"])
                 finally:
                     gen_bar.close()
+
+            # CPU reward processes were submitted as each rollout arrived and
+            # continue running here. Keep vLLM awake and use that same interval
+            # to score fixed base/reference token logprobs without the adapter.
+            if cfg.generation_backend == "vllm" and vllm_logprob_records:
+                scoring_started = time.time()
+                eval_done_before = sum(
+                    future.done() for futures in reward_futures.values()
+                    for future in futures)
+                prompt_token_ids = {}
+                score_pairs = []
+                for record in vllm_logprob_records:
+                    job_idx = record["job_idx"]
+                    if job_idx not in prompt_token_ids:
+                        prompt_token_ids[job_idx] = tokenizer(
+                            prompt_jobs[job_idx]["prompt_text"]).input_ids
+                    score_pairs.append((
+                        prompt_token_ids[job_idx], record["token_ids"]))
+                try:
+                    reference_scores = gen_pool.score_token_logprobs(
+                        score_pairs, show_progress=True)
+                except Exception as error:
+                    reference_scores = [None] * len(score_pairs)
+                    print(f"[warn] vLLM reference scoring failed ({error!r}); "
+                          "missing values will fall back to HF", flush=True)
+                for record, values in zip(
+                        vllm_logprob_records, reference_scores):
+                    record["reference_logprobs"] = values
+                behavior_count = sum(
+                    record["behavior_logprobs"] is not None
+                    for record in vllm_logprob_records)
+                reference_count = sum(
+                    record["reference_logprobs"] is not None
+                    for record in vllm_logprob_records)
+                eval_done_after = sum(
+                    future.done() for futures in reward_futures.values()
+                    for future in futures)
+                print(f"[step {step_idx}] vLLM logprobs: rollout "
+                      f"{behavior_count}/{len(vllm_logprob_records)}, "
+                      f"reference {reference_count}/"
+                      f"{len(vllm_logprob_records)} in "
+                      f"{time.time() - scoring_started:.1f}s "
+                      f"(CPU evaluations completed during scoring: "
+                      f"{eval_done_before}->{eval_done_after})", flush=True)
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
                 gen_pool.release()
@@ -2744,8 +2868,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "one-GPU gpu_mode requires the trainer to offload before "
                     "candidate benchmark evaluation, but this model/runtime "
                     "cannot move the training state to CPU") from exc
-            for job_idx, text, token_ids in deferred_rollouts:
-                _submit_rollout(job_idx, text, token_ids)
+            for record in deferred_rollouts:
+                _submit_rollout(record)
 
         # Wait for whatever rewards are still running (a small tail if overlap
         # worked); shows how many were already done when generation finished.
@@ -2781,14 +2905,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     prompt_ids_by_job = {}
 
     for g, parent in enumerate(parents):
-        responses = group_responses[g]          # list of (text, token_ids, job)
+        responses = group_responses[g]          # streamed mutable rollout records
         futs = reward_futures[g]                 # aligned RewardResult futures
 
         rewards = []
         codes = []
         valids = []
         outs = []        # list of RewardResult
-        for r_idx, (text, token_ids, job_idx) in enumerate(responses):
+        for r_idx, record in enumerate(responses):
             res = futs[r_idx].result()           # already computed (or finishes now)
             rewards.append(res.reward)
             codes.append(res.code or "")
@@ -2836,7 +2960,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
         arm_observations = {}
-        for r_idx, (_text, _token_ids, job_idx) in enumerate(responses):
+        for r_idx, record in enumerate(responses):
+            job_idx = record["job_idx"]
             job = prompt_jobs[job_idx]
             obs = arm_observations.setdefault(job["arm"], {
                 "memory_ids": job["memory_ids"], "rewards": [], "valids": [],
@@ -2857,7 +2982,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       f"valid={update['valid']}/{update['rollouts']}")
 
         # Save every rollout (response + meta) to disk for debugging
-        for r_idx, (text, token_ids, job_idx) in enumerate(responses):
+        for r_idx, record in enumerate(responses):
+            text = record["text"]
+            token_ids = record["token_ids"]
+            job_idx = record["job_idx"]
             res = outs[r_idx]
             job = prompt_jobs[job_idx]
             # Allocate a durable ID even for invalid/duplicate candidates. A
@@ -2969,7 +3097,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # itself happens in the train loop, where log pi_thetabar is already
         # available from the existing forward pass.
         if fb_candidate_on:
-            for r_idx, (text, token_ids, job_idx) in enumerate(responses):
+            for r_idx, record in enumerate(responses):
+                job_idx = record["job_idx"]
                 res = outs[r_idx]
                 if not is_code_failure(res):
                     continue
@@ -2995,8 +3124,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and not (fb_candidate_on and fb_cfg.include_constant_groups)):
             continue
 
-        for r_idx, ((text, token_ids, job_idx), adv) in enumerate(
+        for r_idx, (record, adv) in enumerate(
                 zip(responses, advantages)):
+            token_ids = record["token_ids"]
+            job_idx = record["job_idx"]
             if len(token_ids) == 0:
                 continue
             if job_idx not in prompt_ids_by_job:
@@ -3004,12 +3135,25 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     prompt_jobs[job_idx]["prompt_text"],
                     return_tensors="pt").input_ids.to(model.device)
             response_ids = torch.tensor([token_ids], device=model.device)
+            behavior_values = record["behavior_logprobs"]
+            reference_values = record["reference_logprobs"]
+            behavior_logprobs = (
+                torch.tensor(behavior_values, dtype=torch.float32,
+                             device=model.device)
+                if behavior_values is not None
+                and len(behavior_values) == len(token_ids) else None)
+            reference_logprobs = (
+                torch.tensor(reference_values, dtype=torch.float32,
+                             device=model.device)
+                if reference_values is not None
+                and len(reference_values) == len(token_ids) else None)
             res = outs[r_idx]
             all_examples.append({
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
                 "advantage": float(adv),
-                "behavior_logprobs": None,   # IS disabled (workers don't return logprobs)
+                "behavior_logprobs": behavior_logprobs,
+                "reference_logprobs": reference_logprobs,
                 "reprompt_text": reprompt_by_key.get((g, r_idx)),
                 "failure_signature": RolloutRecord(
                     msg=res.msg or "").failure_signature(),
@@ -3196,23 +3340,36 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         current_logprobs = compute_batched_token_logprobs(
             model, batch, with_grad=True, chunk=cfg.logprob_chunk,
             pad_token_id=tokenizer.pad_token_id)
-        try:
-            with backend.disable_adapter(), torch.no_grad():
-                base_logprobs = compute_batched_token_logprobs(
-                    model, batch, with_grad=False, chunk=cfg.logprob_chunk,
-                    pad_token_id=tokenizer.pad_token_id)
-        except Exception as e:
-            if not hasattr(train_step, "_kl_warned"):
-                print(f"[warn] disable_adapter failed ({e}); "
-                      "training without KL penalty")
-                train_step._kl_warned = True
-            base_logprobs = [
-                current_lp.detach() for current_lp in current_logprobs
-            ]
+        base_logprobs = [
+            example.get("reference_logprobs") for example in batch
+        ]
+        supplied_reference = all(
+            torch.is_tensor(value)
+            and value.ndim == 1
+            and value.shape[0] == example["response_ids"].shape[1]
+            and torch.isfinite(value).all()
+            for example, value in zip(batch, base_logprobs)
+        )
+        if not supplied_reference:
+            try:
+                with backend.disable_adapter(), torch.no_grad():
+                    base_logprobs = compute_batched_token_logprobs(
+                        model, batch, with_grad=False,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
+            except Exception as e:
+                if not hasattr(train_step, "_kl_warned"):
+                    print(f"[warn] disable_adapter failed ({e}); "
+                          "training without KL penalty")
+                    train_step._kl_warned = True
+                base_logprobs = [
+                    current_lp.detach() for current_lp in current_logprobs
+                ]
 
         batch_losses = []
         for ex, cur_lp, base_lp in zip(
                 batch, current_logprobs, base_logprobs):
+            base_lp = base_lp.to(cur_lp.device)
             rid = ex["response_ids"]
             adv = ex["advantage"]
             logp_diff = (cur_lp - base_lp).detach()

@@ -14,6 +14,7 @@ from gen_workers import (
     OnDemandGenerationPool,
     PhasedVLLMGenerationPool,
     distribute_jobs,
+    _chosen_token_logprobs,
     _flashinfer_comm_guard_required,
     _prepare_flashinfer_comm_compat,
     _redirect_vllm_output,
@@ -80,6 +81,18 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_chosen_token_logprobs_keeps_only_observed_tokens(self):
+        entries = [
+            {4: types.SimpleNamespace(logprob=-0.4),
+             9: types.SimpleNamespace(logprob=-9.0)},
+            {7: types.SimpleNamespace(logprob=-0.7)},
+        ]
+
+        self.assertEqual(
+            _chosen_token_logprobs([4, 7], entries), [-0.4, -0.7])
+        self.assertIsNone(_chosen_token_logprobs([4], entries))
+        self.assertIsNone(_chosen_token_logprobs([4, 8], entries))
+
     def test_training_microbatches_honor_example_and_padded_token_caps(self):
         import torch
         from train_multy_CVaR import _training_microbatches
@@ -1051,6 +1064,33 @@ class VLLMBackendTests(unittest.TestCase):
                 show_progress=False,
             ))
 
+    def test_generation_pool_scores_reference_tokens_across_workers(self):
+        pool = GenerationPool.__new__(GenerationPool)
+        pool.backend = "vllm"
+        pool.num_workers = 2
+        pool.max_seq_length = 8
+        pool.task_queues = [_Queue(), _Queue()]
+        pool.result_queue = _Queue([
+            (0, "__score__", [(0, [-0.1])]),
+            (1, "__score__", [(1, [-0.2, -0.3])]),
+        ])
+        pool.procs = [
+            types.SimpleNamespace(exitcode=None),
+            types.SimpleNamespace(exitcode=None),
+        ]
+
+        scores = pool.score_token_logprobs([
+            ([1, 2], [3]),
+            ([1], [2, 3]),
+            ([1, 2, 3, 4, 5, 6, 7], [8]),
+        ], show_progress=False)
+
+        self.assertEqual(scores, [[-0.1], [-0.2, -0.3], None])
+        queued = [queue.items[0] for queue in pool.task_queues]
+        self.assertEqual(queued[0][0], "__score__")
+        self.assertEqual(queued[1][0], "__score__")
+        self.assertEqual(sum(len(task[1]) for task in queued), 2)
+
     def test_on_demand_pool_releases_shared_gpu(self):
         events = []
 
@@ -1104,6 +1144,10 @@ class VLLMBackendTests(unittest.TestCase):
                 events.append(("generate", None))
                 yield 0, [("ok", [1])]
 
+            def score_token_logprobs(self, pairs, **kwargs):
+                events.append(("score", list(pairs)))
+                return [[-0.25]]
+
             def shutdown(self):
                 events.append(("shutdown", None))
 
@@ -1114,16 +1158,19 @@ class VLLMBackendTests(unittest.TestCase):
                 model_name="org/model", num_workers=1, gpu_ids=[7],
             )
             got = list(pool.iter_group_jobs())
+            scores = pool.score_token_logprobs([([1], [2])])
             pool.release()
             got_again = list(pool.iter_group_jobs())
             pool.release()
             pool.shutdown()
 
         self.assertEqual(got, [(0, [("ok", [1])])])
+        self.assertEqual(scores, [[-0.25]])
         self.assertEqual(got_again, [(0, [("ok", [1])])])
         self.assertEqual(events, [
             ("offload", None), ("start", (True, 2)),
-            ("generate", None), ("sleep", None), ("restore", None),
+            ("generate", None), ("score", [([1], [2])]),
+            ("sleep", None), ("restore", None),
             ("offload", None), ("wake", None), ("generate", None),
             ("sleep", None), ("restore", None),
             ("shutdown", None),
@@ -1257,6 +1304,86 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(ready_queue.items, [("ready", 0, "")])
         self.assertEqual(result_queue.items, [
             (0, 7, [("prompt-0", [1]), ("prompt-1", [2])]),
+        ])
+
+    def test_vllm_worker_returns_rollout_and_reference_logprobs(self):
+        fake_vllm = types.ModuleType("vllm")
+        fake_request = types.ModuleType("vllm.lora.request")
+
+        class SamplingParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class LoRARequest:
+            def __init__(self, *_args):
+                pass
+
+        class Entry:
+            def __init__(self, value):
+                self.logprob = value
+
+        class LLM:
+            def __init__(self, **_kwargs):
+                pass
+
+            def get_tokenizer(self):
+                return types.SimpleNamespace(encode=lambda _prompt: [10])
+
+            def generate(self, prompts, sampling_params, **_kwargs):
+                if prompts and isinstance(prompts[0], dict):
+                    return [types.SimpleNamespace(
+                        prompt_logprobs=[
+                            None,
+                            {20: Entry(-0.2)},
+                            {30: Entry(-0.3)},
+                        ],
+                        outputs=[],
+                    )]
+                candidate = types.SimpleNamespace(
+                    text="answer",
+                    token_ids=[7, 8],
+                    logprobs=[{7: Entry(-0.7)}, {8: Entry(-0.8)}],
+                )
+                return [types.SimpleNamespace(outputs=[candidate])]
+
+        fake_vllm.LLM = LLM
+        fake_vllm.SamplingParams = SamplingParams
+        fake_request.LoRARequest = LoRARequest
+        task_queue = _Queue([
+            (4, "/tmp/adapter_step004", [(7, "prompt", 1)], {
+                "max_new_tokens": 10,
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "return_logprobs": True,
+            }),
+            ("__score__", [(0, [10], [20, 30])]),
+            None,
+        ])
+        result_queue = _Queue()
+        ready_queue = _Queue()
+        modules = {
+            "vllm": fake_vllm,
+            "vllm.lora": types.ModuleType("vllm.lora"),
+            "vllm.lora.request": fake_request,
+        }
+
+        with patch.dict(sys.modules, modules):
+            _vllm_worker_loop(
+                rank=0,
+                gpu_id=3,
+                model_name="org/model",
+                max_seq_length=1024,
+                load_in_4bit=False,
+                task_queue=task_queue,
+                result_queue=result_queue,
+                ready_queue=ready_queue,
+                seed=42,
+                enable_sleep_mode=True,
+            )
+
+        self.assertEqual(result_queue.items, [
+            (0, 7, [("answer", [7, 8], [-0.7, -0.8])]),
+            (0, "__score__", [(0, [-0.2, -0.3])]),
         ])
 
     def test_vllm_worker_deep_sleep_discards_and_reloads_weights(self):

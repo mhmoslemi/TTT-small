@@ -16,10 +16,13 @@ small LoRA adapter to a new directory, then asks the pool to generate with those
 weights. In vLLM mode this is deliberately a trainer/rollout split: vLLM is the
 fast inference engine, while HF+PEFT (or optionally Unsloth) performs backward.
 
-IMPORTANCE SAMPLING (fix 6) IS DISABLED FOR SPEED.
-We do NOT compute per-token behavior logprobs; generation returns tokens only.
-generate_groups() fills the trainer's logprob slot with None (read as on-policy,
-IS ratio = 1). iter_group_jobs() yields plain (text, token_ids) pairs.
+LOGPROBS. vLLM rollout calls can return the sampled token's logprob with each
+token. The trainer retains only those scalar values on the CPU, not full-vocab
+distributions. While CPU reward sandboxes continue running, the same awake vLLM
+engines score each completed prompt/response once without LoRA to obtain the
+fixed reference logprobs. HF training then performs only the differentiable
+current-policy pass. Non-training generation calls keep the old compact
+(text, token_ids) result format.
 
 SEEDING. HF workers reseed random / numpy / torch from (seed, step, rank)
 before every task. vLLM workers use stable per-request seeds derived from
@@ -39,7 +42,9 @@ No async. Plain torch.multiprocessing with persistent workers and queues.
 Protocol (per step):
   main -> worker[w].task_queue:   (step, adapter_path, jobs, gen_kwargs)
        where jobs = [(group_idx, prompt_text, num_samples), ...]
-  worker[w] -> result_queue:      (rank, group_idx, [(text, token_ids), ...])
+  worker[w] -> result_queue:      (rank, group_idx, [result, ...])
+       where result is (text, token_ids), optionally with sampled logprobs as
+       a third item when the caller requests them.
        one message PER JOB, so the pool can stream results as they land.
 """
 
@@ -143,6 +148,31 @@ def worker_seed(seed, step, rank):
     so the trainer's single-GPU path can key its own reseed the same way.
     """
     return (int(seed) * 1_000_003 + int(step) * 1009 + int(rank) * 7 + 13) % (2 ** 31 - 1)
+
+
+def _chosen_token_logprobs(token_ids, position_logprobs):
+    """Extract only each observed token's scalar logprob from vLLM output."""
+    if position_logprobs is None or len(position_logprobs) != len(token_ids):
+        return None
+    values = []
+    for token_id, candidates in zip(token_ids, position_logprobs):
+        if candidates is None:
+            return None
+        try:
+            entry = candidates.get(int(token_id))
+        except AttributeError:
+            try:
+                entry = candidates[int(token_id)]
+            except (KeyError, IndexError, TypeError):
+                entry = None
+        if entry is None:
+            return None
+        value = getattr(entry, "logprob", entry)
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return values
 
 
 def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
@@ -709,6 +739,58 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     control_queue.put(
                         ("error", rank, command, detail))
             continue
+        if (isinstance(task, tuple) and len(task) == 2
+                and task[0] == "__score__"):
+            score_jobs = task[1]
+            if not score_jobs:
+                continue
+            try:
+                prompts = [
+                    {"prompt_token_ids": list(prompt_ids) + list(response_ids)}
+                    for _request_idx, prompt_ids, response_ids in score_jobs
+                ]
+                # prompt_logprobs=0 retains only the observed token at every
+                # position. One generated token is required by older offline
+                # vLLM APIs, but is discarded. No LoRARequest is supplied, so
+                # these are fixed base/reference-policy scores.
+                score_params = SamplingParams(
+                    max_tokens=1,
+                    temperature=0.0,
+                    prompt_logprobs=0,
+                    detokenize=False,
+                )
+                outputs = llm.generate(
+                    prompts,
+                    sampling_params=score_params,
+                    lora_request=None,
+                    use_tqdm=False,
+                )
+                scored = []
+                for job_pos, (request_idx, prompt_ids, response_ids) in enumerate(
+                        score_jobs):
+                    request_output = (outputs[job_pos]
+                                      if job_pos < len(outputs) else None)
+                    values = None
+                    if request_output is not None:
+                        prompt_logprobs = getattr(
+                            request_output, "prompt_logprobs", None)
+                        start = len(prompt_ids)
+                        end = start + len(response_ids)
+                        if (prompt_logprobs is not None
+                                and len(prompt_logprobs) >= end):
+                            values = _chosen_token_logprobs(
+                                response_ids, prompt_logprobs[start:end])
+                    scored.append((request_idx, values))
+                result_queue.put((rank, "__score__", scored))
+            except Exception:
+                detail = traceback.format_exc()
+                print(f"[vllm worker {rank}] reference scoring failed:\n"
+                      f"{detail}", file=sys.stderr, flush=True)
+                if vllm_log_path:
+                    detail = ("details: "
+                              f"{os.path.abspath(os.fspath(vllm_log_path))}")
+                result_queue.put((rank, None, {"error": detail}))
+            continue
         step, adapter_path, jobs, gen_kwargs = task
         if not jobs:
             continue
@@ -750,8 +832,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 continue
 
             prompts = [prompt for (_group_idx, prompt, _count) in runnable_jobs]
-            sampling = [
-                SamplingParams(
+            return_logprobs = bool(gen_kwargs.get("return_logprobs", False))
+            sampling = []
+            for (group_idx, _prompt, count), max_tokens in zip(
+                    runnable_jobs, max_tokens_by_job):
+                sampling_kwargs = dict(
                     n=int(count),
                     max_tokens=int(max_tokens),
                     temperature=float(gen_kwargs["temperature"]),
@@ -759,9 +844,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     seed=_vllm_job_seed(seed, step, rank, group_idx),
                     skip_special_tokens=True,
                 )
-                for (group_idx, _prompt, count), max_tokens
-                in zip(runnable_jobs, max_tokens_by_job)
-            ]
+                if return_logprobs:
+                    # vLLM always includes the sampled token in logprobs; zero
+                    # asks for no additional top-k entries.
+                    sampling_kwargs["logprobs"] = 0
+                sampling.append(SamplingParams(**sampling_kwargs))
             outputs = llm.generate(
                 prompts,
                 sampling_params=sampling,
@@ -772,16 +859,26 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             for job_pos, (group_idx, _prompt, count) in enumerate(runnable_jobs):
                 request_output = (outputs[job_pos]
                                   if job_pos < len(outputs) else None)
-                job_results = ([
-                    (candidate.text, list(candidate.token_ids))
-                    for candidate in request_output.outputs
-                ][:int(count)] if request_output is not None else [])
+                job_results = []
+                if request_output is not None:
+                    for candidate in request_output.outputs[:int(count)]:
+                        token_ids = list(candidate.token_ids)
+                        if return_logprobs:
+                            values = _chosen_token_logprobs(
+                                token_ids,
+                                getattr(candidate, "logprobs", None))
+                            job_results.append(
+                                (candidate.text, token_ids, values))
+                        else:
+                            job_results.append((candidate.text, token_ids))
                 # Preserve the queue contract even if an engine/version returns
                 # fewer samples than requested; downstream treats these as
                 # invalid rollouts instead of blocking forever.
                 if len(job_results) < int(count):
-                    job_results.extend(
-                        [("", []) for _ in range(int(count) - len(job_results))])
+                    missing = int(count) - len(job_results)
+                    placeholder = (("", [], None) if return_logprobs
+                                   else ("", []))
+                    job_results.extend([placeholder for _ in range(missing)])
                 result_queue.put((rank, group_idx, job_results))
         except Exception:
             detail = traceback.format_exc()
@@ -822,6 +919,7 @@ class GenerationPool:
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
+        self.max_seq_length = int(max_seq_length)
         self.gen_micro_batch = int(gen_micro_batch or 0)
         self.backend = str(backend).lower()
         self.sleep_requested = bool(vllm_enable_sleep_mode)
@@ -1007,7 +1105,8 @@ class GenerationPool:
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        show_progress=True, counts_by_group=None):
+                        show_progress=True, counts_by_group=None,
+                        return_logprobs=False):
         """
         Stream generation results as each (worker, group) job completes.
 
@@ -1035,6 +1134,7 @@ class GenerationPool:
             "temperature": temperature,
             "top_p": top_p,
             "micro_batch": self.gen_micro_batch,
+            "return_logprobs": bool(return_logprobs),
         }
         total_expected = sum(count for wj in worker_jobs for (_, _, count) in wj)
 
@@ -1069,23 +1169,110 @@ class GenerationPool:
             if bar is not None:
                 bar.close()
 
+    def score_token_logprobs(self, prompt_response_pairs, show_progress=True):
+        """Score observed response tokens with the base vLLM model.
+
+        Calls are length-balanced over the already-awake engines and omit the
+        rollout LoRA adapter. Results align with prompt_response_pairs; None
+        marks an input that must fall back to HF scoring.
+        """
+        if self.backend != "vllm":
+            raise RuntimeError("token scoring is only available on vLLM pools")
+        pairs = list(prompt_response_pairs)
+        scores = [None] * len(pairs)
+        worker_jobs = [[] for _ in range(self.num_workers)]
+        worker_loads = [0 for _ in range(self.num_workers)]
+        skipped = 0
+        ordered = sorted(
+            enumerate(pairs),
+            key=lambda item: len(item[1][0]) + len(item[1][1]),
+            reverse=True,
+        )
+        for request_idx, (prompt_ids, response_ids) in ordered:
+            total = len(prompt_ids) + len(response_ids)
+            # Older vLLM releases require at least one generated token after
+            # prompt scoring. Leave exact-limit sequences to the HF fallback.
+            if not response_ids or total >= self.max_seq_length:
+                skipped += 1
+                continue
+            worker = min(
+                range(self.num_workers), key=lambda idx: worker_loads[idx])
+            worker_jobs[worker].append(
+                (request_idx, list(prompt_ids), list(response_ids)))
+            worker_loads[worker] += total
+
+        expected_jobs = sum(len(jobs) for jobs in worker_jobs)
+        active_workers = sum(bool(jobs) for jobs in worker_jobs)
+        if not expected_jobs:
+            return scores
+        for worker, jobs in enumerate(worker_jobs):
+            if jobs:
+                self.task_queues[worker].put(("__score__", jobs))
+
+        completed_workers = set()
+        bar = (make_progress_bar(len(pairs), desc="vllm reference logprobs")
+               if show_progress else None)
+        if bar is not None and skipped:
+            bar.update(skipped)
+        try:
+            while len(completed_workers) < active_workers:
+                try:
+                    rank, group_idx, job_results = self.result_queue.get(
+                        timeout=1.0)
+                except queue.Empty:
+                    dead = [(idx, proc.exitcode)
+                            for idx, proc in enumerate(self.procs)
+                            if proc.exitcode is not None]
+                    if dead:
+                        raise RuntimeError(
+                            "vLLM worker(s) exited during reference scoring: "
+                            f"{dead}")
+                    continue
+                if group_idx is None and isinstance(job_results, dict):
+                    detail = job_results.get("error", "unknown worker failure")
+                    print(f"[warn] vLLM worker {rank} failed during reference "
+                          f"scoring ({detail}); its values will fall back to "
+                          "HF", flush=True)
+                    completed_workers.add(int(rank))
+                    continue
+                if group_idx != "__score__":
+                    raise RuntimeError(
+                        "unexpected generation result during reference scoring")
+                if int(rank) in completed_workers:
+                    raise RuntimeError(
+                        f"duplicate vLLM reference result from worker {rank}")
+                for request_idx, values in job_results:
+                    scores[int(request_idx)] = values
+                completed_workers.add(int(rank))
+                if bar is not None:
+                    bar.update(len(job_results))
+        finally:
+            if bar is not None:
+                bar.close()
+        return scores
+
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        counts_by_group=None):
+                        counts_by_group=None, return_logprobs=False):
         """
         Backward-compatible blocking variant. Returns:
-          dict group_idx -> list of (text, token_ids, None)
-        (behavior_logprobs is None; IS disabled). Prefer iter_group_jobs() when
-        you want to overlap reward evaluation with generation.
+          dict group_idx -> list of (text, token_ids, behavior_logprobs)
+        The last item is None unless return_logprobs=True on a vLLM pool.
+        Prefer iter_group_jobs() when you want to overlap reward evaluation
+        with generation.
         """
         num_groups = len(prompts_by_group)
         by_group = {g: [] for g in range(num_groups)}
         for group_idx, job_results in self.iter_group_jobs(
                 prompts_by_group, group_size, adapter_path,
                 max_new_tokens, temperature, top_p, step_idx=step_idx,
-                counts_by_group=counts_by_group):
-            for (text, token_ids) in job_results:
-                by_group[group_idx].append((text, token_ids, None))
+                counts_by_group=counts_by_group,
+                return_logprobs=return_logprobs):
+            for item in job_results:
+                text, token_ids = item[:2]
+                behavior_logprobs = item[2] if len(item) > 2 else None
+                by_group[group_idx].append(
+                    (text, token_ids, behavior_logprobs))
         return by_group
 
     def shutdown(self):
@@ -1294,6 +1481,9 @@ class PhasedVLLMGenerationPool:
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)
 
+    def score_token_logprobs(self, *args, **kwargs):
+        return self._ensure_started().score_token_logprobs(*args, **kwargs)
+
     def release(self):
         if not self._awake:
             return
@@ -1363,6 +1553,9 @@ class OnDemandGenerationPool:
 
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)
+
+    def score_token_logprobs(self, *args, **kwargs):
+        return self._ensure_started().score_token_logprobs(*args, **kwargs)
 
     def release(self):
         if self._pool is None:
