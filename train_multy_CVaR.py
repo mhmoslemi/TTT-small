@@ -1475,6 +1475,7 @@ class ReplicatedDataParallelTrainer:
                   f"ready on physical GPU {physical_ids[logical_id]}", flush=True)
 
         self._validate_parameter_layouts()
+        self._validate_replica_devices()
         self._broadcast_trainable_parameters()
         for logical_id in range(world_size):
             torch.cuda.synchronize(logical_id)
@@ -1508,6 +1509,19 @@ class ReplicatedDataParallelTrainer:
                 raise RuntimeError(
                     f"trainer replica {logical_id} has a different trainable "
                     "parameter layout")
+
+    def _validate_replica_devices(self):
+        import torch
+        for _, model, _, logical_id in self.replicas:
+            expected = torch.device(f"cuda:{logical_id}")
+            wrong_devices = {
+                str(parameter.device) for parameter in model.parameters()
+                if parameter.device != expected
+            }
+            if wrong_devices:
+                raise RuntimeError(
+                    f"trainer replica {logical_id} expected every parameter on "
+                    f"{expected}, but also found {sorted(wrong_devices)}")
 
     def _broadcast_trainable_parameters(self):
         import torch
@@ -1967,6 +1981,7 @@ class ReplicatedDataParallelTrainer:
                 torch.cuda.synchronize(logical_id)
 
         self._run_replicas(restore, self.replicas)
+        self._validate_replica_devices()
         _restore_optimizer_state_to_parameters(self.optimizer)
         self._offloaded = False
 

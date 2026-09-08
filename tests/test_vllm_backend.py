@@ -261,6 +261,30 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(events[2][2]["device_map"], Model.hf_device_map)
         self.assertTrue(events[2][2]["force_hooks"])
 
+    def test_replica_backend_restores_its_explicit_device(self):
+        from model_backend import _ModelPlacementBackend
+
+        events = []
+
+        class Model:
+            # Reproduce runtimes that omit hf_device_map for a whole-model map.
+            def to(self, device):
+                events.append(device)
+                return self
+
+        class Backend(_ModelPlacementBackend):
+            pass
+
+        backend = Backend()
+        backend.cfg = types.SimpleNamespace(training_replica_device=3)
+        backend.model = Model()
+        backend._remember_training_placement(backend.model)
+        backend.offload_for_generation()
+        backend.restore_after_generation()
+
+        self.assertEqual(backend._training_device_map, {"": 3})
+        self.assertEqual(events, ["cpu", "cuda:3"])
+
     def test_saved_adapter_names_the_generation_base(self):
         from train_multy import _save_adapter
 

@@ -95,6 +95,15 @@ class _ModelPlacementBackend:
     def _remember_training_placement(self, loaded_model):
         self._placement_model = loaded_model
         device_map = getattr(loaded_model, "hf_device_map", None) or {}
+        # A whole-model explicit device_map is not guaranteed to survive on
+        # every Transformers/Accelerate combination. Replicated training owns
+        # an unambiguous logical device, so retain it directly instead of
+        # allowing restore_after_generation() to fall back to cuda:0. Without
+        # this, all replicas can collapse onto GPU 0 after the first vLLM phase.
+        replica_device = getattr(
+            getattr(self, "cfg", None), "training_replica_device", None)
+        if replica_device is not None:
+            device_map = {"": int(replica_device)}
         self._training_device_map = dict(device_map)
         cpu_targets = [name for name, target in self._training_device_map.items()
                        if str(target).lower() in ("cpu", "disk")]
