@@ -26,9 +26,9 @@ roles are:
 
 | Problem | Inventory size | Training model | Generation | Evaluation |
 |---|---:|---|---|---|
-| CPU-evaluated | any | every id, model-sharded | every id | CPU |
+| CPU-evaluated | any | one data-parallel replica per id | every id | CPU |
 | GPU-mode | 1 | first | first | first, sequential |
-| GPU-mode | 2+ | every id except last, model-sharded | every id except last | last, exclusive |
+| GPU-mode | 2+ | one replica per id except last | every id except last | last, exclusive |
 
 For vLLM, every derived generation GPU is consumed exactly once. The runtime
 chooses the largest tensor-parallel factor that divides both the GPU count and
@@ -42,12 +42,15 @@ engine while reserving physical GPU 6. Unknown local checkpoints have their
 attention-head count read directly from `config.json`; other unknown model
 families retain all-card TP and are validated before worker startup.
 
-No rollout card is stranded as training-only. The trainer sees the complete
-ordered generation group and uses a balanced device map when it has multiple
-cards, so a model too large for GPU 0 is sharded across the group. HF/Unsloth
-generation uses that live model with cross-prompt batches. With vLLM, the
-training shards and optimizer are offloaded before the all-card TP/PP engines
-wake. Engines start lazily at the first rollout and use level-2 deep sleep
+No rollout card is stranded as training-only. With HF training and vLLM
+generation, the QLoRA trainer is replicated once per training GPU. Every step's
+examples are length-balanced across those replicas and run concurrently; LoRA
+gradients are summed on the primary card before each optimizer update, then the
+updated adapter is broadcast to every replica. The search, evaluation, and file
+writing remain single-owner and are not duplicated. Other backend combinations
+retain the balanced single-process model-sharding fallback. Before vLLM wakes,
+all trainer replicas and the optimizer are offloaded. Engines start lazily at
+the first rollout and use level-2 deep sleep
 between phases, discarding weights instead of retaining one full CPU-RAM backup
 per replica; wake reloads the unchanged base checkpoint before applying the
 next LoRA. If safe deep sleep is unavailable, the fallback is a transient
@@ -59,6 +62,11 @@ lease, and `reward_workers` is forced to one, so two candidate benchmarks
 cannot contend on the evaluation card. On a one-card GPU-mode run, the trainer
 is also offloaded during the benchmark phase, so training, generation, and
 candidate evaluation never hold that GPU concurrently.
+
+The end of every completed step prints both that step's total adapter-training
+time and the cumulative training time for the current process. The same values
+are stored in the step summary as `training_seconds` and
+`cumulative_training_seconds`.
 
 The trainer keeps `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, but
 sleep-enabled vLLM workers remove only that allocator option before importing

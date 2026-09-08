@@ -1430,6 +1430,547 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
     return {"rank_updates": history, "rank_train_seconds": time.time() - started}
 
 
+class ReplicatedDataParallelTrainer:
+    """Run each step's LoRA update concurrently on one model replica per GPU.
+
+    Rollout orchestration remains in the main process.  Only the differentiable
+    work is replicated: examples are load-balanced across devices, each replica
+    accumulates its local gradients, and the (small) LoRA gradients are summed
+    onto GPU 0 before one optimizer update.  Updated adapter weights are then
+    broadcast back to every replica.  This preserves the existing global loss
+    exactly without launching duplicate search/evaluation processes.
+    """
+
+    def __init__(self, primary_backend, primary_model, primary_tokenizer,
+                 optimizer, cfg, dependency_log_path=None):
+        import torch
+        from model_backend import load_backend
+
+        self.cfg = cfg
+        self.optimizer = optimizer
+        self.replicas = [
+            (primary_backend, primary_model, primary_tokenizer, 0)
+        ]
+        self._offloaded = False
+        world_size = int(cfg.num_training_gpus)
+        physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
+        if world_size != len(physical_ids):
+            raise ValueError("num_training_gpus does not match training_gpu_ids")
+
+        print(f"[train-parallel] loading {world_size - 1} additional trainer "
+              f"replica(s) for data parallelism", flush=True)
+        for logical_id in range(1, world_size):
+            replica_cfg = SimpleNamespace(**vars(cfg))
+            replica_cfg.training_replica_device = logical_id
+            # The explicit replica device controls placement. Keep the complete
+            # budget vector so model_backend can select this device's budget.
+            replica_cfg.num_training_gpus = 1
+            with _route_dependency_notices(dependency_log_path):
+                replica_backend = load_backend(cfg.backend, replica_cfg)
+                replica_model, replica_tokenizer = replica_backend.load()
+            self.replicas.append(
+                (replica_backend, replica_model, replica_tokenizer, logical_id)
+            )
+            print(f"[train-parallel] replica {logical_id}/{world_size - 1} "
+                  f"ready on physical GPU {physical_ids[logical_id]}", flush=True)
+
+        self._validate_parameter_layouts()
+        self._broadcast_trainable_parameters()
+        for logical_id in range(world_size):
+            torch.cuda.synchronize(logical_id)
+        print(f"[train-parallel] active on all {world_size} training GPUs "
+              f"{physical_ids}", flush=True)
+
+    @property
+    def world_size(self):
+        return len(self.replicas)
+
+    @property
+    def is_offloaded(self):
+        return self._offloaded
+
+    @staticmethod
+    def _trainable_parameters(model):
+        return [(name, parameter) for name, parameter in model.named_parameters()
+                if parameter.requires_grad]
+
+    def _validate_parameter_layouts(self):
+        expected = [
+            (name, tuple(parameter.shape))
+            for name, parameter in self._trainable_parameters(self.replicas[0][1])
+        ]
+        for _, model, _, logical_id in self.replicas[1:]:
+            actual = [
+                (name, tuple(parameter.shape))
+                for name, parameter in self._trainable_parameters(model)
+            ]
+            if actual != expected:
+                raise RuntimeError(
+                    f"trainer replica {logical_id} has a different trainable "
+                    "parameter layout")
+
+    def _broadcast_trainable_parameters(self):
+        import torch
+        source = self._trainable_parameters(self.replicas[0][1])
+
+        def copy_replica(replica):
+            _, model, _, logical_id = replica
+            target = self._trainable_parameters(model)
+            with torch.cuda.device(logical_id), torch.no_grad():
+                for (_, source_parameter), (_, target_parameter) in zip(source, target):
+                    target_parameter.copy_(
+                        source_parameter.detach().to(
+                            target_parameter.device, non_blocking=True))
+                torch.cuda.synchronize(logical_id)
+
+        self._run_replicas(copy_replica, self.replicas[1:])
+
+    @staticmethod
+    def _run_replicas(fn, items):
+        from concurrent.futures import ThreadPoolExecutor
+        items = list(items)
+        if not items:
+            return []
+        with ThreadPoolExecutor(max_workers=len(items)) as pool:
+            futures = [pool.submit(fn, item) for item in items]
+            return [future.result() for future in futures]
+
+    @staticmethod
+    def _cpu_examples(examples):
+        import torch
+        tensor_cache = {}
+        out = []
+        for example in examples:
+            copied = {}
+            for key, value in example.items():
+                if torch.is_tensor(value):
+                    cache_key = id(value)
+                    if cache_key not in tensor_cache:
+                        tensor_cache[cache_key] = value.detach().cpu()
+                    copied[key] = tensor_cache[cache_key]
+                else:
+                    copied[key] = value
+            out.append(copied)
+        return out
+
+    def _shard_examples(self, examples):
+        """Longest-first scheduling keeps uneven sequence lengths balanced."""
+        shards = [[] for _ in self.replicas]
+        loads = [0 for _ in self.replicas]
+        ordered = sorted(
+            self._cpu_examples(examples),
+            key=lambda ex: int(ex["prompt_ids"].numel()
+                               + ex["response_ids"].numel()),
+            reverse=True,
+        )
+        for example in ordered:
+            rank = min(range(self.world_size), key=lambda idx: loads[idx])
+            shards[rank].append(example)
+            loads[rank] += int(example["prompt_ids"].numel()
+                               + example["response_ids"].numel())
+        return shards, loads
+
+    @staticmethod
+    def _move_shard(shard, logical_id):
+        import torch
+        device = torch.device(f"cuda:{logical_id}")
+        tensor_cache = {}
+        moved = []
+        for example in shard:
+            local = {}
+            for key, value in example.items():
+                if torch.is_tensor(value):
+                    cache_key = id(value)
+                    if cache_key not in tensor_cache:
+                        tensor_cache[cache_key] = value.to(
+                            device, non_blocking=True)
+                    local[key] = tensor_cache[cache_key]
+                else:
+                    local[key] = value
+            moved.append(local)
+        return moved
+
+    def _prepare_shards(self, examples):
+        import torch
+        shards, token_loads = self._shard_examples(examples)
+
+        def move(item):
+            replica, shard = item
+            logical_id = replica[3]
+            with torch.cuda.device(logical_id):
+                return self._move_shard(shard, logical_id)
+
+        local_shards = self._run_replicas(
+            move, list(zip(self.replicas, shards)))
+        counts = [len(shard) for shard in local_shards]
+        print(f"[train-parallel] examples/GPU={counts}; "
+              f"tokens/GPU={token_loads}", flush=True)
+        return local_shards
+
+    def _zero_gradients(self):
+        for _, model, _, _ in self.replicas:
+            model.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _sum_gradients_to_primary(self):
+        """Sum replica gradients without DDP's implicit world-size average."""
+        import torch
+        primary = self._trainable_parameters(self.replicas[0][1])
+        others = [self._trainable_parameters(replica[1])
+                  for replica in self.replicas[1:]]
+        with torch.cuda.device(0), torch.no_grad():
+            for parameter_index, (_, destination) in enumerate(primary):
+                gradient = destination.grad
+                if gradient is None:
+                    gradient = torch.zeros_like(destination)
+                    destination.grad = gradient
+                for replica_parameters in others:
+                    source_gradient = replica_parameters[parameter_index][1].grad
+                    if source_gradient is not None:
+                        gradient.add_(source_gradient.to(
+                            destination.device, non_blocking=True))
+            torch.cuda.synchronize(0)
+
+    @staticmethod
+    def _merge_feedback_stats(stats):
+        from feedback import FeedbackStats
+        merged = FeedbackStats()
+        for item in stats:
+            if item is None:
+                continue
+            merged.n += item.n
+            merged.skipped += item.skipped
+            merged.sum_abs += item.sum_abs
+            merged.sum_pos += item.sum_pos
+            merged.max_abs = max(merged.max_abs, item.max_abs)
+        return merged
+
+    def _clip_step_and_sync(self, cfg):
+        import torch
+        self._sum_gradients_to_primary()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [parameter for _, parameter in
+             self._trainable_parameters(self.replicas[0][1])],
+            max_norm=cfg.grad_clip, error_if_nonfinite=True)
+        self.optimizer.step()
+        self._broadcast_trainable_parameters()
+        value = float(grad_norm.item())
+        for _, model, _, _ in self.replicas:
+            model.zero_grad(set_to_none=True)
+        return value
+
+    def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
+                   fb_on=False, fb_lambda=0.0):
+        import torch
+        from feedback import (FeedbackStats, bound_feedback_advantage,
+                              feedback_advantage)
+
+        started = time.time()
+        if self._offloaded:
+            print(f"[train-parallel] restoring {self.world_size} trainer "
+                  "replicas for the update", flush=True)
+            self.restore_after_generation()
+        epochs = int(getattr(cfg, "rank_update_epochs",
+                             RANK_UPDATE_EPOCHS_DEFAULT))
+        epsilon = float(getattr(cfg, "rank_clip_epsilon",
+                                RANK_CLIP_EPSILON_DEFAULT))
+        entropy_coef = float(getattr(cfg, "rank_entropy_coef",
+                                     RANK_ENTROPY_COEF_DEFAULT))
+        kl_coef = float(cfg.kl_penalty_coef)
+        local_shards = self._prepare_shards(examples)
+        print(f"[step {step_idx}] rank: caching old/reference logprobs for "
+              f"{len(examples)} examples across {self.world_size} GPUs before "
+              f"{epochs} update(s)", flush=True)
+
+        def cache(item):
+            replica_index, shard = item
+            backend, model, tokenizer, logical_id = self.replicas[replica_index]
+            stats = FeedbackStats() if fb_on else None
+            backend.set_training_mode()
+            with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
+                for example in shard:
+                    prompt_ids = example["prompt_ids"]
+                    response_ids = example["response_ids"]
+                    old_lp = compute_token_logprobs(
+                        model, prompt_ids, response_ids, with_grad=False,
+                        chunk=cfg.logprob_chunk)
+                    if not torch.isfinite(old_lp).all():
+                        raise FloatingPointError("nonfinite old-policy logprobs")
+                    example["rank_old_logprobs"] = old_lp.detach().cpu()
+                    example["rank_reference_logprob"] = None
+                    if kl_coef:
+                        with backend.disable_adapter(), torch.no_grad():
+                            reference_lp = compute_token_logprobs(
+                                model, prompt_ids, response_ids, with_grad=False,
+                                chunk=cfg.logprob_chunk)
+                        if not torch.isfinite(reference_lp).all():
+                            raise FloatingPointError(
+                                "nonfinite reference-policy logprobs")
+                        example["rank_reference_logprob"] = float(
+                            reference_lp.double().sum().item())
+                    example["rank_feedback_advantage"] = None
+                    if fb_on and example.get("reprompt_text"):
+                        fb_advantage = feedback_advantage(
+                            compute_token_logprobs, model, tokenizer,
+                            example["reprompt_text"], response_ids,
+                            old_lp.detach(), fb_cfg, lam=fb_lambda,
+                            chunk=cfg.logprob_chunk)
+                        if fb_advantage is None:
+                            stats.skipped += 1
+                        else:
+                            fb_advantage, _ = bound_feedback_advantage(
+                                fb_advantage,
+                                reward_advantage=example["advantage"],
+                                cfg=fb_cfg)
+                            stats.add(fb_advantage)
+                            example["rank_feedback_advantage"] = (
+                                fb_advantage.detach().cpu())
+                torch.cuda.synchronize(logical_id)
+            return stats
+
+        cache_stats = self._run_replicas(
+            cache, list(enumerate(local_shards)))
+        feedback_stats = self._merge_feedback_stats(cache_stats)
+        history = []
+        for epoch in range(epochs):
+            self._zero_gradients()
+
+            def accumulate(item):
+                replica_index, shard = item
+                _, model, _, logical_id = self.replicas[replica_index]
+                totals = {key: 0.0 for key in (
+                    "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+                    "ratio", "clipped_fraction")}
+                max_ratio = 0.0
+                max_prefix_ratio = 0.0
+                entropy_examples = 0
+                with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
+                    for example in shard:
+                        gate = bool(example["rank_entropy_gate"]
+                                    and entropy_coef > 0.0)
+                        result = compute_token_logprobs(
+                            model, example["prompt_ids"],
+                            example["response_ids"], with_grad=True,
+                            chunk=cfg.logprob_chunk, return_entropy=gate)
+                        current_lp, token_entropy = (
+                            result if gate else (result, None))
+                        loss, metrics = rank_grpo_loss(
+                            current_lp, example["rank_old_logprobs"],
+                            example["rank_reference_logprob"],
+                            example["advantage"], clip_epsilon=epsilon,
+                            kl_coef=kl_coef,
+                            entropy_coef=entropy_coef if gate else 0.0,
+                            token_entropies=token_entropy)
+                        fb_advantage = example["rank_feedback_advantage"]
+                        if fb_advantage is not None:
+                            loss = loss - (
+                                fb_advantage.to(current_lp.device)
+                                * current_lp).mean()
+                        weight = float(example["sample_weight"])
+                        if not torch.isfinite(loss).all():
+                            raise FloatingPointError(
+                                "nonfinite rank/feedback loss")
+                        (weight * loss).backward()
+                        totals["loss"] += weight * float(loss.detach().item())
+                        for key in ("policy_loss", "kl_estimate",
+                                    "entropy_estimate", "ratio"):
+                            totals[key] += weight * metrics[key]
+                        totals["clipped_fraction"] += (
+                            weight * float(metrics["clipped"]))
+                        max_ratio = max(max_ratio, metrics["ratio"])
+                        max_prefix_ratio = max(
+                            max_prefix_ratio, metrics["prefix_ratio_max"])
+                        entropy_examples += int(gate)
+                    torch.cuda.synchronize(logical_id)
+                return totals, max_ratio, max_prefix_ratio, entropy_examples
+
+            results = self._run_replicas(
+                accumulate, list(enumerate(local_shards)))
+            totals = {key: sum(result[0][key] for result in results)
+                      for key in results[0][0]}
+            max_ratio = max(result[1] for result in results)
+            max_prefix_ratio = max(result[2] for result in results)
+            entropy_examples = sum(result[3] for result in results)
+            grad_norm = self._clip_step_and_sync(cfg)
+            history.append({
+                "epoch": epoch + 1, **totals, "ratio_max": max_ratio,
+                "prefix_ratio_max": max_prefix_ratio,
+                "entropy_examples": entropy_examples,
+                "grad_norm": grad_norm,
+            })
+            print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
+                  f"loss={totals['loss']:.6f} "
+                  f"KL estimate={totals['kl_estimate']:.6f} "
+                  f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+                  f"clipped={totals['clipped_fraction']:.1%} "
+                  f"entropy examples={entropy_examples}", flush=True)
+
+        if fb_on:
+            print(feedback_stats.line(step_idx, fb_lambda))
+        return {
+            "rank_updates": history,
+            "rank_train_seconds": time.time() - started,
+            "training_parallel_gpus": self.world_size,
+        }
+
+    def train_policy(self, examples, cfg, step_idx, *, fb_cfg=None,
+                     fb_on=False, fb_lambda=0.0):
+        import torch
+        from feedback import (FeedbackStats, bound_feedback_advantage,
+                              feedback_advantage)
+
+        started = time.time()
+        if self._offloaded:
+            print(f"[train-parallel] restoring {self.world_size} trainer "
+                  "replicas for the update", flush=True)
+            self.restore_after_generation()
+        local_shards = self._prepare_shards(examples)
+        n_examples = len(examples)
+        self._zero_gradients()
+
+        def accumulate(item):
+            replica_index, shard = item
+            backend, model, tokenizer, logical_id = self.replicas[replica_index]
+            total_loss = 0.0
+            total_logp_delta = 0.0
+            ratio_sum = 0.0
+            ratio_max = 0.0
+            ratio_count = 0
+            stats = FeedbackStats()
+            kl_error = None
+            backend.set_training_mode()
+            with torch.cuda.device(logical_id):
+                for example in shard:
+                    prompt_ids = example["prompt_ids"]
+                    response_ids = example["response_ids"]
+                    advantage = example["advantage"]
+                    current_lp = compute_token_logprobs(
+                        model, prompt_ids, response_ids, with_grad=True,
+                        chunk=cfg.logprob_chunk)
+                    try:
+                        with backend.disable_adapter(), torch.no_grad():
+                            base_lp = compute_token_logprobs(
+                                model, prompt_ids, response_ids,
+                                with_grad=False, chunk=cfg.logprob_chunk)
+                    except Exception as error:
+                        kl_error = repr(error)
+                        base_lp = current_lp.detach()
+                    logp_difference = (current_lp - base_lp).detach()
+                    average_difference = logp_difference.mean()
+                    kl_advantage = cfg.kl_penalty_coef * (
+                        average_difference - (current_lp - base_lp))
+                    effective_advantage = advantage + kl_advantage
+                    if fb_on and example.get("reprompt_text"):
+                        fb_advantage = feedback_advantage(
+                            compute_token_logprobs, model, tokenizer,
+                            example["reprompt_text"], response_ids,
+                            current_lp.detach(), fb_cfg, lam=fb_lambda,
+                            chunk=cfg.logprob_chunk)
+                        if fb_advantage is None:
+                            stats.skipped += 1
+                        else:
+                            fb_advantage, _ = bound_feedback_advantage(
+                                fb_advantage, reward_advantage=advantage,
+                                cfg=fb_cfg)
+                            stats.add(fb_advantage)
+                            effective_advantage = (
+                                effective_advantage + fb_advantage)
+                    behavior_lp = example.get("behavior_logprobs")
+                    if (behavior_lp is not None
+                            and behavior_lp.shape[0] == current_lp.shape[0]):
+                        importance_ratio = torch.exp(
+                            current_lp.detach() - behavior_lp)
+                        ratio_sum += float(importance_ratio.mean().item())
+                        ratio_max = max(
+                            ratio_max, float(importance_ratio.max().item()))
+                        ratio_count += 1
+                    else:
+                        importance_ratio = 1.0
+                    loss = -(
+                        importance_ratio * effective_advantage.detach()
+                        * current_lp).mean()
+                    (loss / n_examples).backward()
+                    total_loss += float(loss.detach().item())
+                    total_logp_delta += float(logp_difference.mean().item())
+                torch.cuda.synchronize(logical_id)
+            return (total_loss, total_logp_delta, ratio_sum, ratio_max,
+                    ratio_count, stats, kl_error)
+
+        results = self._run_replicas(
+            accumulate, list(enumerate(local_shards)))
+        grad_norm = self._clip_step_and_sync(cfg)
+        total_loss = sum(result[0] for result in results)
+        total_logp_delta = sum(result[1] for result in results)
+        ratio_sum = sum(result[2] for result in results)
+        ratio_max = max(result[3] for result in results)
+        ratio_count = sum(result[4] for result in results)
+        feedback_stats = self._merge_feedback_stats(
+            [result[5] for result in results])
+        kl_errors = [result[6] for result in results if result[6] is not None]
+        if kl_errors:
+            print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
+                  "training without KL penalty on affected examples")
+        elapsed = time.time() - started
+        ratio_message = ""
+        if ratio_count:
+            ratio_message = (f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
+                             f"max={ratio_max:.3f}")
+        print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
+              f"avg loss: {total_loss / n_examples:.9f}  "
+              f"avg logpi_theta - logpi_base: "
+              f"{total_logp_delta / n_examples:.9f}{ratio_message}")
+        if fb_on:
+            print(feedback_stats.line(step_idx, fb_lambda))
+        return {
+            "training_seconds": elapsed,
+            "training_parallel_gpus": self.world_size,
+            "training_grad_norm": grad_norm,
+        }
+
+    def offload_for_generation(self):
+        """Release every replica before an all-GPU vLLM phase."""
+        if self._offloaded:
+            return
+        import gc
+        import torch
+        # Mark first so a partially completed move is recoverable if any one
+        # quantized replica raises while transferring to host memory.
+        self._offloaded = True
+        try:
+            for logical_id in range(self.world_size):
+                torch.cuda.synchronize(logical_id)
+            _move_optimizer_state(self.optimizer, "cpu")
+            for backend, _, _, _ in self.replicas:
+                backend.offload_for_generation()
+            gc.collect()
+            for logical_id in range(self.world_size):
+                with torch.cuda.device(logical_id):
+                    torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            self.restore_after_generation()
+            raise
+
+    def restore_after_generation(self):
+        if not self._offloaded:
+            return
+        import gc
+        import torch
+        gc.collect()
+
+        def restore(replica):
+            backend, _, _, logical_id = replica
+            with torch.cuda.device(logical_id):
+                torch.cuda.empty_cache()
+                backend.restore_after_generation()
+                backend.set_training_mode()
+                torch.cuda.synchronize(logical_id)
+
+        self._run_replicas(restore, self.replicas)
+        _restore_optimizer_state_to_parameters(self.optimizer)
+        self._offloaded = False
+
+
 # ======================================================================
 # LoRA adapter sync (main process -> generation workers)
 # ======================================================================
@@ -1651,7 +2192,7 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
-               curator=None, fb_cfg=None):
+               curator=None, fb_cfg=None, parallel_trainer=None):
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2352,14 +2893,32 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return step_stats
 
     if rank_mode:
-        step_stats.update(_train_rank_examples(
-            backend, model, tokenizer, optimizer, all_examples, cfg, step_idx,
-            fb_cfg=fb_cfg, fb_on=fb_on, fb_lambda=fb_lambda))
+        if parallel_trainer is not None:
+            step_stats.update(parallel_trainer.train_rank(
+                all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
+                fb_lambda=fb_lambda))
+        else:
+            step_stats.update(_train_rank_examples(
+                backend, model, tokenizer, optimizer, all_examples, cfg,
+                step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
+                fb_lambda=fb_lambda))
         return step_stats
 
     # ----- TRAIN STEP -----
     print(f"[step {step_idx}] starting adapter training; rollout artifacts "
           f"are already on disk", flush=True)
+    if parallel_trainer is not None:
+        step_stats.update(parallel_trainer.train_policy(
+            all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
+            fb_lambda=fb_lambda))
+        best = sampler.best_state()
+        if best is not None:
+            raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
+            print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
+                  f"(step total {time.time() - step_t0:.1f}s, "
+                  f"archive={sampler.archive_size()})")
+        return step_stats
+
     backend.set_training_mode()
     optimizer.zero_grad()
 
@@ -2446,6 +3005,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     optimizer.step()
 
     train_time = time.time() - train_t0
+    step_stats["training_seconds"] = train_time
+    step_stats["training_parallel_gpus"] = 1
     is_msg = ""
     if is_ratio_count > 0:
         is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.9f} "
@@ -2547,6 +3108,18 @@ def main():
               f"injected block: max_seq_length = {cfg.max_seq_length}. "
               f"Use the same value for the no-memory baseline.")
 
+    # Replicate the compact QLoRA trainer rather than layer-sharding it. The
+    # main process still owns search/evaluation; only per-example gradient work
+    # runs concurrently. vLLM phase sharing gives these replicas exclusive use
+    # of the cards during training and requires them to offload for generation.
+    use_replicated_training = bool(
+        int(cfg.num_training_gpus) > 1
+        and cfg.backend == "hf"
+        and cfg.generation_backend == "vllm"
+    )
+    if use_replicated_training:
+        cfg.training_replica_device = 0
+
     # Build the problem from the merged config (the registry reads problem-only
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
     from problems.registry import get_problem
@@ -2567,6 +3140,8 @@ def main():
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
+    print(f"Training layout:    "
+          f"{'replicated data parallel' if use_replicated_training else 'model parallel/single GPU'}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
@@ -2671,6 +3246,13 @@ def main():
     print(f"[init] trainable params: {trainable:,} / total {total:,} "
           f"({100 * trainable / total:.2f}%)")
 
+    parallel_trainer = None
+    if use_replicated_training:
+        parallel_trainer = ReplicatedDataParallelTrainer(
+            backend, model, tokenizer, optimizer, cfg,
+            dependency_log_path=dependency_log_path,
+        )
+
     # ---- sampler ----
     from sampler import PUCTSampler
     sampler = PUCTSampler(
@@ -2694,10 +3276,9 @@ def main():
 
     # ---- generation pool ----
     gen_pool = None
-    # A multi-GPU HF/Unsloth model already spans every rollout card, so its
-    # cross-prompt batches run in-process without duplicate worker copies. vLLM
-    # forms exact TP/PP engines over every rollout card; because those cards also
-    # hold training shards, the two runtimes alternate residency.
+    # vLLM forms exact TP/PP engines over every rollout card. Because those
+    # cards also hold either training replicas or model shards, the two runtimes
+    # alternate residency.
     use_gen_pool = bool(cfg.num_gpus) and (
         cfg.generation_backend == "vllm"
         or (cfg.num_gpus > 1 and cfg.num_training_gpus == 1))
@@ -2731,23 +3312,35 @@ def main():
 
             def _offload_trainer_for_generation():
                 nonlocal trainer_offloaded
-                if trainer_offloaded:
+                if (parallel_trainer is not None
+                        and parallel_trainer.is_offloaded):
                     return
-                print("[gpu] offloading trainer to CPU before shared-GPU vLLM "
-                      "generation", flush=True)
+                if parallel_trainer is None and trainer_offloaded:
+                    return
+                replica_label = (f"all {parallel_trainer.world_size} trainer "
+                                 "replicas" if parallel_trainer is not None
+                                 else "trainer")
+                print(f"[gpu] offloading {replica_label} to CPU before "
+                      "shared-GPU vLLM generation", flush=True)
                 try:
-                    torch.cuda.synchronize()
-                    _move_optimizer_state(optimizer, "cpu")
-                    backend.offload_for_generation()
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
+                    if parallel_trainer is not None:
+                        parallel_trainer.offload_for_generation()
+                    else:
+                        torch.cuda.synchronize()
+                        _move_optimizer_state(optimizer, "cpu")
+                        backend.offload_for_generation()
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
                     trainer_offloaded = True
                 except Exception as exc:
                     try:
-                        backend.restore_after_generation()
-                        _restore_optimizer_state_to_parameters(optimizer)
+                        if parallel_trainer is not None:
+                            parallel_trainer.restore_after_generation()
+                        else:
+                            backend.restore_after_generation()
+                            _restore_optimizer_state_to_parameters(optimizer)
                     except Exception:
                         pass
                     raise RuntimeError(
@@ -2757,6 +3350,14 @@ def main():
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
+                if parallel_trainer is not None:
+                    # Memory lookup, rollouts, extraction, and curation may each
+                    # open a separate vLLM phase in one step. Keep replicas on
+                    # CPU between those phases and restore them once, lazily,
+                    # when the actual gradient update begins.
+                    print("[gpu] keeping trainer replicas offloaded until the "
+                          "adapter update", flush=True)
+                    return
                 if not trainer_offloaded:
                     return
                 print("[gpu] restoring trainer after shared-GPU vLLM "
@@ -2879,6 +3480,22 @@ def main():
           f"forced to max at step {cfg.growth_force_step}")
 
     # ---- main loop ----
+    cumulative_training_seconds = 0.0
+    for completed_step in range(start_step):
+        summary_path = (Path(exp_dir) / f"step{completed_step:02d}"
+                        / f"step{completed_step:02d}.summary.json")
+        try:
+            completed_summary = json.loads(summary_path.read_text())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        cumulative_training_seconds += float(
+            completed_summary.get(
+                "training_seconds",
+                completed_summary.get("rank_train_seconds", 0.0),
+            ) or 0.0)
+    if cumulative_training_seconds:
+        print(f"[resume] prior cumulative training time: "
+              f"{cumulative_training_seconds:.1f}s")
     try:
         if start_step >= cfg.num_steps:
             print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
@@ -2895,7 +3512,20 @@ def main():
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
                                cfg, exp_dir, problem, gen_pool,
                                memory=memory, extractor=extractor, mem_cfg=mem_cfg,
-                               lookup=lookup, curator=curator, fb_cfg=fb_cfg)
+                               lookup=lookup, curator=curator, fb_cfg=fb_cfg,
+                               parallel_trainer=parallel_trainer)
+
+            stats = stats or {}
+            step_training_seconds = float(
+                stats.get("training_seconds",
+                          stats.get("rank_train_seconds", 0.0)) or 0.0)
+            cumulative_training_seconds += step_training_seconds
+            stats["training_seconds"] = step_training_seconds
+            stats["cumulative_training_seconds"] = cumulative_training_seconds
+            print(f"[step {step}] TOTAL TRAINING TIME: "
+                  f"{step_training_seconds:.1f}s  "
+                  f"(run cumulative {cumulative_training_seconds:.1f}s)",
+                  flush=True)
 
             # Ratchet up for the next step (skipped once we are in the forced
             # region, since we are already pinned to the max there).

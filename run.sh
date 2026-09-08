@@ -11,10 +11,11 @@ memory_version="${MEMORY_VERSION:-V2}"
 # Runtime-only environment belongs here. Models, GPU roles, memory/feedback,
 # sampling, and optimization hyperparameters belong in the selected YAML.
 # Authoritative ordered physical GPU inventory. Edit this one list (or export
-# it before invoking the script); Python derives every role from it. The first
-# card trains and also rejoins rollout generation. GPU-mode reserves only the
-# last card for evaluation when a separate card exists. vLLM derives compatible
-# TP groups/replicas that consume this complete list without dropping a card.
+# it before invoking the script); Python derives every role from it. Every
+# rollout card hosts a parallel trainer replica and then rejoins generation.
+# GPU-mode reserves only the last card for evaluation when a separate card
+# exists. vLLM derives compatible TP groups/replicas that consume the remaining
+# complete list without dropping a card.
 # FlashInfer sampling can trigger runtime compilation and require nvcc. vLLM's
 # native PyTorch/Triton sampler is the safe default; callers may explicitly opt
 # back in with VLLM_USE_FLASHINFER_SAMPLER=1.
@@ -77,7 +78,6 @@ esac
 
 # exec python3 train_multy.py --config "$config_path" "$@"
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank
-
 
 
 

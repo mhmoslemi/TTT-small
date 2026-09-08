@@ -162,9 +162,11 @@ class PoolMemoryLLM:
                         out[group_idx] = text
         finally:
             # Shared-card vLLM wakes by offloading the trainer. Memory calls are
-            # self-contained phases, so restore the trainer even if generation
-            # or parsing raises. If the pool was already awake, its owner keeps
-            # responsibility for ending the surrounding rollout phase.
+            # self-contained phases, so release the engine even if generation
+            # or parsing raises. The normal single/model-parallel path restores
+            # immediately; replicated training may stay on CPU until the update
+            # to avoid repeated all-replica transfers within one search step.
+            # If the pool was already awake, its owner ends the outer phase.
             if release_after:
                 self.pool.release()
         return out

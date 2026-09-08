@@ -132,9 +132,20 @@ class VLLMBackendTests(unittest.TestCase):
             {"": 0},
         )
         self.assertEqual(
+            _training_device_map(types.SimpleNamespace(
+                num_training_gpus=8, training_replica_device=3)),
+            {"": 3},
+        )
+        self.assertEqual(
             _training_max_memory(types.SimpleNamespace(
                 training_max_memory_gib=[39.0, 38.5, 40.0])),
             {0: "39.0GiB", 1: "38.5GiB", 2: "40.0GiB"},
+        )
+        self.assertEqual(
+            _training_max_memory(types.SimpleNamespace(
+                training_max_memory_gib=[39.0, 38.5, 40.0],
+                training_replica_device=1)),
+            {1: "38.5GiB"},
         )
         self.assertEqual(
             _quantization_method(types.SimpleNamespace(

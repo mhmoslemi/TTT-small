@@ -25,7 +25,10 @@ def _requires_unsloth_gpt_oss_loader(model_name):
 
 
 def _training_device_map(cfg):
-    """Use every visible training GPU for single-process model parallelism."""
+    """Choose replicated data parallelism or single-process model sharding."""
+    replica_device = getattr(cfg, "training_replica_device", None)
+    if replica_device is not None:
+        return {"": int(replica_device)}
     count = int(getattr(cfg, "num_training_gpus", 1) or 1)
     return "balanced" if count > 1 else {"": 0}
 
@@ -34,6 +37,12 @@ def _training_max_memory(cfg):
     budgets = list(getattr(cfg, "training_max_memory_gib", None) or [])
     if not budgets:
         return None
+    replica_device = getattr(cfg, "training_replica_device", None)
+    if replica_device is not None:
+        logical_id = int(replica_device)
+        if logical_id >= len(budgets):
+            return None
+        return {logical_id: f"{float(budgets[logical_id]):.1f}GiB"}
     return {logical_id: f"{float(gib):.1f}GiB"
             for logical_id, gib in enumerate(budgets)}
 
@@ -134,7 +143,9 @@ class _ModelPlacementBackend:
             dispatch_model(
                 placement_model, device_map=device_map, force_hooks=True)
         else:
-            self.model.to("cuda:0")
+            target = next(iter(devices), "0")
+            target = target if str(target).startswith("cuda:") else f"cuda:{target}"
+            self.model.to(target)
         self._trainer_is_offloaded = False
 
 
