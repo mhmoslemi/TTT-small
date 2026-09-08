@@ -90,16 +90,157 @@ def _use_training_4bit(
 
 
 def _hf_training_attention_implementation():
-    """Require a genuinely linear-memory backend for HF long-context LoRA.
+    """Internal exact attention backend; no flash-attn package is required."""
+    return "ttt_blockwise_attention"
 
-    Current Transformers resolves this name to the installed flash-attn package
-    or its compatible precompiled Hub kernel.  Selecting SDPA and globally
-    disabling its math implementation is not equivalent: on installations
-    whose PyTorch build has no compatible fused kernel, that produced
-    ``RuntimeError: Invalid backend``.  Leaving math enabled instead can create
-    an O(sequence^2) attention tensor (122 GiB at the observed context length).
+
+def _raw_padding_attention_mask(*args, attention_mask=None, **kwargs):
+    """Keep only the compact 2D padding mask for blockwise attention."""
+    return attention_mask
+
+
+def _repeat_kv_heads(hidden_states, repetitions):
+    if repetitions == 1:
+        return hidden_states
+    batch, heads, length, width = hidden_states.shape
+    expanded = hidden_states[:, :, None, :, :].expand(
+        batch, heads, repetitions, length, width)
+    return expanded.reshape(batch, heads * repetitions, length, width)
+
+
+def _attention_allowed_mask(attention_mask, *, batch, query_start,
+                            query_end, query_offset, key_length, device,
+                            sliding_window=None):
+    """Build only one query block of the causal/padding mask."""
+    query_positions = (
+        torch.arange(query_start, query_end, device=device) + query_offset)
+    key_positions = torch.arange(key_length, device=device)
+    allowed = key_positions[None, :] <= query_positions[:, None]
+    if sliding_window is not None:
+        allowed = allowed & (
+            key_positions[None, :]
+            > query_positions[:, None] - int(sliding_window))
+    allowed = allowed[None, None, :, :]
+    additive = None
+    if attention_mask is None:
+        return allowed, additive
+    if attention_mask.ndim == 2:
+        padding = attention_mask[:, None, None, :key_length].bool()
+        return allowed & padding, additive
+    if attention_mask.ndim == 4:
+        block = attention_mask[
+            :, :, query_start:query_end, :key_length]
+        if block.dtype == torch.bool:
+            return allowed & block, additive
+        additive = block
+        return allowed, additive
+    raise ValueError(
+        "ttt blockwise attention accepts a 2D padding or 4D attention mask")
+
+
+def _ttt_blockwise_attention_forward(
+        module, query, key, value, attention_mask, dropout=0.0,
+        scaling=None, sliding_window=None, **kwargs):
+    """Exact causal attention with a bounded score tensor and autograd.
+
+    Small calls retain native SDPA speed. Large calls split only the query
+    dimension, attend each block to the complete key/value history, and
+    checkpoint each block. This is mathematically full attention—not context
+    truncation—while peak score memory is O(query_block * sequence_length).
     """
-    return "flash_attention_2"
+    import torch.nn.functional as F
+
+    batch, query_heads, query_length, head_dim = query.shape
+    key_heads = int(key.shape[1])
+    key_length = int(key.shape[2])
+    if query_heads % key_heads:
+        raise ValueError(
+            "query attention heads must be divisible by key/value heads")
+    groups = query_heads // key_heads
+    scale = float(scaling) if scaling is not None else head_dim ** -0.5
+    query_offset = key_length - query_length
+    score_elements = batch * query_heads * query_length * key_length
+    native_limit = 134_217_728
+
+    if score_elements <= native_limit:
+        native_key = _repeat_kv_heads(key, groups)
+        native_value = _repeat_kv_heads(value, groups)
+        native_mask = None
+        is_causal = bool(
+            attention_mask is None and sliding_window is None
+            and query_length == key_length and query_length > 1)
+        if not is_causal:
+            allowed, additive = _attention_allowed_mask(
+                attention_mask, batch=batch, query_start=0,
+                query_end=query_length, query_offset=query_offset,
+                key_length=key_length, device=query.device,
+                sliding_window=sliding_window)
+            native_mask = allowed if additive is None else additive.masked_fill(
+                ~allowed, torch.finfo(additive.dtype).min)
+        output = F.scaled_dot_product_attention(
+            query, native_key, native_value, attn_mask=native_mask,
+            dropout_p=float(dropout), scale=scale, is_causal=is_causal)
+        return output.transpose(1, 2).contiguous(), None
+
+    # Bound the FP32 probability block to roughly 256 MiB (and the BF16/FP16
+    # score block to roughly 128 MiB).
+    score_budget = 67_108_864
+    denominator = max(1, batch * query_heads * key_length)
+    query_block = max(1, min(256, score_budget // denominator))
+
+    def attend_block(query_part, key_states, value_states, start, end):
+        local_query = query_part.reshape(
+            batch, key_heads, groups, end - start, head_dim)
+        scores = torch.matmul(
+            local_query,
+            key_states[:, :, None, :, :].transpose(-2, -1),
+        ) * scale
+        allowed, additive = _attention_allowed_mask(
+            attention_mask, batch=batch, query_start=start, query_end=end,
+            query_offset=query_offset, key_length=key_length,
+            device=query.device, sliding_window=sliding_window)
+        allowed = allowed[:, :, None, :, :]
+        scores = scores.masked_fill(
+            ~allowed, torch.finfo(scores.dtype).min)
+        if additive is not None:
+            scores = scores + additive[:, :, None, :, :]
+        probabilities = F.softmax(
+            scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        if dropout:
+            probabilities = F.dropout(
+                probabilities, p=float(dropout), training=module.training)
+        result = torch.matmul(
+            probabilities, value_states[:, :, None, :, :])
+        return result.reshape(
+            batch, query_heads, end - start, head_dim)
+
+    output_blocks = []
+    needs_grad = bool(
+        torch.is_grad_enabled()
+        and (query.requires_grad or key.requires_grad or value.requires_grad))
+    for start in range(0, query_length, query_block):
+        end = min(start + query_block, query_length)
+        if needs_grad:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(
+                attend_block, query[:, :, start:end, :], key, value,
+                start, end, use_reentrant=False)
+        else:
+            output = attend_block(
+                query[:, :, start:end, :], key, value, start, end)
+        output_blocks.append(output)
+    output = torch.cat(output_blocks, dim=2)
+    return output.transpose(1, 2).contiguous(), None
+
+
+def _register_ttt_attention_backend():
+    """Register runtime and mask functions before Transformers builds a model."""
+    from transformers import AttentionInterface
+    from transformers.masking_utils import AttentionMaskInterface
+
+    name = _hf_training_attention_implementation()
+    AttentionInterface.register(name, _ttt_blockwise_attention_forward)
+    AttentionMaskInterface.register(name, _raw_padding_attention_mask)
 
 
 class _ModelPlacementBackend:
@@ -321,6 +462,7 @@ class HFBackend(_ModelPlacementBackend):
         # GPU-mode's exclusive evaluation card was removed from visibility by
         # role allocation. "balanced" therefore uses every rollout/training GPU
         # without ever placing weights on the benchmark card.
+        _register_ttt_attention_backend()
         attention_implementation = _hf_training_attention_implementation()
         model_kwargs = dict(
             dtype=torch.bfloat16,
@@ -329,7 +471,8 @@ class HFBackend(_ModelPlacementBackend):
             attn_implementation=attention_implementation,
         )
         print(f"[memory] HF training attention: "
-              f"{attention_implementation} (linear-memory)")
+              f"{attention_implementation} (native SDPA + exact bounded "
+              "long-context blocks; no external package)")
         max_memory = _training_max_memory(self.cfg)
         if max_memory:
             model_kwargs["max_memory"] = max_memory
