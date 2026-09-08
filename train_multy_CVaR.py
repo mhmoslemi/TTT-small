@@ -331,6 +331,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="cvar mode: mixing weight in [0,1] of the upper-tail "
                         f"term; 0 = plain grpo (default {CVAR_LAMBDA_DEFAULT}).")
     p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument(
+        "--train-examples-per-microbatch", type=int, default=None,
+        help="Maximum examples in one LoRA forward/backward call per GPU. "
+             "Examples are length-bucketed and may be split further to keep "
+             "the padded-token total within max_seq_length.")
     p.add_argument("--logprob-chunk", type=int, default=None,
                    help="Slice compute_token_logprobs over response positions "
                         "into chunks of at most this many tokens, bounding the "
@@ -753,6 +758,10 @@ def load_config():
         raise ValueError("cvar_lambda must be in [0, 1]")
     merged["cvar_lambda"] = cvar_lambda
     _resolve_rank_options(merged)
+    train_microbatch = int(merged["train_examples_per_microbatch"])
+    if train_microbatch < 1:
+        raise ValueError("train_examples_per_microbatch must be >= 1")
+    merged["train_examples_per_microbatch"] = train_microbatch
     raw_tp = merged["vllm_tensor_parallel_size"]
     tp = (0 if str(raw_tp or "").strip().lower() in ("", "auto")
           else int(raw_tp))
@@ -1211,6 +1220,143 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
     return gathered.squeeze(0)
 
 
+def compute_batched_token_logprobs(
+        model, examples, with_grad: bool, chunk: int = 0, *,
+        pad_token_id: int = 0, return_entropy: bool = False):
+    """Compute response log-probabilities for a padded example microbatch.
+
+    Padding is appended after each complete prompt/response sequence and masked,
+    so every real token retains the same causal positions as the old one-example
+    path.  A singleton deliberately uses compute_token_logprobs() directly,
+    preserving the previous behavior for long examples that the planner cannot
+    safely combine with another sequence.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    examples = list(examples)
+    if not examples:
+        return ([], []) if return_entropy else []
+    if len(examples) == 1:
+        example = examples[0]
+        result = compute_token_logprobs(
+            model, example["prompt_ids"], example["response_ids"],
+            with_grad=with_grad, chunk=chunk, return_entropy=return_entropy)
+        if return_entropy:
+            logprobs, entropies = result
+            return [logprobs], [entropies]
+        return [result]
+
+    prompts = [example["prompt_ids"] for example in examples]
+    responses = [example["response_ids"] for example in examples]
+    for prompt_ids, response_ids in zip(prompts, responses):
+        if (prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1
+                or response_ids.ndim != 2 or response_ids.shape[0] != 1):
+            raise ValueError(
+                "training examples must contain (1, length) token tensors")
+        if prompt_ids.shape[1] < 1 or response_ids.shape[1] < 1:
+            raise ValueError("training prompt/response tensors must be nonempty")
+
+    device = prompts[0].device
+    dtype = prompts[0].dtype
+    totals = [int(prompt.shape[1] + response.shape[1])
+              for prompt, response in zip(prompts, responses)]
+    max_total = max(totals)
+    input_ids = torch.full(
+        (len(examples), max_total), int(pad_token_id),
+        dtype=dtype, device=device)
+    attention_mask = torch.zeros(
+        (len(examples), max_total), dtype=torch.long, device=device)
+    for row, (prompt_ids, response_ids, total) in enumerate(
+            zip(prompts, responses, totals)):
+        if prompt_ids.device != device or response_ids.device != device:
+            raise ValueError("one training microbatch spans multiple devices")
+        full_ids = torch.cat((prompt_ids, response_ids), dim=1)
+        input_ids[row, :total] = full_ids[0]
+        attention_mask[row, :total] = 1
+
+    context = torch.enable_grad() if with_grad else torch.no_grad()
+    gathered_examples = []
+    entropy_examples = []
+    with context:
+        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = out.logits
+        for row, (prompt_ids, response_ids) in enumerate(
+                zip(prompts, responses)):
+            prompt_len = int(prompt_ids.shape[1])
+            response_len = int(response_ids.shape[1])
+            pred_logits = logits[
+                row, prompt_len - 1:prompt_len - 1 + response_len, :]
+            targets = response_ids[0]
+            step = (int(chunk) if chunk and 0 < int(chunk) < response_len
+                    else response_len)
+            parts = []
+            entropies = []
+            for start in range(0, response_len, step):
+                end = min(start + step, response_len)
+                log_probs = F.log_softmax(
+                    pred_logits[start:end, :].float(), dim=-1)
+                parts.append(log_probs.gather(
+                    1, targets[start:end].unsqueeze(-1)).squeeze(-1))
+                if return_entropy:
+                    safe = log_probs.masked_fill(
+                        ~torch.isfinite(log_probs), 0.0)
+                    entropies.append(
+                        -(log_probs.exp() * safe).sum(dim=-1))
+            gathered_examples.append(torch.cat(parts, dim=0))
+            if return_entropy:
+                entropy_examples.append(torch.cat(entropies, dim=0))
+    if return_entropy:
+        return gathered_examples, entropy_examples
+    return gathered_examples
+
+
+def _training_microbatches(examples, cfg, *, partition_key=None):
+    """Length-bucket examples into real model batches.
+
+    train_examples_per_microbatch is an example-count ceiling.  The padded-token
+    ceiling keeps one batch at or below max_seq_length total padded tokens, so a
+    configured value such as 64 is useful for short responses without forcing
+    64 long contexts into memory together.
+    """
+    example_cap = int(getattr(cfg, "train_examples_per_microbatch", 1) or 0)
+    if example_cap < 1:
+        raise ValueError("train_examples_per_microbatch must be >= 1")
+    token_cap = max(1, int(getattr(cfg, "max_seq_length", 1) or 1))
+
+    partitions = {}
+    for example in examples:
+        key = partition_key(example) if partition_key is not None else None
+        partitions.setdefault(key, []).append(example)
+
+    batches = []
+    for partition in partitions.values():
+        ordered = sorted(
+            partition,
+            key=lambda example: int(
+                example["prompt_ids"].shape[1]
+                + example["response_ids"].shape[1]),
+            reverse=True,
+        )
+        current = []
+        current_max = 0
+        for example in ordered:
+            length = int(example["prompt_ids"].shape[1]
+                         + example["response_ids"].shape[1])
+            next_max = max(current_max, length)
+            exceeds_tokens = bool(
+                current and next_max * (len(current) + 1) > token_cap)
+            if current and (len(current) >= example_cap or exceeds_tokens):
+                batches.append(current)
+                current = []
+                current_max = 0
+            current.append(example)
+            current_max = max(current_max, length)
+        if current:
+            batches.append(current)
+    return batches
+
+
 def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
                    advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
                    kl_coef=0.0, entropy_coef=0.0, token_entropies=None):
@@ -1330,44 +1476,62 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
         fb_stats = FeedbackStats()
     backend.set_training_mode()
     started = time.time()
+    cache_batches = _training_microbatches(examples, cfg)
+    update_batches = _training_microbatches(
+        examples, cfg,
+        partition_key=lambda example: bool(
+            example["rank_entropy_gate"] and entropy_coef > 0.0))
+    largest_batch = max((len(batch) for batch in cache_batches), default=0)
+    print(f"[train] LoRA microbatches={len(cache_batches)}; "
+          f"configured max={int(cfg.train_examples_per_microbatch)}, "
+          f"effective max={largest_batch}, "
+          f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
     print(f"[step {step_idx}] rank: caching old/reference logprobs for "
           f"{len(examples)} examples before {epochs} update(s)", flush=True)
 
     with _rank_dropout_disabled(model):
         # No optimizer step may precede completion of this loop. CPU caches
         # avoid retaining graphs or duplicating the entire model on the GPU.
-        for ex in examples:
-            pid, rid = ex["prompt_ids"], ex["response_ids"]
-            old_lp = compute_token_logprobs(
-                model, pid, rid, with_grad=False, chunk=cfg.logprob_chunk)
-            if not torch.isfinite(old_lp).all():
+        for batch in cache_batches:
+            old_logprobs = compute_batched_token_logprobs(
+                model, batch, with_grad=False, chunk=cfg.logprob_chunk,
+                pad_token_id=tokenizer.pad_token_id)
+            if any(not torch.isfinite(value).all()
+                   for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
-            ex["rank_old_logprobs"] = old_lp.detach().cpu()
-            ex["rank_reference_logprob"] = None
+            reference_logprobs = [None] * len(batch)
             if kl_coef:
                 # Disabling the LoRA adapter is the runner's fixed reference.
                 # A failure must not silently remove the requested KL term.
                 with backend.disable_adapter(), torch.no_grad():
-                    ref_lp = compute_token_logprobs(
-                        model, pid, rid, with_grad=False, chunk=cfg.logprob_chunk)
-                if not torch.isfinite(ref_lp).all():
+                    reference_logprobs = compute_batched_token_logprobs(
+                        model, batch, with_grad=False,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
+                if any(not torch.isfinite(value).all()
+                       for value in reference_logprobs):
                     raise FloatingPointError("nonfinite reference-policy logprobs")
-                ex["rank_reference_logprob"] = float(ref_lp.double().sum().item())
-                del ref_lp
-            ex["rank_feedback_advantage"] = None
-            if fb_on and ex.get("reprompt_text"):
-                fb_adv = feedback_advantage(
-                    compute_token_logprobs, model, tokenizer, ex["reprompt_text"],
-                    rid, old_lp.detach(), fb_cfg, lam=fb_lambda,
-                    chunk=cfg.logprob_chunk)
-                if fb_adv is None:
-                    fb_stats.skipped += 1
-                else:
-                    fb_adv, _ = bound_feedback_advantage(
-                        fb_adv, reward_advantage=ex["advantage"], cfg=fb_cfg)
-                    fb_stats.add(fb_adv)
-                    ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
-            del old_lp
+            for ex, old_lp, ref_lp in zip(
+                    batch, old_logprobs, reference_logprobs):
+                rid = ex["response_ids"]
+                ex["rank_old_logprobs"] = old_lp.detach().cpu()
+                ex["rank_reference_logprob"] = (
+                    float(ref_lp.double().sum().item())
+                    if ref_lp is not None else None)
+                ex["rank_feedback_advantage"] = None
+                if fb_on and ex.get("reprompt_text"):
+                    fb_adv = feedback_advantage(
+                        compute_token_logprobs, model, tokenizer,
+                        ex["reprompt_text"], rid, old_lp.detach(), fb_cfg,
+                        lam=fb_lambda, chunk=cfg.logprob_chunk)
+                    if fb_adv is None:
+                        fb_stats.skipped += 1
+                    else:
+                        fb_adv, _ = bound_feedback_advantage(
+                            fb_adv, reward_advantage=ex["advantage"],
+                            cfg=fb_cfg)
+                        fb_stats.add(fb_adv)
+                        ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
 
         history = []
         for epoch in range(epochs):
@@ -1378,34 +1542,50 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
             max_ratio = 0.0
             max_prefix_ratio = 0.0
             entropy_examples = 0
-            for ex in examples:
-                gate = bool(ex["rank_entropy_gate"] and entropy_coef > 0.0)
-                result = compute_token_logprobs(
-                    model, ex["prompt_ids"], ex["response_ids"], with_grad=True,
-                    chunk=cfg.logprob_chunk, return_entropy=gate)
-                cur_lp, token_entropy = result if gate else (result, None)
-                loss, metrics = rank_grpo_loss(
-                    cur_lp, ex["rank_old_logprobs"], ex["rank_reference_logprob"],
-                    ex["advantage"], clip_epsilon=epsilon, kl_coef=kl_coef,
-                    entropy_coef=entropy_coef if gate else 0.0,
-                    token_entropies=token_entropy)
-                # Optional existing feedback is a separate token-level repair
-                # objective. It does not alter or re-normalize rank advantages.
-                fb_adv = ex["rank_feedback_advantage"]
-                if fb_adv is not None:
-                    loss = loss - (fb_adv.to(cur_lp.device) * cur_lp).mean()
-                weight = float(ex["sample_weight"])
-                if not torch.isfinite(loss).all():
-                    raise FloatingPointError("nonfinite rank/feedback loss")
-                (weight * loss).backward()
-                totals["loss"] += weight * float(loss.detach().item())
-                for key in ("policy_loss", "kl_estimate", "entropy_estimate", "ratio"):
-                    totals[key] += weight * metrics[key]
-                totals["clipped_fraction"] += weight * float(metrics["clipped"])
-                max_ratio = max(max_ratio, metrics["ratio"])
-                max_prefix_ratio = max(max_prefix_ratio, metrics["prefix_ratio_max"])
-                entropy_examples += int(gate)
-                del result, cur_lp, token_entropy, loss
+            for batch in update_batches:
+                gate = bool(batch[0]["rank_entropy_gate"]
+                            and entropy_coef > 0.0)
+                result = compute_batched_token_logprobs(
+                    model, batch, with_grad=True, chunk=cfg.logprob_chunk,
+                    pad_token_id=tokenizer.pad_token_id,
+                    return_entropy=gate)
+                if gate:
+                    current_logprobs, token_entropies = result
+                else:
+                    current_logprobs = result
+                    token_entropies = [None] * len(batch)
+                weighted_losses = []
+                for ex, cur_lp, token_entropy in zip(
+                        batch, current_logprobs, token_entropies):
+                    loss, metrics = rank_grpo_loss(
+                        cur_lp, ex["rank_old_logprobs"],
+                        ex["rank_reference_logprob"], ex["advantage"],
+                        clip_epsilon=epsilon, kl_coef=kl_coef,
+                        entropy_coef=entropy_coef if gate else 0.0,
+                        token_entropies=token_entropy)
+                    # Optional existing feedback is a separate token-level
+                    # repair objective and does not re-normalize rank weights.
+                    fb_adv = ex["rank_feedback_advantage"]
+                    if fb_adv is not None:
+                        loss = loss - (
+                            fb_adv.to(cur_lp.device) * cur_lp).mean()
+                    weight = float(ex["sample_weight"])
+                    if not torch.isfinite(loss).all():
+                        raise FloatingPointError(
+                            "nonfinite rank/feedback loss")
+                    weighted_losses.append(weight * loss)
+                    totals["loss"] += weight * float(loss.detach().item())
+                    for key in ("policy_loss", "kl_estimate",
+                                "entropy_estimate", "ratio"):
+                        totals[key] += weight * metrics[key]
+                    totals["clipped_fraction"] += (
+                        weight * float(metrics["clipped"]))
+                    max_ratio = max(max_ratio, metrics["ratio"])
+                    max_prefix_ratio = max(
+                        max_prefix_ratio, metrics["prefix_ratio_max"])
+                    entropy_examples += int(gate)
+                if weighted_losses:
+                    sum(weighted_losses[1:], weighted_losses[0]).backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
@@ -1692,66 +1872,91 @@ class ReplicatedDataParallelTrainer:
                                      RANK_ENTROPY_COEF_DEFAULT))
         kl_coef = float(cfg.kl_penalty_coef)
         local_shards = self._prepare_shards(examples)
+        cache_batches = [
+            _training_microbatches(shard, cfg) for shard in local_shards
+        ]
+        update_batches = [
+            _training_microbatches(
+                shard, cfg,
+                partition_key=lambda example: bool(
+                    example["rank_entropy_gate"] and entropy_coef > 0.0))
+            for shard in local_shards
+        ]
+        largest_batch = max(
+            (len(batch) for batches in cache_batches for batch in batches),
+            default=0)
+        print(f"[train-parallel] LoRA microbatches/GPU="
+              f"{[len(batches) for batches in cache_batches]}; "
+              f"configured max={int(cfg.train_examples_per_microbatch)}, "
+              f"effective max={largest_batch}, "
+              f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
         print(f"[step {step_idx}] rank: caching old/reference logprobs for "
               f"{len(examples)} examples across {self.world_size} GPUs before "
               f"{epochs} update(s)", flush=True)
 
         def cache(item):
-            replica_index, shard = item
+            replica_index, batches = item
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             stats = FeedbackStats() if fb_on else None
             backend.set_training_mode()
             with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
-                for example in shard:
-                    prompt_ids = example["prompt_ids"]
-                    response_ids = example["response_ids"]
-                    old_lp = compute_token_logprobs(
-                        model, prompt_ids, response_ids, with_grad=False,
-                        chunk=cfg.logprob_chunk)
-                    if not torch.isfinite(old_lp).all():
-                        raise FloatingPointError("nonfinite old-policy logprobs")
-                    example["rank_old_logprobs"] = old_lp.detach().cpu()
-                    example["rank_reference_logprob"] = None
+                for batch in batches:
+                    old_logprobs = compute_batched_token_logprobs(
+                        model, batch, with_grad=False,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
+                    if any(not torch.isfinite(value).all()
+                           for value in old_logprobs):
+                        raise FloatingPointError(
+                            "nonfinite old-policy logprobs")
+                    reference_logprobs = [None] * len(batch)
                     if kl_coef:
                         with backend.disable_adapter(), torch.no_grad():
-                            reference_lp = compute_token_logprobs(
-                                model, prompt_ids, response_ids, with_grad=False,
-                                chunk=cfg.logprob_chunk)
-                        if not torch.isfinite(reference_lp).all():
+                            reference_logprobs = compute_batched_token_logprobs(
+                                model, batch, with_grad=False,
+                                chunk=cfg.logprob_chunk,
+                                pad_token_id=tokenizer.pad_token_id)
+                        if any(not torch.isfinite(value).all()
+                               for value in reference_logprobs):
                             raise FloatingPointError(
                                 "nonfinite reference-policy logprobs")
-                        example["rank_reference_logprob"] = float(
-                            reference_lp.double().sum().item())
-                    example["rank_feedback_advantage"] = None
-                    if fb_on and example.get("reprompt_text"):
-                        fb_advantage = feedback_advantage(
-                            compute_token_logprobs, model, tokenizer,
-                            example["reprompt_text"], response_ids,
-                            old_lp.detach(), fb_cfg, lam=fb_lambda,
-                            chunk=cfg.logprob_chunk)
-                        if fb_advantage is None:
-                            stats.skipped += 1
-                        else:
-                            fb_advantage, _ = bound_feedback_advantage(
-                                fb_advantage,
-                                reward_advantage=example["advantage"],
-                                cfg=fb_cfg)
-                            stats.add(fb_advantage)
-                            example["rank_feedback_advantage"] = (
-                                fb_advantage.detach().cpu())
+                    for example, old_lp, reference_lp in zip(
+                            batch, old_logprobs, reference_logprobs):
+                        response_ids = example["response_ids"]
+                        example["rank_old_logprobs"] = old_lp.detach().cpu()
+                        example["rank_reference_logprob"] = (
+                            float(reference_lp.double().sum().item())
+                            if reference_lp is not None else None)
+                        example["rank_feedback_advantage"] = None
+                        if fb_on and example.get("reprompt_text"):
+                            fb_advantage = feedback_advantage(
+                                compute_token_logprobs, model, tokenizer,
+                                example["reprompt_text"], response_ids,
+                                old_lp.detach(), fb_cfg, lam=fb_lambda,
+                                chunk=cfg.logprob_chunk)
+                            if fb_advantage is None:
+                                stats.skipped += 1
+                            else:
+                                fb_advantage, _ = bound_feedback_advantage(
+                                    fb_advantage,
+                                    reward_advantage=example["advantage"],
+                                    cfg=fb_cfg)
+                                stats.add(fb_advantage)
+                                example["rank_feedback_advantage"] = (
+                                    fb_advantage.detach().cpu())
                 torch.cuda.synchronize(logical_id)
             return stats
 
         cache_stats = self._run_replicas(
-            cache, list(enumerate(local_shards)))
+            cache, list(enumerate(cache_batches)))
         feedback_stats = self._merge_feedback_stats(cache_stats)
         history = []
         for epoch in range(epochs):
             self._zero_gradients()
 
             def accumulate(item):
-                replica_index, shard = item
-                _, model, _, logical_id = self.replicas[replica_index]
+                replica_index, batches = item
+                _, model, tokenizer, logical_id = self.replicas[replica_index]
                 totals = {key: 0.0 for key in (
                     "loss", "policy_loss", "kl_estimate", "entropy_estimate",
                     "ratio", "clipped_fraction")}
@@ -1759,47 +1964,58 @@ class ReplicatedDataParallelTrainer:
                 max_prefix_ratio = 0.0
                 entropy_examples = 0
                 with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
-                    for example in shard:
-                        gate = bool(example["rank_entropy_gate"]
+                    for batch in batches:
+                        gate = bool(batch[0]["rank_entropy_gate"]
                                     and entropy_coef > 0.0)
-                        result = compute_token_logprobs(
-                            model, example["prompt_ids"],
-                            example["response_ids"], with_grad=True,
-                            chunk=cfg.logprob_chunk, return_entropy=gate)
-                        current_lp, token_entropy = (
-                            result if gate else (result, None))
-                        loss, metrics = rank_grpo_loss(
-                            current_lp, example["rank_old_logprobs"],
-                            example["rank_reference_logprob"],
-                            example["advantage"], clip_epsilon=epsilon,
-                            kl_coef=kl_coef,
-                            entropy_coef=entropy_coef if gate else 0.0,
-                            token_entropies=token_entropy)
-                        fb_advantage = example["rank_feedback_advantage"]
-                        if fb_advantage is not None:
-                            loss = loss - (
-                                fb_advantage.to(current_lp.device)
-                                * current_lp).mean()
-                        weight = float(example["sample_weight"])
-                        if not torch.isfinite(loss).all():
-                            raise FloatingPointError(
-                                "nonfinite rank/feedback loss")
-                        (weight * loss).backward()
-                        totals["loss"] += weight * float(loss.detach().item())
-                        for key in ("policy_loss", "kl_estimate",
-                                    "entropy_estimate", "ratio"):
-                            totals[key] += weight * metrics[key]
-                        totals["clipped_fraction"] += (
-                            weight * float(metrics["clipped"]))
-                        max_ratio = max(max_ratio, metrics["ratio"])
-                        max_prefix_ratio = max(
-                            max_prefix_ratio, metrics["prefix_ratio_max"])
-                        entropy_examples += int(gate)
+                        result = compute_batched_token_logprobs(
+                            model, batch, with_grad=True,
+                            chunk=cfg.logprob_chunk,
+                            pad_token_id=tokenizer.pad_token_id,
+                            return_entropy=gate)
+                        if gate:
+                            current_logprobs, token_entropies = result
+                        else:
+                            current_logprobs = result
+                            token_entropies = [None] * len(batch)
+                        weighted_losses = []
+                        for example, current_lp, token_entropy in zip(
+                                batch, current_logprobs, token_entropies):
+                            loss, metrics = rank_grpo_loss(
+                                current_lp, example["rank_old_logprobs"],
+                                example["rank_reference_logprob"],
+                                example["advantage"], clip_epsilon=epsilon,
+                                kl_coef=kl_coef,
+                                entropy_coef=entropy_coef if gate else 0.0,
+                                token_entropies=token_entropy)
+                            fb_advantage = example["rank_feedback_advantage"]
+                            if fb_advantage is not None:
+                                loss = loss - (
+                                    fb_advantage.to(current_lp.device)
+                                    * current_lp).mean()
+                            weight = float(example["sample_weight"])
+                            if not torch.isfinite(loss).all():
+                                raise FloatingPointError(
+                                    "nonfinite rank/feedback loss")
+                            weighted_losses.append(weight * loss)
+                            totals["loss"] += (
+                                weight * float(loss.detach().item()))
+                            for key in ("policy_loss", "kl_estimate",
+                                        "entropy_estimate", "ratio"):
+                                totals[key] += weight * metrics[key]
+                            totals["clipped_fraction"] += (
+                                weight * float(metrics["clipped"]))
+                            max_ratio = max(max_ratio, metrics["ratio"])
+                            max_prefix_ratio = max(
+                                max_prefix_ratio,
+                                metrics["prefix_ratio_max"])
+                            entropy_examples += int(gate)
+                        if weighted_losses:
+                            sum(weighted_losses[1:], weighted_losses[0]).backward()
                     torch.cuda.synchronize(logical_id)
                 return totals, max_ratio, max_prefix_ratio, entropy_examples
 
             results = self._run_replicas(
-                accumulate, list(enumerate(local_shards)))
+                accumulate, list(enumerate(update_batches)))
             totals = {key: sum(result[0][key] for result in results)
                       for key in results[0][0]}
             max_ratio = max(result[1] for result in results)
@@ -1840,10 +2056,21 @@ class ReplicatedDataParallelTrainer:
             self.restore_after_generation()
         local_shards = self._prepare_shards(examples)
         n_examples = len(examples)
+        microbatches = [
+            _training_microbatches(shard, cfg) for shard in local_shards
+        ]
+        largest_batch = max(
+            (len(batch) for batches in microbatches for batch in batches),
+            default=0)
+        print(f"[train-parallel] LoRA microbatches/GPU="
+              f"{[len(batches) for batches in microbatches]}; "
+              f"configured max={int(cfg.train_examples_per_microbatch)}, "
+              f"effective max={largest_batch}, "
+              f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
         self._zero_gradients()
 
         def accumulate(item):
-            replica_index, shard = item
+            replica_index, batches = item
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             total_loss = 0.0
             total_logp_delta = 0.0
@@ -1854,64 +2081,76 @@ class ReplicatedDataParallelTrainer:
             kl_error = None
             backend.set_training_mode()
             with torch.cuda.device(logical_id):
-                for example in shard:
-                    prompt_ids = example["prompt_ids"]
-                    response_ids = example["response_ids"]
-                    advantage = example["advantage"]
-                    current_lp = compute_token_logprobs(
-                        model, prompt_ids, response_ids, with_grad=True,
-                        chunk=cfg.logprob_chunk)
+                for batch in batches:
+                    current_logprobs = compute_batched_token_logprobs(
+                        model, batch, with_grad=True,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
                     try:
                         with backend.disable_adapter(), torch.no_grad():
-                            base_lp = compute_token_logprobs(
-                                model, prompt_ids, response_ids,
-                                with_grad=False, chunk=cfg.logprob_chunk)
+                            base_logprobs = compute_batched_token_logprobs(
+                                model, batch, with_grad=False,
+                                chunk=cfg.logprob_chunk,
+                                pad_token_id=tokenizer.pad_token_id)
                     except Exception as error:
                         kl_error = repr(error)
-                        base_lp = current_lp.detach()
-                    logp_difference = (current_lp - base_lp).detach()
-                    average_difference = logp_difference.mean()
-                    kl_advantage = cfg.kl_penalty_coef * (
-                        average_difference - (current_lp - base_lp))
-                    effective_advantage = advantage + kl_advantage
-                    if fb_on and example.get("reprompt_text"):
-                        fb_advantage = feedback_advantage(
-                            compute_token_logprobs, model, tokenizer,
-                            example["reprompt_text"], response_ids,
-                            current_lp.detach(), fb_cfg, lam=fb_lambda,
-                            chunk=cfg.logprob_chunk)
-                        if fb_advantage is None:
-                            stats.skipped += 1
+                        base_logprobs = [
+                            current_lp.detach()
+                            for current_lp in current_logprobs
+                        ]
+                    batch_losses = []
+                    for example, current_lp, base_lp in zip(
+                            batch, current_logprobs, base_logprobs):
+                        response_ids = example["response_ids"]
+                        advantage = example["advantage"]
+                        logp_difference = (current_lp - base_lp).detach()
+                        average_difference = logp_difference.mean()
+                        kl_advantage = cfg.kl_penalty_coef * (
+                            average_difference - (current_lp - base_lp))
+                        effective_advantage = advantage + kl_advantage
+                        if fb_on and example.get("reprompt_text"):
+                            fb_advantage = feedback_advantage(
+                                compute_token_logprobs, model, tokenizer,
+                                example["reprompt_text"], response_ids,
+                                current_lp.detach(), fb_cfg, lam=fb_lambda,
+                                chunk=cfg.logprob_chunk)
+                            if fb_advantage is None:
+                                stats.skipped += 1
+                            else:
+                                fb_advantage, _ = bound_feedback_advantage(
+                                    fb_advantage,
+                                    reward_advantage=advantage, cfg=fb_cfg)
+                                stats.add(fb_advantage)
+                                effective_advantage = (
+                                    effective_advantage + fb_advantage)
+                        behavior_lp = example.get("behavior_logprobs")
+                        if (behavior_lp is not None
+                                and behavior_lp.shape[0] == current_lp.shape[0]):
+                            importance_ratio = torch.exp(
+                                current_lp.detach() - behavior_lp)
+                            ratio_sum += float(
+                                importance_ratio.mean().item())
+                            ratio_max = max(
+                                ratio_max,
+                                float(importance_ratio.max().item()))
+                            ratio_count += 1
                         else:
-                            fb_advantage, _ = bound_feedback_advantage(
-                                fb_advantage, reward_advantage=advantage,
-                                cfg=fb_cfg)
-                            stats.add(fb_advantage)
-                            effective_advantage = (
-                                effective_advantage + fb_advantage)
-                    behavior_lp = example.get("behavior_logprobs")
-                    if (behavior_lp is not None
-                            and behavior_lp.shape[0] == current_lp.shape[0]):
-                        importance_ratio = torch.exp(
-                            current_lp.detach() - behavior_lp)
-                        ratio_sum += float(importance_ratio.mean().item())
-                        ratio_max = max(
-                            ratio_max, float(importance_ratio.max().item()))
-                        ratio_count += 1
-                    else:
-                        importance_ratio = 1.0
-                    loss = -(
-                        importance_ratio * effective_advantage.detach()
-                        * current_lp).mean()
-                    (loss / n_examples).backward()
-                    total_loss += float(loss.detach().item())
-                    total_logp_delta += float(logp_difference.mean().item())
+                            importance_ratio = 1.0
+                        loss = -(
+                            importance_ratio * effective_advantage.detach()
+                            * current_lp).mean()
+                        batch_losses.append(loss / n_examples)
+                        total_loss += float(loss.detach().item())
+                        total_logp_delta += float(
+                            logp_difference.mean().item())
+                    if batch_losses:
+                        sum(batch_losses[1:], batch_losses[0]).backward()
                 torch.cuda.synchronize(logical_id)
             return (total_loss, total_logp_delta, ratio_sum, ratio_max,
                     ratio_count, stats, kl_error)
 
         results = self._run_replicas(
-            accumulate, list(enumerate(local_shards)))
+            accumulate, list(enumerate(microbatches)))
         grad_norm = self._clip_step_and_sync(cfg)
         total_loss = sum(result[0] for result in results)
         total_logp_delta = sum(result[1] for result in results)
@@ -2946,71 +3185,81 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     is_ratio_max = 0.0
     is_ratio_count = 0
     fb_stats = FeedbackStats()
+    microbatches = _training_microbatches(all_examples, cfg)
+    largest_batch = max((len(batch) for batch in microbatches), default=0)
+    print(f"[train] LoRA microbatches={len(microbatches)}; "
+          f"configured max={int(cfg.train_examples_per_microbatch)}, "
+          f"effective max={largest_batch}, "
+          f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
 
-    for ex in all_examples:
-        pid = ex["prompt_ids"]
-        rid = ex["response_ids"]
-        adv = ex["advantage"]
-
-        cur_lp = compute_token_logprobs(model, pid, rid, with_grad=True,
-                                        chunk=cfg.logprob_chunk)  # (R,)
-
+    for batch in microbatches:
+        current_logprobs = compute_batched_token_logprobs(
+            model, batch, with_grad=True, chunk=cfg.logprob_chunk,
+            pad_token_id=tokenizer.pad_token_id)
         try:
             with backend.disable_adapter(), torch.no_grad():
-                base_lp = compute_token_logprobs(model, pid, rid, with_grad=False,
-                                                 chunk=cfg.logprob_chunk)
+                base_logprobs = compute_batched_token_logprobs(
+                    model, batch, with_grad=False, chunk=cfg.logprob_chunk,
+                    pad_token_id=tokenizer.pad_token_id)
         except Exception as e:
             if not hasattr(train_step, "_kl_warned"):
-                print(f"[warn] disable_adapter failed ({e}); training without KL penalty")
+                print(f"[warn] disable_adapter failed ({e}); "
+                      "training without KL penalty")
                 train_step._kl_warned = True
-            base_lp = cur_lp.detach()
+            base_logprobs = [
+                current_lp.detach() for current_lp in current_logprobs
+            ]
 
-        logp_diff = (cur_lp - base_lp).detach()
-        avg_logp_diff = logp_diff.mean()
-        kl_adv = cfg.kl_penalty_coef * (avg_logp_diff - (cur_lp - base_lp))
-        eff_adv = adv + kl_adv
+        batch_losses = []
+        for ex, cur_lp, base_lp in zip(
+                batch, current_logprobs, base_logprobs):
+            rid = ex["response_ids"]
+            adv = ex["advantage"]
+            logp_diff = (cur_lp - base_lp).detach()
+            avg_logp_diff = logp_diff.mean()
+            kl_adv = cfg.kl_penalty_coef * (
+                avg_logp_diff - (cur_lp - base_lp))
+            eff_adv = adv + kl_adv
 
-        # ---- feedback-based program repair (Sec. 2.3, Eq. 9) -------------
-        # A_{i,l} = A^rew_i + lambda_f * d_i * A^fb_{i,l}, and d_i is implicit:
-        # reprompt_text is only ever set for an eligible code failure.
-        #
-        # cur_lp.detach() IS log pi_thetabar here. Gradients accumulate across
-        # every example and optimizer.step() runs once at the end of the loop,
-        # so theta has not moved since the rollouts were sampled. If that ever
-        # changes to more than one update per step, this term needs its own
-        # forward pass at thetabar.
-        if fb_on and ex.get("reprompt_text"):
-            fb_adv = feedback_advantage(
-                compute_token_logprobs, model, tokenizer,
-                ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
-                lam=fb_lambda, chunk=cfg.logprob_chunk)
-            if fb_adv is None:
-                fb_stats.skipped += 1
+            # ---- feedback-based program repair (Sec. 2.3, Eq. 9) ---------
+            # cur_lp remains the pre-update policy because optimizer.step()
+            # still happens only after every microbatch has accumulated.
+            if fb_on and ex.get("reprompt_text"):
+                fb_adv = feedback_advantage(
+                    compute_token_logprobs, model, tokenizer,
+                    ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
+                    lam=fb_lambda, chunk=cfg.logprob_chunk)
+                if fb_adv is None:
+                    fb_stats.skipped += 1
+                else:
+                    fb_adv, _fb_scale = bound_feedback_advantage(
+                        fb_adv, reward_advantage=adv, cfg=fb_cfg)
+                    fb_stats.add(fb_adv)
+                    eff_adv = eff_adv + fb_adv
+
+            behavior_lp = ex.get("behavior_logprobs")
+            if (behavior_lp is not None
+                    and behavior_lp.shape[0] == cur_lp.shape[0]):
+                is_ratio = torch.exp(cur_lp.detach() - behavior_lp)
+                is_ratio_sum += float(is_ratio.mean().item())
+                is_ratio_max = max(
+                    is_ratio_max, float(is_ratio.max().item()))
+                is_ratio_count += 1
             else:
-                fb_adv, _fb_scale = bound_feedback_advantage(
-                    fb_adv, reward_advantage=adv, cfg=fb_cfg)
-                fb_stats.add(fb_adv)
-                eff_adv = eff_adv + fb_adv
+                if (behavior_lp is not None
+                        and not hasattr(train_step, "_is_len_warned")):
+                    print(f"[warn] behavior/current logprob length mismatch "
+                          f"({behavior_lp.shape[0]} vs {cur_lp.shape[0]}); "
+                          f"skipping IS for affected examples")
+                    train_step._is_len_warned = True
+                is_ratio = 1.0
 
-        behavior_lp = ex.get("behavior_logprobs")
-        if behavior_lp is not None and behavior_lp.shape[0] == cur_lp.shape[0]:
-            is_ratio = torch.exp(cur_lp.detach() - behavior_lp)
-            is_ratio_sum += float(is_ratio.mean().item())
-            is_ratio_max = max(is_ratio_max, float(is_ratio.max().item()))
-            is_ratio_count += 1
-        else:
-            if behavior_lp is not None and not hasattr(train_step, "_is_len_warned"):
-                print(f"[warn] behavior/current logprob length mismatch "
-                      f"({behavior_lp.shape[0]} vs {cur_lp.shape[0]}); "
-                      f"skipping IS for affected examples")
-                train_step._is_len_warned = True
-            is_ratio = 1.0
-
-        loss = -(is_ratio * eff_adv.detach() * cur_lp).mean()
-        (loss / n_examples).backward()
-
-        total_loss += float(loss.detach().item())
-        total_logp_delta += float(logp_diff.mean().item())
+            loss = -(is_ratio * eff_adv.detach() * cur_lp).mean()
+            batch_losses.append(loss / n_examples)
+            total_loss += float(loss.detach().item())
+            total_logp_delta += float(logp_diff.mean().item())
+        if batch_losses:
+            sum(batch_losses[1:], batch_losses[0]).backward()
 
     import torch as _torch
     _torch.nn.utils.clip_grad_norm_(
@@ -3180,6 +3429,8 @@ def main():
         print(f"Rank update epochs: {cfg.rank_update_epochs}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     print(f"Max seq length:     {cfg.max_seq_length}")
+    print(f"Train microbatch:   up to "
+          f"{cfg.train_examples_per_microbatch} examples/GPU")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")

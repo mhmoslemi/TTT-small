@@ -80,6 +80,85 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_training_microbatches_honor_example_and_padded_token_caps(self):
+        import torch
+        from train_multy_CVaR import _training_microbatches
+
+        def example(total):
+            return {
+                "prompt_ids": torch.zeros((1, 2), dtype=torch.long),
+                "response_ids": torch.zeros((1, total - 2), dtype=torch.long),
+            }
+
+        cfg = types.SimpleNamespace(
+            train_examples_per_microbatch=4, max_seq_length=12)
+        batches = _training_microbatches(
+            [example(3), example(4), example(5), example(6), example(7)], cfg)
+
+        self.assertEqual(sum(len(batch) for batch in batches), 5)
+        self.assertTrue(all(len(batch) <= 4 for batch in batches))
+        self.assertTrue(all(
+            len(batch) * max(
+                int(item["prompt_ids"].shape[1]
+                    + item["response_ids"].shape[1])
+                for item in batch) <= 12
+            for batch in batches
+        ))
+
+    def test_batched_logprobs_match_single_example_path(self):
+        import torch
+        from train_multy_CVaR import (compute_batched_token_logprobs,
+                                      compute_token_logprobs)
+
+        class ToyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(0.25))
+
+            def forward(self, input_ids, attention_mask=None):
+                del attention_mask
+                vocab = torch.arange(9, dtype=torch.float32)
+                logits = -(
+                    input_ids.to(torch.float32).unsqueeze(-1)
+                    - vocab.reshape(1, 1, -1)).abs() * self.scale
+                return types.SimpleNamespace(logits=logits)
+
+        model = ToyModel()
+        examples = [
+            {
+                "prompt_ids": torch.tensor([[1, 2]]),
+                "response_ids": torch.tensor([[3, 4, 5]]),
+            },
+            {
+                "prompt_ids": torch.tensor([[2, 1, 3]]),
+                "response_ids": torch.tensor([[4, 2]]),
+            },
+        ]
+        expected = [
+            compute_token_logprobs(
+                model, item["prompt_ids"], item["response_ids"],
+                with_grad=False, chunk=2)
+            for item in examples
+        ]
+        actual = compute_batched_token_logprobs(
+            model, examples, with_grad=False, chunk=2, pad_token_id=0)
+
+        self.assertEqual(len(actual), len(expected))
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want)
+
+        model.zero_grad(set_to_none=True)
+        for item in examples:
+            compute_token_logprobs(
+                model, item["prompt_ids"], item["response_ids"],
+                with_grad=True, chunk=2).sum().backward()
+        expected_gradient = model.scale.grad.detach().clone()
+        model.zero_grad(set_to_none=True)
+        batched_with_grad = compute_batched_token_logprobs(
+            model, examples, with_grad=True, chunk=2, pad_token_id=0)
+        sum(value.sum() for value in batched_with_grad).backward()
+        torch.testing.assert_close(model.scale.grad, expected_gradient)
+
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
         from train_multy import (_resolve_training_backend,
                                  _resolve_training_model_name)

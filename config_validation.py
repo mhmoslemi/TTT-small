@@ -192,7 +192,8 @@ def validate_problem_config(
         )
 
     for key in ("num_steps", "groups_per_step", "group_size",
-                "num_seed_states", "max_new_tokens", "max_seq_length"):
+                "num_seed_states", "max_new_tokens", "max_seq_length",
+                "train_examples_per_microbatch"):
         if key in data:
             _positive_int(data, key, source)
     if "eval_cpus" in data:
