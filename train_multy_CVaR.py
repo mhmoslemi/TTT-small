@@ -1378,7 +1378,7 @@ def _initialize_rank_logprob_caches(examples):
     for example in examples:
         old = example.get("behavior_logprobs")
         if _valid_example_token_logprobs(example, "behavior_logprobs"):
-            example["rank_old_logprobs"] = old.detach().cpu()
+            example["rank_old_logprobs"] = old.detach()
         else:
             example["rank_old_logprobs"] = None
             missing_old.append(example)
@@ -1543,7 +1543,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                    for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
             for ex, old_lp in zip(batch, old_logprobs):
-                ex["rank_old_logprobs"] = old_lp.detach().cpu()
+                ex["rank_old_logprobs"] = old_lp.detach()
         if reference_fallback:
             with backend.disable_adapter(), torch.no_grad():
                 for batch in _training_microbatches(reference_fallback, cfg):
@@ -1958,7 +1958,7 @@ class ReplicatedDataParallelTrainer:
                         raise FloatingPointError(
                             "nonfinite old-policy logprobs")
                     for example, old_lp in zip(batch, old_logprobs):
-                        example["rank_old_logprobs"] = old_lp.detach().cpu()
+                        example["rank_old_logprobs"] = old_lp.detach()
                 if kl_coef and missing_reference:
                     with backend.disable_adapter(), torch.no_grad():
                         for batch in _training_microbatches(
