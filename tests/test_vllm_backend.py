@@ -81,6 +81,19 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_hf_attention_prefers_flash_and_never_requests_eager(self):
+        from model_backend import _hf_training_attention_implementation
+
+        with patch("model_backend.importlib.util.find_spec",
+                   return_value=object()):
+            self.assertEqual(
+                _hf_training_attention_implementation(),
+                "flash_attention_2")
+        with patch("model_backend.importlib.util.find_spec",
+                   return_value=None):
+            self.assertEqual(
+                _hf_training_attention_implementation(), "sdpa")
+
     def test_chosen_token_logprobs_keeps_only_observed_tokens(self):
         entries = [
             {4: types.SimpleNamespace(logprob=-0.4),
@@ -197,6 +210,87 @@ class VLLMBackendTests(unittest.TestCase):
             model, examples, with_grad=True, chunk=2, pad_token_id=0)
         sum(value.sum() for value in batched_with_grad).backward()
         torch.testing.assert_close(model.scale.grad, expected_gradient)
+
+    def test_decoder_scoring_avoids_full_sequence_logits_and_keeps_gradients(self):
+        import torch
+        import torch.nn.functional as F
+        from train_multy_CVaR import compute_token_logprobs
+
+        class Decoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(11, 5)
+
+            def forward(self, input_ids, attention_mask=None, **_kwargs):
+                del attention_mask
+                return types.SimpleNamespace(
+                    last_hidden_state=self.embedding(input_ids))
+
+        class BoundedCausalLM(torch.nn.Module):
+            base_model_prefix = "decoder"
+
+            def __init__(self):
+                super().__init__()
+                self.decoder = Decoder()
+                self.head = torch.nn.Linear(5, 11, bias=False)
+
+            def get_base_model(self):
+                return self
+
+            def get_output_embeddings(self):
+                return self.head
+
+            def forward(self, *_args, **_kwargs):
+                raise AssertionError("full CausalLM logits must not be built")
+
+        model = BoundedCausalLM()
+        prompt = torch.tensor([[1, 2, 3]])
+        response = torch.tensor([[4, 5, 6, 7]])
+        full = torch.cat((prompt, response), dim=1)
+        hidden = model.decoder(full).last_hidden_state
+        expected = F.log_softmax(
+            model.head(hidden[:, 2:6, :]).float(), dim=-1).gather(
+                2, response.unsqueeze(-1)).squeeze(0).squeeze(-1)
+        expected.sum().backward()
+        expected_embedding_grad = model.decoder.embedding.weight.grad.clone()
+        expected_head_grad = model.head.weight.grad.clone()
+
+        model.zero_grad(set_to_none=True)
+        actual = compute_token_logprobs(
+            model, prompt, response, with_grad=True, chunk=2)
+        actual.sum().backward()
+
+        torch.testing.assert_close(actual, expected.detach())
+        torch.testing.assert_close(
+            model.decoder.embedding.weight.grad, expected_embedding_grad)
+        torch.testing.assert_close(model.head.weight.grad, expected_head_grad)
+
+    def test_training_oom_backoff_retries_with_smaller_batches(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        examples = [{
+            "prompt_ids": torch.zeros((1, 1), dtype=torch.long),
+            "response_ids": torch.zeros((1, 1), dtype=torch.long),
+        } for _ in range(4)]
+        attempted_maxima = []
+
+        def attempt(batches):
+            attempted_maxima.append(max(len(batch) for batch in batches))
+            if len(attempted_maxima) == 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            model(torch.ones((1, 2))).sum().backward()
+            return "ok"
+
+        with patch("torch.cuda.empty_cache"):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [examples], attempt, device_label="cuda:0")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempted_maxima, [4, 2])
+        self.assertEqual(max(len(batch) for batch in effective), 2)
+        self.assertEqual(quarantined, [])
 
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
         from train_multy import (_resolve_training_backend,
