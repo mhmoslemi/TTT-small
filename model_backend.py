@@ -90,28 +90,16 @@ def _use_training_4bit(
 
 
 def _hf_training_attention_implementation():
-    """Select a linear-memory attention backend for long-context training."""
-    if importlib.util.find_spec("flash_attn") is not None:
-        return "flash_attention_2"
-    # PyTorch SDPA can use its built-in Flash/Efficient kernels without the
-    # external flash-attn package. The training loop explicitly excludes the
-    # quadratic math kernel for long sequences.
-    return "sdpa"
+    """Require a genuinely linear-memory backend for HF long-context LoRA.
 
-
-def _configure_linear_memory_sdpa():
-    """Prevent PyTorch from silently selecting quadratic math attention."""
-    cuda_backends = getattr(torch.backends, "cuda", None)
-    if cuda_backends is None:
-        return
-    for name in ("enable_flash_sdp", "enable_mem_efficient_sdp",
-                 "enable_cudnn_sdp"):
-        setter = getattr(cuda_backends, name, None)
-        if callable(setter):
-            setter(True)
-    disable_math = getattr(cuda_backends, "enable_math_sdp", None)
-    if callable(disable_math):
-        disable_math(False)
+    Current Transformers resolves this name to the installed flash-attn package
+    or its compatible precompiled Hub kernel.  Selecting SDPA and globally
+    disabling its math implementation is not equivalent: on installations
+    whose PyTorch build has no compatible fused kernel, that produced
+    ``RuntimeError: Invalid backend``.  Leaving math enabled instead can create
+    an O(sequence^2) attention tensor (122 GiB at the observed context length).
+    """
+    return "flash_attention_2"
 
 
 class _ModelPlacementBackend:
@@ -334,19 +322,14 @@ class HFBackend(_ModelPlacementBackend):
         # role allocation. "balanced" therefore uses every rollout/training GPU
         # without ever placing weights on the benchmark card.
         attention_implementation = _hf_training_attention_implementation()
-        if attention_implementation == "sdpa":
-            _configure_linear_memory_sdpa()
         model_kwargs = dict(
             dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
             attn_implementation=attention_implementation,
         )
-        attention_note = (
-            " (quadratic math kernel disabled)"
-            if attention_implementation == "sdpa" else "")
         print(f"[memory] HF training attention: "
-              f"{attention_implementation}{attention_note}")
+              f"{attention_implementation} (linear-memory)")
         max_memory = _training_max_memory(self.cfg)
         if max_memory:
             model_kwargs["max_memory"] = max_memory
