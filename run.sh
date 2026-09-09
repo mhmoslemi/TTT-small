@@ -31,9 +31,11 @@ memory_version="${MEMORY_VERSION:-V2}"
 # Resume keeps saved experiment settings; AVAILABLE_GPUS still defines this
 # launch's physical inventory:
 #   sh run.sh --resume /path/to/run
-# Opt into the adaptive shared-queue trainer. Omitting --fast keeps the current
-# training implementation exactly as the default:
+# Opt into the process-per-GPU adaptive trainer. Omitting --fast keeps the
+# current training implementation exactly as the default:
 #   sh run.sh --fast
+# Set asymmetric rank clipping as distances below/above 1, for example:
+#   sh run.sh --fast --rank-clip-epsilon-low 0.1 --rank-clip-epsilon-high 0.3
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 case "${1:-}" in
@@ -81,5 +83,3 @@ esac
 
 # exec python3 train_multy.py --config "$config_path" "$@"
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank
-
-

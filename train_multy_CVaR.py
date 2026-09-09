@@ -213,6 +213,14 @@ def _resolve_rank_options(merged):
         raise ValueError("rank_gamma must be positive")
     if not 0.0 < merged["rank_clip_epsilon"] < 1.0:
         raise ValueError("rank_clip_epsilon must be in (0, 1)")
+    for side in ("low", "high"):
+        name = f"rank_clip_epsilon_{side}"
+        value = merged.get(name)
+        value = (merged["rank_clip_epsilon"] if value is None
+                 else float(value))
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be finite and in (0, 1)")
+        merged[name] = value
     if merged["rank_entropy_coef"] < 0.0:
         raise ValueError("rank_entropy_coef must be nonnegative")
     epochs = merged.get("rank_update_epochs")
@@ -266,9 +274,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
         "--fast", action="store_const", const=True, default=None,
-        help="Use the opt-in adaptive rank trainer: all training GPUs pull "
-             "length-bucketed work from one shared queue and independently "
-             "learn a padded-token budget targeting 90%% GPU memory use. "
+        help="Use the opt-in process-per-GPU rank trainer: work is balanced "
+             "by sequence cost and every GPU independently learns a padded-"
+             "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
@@ -324,7 +332,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="rank mode: selection KL budget (default log(2)); "
                         "distinct from --kl-penalty-coef.")
     p.add_argument("--rank-clip-epsilon", type=float, default=None,
-                   help="rank mode: trajectory ratio clipping width (default 0.2).")
+                   help="rank mode: symmetric token-ratio clipping width used "
+                        "for both sides unless a side-specific value is given "
+                        "(default 0.2).")
+    p.add_argument("--rank-clip-epsilon-low", type=float, default=None,
+                   help="rank mode: lower clipping distance, giving the bound "
+                        "1-epsilon-low (defaults to --rank-clip-epsilon).")
+    p.add_argument("--rank-clip-epsilon-high", type=float, default=None,
+                   help="rank mode: upper clipping distance, giving the bound "
+                        "1+epsilon-high (defaults to --rank-clip-epsilon).")
     p.add_argument("--rank-entropy-coef", type=float, default=None,
                    help="rank mode: entropy coefficient for fully tied groups "
                         "(default 0.01; 0 disables entropy).")
@@ -614,7 +630,8 @@ def _resolve_training_backend(backend, training_model_name):
     return resolved
 
 
-def _resolve_training_memory_budgets(training_gpu_ids, memory):
+def _resolve_training_memory_budgets(training_gpu_ids, memory, *,
+                                     max_fraction=0.90):
     """Reserve host/runtime headroom and cap checkpoint placement per card."""
     if not memory or any(gpu_id not in memory for gpu_id in training_gpu_ids):
         return []
@@ -623,7 +640,9 @@ def _resolve_training_memory_budgets(training_gpu_ids, memory):
         gpu = memory[gpu_id]
         # Keep at least 6 GiB outside Accelerate's weight placement for CUDA,
         # activations, temporary quantization buffers, and LoRA optimizer state.
-        usable = min(float(gpu.total_gib) * 0.90, float(gpu.free_gib) - 6.0)
+        usable = min(
+            float(gpu.total_gib) * float(max_fraction),
+            float(gpu.free_gib) - 6.0)
         budgets.append(round(max(1.0, usable), 1))
     return budgets
 
@@ -737,7 +756,14 @@ def load_config():
             continue
         key = _CLI_TO_CFG.get(arg_name, arg_name)
         merged[key] = value
-    merged["fast"] = bool(merged.get("fast", False))
+    if args.rank_clip_epsilon is not None:
+        if args.rank_clip_epsilon_low is None:
+            merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
+        if args.rank_clip_epsilon_high is None:
+            merged["rank_clip_epsilon_high"] = args.rank_clip_epsilon
+    # Fast is deliberately launch-scoped. A saved/YAML value must not silently
+    # change the default trainer; only this invocation's --fast selects it.
+    merged["fast"] = bool(args.fast)
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -902,7 +928,8 @@ def load_config():
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
     training_budgets = _resolve_training_memory_budgets(
-        training_gpu_ids, memory)
+        training_gpu_ids, memory,
+        max_fraction=(0.80 if merged["fast"] else 0.90))
     _validate_known_training_capacity(
         merged["training_model_name"], training_budgets)
     merged["training_max_memory_gib"] = training_budgets
@@ -1672,6 +1699,7 @@ def _initialize_rank_logprob_caches(examples):
 
 def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
                    advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
+                   clip_epsilon_low=None, clip_epsilon_high=None,
                    kl_coef=0.0, entropy_coef=0.0, token_entropies=None,
                    return_tensor_metrics=False):
     """One trajectory's loss; callers average equally within each parent.
@@ -1680,6 +1708,8 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     scalar group advantage are frozen. The sampled per-token reference-KL
     estimator is exp(log pi_ref - log pi_theta)
                  - (log pi_ref - log pi_theta) - 1.
+    Clipping is asymmetric when requested: [1 - epsilon_low,
+    1 + epsilon_high]. The legacy clip_epsilon remains the fallback for both.
 
     If enabled, trajectory entropy is estimated by the chain rule:
         H_hat = sum_l rho_prefix(l) * H(pi_theta(. | x, y_<l)).
@@ -1694,8 +1724,15 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     """
     import torch
 
-    if not 0.0 < float(clip_epsilon) < 1.0:
-        raise ValueError("clip_epsilon must be in (0, 1)")
+    symmetric_epsilon = float(clip_epsilon)
+    epsilon_low = (symmetric_epsilon if clip_epsilon_low is None
+                   else float(clip_epsilon_low))
+    epsilon_high = (symmetric_epsilon if clip_epsilon_high is None
+                    else float(clip_epsilon_high))
+    if (not math.isfinite(epsilon_low) or not 0.0 < epsilon_low < 1.0
+            or not math.isfinite(epsilon_high)
+            or not 0.0 < epsilon_high < 1.0):
+        raise ValueError("clip epsilon low/high must be finite and in (0, 1)")
     if (not math.isfinite(float(kl_coef)) or kl_coef < 0.0
             or not math.isfinite(float(entropy_coef)) or entropy_coef < 0.0):
         raise ValueError("KL and entropy coefficients must be finite and nonnegative")
@@ -1712,7 +1749,7 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     log_ratios = cur - old
     token_ratios = log_ratios.exp()
     clipped_token_ratios = token_ratios.clamp(
-        1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        1.0 - epsilon_low, 1.0 + epsilon_high)
     policy_loss = -torch.minimum(
         token_ratios * adv, clipped_token_ratios * adv).mean()
     ratio = token_ratios.mean()
@@ -1795,6 +1832,8 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
 
     epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
     epsilon = float(getattr(cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
+    epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
+    epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
     entropy_coef = float(getattr(cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
     kl_coef = float(cfg.kl_penalty_coef)
     fb_stats = None
@@ -1897,7 +1936,10 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                         loss, metrics = rank_grpo_loss(
                             cur_lp, ex["rank_old_logprobs"],
                             ex["rank_reference_logprob"], ex["advantage"],
-                            clip_epsilon=epsilon, kl_coef=kl_coef,
+                            clip_epsilon=epsilon,
+                            clip_epsilon_low=epsilon_low,
+                            clip_epsilon_high=epsilon_high,
+                            kl_coef=kl_coef,
                             entropy_coef=(entropy_coef if gate else 0.0),
                             token_entropies=token_entropy)
                         fb_adv = ex["rank_feedback_advantage"]
@@ -2229,7 +2271,7 @@ class ReplicatedDataParallelTrainer:
         Each replica repeatedly claims a length-bucketed batch from one shared
         CPU queue. Its padded-token budget is learned from real peak allocator
         use on that GPU and persists across steps. The controller aims below
-        90% total device occupancy, while the normal OOM splitter remains the
+        80% total device occupancy, while the normal OOM splitter remains the
         final guard for nonlinear attention/output-head memory spikes.
         """
         import threading
@@ -2249,6 +2291,8 @@ class ReplicatedDataParallelTrainer:
             raise ValueError("--fast requires rank_update_epochs=1")
         epsilon = float(getattr(cfg, "rank_clip_epsilon",
                                 RANK_CLIP_EPSILON_DEFAULT))
+        epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
+        epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
         entropy_coef = float(getattr(cfg, "rank_entropy_coef",
                                      RANK_ENTROPY_COEF_DEFAULT))
         kl_coef = float(cfg.kl_penalty_coef)
@@ -2318,7 +2362,7 @@ class ReplicatedDataParallelTrainer:
                     1, int(budgets[replica_index] or initial_budget))
 
         print(f"[train-fast] shared adaptive queue on {self.world_size} GPUs; "
-              "memory target=90%; initial padded-token budgets/GPU="
+              "memory target=80%; initial padded-token budgets/GPU="
               f"{list(budgets)}", flush=True)
         self._zero_gradients()
 
@@ -2470,6 +2514,8 @@ class ReplicatedDataParallelTrainer:
                                         example["rank_reference_logprob"],
                                         example["advantage"],
                                         clip_epsilon=epsilon,
+                                        clip_epsilon_low=epsilon_low,
+                                        clip_epsilon_high=epsilon_high,
                                         kl_coef=kl_coef,
                                         entropy_coef=(entropy_coef
                                                       if gate else 0.0),
@@ -2600,7 +2646,7 @@ class ReplicatedDataParallelTrainer:
                             1, peak_allocated - base_allocated)
                         target_process_bytes = max(
                             base_allocated + 1,
-                            int(0.90 * int(total_bytes)) - external_bytes)
+                            int(0.80 * int(total_bytes)) - external_bytes)
                         available_for_batch = max(
                             1, target_process_bytes - base_allocated)
                         desired_budget = int(
@@ -2713,6 +2759,8 @@ class ReplicatedDataParallelTrainer:
                              RANK_UPDATE_EPOCHS_DEFAULT))
         epsilon = float(getattr(cfg, "rank_clip_epsilon",
                                 RANK_CLIP_EPSILON_DEFAULT))
+        epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
+        epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
         entropy_coef = float(getattr(cfg, "rank_entropy_coef",
                                      RANK_ENTROPY_COEF_DEFAULT))
         kl_coef = float(cfg.kl_penalty_coef)
@@ -2844,7 +2892,10 @@ class ReplicatedDataParallelTrainer:
                                     example["rank_old_logprobs"],
                                     example["rank_reference_logprob"],
                                     example["advantage"],
-                                    clip_epsilon=epsilon, kl_coef=kl_coef,
+                                    clip_epsilon=epsilon,
+                                    clip_epsilon_low=epsilon_low,
+                                    clip_epsilon_high=epsilon_high,
+                                    kl_coef=kl_coef,
                                     entropy_coef=(entropy_coef
                                                   if gate else 0.0),
                                     token_entropies=token_entropy)
@@ -3129,6 +3180,464 @@ class ReplicatedDataParallelTrainer:
         self._validate_replica_devices()
         _restore_optimizer_state_to_parameters(self.optimizer)
         self._offloaded = False
+
+
+class ProcessDistributedTrainer:
+    """Fast rank trainer with one persistent Python process per GPU."""
+
+    def __init__(self, primary_backend, primary_model, primary_tokenizer,
+                 optimizer, cfg, exp_dir, dependency_log_path=None):
+        import queue
+        import uuid
+        from datetime import timedelta
+        import torch
+        import torch.distributed as dist
+        import torch.multiprocessing as mp
+        from fast_distributed import (
+            broadcast_trainable_parameters, set_total_memory_ceiling,
+            trainable_parameter_signature, validate_model_device, worker_main,
+        )
+
+        if dist.is_initialized():
+            raise RuntimeError(
+                "--fast cannot start because torch.distributed is already "
+                "initialized in the main process")
+        self.backend = primary_backend
+        self.model = primary_model
+        self.tokenizer = primary_tokenizer
+        self.optimizer = optimizer
+        self.cfg = cfg
+        self._offloaded = False
+        self._closed = False
+        self._workers_idle = True
+        self._dist_initialized = False
+        self._queue_module = queue
+        self._context = mp.get_context("spawn")
+        self._result_queue = self._context.Queue()
+        self._work_queue = self._context.Queue()
+        self._command_queues = {}
+        self._processes = {}
+        self._physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
+        self._world_size = int(cfg.num_training_gpus)
+        self._token_budgets = [
+            max(1, int(cfg.max_seq_length))
+            for _ in range(self._world_size)
+        ]
+        if self._world_size != len(self._physical_ids):
+            raise ValueError(
+                "num_training_gpus does not match training_gpu_ids")
+        if self._world_size < 2:
+            raise ValueError("process-distributed --fast requires two GPUs")
+
+        # Eight independent Python processes must not each create a full-sized
+        # host thread pool. GPU 0 was loaded before this class is constructed;
+        # the allocator limit still constrains every subsequent allocation.
+        torch.set_num_threads(max(
+            1, int(os.cpu_count() or self._world_size) // self._world_size))
+        torch.cuda.set_device(0)
+        set_total_memory_ceiling(0, 0.80)
+        validate_model_device(self.model, 0)
+        expected_signature = trainable_parameter_signature(self.model)
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
+        sync_dir = Path(exp_dir).resolve() / ".fast_trainer"
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        rendezvous_path = sync_dir / (
+            f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
+        self._init_method = rendezvous_path.as_uri()
+        cfg_dict = dict(vars(cfg))
+
+        print(f"[train-fast] starting {self._world_size - 1} persistent "
+              "worker processes; main process is rank 0", flush=True)
+        try:
+            for rank in range(1, self._world_size):
+                command_queue = self._context.Queue(maxsize=2)
+                process = self._context.Process(
+                    target=worker_main,
+                    args=(
+                        rank, self._world_size, cfg_dict,
+                        self._init_method, self._work_queue, command_queue,
+                        self._result_queue, dependency_log_path,
+                    ),
+                    name=f"ttt-fast-trainer-rank-{rank}",
+                )
+                process.start()
+                self._command_queues[rank] = command_queue
+                self._processes[rank] = process
+
+            loaded = self._collect_event(
+                "loaded", range(1, self._world_size))
+            for rank, message in loaded.items():
+                if message.get("parameter_signature") != expected_signature:
+                    raise RuntimeError(
+                        f"fast trainer rank {rank} has a different trainable "
+                        "parameter layout")
+            for command_queue in self._command_queues.values():
+                command_queue.put({"kind": "init_distributed"})
+            dist.init_process_group(
+                backend="nccl", init_method=self._init_method,
+                rank=0, world_size=self._world_size,
+                timeout=timedelta(minutes=30))
+            self._dist_initialized = True
+            broadcast_trainable_parameters(self.model, source_rank=0)
+            self._collect_event("ready", range(1, self._world_size))
+        except BaseException:
+            self._abort_workers()
+            raise
+
+        print(f"[train-fast] process-distributed trainer active on physical "
+              f"GPUs {self._physical_ids}; adaptive memory ceiling=80%",
+              flush=True)
+
+    @property
+    def world_size(self):
+        return self._world_size
+
+    @property
+    def is_offloaded(self):
+        return self._offloaded
+
+    def _dead_workers(self, pending):
+        return [
+            rank for rank in pending
+            if rank in self._processes
+            and not self._processes[rank].is_alive()
+        ]
+
+    def _collect_event(self, event, ranks):
+        pending = set(int(rank) for rank in ranks)
+        results = {}
+        while pending:
+            try:
+                message = self._result_queue.get(timeout=5.0)
+            except self._queue_module.Empty:
+                dead = self._dead_workers(pending)
+                if dead:
+                    codes = {
+                        rank: self._processes[rank].exitcode for rank in dead
+                    }
+                    raise RuntimeError(
+                        f"fast trainer worker(s) exited while waiting for "
+                        f"{event}: {codes}")
+                continue
+            message_event = message.get("event")
+            rank = int(message.get("rank", -1))
+            if message_event == "error":
+                raise RuntimeError(
+                    f"fast trainer rank {rank} failed:\n"
+                    f"{message.get('traceback', 'no traceback')}")
+            if message_event != event or rank not in pending:
+                raise RuntimeError(
+                    f"unexpected fast trainer message while waiting for "
+                    f"{event}: {message}")
+            pending.remove(rank)
+            results[rank] = message
+        return results
+
+    @staticmethod
+    def _cpu_examples(examples):
+        import torch
+
+        tensor_cache = {}
+        copied_examples = []
+        for example in examples:
+            copied = {}
+            for key, value in example.items():
+                if torch.is_tensor(value):
+                    cache_key = id(value)
+                    if cache_key not in tensor_cache:
+                        tensor_cache[cache_key] = value.detach().cpu()
+                    copied[key] = tensor_cache[cache_key]
+                else:
+                    copied[key] = value
+            copied_examples.append(copied)
+        return copied_examples
+
+    def _queue_examples(self, examples):
+        """Queue expensive examples first; idle ranks steal the next work."""
+        maximum_length = max(1, int(self.cfg.max_seq_length))
+
+        def estimated_cost(example):
+            prompt = int(example["prompt_ids"].shape[1])
+            response = int(example["response_ids"].shape[1])
+            total = prompt + response
+            return total * total + response * maximum_length
+
+        ordered = sorted(
+            self._cpu_examples(examples),
+            key=estimated_cost, reverse=True)
+        for example in ordered:
+            self._work_queue.put(example)
+        for _ in range(self._world_size):
+            self._work_queue.put(None)
+        print(f"[train-fast] queued {len(ordered)} examples longest-first; "
+              "each free GPU claims the next adaptive batch", flush=True)
+        return ordered
+
+    @staticmethod
+    def _merge_feedback_dicts(items):
+        from feedback import FeedbackStats
+
+        merged = FeedbackStats()
+        for item in items:
+            merged.n += int(item.get("n", 0))
+            merged.skipped += int(item.get("skipped", 0))
+            merged.sum_abs += float(item.get("sum_abs", 0.0))
+            merged.sum_pos += float(item.get("sum_pos", 0.0))
+            merged.max_abs = max(
+                merged.max_abs, float(item.get("max_abs", 0.0)))
+        return merged
+
+    def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
+                   fb_on=False, fb_lambda=0.0):
+        import torch
+        from fast_distributed import (broadcast_trainable_parameters,
+                                      local_rank_update,
+                                      reduce_trainable_gradients)
+
+        if self._offloaded:
+            print(f"[train-fast] restoring {self._world_size} process "
+                  "trainers for the update", flush=True)
+            self.restore_after_generation()
+        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+            raise ValueError("--fast requires rank_update_epochs=1")
+
+        started = time.time()
+        queued_examples = self._queue_examples(examples)
+        supplied_old = sum(
+            _valid_example_token_logprobs(example, "behavior_logprobs")
+            for example in queued_examples)
+        supplied_reference = (sum(
+            _valid_example_token_logprobs(example, "reference_logprobs")
+            for example in queued_examples)
+            if float(cfg.kl_penalty_coef) else len(examples))
+        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+              f"{supplied_old}/{len(examples)}, reference="
+              f"{supplied_reference}/{len(examples)}", flush=True)
+        print(f"[train-fast] one process/GPU; memory ceiling=80%; "
+              f"initial padded-token budgets/GPU={self._token_budgets}",
+              flush=True)
+
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "train_rank",
+                "token_budget": self._token_budgets[rank],
+                "memory_fraction": 0.80,
+                "fb_cfg": fb_cfg,
+                "fb_on": bool(fb_on),
+                "fb_lambda": float(fb_lambda),
+            })
+
+        local_stats = local_rank_update(
+            self.backend, self.model, self.tokenizer, (), cfg, 0,
+            self._token_budgets[0], memory_fraction=0.80,
+            fb_cfg=fb_cfg, fb_on=fb_on, fb_lambda=fb_lambda,
+            work_queue=self._work_queue)
+        child_messages = self._collect_event(
+            "computed", range(1, self._world_size))
+        rank_stats = [local_stats] + [
+            child_messages[rank]["stats"]
+            for rank in range(1, self._world_size)
+        ]
+        accounted_examples = sum(
+            int(stats["trained_examples"])
+            + int(stats["quarantined_examples"])
+            for stats in rank_stats)
+        if accounted_examples != len(queued_examples):
+            raise RuntimeError(
+                "fast trainer shared queue lost or duplicated work: "
+                f"accounted for {accounted_examples}/{len(queued_examples)} "
+                "examples")
+
+        for command_queue in self._command_queues.values():
+            command_queue.put({"kind": "finish_update"})
+        reduce_trainable_gradients(self.model, destination_rank=0)
+
+        update_error = None
+        grad_norm = None
+        try:
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in self.model.parameters()
+                 if parameter.requires_grad],
+                max_norm=cfg.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            grad_norm = float(grad_norm_tensor.item())
+        except BaseException as error:
+            update_error = error
+        finally:
+            self.model.zero_grad(set_to_none=True)
+            broadcast_trainable_parameters(self.model, source_rank=0)
+            self._collect_event("updated", range(1, self._world_size))
+            self._workers_idle = True
+        if update_error is not None:
+            raise update_error
+
+        for rank, stats in enumerate(rank_stats):
+            self._token_budgets[rank] = max(
+                1, int(stats["token_budget"]))
+        metric_keys = (
+            "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+            "ratio", "clipped_fraction",
+        )
+        totals = {
+            key: sum(stats["totals"][key] for stats in rank_stats)
+            for key in metric_keys
+        }
+        max_ratio = max(stats["max_ratio"] for stats in rank_stats)
+        max_prefix_ratio = max(
+            stats["max_prefix_ratio"] for stats in rank_stats)
+        entropy_examples = sum(
+            stats["entropy_examples"] for stats in rank_stats)
+        quarantined_examples = sum(
+            stats["quarantined_examples"] for stats in rank_stats)
+        trained_per_gpu = [
+            stats["trained_examples"] for stats in rank_stats]
+        batches_per_gpu = [
+            stats["backward_batches"] for stats in rank_stats]
+        peak_fractions = [
+            stats["peak_memory_fraction"] for stats in rank_stats]
+        allocator_fractions = [
+            stats["allocator_memory_fraction"] for stats in rank_stats]
+        peak_percentages = [
+            round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [
+            round(100.0 * fraction, 1) for fraction in allocator_fractions]
+        feedback_stats = self._merge_feedback_dicts([
+            stats["feedback_stats"] for stats in rank_stats])
+        history = [{
+            "epoch": 1, **totals, "ratio_max": max_ratio,
+            "prefix_ratio_max": max_prefix_ratio,
+            "entropy_examples": entropy_examples,
+            "oom_quarantined_examples": quarantined_examples,
+            "grad_norm": grad_norm,
+        }]
+        print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
+              f"backward batches/GPU={batches_per_gpu}; final padded-token "
+              f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+              f"{peak_percentages}%; allocator caps/GPU="
+              f"{allocator_percentages}%", flush=True)
+        print(f"[step {step_idx}] rank epoch 1/1: "
+              f"loss={totals['loss']:.6f} "
+              f"KL estimate={totals['kl_estimate']:.6f} "
+              f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+              f"clipped={totals['clipped_fraction']:.1%} "
+              f"entropy examples={entropy_examples} "
+              f"OOM-quarantined={quarantined_examples}", flush=True)
+        if fb_on:
+            print(feedback_stats.line(step_idx, fb_lambda))
+        return {
+            "rank_updates": history,
+            "rank_train_seconds": time.time() - started,
+            "training_parallel_gpus": self._world_size,
+            "training_fast": True,
+            "training_fast_processes": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(self._token_budgets),
+            "fast_peak_memory_fraction": peak_fractions,
+            "fast_allocator_memory_fraction": allocator_fractions,
+            "oom_quarantined_examples": quarantined_examples,
+        }
+
+    def train_policy(self, *args, **kwargs):
+        raise RuntimeError("process-distributed --fast supports rank mode only")
+
+    def offload_for_generation(self):
+        if self._offloaded:
+            return
+        import gc
+        import torch
+
+        self._offloaded = True
+        try:
+            for command_queue in self._command_queues.values():
+                command_queue.put({"kind": "offload"})
+            torch.cuda.synchronize(0)
+            _move_optimizer_state(self.optimizer, "cpu")
+            self.backend.offload_for_generation()
+            gc.collect()
+            with torch.cuda.device(0):
+                torch.cuda.empty_cache()
+            self._collect_event("offloaded", range(1, self._world_size))
+        except BaseException:
+            # A failed worker has already left the NCCL process group. Do not
+            # attempt a graceful barrier/restore against a partial group.
+            self._workers_idle = False
+            self._abort_workers()
+            raise
+
+    def restore_after_generation(self):
+        if not self._offloaded:
+            return
+        if not self._dist_initialized:
+            raise RuntimeError(
+                "process-distributed trainer is unavailable after a worker "
+                "failure")
+        import gc
+        import torch
+        from fast_distributed import (set_total_memory_ceiling,
+                                      validate_model_device)
+
+        try:
+            for command_queue in self._command_queues.values():
+                command_queue.put({"kind": "restore"})
+            gc.collect()
+            with torch.cuda.device(0):
+                torch.cuda.empty_cache()
+                set_total_memory_ceiling(0, 0.80)
+                self.backend.restore_after_generation()
+                self.backend.set_training_mode()
+                torch.cuda.synchronize(0)
+            validate_model_device(self.model, 0)
+            _restore_optimizer_state_to_parameters(self.optimizer)
+            self._collect_event("restored", range(1, self._world_size))
+            self._offloaded = False
+        except BaseException:
+            self._workers_idle = False
+            self._abort_workers()
+            raise
+
+    def _abort_workers(self):
+        import torch.distributed as dist
+
+        for process in self._processes.values():
+            if process.is_alive():
+                process.terminate()
+        for process in self._processes.values():
+            process.join(timeout=10.0)
+        if self._dist_initialized and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        self._dist_initialized = False
+
+    def shutdown(self):
+        if self._closed:
+            return
+        self._closed = True
+        import torch.distributed as dist
+
+        if (not self._workers_idle or not self._dist_initialized
+                or self._dead_workers(range(1, self._world_size))):
+            self._abort_workers()
+            return
+        try:
+            for command_queue in self._command_queues.values():
+                command_queue.put({"kind": "stop"})
+            dist.barrier()
+            self._collect_event("stopped", range(1, self._world_size))
+        finally:
+            if self._dist_initialized and dist.is_initialized():
+                dist.destroy_process_group()
+            self._dist_initialized = False
+            for process in self._processes.values():
+                process.join(timeout=10.0)
+            for process in self._processes.values():
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10.0)
 
 
 # ======================================================================
@@ -3791,11 +4300,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             cvar_alpha=getattr(cfg, "cvar_alpha", None),
             cvar_lambda=getattr(cfg, "cvar_lambda", None),
             rank_gamma=getattr(cfg, "rank_gamma", None), return_info=True)
+        constant = (bool(adv_info["all_tied"]) if rank_mode else
+                    float(rewards_np.max() - rewards_np.min()) < 1e-12)
+        rank_entropy_gate = bool(
+            rank_mode
+            and constant
+            and any(valids)
+            and float(rewards_np.max()) > float(cfg.fail_score)
+        )
         if rank_mode:
             rank_diagnostics = {
                 k: v for k, v in adv_info.items() if k not in ("ranks", "weights")
             }
-            rank_group_stats.append({"group": g, **rank_diagnostics})
+            rank_group_stats.append({
+                "group": g, **rank_diagnostics,
+                "entropy_gate": rank_entropy_gate,
+            })
 
         # growth signals for this group
         if len(valids):
@@ -3817,7 +4337,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"ESS={adv_info['ess']:.2f}/{len(rewards)} "
                   f"top ties={adv_info['top_count']} "
                   f"saturated={adv_info['saturated']} "
-                  f"entropy gate={adv_info['all_tied']}")
+                  f"entropy gate={rank_entropy_gate}")
 
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
@@ -3979,9 +4499,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # is where it pays most, since an all-failed group is exactly the case
         # the reward channel cannot score at all.
         # Rank mode uses exact equality and retains fully tied groups for
-        # entropy/reference updates; representable small gaps are informative.
-        constant = (bool(adv_info["all_tied"]) if rank_mode else
-                    float(rewards_np.max() - rewards_np.min()) < 1e-12)
+        # reference updates. Entropy is gated separately above: an all-failure
+        # tie at fail_score must not receive an entropy update.
         if (constant and not rank_mode
                 and not (fb_candidate_on and fb_cfg.include_constant_groups)):
             continue
@@ -4020,7 +4539,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "failure_signature": RolloutRecord(
                     msg=res.msg or "").failure_signature(),
                 "reward_constant": constant,
-                "rank_entropy_gate": bool(rank_mode and constant),
+                "rank_entropy_gate": rank_entropy_gate,
                 "group_id": g,
                 "prompt_job_id": job_idx,
                 # Implements mean_over_parents(mean_over_rollouts(loss)).
@@ -4445,9 +4964,9 @@ def main():
     print(f"Generation backend: {cfg.generation_backend}")
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
     print(f"Training layout:    "
-          f"{'replicated data parallel' if use_replicated_training else 'model parallel/single GPU'}")
+          f"{'process-distributed LoRA' if cfg.fast else ('replicated data parallel' if use_replicated_training else 'model parallel/single GPU')}")
     print(f"Training scheduler: "
-          f"{'adaptive shared queue (--fast)' if cfg.fast else 'default'}")
+          f"{'adaptive process-per-GPU (--fast)' if cfg.fast else 'default'}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
@@ -4466,7 +4985,10 @@ def main():
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
     if getattr(cfg, "advantage_mode", "entropic") == "rank":
         print(f"Rank gamma:         {cfg.rank_gamma}")
-        print(f"Rank clip epsilon:  {cfg.rank_clip_epsilon}")
+        print(f"Rank clip eps low/high: "
+              f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
+              f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
+              f"{1.0 + cfg.rank_clip_epsilon_high:.4f})")
         print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
         print(f"Rank update epochs: {cfg.rank_update_epochs}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
@@ -4556,10 +5078,16 @@ def main():
 
     parallel_trainer = None
     if use_replicated_training:
-        parallel_trainer = ReplicatedDataParallelTrainer(
-            backend, model, tokenizer, optimizer, cfg,
-            dependency_log_path=dependency_log_path,
-        )
+        if cfg.fast:
+            parallel_trainer = ProcessDistributedTrainer(
+                backend, model, tokenizer, optimizer, cfg, exp_dir,
+                dependency_log_path=dependency_log_path,
+            )
+        else:
+            parallel_trainer = ReplicatedDataParallelTrainer(
+                backend, model, tokenizer, optimizer, cfg,
+                dependency_log_path=dependency_log_path,
+            )
 
     # ---- sampler ----
     from sampler import PUCTSampler
@@ -4872,6 +5400,10 @@ def main():
         if gen_pool is not None:
             print("[shutdown] stopping generation pool ...")
             gen_pool.shutdown()
+        if (parallel_trainer is not None
+                and hasattr(parallel_trainer, "shutdown")):
+            print("[shutdown] stopping process-distributed trainer ...")
+            parallel_trainer.shutdown()
 
     # ---- summary ----
     print("\n" + "=" * 70)
