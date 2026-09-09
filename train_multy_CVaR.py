@@ -1726,9 +1726,12 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     """One trajectory's loss; callers average equally within each parent.
 
     Per-token rho = exp(current_lp - old_lp) is differentiable; old_lp and the
-    scalar group advantage are frozen. The sampled per-token reference-KL
-    estimator is exp(log pi_ref - log pi_theta)
-                 - (log pi_ref - log pi_theta) - 1.
+    scalar group advantage are frozen. Policy/reference regularization uses the
+    same centered log-probability correction as entropic mode:
+        d = log pi_theta - log pi_ref
+        A_KL = kl_coef * (mean(d) - d).
+    Its policy-gradient surrogate is kept separate from the rank PPO surrogate
+    so rank advantages and asymmetric clipping retain their existing behavior.
     Clipping is asymmetric when requested: [1 - epsilon_low,
     1 + epsilon_high]. The legacy clip_epsilon remains the fallback for both.
 
@@ -1777,7 +1780,8 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     clipped_fraction = (
         token_ratios.detach() != clipped_token_ratios.detach()
     ).double().mean()
-    kl_estimate = cur.new_zeros(())
+    policy_reference_delta = cur.new_zeros(())
+    kl_policy_loss = cur.new_zeros(())
     if kl_coef:
         if reference_logprob is None:
             raise ValueError("reference logprobs are required for nonzero KL coefficient")
@@ -1786,9 +1790,16 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         if ref.shape != cur.shape or not torch.isfinite(ref).all():
             raise ValueError(
                 "reference logprobs must be a finite vector matching current logprobs")
-        log_ref_over_current = ref - cur
-        kl_estimate = (
-            log_ref_over_current.exp() - log_ref_over_current - 1.0
+        logp_difference = (cur - ref).detach()
+        policy_reference_delta = logp_difference.mean()
+        kl_advantage = kl_coef * (
+            policy_reference_delta - (cur - ref)
+        )
+        # This is the KL component of entropic mode's policy-gradient loss.
+        # The detached current/behavior ratio supplies the same importance
+        # weighting without changing the rank PPO objective itself.
+        kl_policy_loss = -(
+            token_ratios.detach() * kl_advantage.detach() * cur
         ).mean()
 
     entropy_estimate = cur.new_zeros(())
@@ -1801,14 +1812,16 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         entropy_estimate = (prefix_ratios * token_entropies.to(cur.dtype)).sum()
         prefix_ratio_max = prefix_ratios.max()
 
-    loss = policy_loss + kl_coef * kl_estimate - entropy_coef * entropy_estimate
+    loss = policy_loss + kl_policy_loss - entropy_coef * entropy_estimate
     if not torch.isfinite(loss).all() or not torch.isfinite(ratio).all():
         raise FloatingPointError(
             "nonfinite rank objective/trajectory ratio; reduce learning rate or "
             "rank_update_epochs and inspect model logprobs")
     tensor_metrics = {
         "policy_loss": policy_loss.detach(),
-        "kl_estimate": kl_estimate.detach(),
+        # Retain the metric key for checkpoint/log compatibility. Its value now
+        # matches entropic mode's mean log pi_theta - log pi_base diagnostic.
+        "kl_estimate": policy_reference_delta.detach(),
         "entropy_estimate": entropy_estimate.detach(),
         "ratio": ratio.detach(),
         "prefix_ratio_max": prefix_ratio_max.detach(),
@@ -2014,7 +2027,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                             "grad_norm": float(grad_norm.item())})
             print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"KL estimate={totals['kl_estimate']:.6f} "
+                  f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
@@ -2740,7 +2753,7 @@ class ReplicatedDataParallelTrainer:
               f"{peak_percentages}%", flush=True)
         print(f"[step {step_idx}] rank epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"KL estimate={totals['kl_estimate']:.6f} "
+              f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
@@ -2984,7 +2997,7 @@ class ReplicatedDataParallelTrainer:
             })
             print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"KL estimate={totals['kl_estimate']:.6f} "
+                  f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
@@ -3540,7 +3553,7 @@ class ProcessDistributedTrainer:
               f"{allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] rank epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"KL estimate={totals['kl_estimate']:.6f} "
+              f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
