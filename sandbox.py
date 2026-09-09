@@ -30,6 +30,15 @@ import pickle
 import traceback
 import importlib.util
 
+# Pin before importing the generated program. The affinity is inherited by
+# every subprocess it creates, so one candidate and its whole process tree stay
+# on the CPU assigned by the evaluation scheduler.
+EVAL_CPU_ID = os.environ.pop("TTT_EVAL_CPU_ID", "")
+if EVAL_CPU_ID:
+    if not hasattr(os, "sched_setaffinity"):
+        raise RuntimeError("isolated evaluation requires Linux CPU affinity")
+    os.sched_setaffinity(0, {int(EVAL_CPU_ID)})
+
 # Force spawn for any multiprocessing the child code might do
 try:
     import multiprocessing as mp
@@ -80,7 +89,8 @@ def _kill_tree(proc, pgid, hard=False):
             pass
 
 
-def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1):
+def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
+             *, cpu_id=None):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
@@ -89,6 +99,18 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1):
       {"ok": True,  "value": <return value>, "stdout": "..."}
       {"ok": False, "error": "...", "stdout": "..."}
     """
+    pinned_cpu = None
+    if cpu_id is not None:
+        if not (hasattr(os, "sched_getaffinity")
+                and hasattr(os, "sched_setaffinity")):
+            raise RuntimeError(
+                "isolated evaluation requires Linux CPU affinity support")
+        pinned_cpu = int(cpu_id)
+        allowed_cpus = set(os.sched_getaffinity(0))
+        if pinned_cpu not in allowed_cpus:
+            raise ValueError(
+                f"CPU {pinned_cpu} is outside this process's allowed CPU set")
+
     # Write code to a temp file
     with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
         program_path = f.name
@@ -114,10 +136,15 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1):
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["HIP_VISIBLE_DEVICES"] = ""
     env["ROCR_VISIBLE_DEVICES"] = ""
-    t = str(max(1, int(max_cpus)))
+    env.pop("TTT_EVAL_CPU_ID", None)
+    # A pinned candidate receives one BLAS thread as well as one-CPU affinity.
+    # The ordinary path retains its configured per-candidate thread count.
+    t = "1" if pinned_cpu is not None else str(max(1, int(max_cpus)))
     for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
         env[key] = t
+    if pinned_cpu is not None:
+        env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
 
     proc = subprocess.Popen(
         [sys.executable, runner_path],

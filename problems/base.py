@@ -136,7 +136,8 @@ class Problem(ABC):
 
     # ---- default reward path (subprocess sandbox) --------------------
     def compute_reward(self, response_text: str, parent: ParentContext,
-                       timeout_s: float) -> RewardResult:
+                       timeout_s: float, *, cpu_id: Optional[int] = None
+                       ) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
         code = extract_python_code(response_text)
         if code is None:
@@ -151,7 +152,8 @@ class Problem(ABC):
             full_code,
             entrypoint=self.entrypoint,
             timeout_s=timeout_s,
-            max_cpus=self.eval_cpus,
+            max_cpus=(1 if cpu_id is not None else self.eval_cpus),
+            cpu_id=cpu_id,
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]

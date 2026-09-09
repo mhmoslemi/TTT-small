@@ -36,6 +36,11 @@ memory_version="${MEMORY_VERSION:-V2}"
 #   sh run.sh --fast
 # Set asymmetric rank clipping as distances below/above 1, for example:
 #   sh run.sh --fast --rank-clip-epsilon-low 0.1 --rank-clip-epsilon-high 0.3
+# Isolate every candidate on one CPU. In this mode reward_workers from the
+# selected YAML is the number of concurrent candidate processes per CPU:
+#   sh run.sh --isolate-eval
+# It can be combined with the fast trainer:
+#   sh run.sh --fast --isolate-eval
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 case "${1:-}" in

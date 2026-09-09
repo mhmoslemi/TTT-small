@@ -67,7 +67,7 @@ feedback_max_per_signature feedback_auto_signature_fraction
 """.split()) | RERANKER_REQUIRED_KEYS
 
 COMMON_OPTIONAL_KEYS = frozenset({
-    "advantage_mode", "cvar_alpha", "cvar_lambda", "fast",
+    "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
 })
 
 CPU_PROBLEMS = frozenset({

@@ -278,6 +278,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "by sequence cost and every GPU independently learns a padded-"
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
+    p.add_argument(
+        "--isolate-eval", action="store_const", const=True, default=None,
+        help="Run every CPU candidate in its own one-CPU-affined sandbox. "
+             "In this mode reward_workers is concurrent processes per CPU, "
+             "and excess candidates wait in the executor queue. Without this "
+             "flag the existing evaluation path is unchanged.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
@@ -388,11 +394,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Max construction length stored per rollout meta. "
                         "0 disables saving it.")
     p.add_argument("--reward-workers", type=int, default=None,
-                   help="Threads for reward evaluation. 0 = auto. Use 1 for any "
-                        "problem whose reward is a measured runtime.")
+                   help="Normally, total reward-launcher threads (0 = auto). "
+                        "With --isolate-eval, concurrent sandbox processes per "
+                        "CPU (must be >= 1). Use 1 for any problem whose reward "
+                        "is a measured runtime.")
     p.add_argument("--eval-cpus", type=int, default=None,
                    help="CPU threads available to each candidate evaluation. "
-                        "Auto reward-worker counts account for this value.")
+                        "Auto reward-worker counts account for this value; "
+                        "--isolate-eval overrides it to one CPU per candidate.")
     p.add_argument("--training-gpu-id", type=int, default=None,
                    help="Assert the training id derived from AVAILABLE_GPUS.")
     p.add_argument("--available-gpu-ids", type=str, default=None,
@@ -761,9 +770,10 @@ def load_config():
             merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
         if args.rank_clip_epsilon_high is None:
             merged["rank_clip_epsilon_high"] = args.rank_clip_epsilon
-    # Fast is deliberately launch-scoped. A saved/YAML value must not silently
-    # change the default trainer; only this invocation's --fast selects it.
+    # These modes are deliberately launch-scoped. Saved/YAML values must not
+    # silently change a later invocation's trainer or evaluator.
     merged["fast"] = bool(args.fast)
+    merged["isolate_eval"] = bool(args.isolate_eval)
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -855,6 +865,17 @@ def load_config():
     available_gpu_ids = parse_gpu_ids(
         inventory_value, field=inventory_source)
     roles = allocate_gpu_roles(available_gpu_ids, merged["problem"])
+    if merged["isolate_eval"]:
+        if roles.gpu_problem:
+            raise ValueError(
+                "--isolate-eval is for CPU sandbox problems; gpu_mode uses "
+                "its dedicated serialized GPU benchmark evaluator")
+        if int(merged.get("reward_workers", 0) or 0) < 1:
+            raise ValueError(
+                "--isolate-eval requires reward_workers >= 1; in this mode "
+                "reward_workers is the concurrent process count per CPU")
+        # Fail before model loading when the host cannot enforce affinity.
+        _isolated_evaluation_cpu_ids()
     training_gpu_id = roles.training
     gpu_ids = roles.generation
     # Training and rollout phases alternate residency, so every rollout card
@@ -3843,7 +3864,20 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
 # `reward_workers` is configured in YAML (0 = auto). Auto
 # leaves ~one CPU core per GPU worker for the generation loop and divides the
 # remainder by the CPU allocation of each candidate evaluation.
+# In --isolate-eval mode it instead means processes per CPU and must be >= 1.
 # ======================================================================
+def _isolated_evaluation_cpu_ids():
+    """Return the exact Linux cpuset available to this training process."""
+    if not (hasattr(os, "sched_getaffinity")
+            and hasattr(os, "sched_setaffinity")):
+        raise RuntimeError(
+            "--isolate-eval requires Linux CPU affinity support")
+    cpu_ids = sorted(int(cpu_id) for cpu_id in os.sched_getaffinity(0))
+    if not cpu_ids:
+        raise RuntimeError("--isolate-eval found no CPUs in the allowed cpuset")
+    return cpu_ids
+
+
 def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
     requested = int(getattr(cfg, "reward_workers", 0) or 0)
     if requested < 0:
@@ -3865,6 +3899,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from queue import Queue
 
     from sampler import State
     from experiment_io import save_parent_selections, save_rollout
@@ -4060,9 +4095,32 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
-    n_reward_workers = _resolve_reward_workers(cfg, problem)
-    print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
-          f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
+    isolated_eval = bool(getattr(cfg, "isolate_eval", False))
+    isolated_cpu_slots = None
+    isolated_cpu_count = 0
+    isolated_processes_per_cpu = 0
+    if isolated_eval:
+        isolated_cpu_ids = _isolated_evaluation_cpu_ids()
+        isolated_cpu_count = len(isolated_cpu_ids)
+        isolated_processes_per_cpu = int(cfg.reward_workers)
+        isolated_cpu_slots = Queue()
+        # Layered admission is intentional: put one candidate on every CPU
+        # before allowing a second on each CPU, and so on.
+        for _layer in range(isolated_processes_per_cpu):
+            for cpu_id in isolated_cpu_ids:
+                isolated_cpu_slots.put(cpu_id)
+        isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
+        n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
+        print(f"[step {step_idx}] isolated evaluation pool: "
+              f"{n_reward_workers} sandbox process(es) across "
+              f"{isolated_cpu_count} CPU(s), up to "
+              f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
+              "process tree is pinned to one CPU and excess candidates remain "
+              "queued")
+    else:
+        n_reward_workers = _resolve_reward_workers(cfg, problem)
+        print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
+              f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
     # Mutable records preserve streamed arrival order while vLLM reference
@@ -4074,14 +4132,27 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
 
+    def _run_isolated_reward(response_text, parent_ctx):
+        cpu_id = isolated_cpu_slots.get()
+        try:
+            return problem.compute_reward(
+                response_text, parent_ctx, cfg.sandbox_timeout_s,
+                cpu_id=cpu_id)
+        finally:
+            isolated_cpu_slots.put(cpu_id)
+
     def _submit_rollout(record):
         job = prompt_jobs[record["job_idx"]]
         g = job["parent_group"]
         group_responses[g].append(record)
-        fut = reward_pool.submit(
-            problem.compute_reward, record["text"], parent_ctxs[g],
-            cfg.sandbox_timeout_s
-        )
+        if isolated_eval:
+            fut = reward_pool.submit(
+                _run_isolated_reward, record["text"], parent_ctxs[g])
+        else:
+            fut = reward_pool.submit(
+                problem.compute_reward, record["text"], parent_ctxs[g],
+                cfg.sandbox_timeout_s
+            )
         reward_futures[g].append(fut)
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
@@ -4675,6 +4746,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "feedback_signature_cap": int(feedback_signature_cap),
         "memory_arm_rollouts": mem_arm_rollouts,
         "memory_arm_updates": mem_arm_updates,
+        "evaluation_isolated": isolated_eval,
+        "evaluation_workers": int(n_reward_workers),
+        "evaluation_cpu_count": int(isolated_cpu_count),
+        "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
     }
     if memory_v2:
         step_stats["memory_version"] = "V2"
@@ -4946,7 +5021,14 @@ def main():
     # Build the problem from the merged config (the registry reads problem-only
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
     from problems.registry import get_problem
-    problem = get_problem(cfg.problem, merged)
+    problem_config = merged
+    if cfg.isolate_eval:
+        # Prompts must describe the sandbox's real allocation. Keep the saved
+        # YAML value intact for ordinary launches, but tell this problem
+        # instance that every candidate owns exactly one CPU.
+        problem_config = dict(merged)
+        problem_config["eval_cpus"] = 1
+    problem = get_problem(cfg.problem, problem_config)
 
     print("=" * 70)
     print("TTT-Discover — local multi-problem implementation")
@@ -4970,6 +5052,10 @@ def main():
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
+    evaluation_mode = (
+        f"isolated, {cfg.reward_workers} processes/CPU (--isolate-eval)"
+        if cfg.isolate_eval else "default")
+    print(f"CPU evaluation:    {evaluation_mode}")
     if cfg.generation_backend == "vllm":
         print(f"vLLM parallelism:   TP={cfg.vllm_tensor_parallel_size or 'auto'} "
               f"PP={cfg.vllm_pipeline_parallel_size}")
