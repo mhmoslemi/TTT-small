@@ -463,13 +463,11 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             kwargs["enable_chunked_prefill"] = True
     if seed is not None:
         kwargs["seed"] = int(seed)
-    # `load_in_4bit` belongs to the differentiable training copy. Deliberately
-    # do not translate it to vLLM BitsAndBytes: a QLoRA trainer adapter is valid
-    # on a BF16/FP8/MXFP4 inference base, and coupling the two modes was a common
-    # source of vLLM startup crashes. Pre-quantized checkpoints are auto-detected.
-    # Users who really want an explicit vLLM mode set vllm_quantization in YAML.
-    del load_in_4bit
+    # Keep vLLM quantization in sync with the training model by default. An
+    # explicit vllm_quantization value still overrides this automatic choice.
     quantization = str(quantization or "").strip()
+    if not quantization and load_in_4bit:
+        quantization = "bitsandbytes"
     if quantization and quantization.lower() not in ("auto", "none"):
         kwargs["quantization"] = quantization
     return kwargs
