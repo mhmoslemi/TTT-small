@@ -7,7 +7,7 @@ Rank-selection mode (the proposed local surrogate):
     python train_multy_CVaR.py --problem erdos --advantage-mode rank --no-feedback
 
 It uses exact reward midranks, KL-budgeted selection weights, A_i = G*q_i - 1,
-trajectory-level clipped ratios, a separate sampled reference KL, and sampled
+token-level clipped ratios, a separate sampled reference KL, and sampled
 trajectory entropy on completely tied groups. Advantages and old/reference
 log-probabilities are frozen across --rank-update-epochs (default 1). No reward
 standardization, EVT fitting, or quantile cutoff is used in this mode.
@@ -264,6 +264,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--backend", choices=["auto", "unsloth", "hf", "vllm"], default=None,
         help="Training backend. 'vllm' is shorthand for HF+PEFT training plus "
              "vLLM rollout generation (vLLM itself does not backpropagate).")
+    p.add_argument(
+        "--fast", action="store_const", const=True, default=None,
+        help="Use the opt-in adaptive rank trainer: all training GPUs pull "
+             "length-bucketed work from one shared queue and independently "
+             "learn a padded-token budget targeting 90%% GPU memory use. "
+             "Without this flag the existing trainer is unchanged.")
     p.add_argument("--generation-backend", choices=["hf", "vllm"], default=None,
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
@@ -731,6 +737,7 @@ def load_config():
             continue
         key = _CLI_TO_CFG.get(arg_name, arg_name)
         merged[key] = value
+    merged["fast"] = bool(merged.get("fast", False))
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -902,6 +909,18 @@ def load_config():
     if training_budgets:
         print(f"[memory] training weight budgets by logical GPU: "
               f"{training_budgets} GiB")
+
+    if merged["fast"]:
+        if merged["advantage_mode"] != "rank":
+            raise ValueError("--fast currently requires --advantage-mode rank")
+        if int(merged["rank_update_epochs"]) != 1:
+            raise ValueError("--fast requires rank_update_epochs=1")
+        if not (int(merged["num_training_gpus"]) > 1
+                and merged["backend"] == "hf"
+                and merged["generation_backend"] == "vllm"):
+            raise ValueError(
+                "--fast requires replicated HF LoRA training with vLLM "
+                "generation on at least two training GPUs")
 
     # Consume every rollout GPU. Prefer compatible TP replicas for throughput.
     # If a complete model plus one full-context request would not fit per
@@ -1643,8 +1662,7 @@ def _initialize_rank_logprob_caches(examples):
 
         reference = example.get("reference_logprobs")
         if _valid_example_token_logprobs(example, "reference_logprobs"):
-            example["rank_reference_logprob"] = float(
-                reference.detach().double().sum().item())
+            example["rank_reference_logprob"] = reference.detach()
         else:
             example["rank_reference_logprob"] = None
             missing_reference.append(example)
@@ -1654,14 +1672,14 @@ def _initialize_rank_logprob_caches(examples):
 
 def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
                    advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
-                   kl_coef=0.0, entropy_coef=0.0, token_entropies=None):
+                   kl_coef=0.0, entropy_coef=0.0, token_entropies=None,
+                   return_tensor_metrics=False):
     """One trajectory's loss; callers average equally within each parent.
 
-    rho = exp(sum(current_lp - old_lp)) is differentiable; old_lp and the
-    scalar group advantage are frozen. The reference-KL estimator is
-        rho * (log pi_theta(y) - log pi_ref(y)) - (rho - 1).
-    The zero-mean control variate (rho - 1) removes an unnecessary +1 score
-    term. This sample estimate may be negative even though true KL is >= 0.
+    Per-token rho = exp(current_lp - old_lp) is differentiable; old_lp and the
+    scalar group advantage are frozen. The sampled per-token reference-KL
+    estimator is exp(log pi_ref - log pi_theta)
+                 - (log pi_ref - log pi_theta) - 1.
 
     If enabled, trajectory entropy is estimated by the chain rule:
         H_hat = sum_l rho_prefix(l) * H(pi_theta(. | x, y_<l)).
@@ -1692,18 +1710,28 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         raise ValueError("rank policy logprobs must be finite")
 
     log_ratios = cur - old
-    ratio = log_ratios.sum().exp()
-    clipped_ratio = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon)
-    policy_loss = -torch.minimum(ratio * adv, clipped_ratio * adv)
+    token_ratios = log_ratios.exp()
+    clipped_token_ratios = token_ratios.clamp(
+        1.0 - clip_epsilon, 1.0 + clip_epsilon)
+    policy_loss = -torch.minimum(
+        token_ratios * adv, clipped_token_ratios * adv).mean()
+    ratio = token_ratios.mean()
+    clipped_fraction = (
+        token_ratios.detach() != clipped_token_ratios.detach()
+    ).double().mean()
     kl_estimate = cur.new_zeros(())
     if kl_coef:
         if reference_logprob is None:
-            raise ValueError("reference logprob is required for nonzero KL coefficient")
+            raise ValueError("reference logprobs are required for nonzero KL coefficient")
         ref = torch.as_tensor(reference_logprob, dtype=cur.dtype,
                               device=cur.device).detach()
-        if ref.numel() != 1 or not torch.isfinite(ref).all():
-            raise ValueError("reference logprob must be a finite scalar")
-        kl_estimate = ratio * (cur.sum() - ref) - (ratio - 1.0)
+        if ref.shape != cur.shape or not torch.isfinite(ref).all():
+            raise ValueError(
+                "reference logprobs must be a finite vector matching current logprobs")
+        log_ref_over_current = ref - cur
+        kl_estimate = (
+            log_ref_over_current.exp() - log_ref_over_current - 1.0
+        ).mean()
 
     entropy_estimate = cur.new_zeros(())
     prefix_ratio_max = cur.new_ones(())
@@ -1720,13 +1748,18 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         raise FloatingPointError(
             "nonfinite rank objective/trajectory ratio; reduce learning rate or "
             "rank_update_epochs and inspect model logprobs")
+    tensor_metrics = {
+        "policy_loss": policy_loss.detach(),
+        "kl_estimate": kl_estimate.detach(),
+        "entropy_estimate": entropy_estimate.detach(),
+        "ratio": ratio.detach(),
+        "prefix_ratio_max": prefix_ratio_max.detach(),
+        "clipped": clipped_fraction.detach(),
+    }
+    if return_tensor_metrics:
+        return loss, tensor_metrics
     return loss, {
-        "policy_loss": float(policy_loss.detach().item()),
-        "kl_estimate": float(kl_estimate.detach().item()),
-        "entropy_estimate": float(entropy_estimate.detach().item()),
-        "ratio": float(ratio.detach().item()),
-        "prefix_ratio_max": float(prefix_ratio_max.detach().item()),
-        "clipped": bool((ratio.detach() != clipped_ratio.detach()).item()),
+        key: float(value.item()) for key, value in tensor_metrics.items()
     }
 
 
@@ -1817,8 +1850,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                         raise FloatingPointError(
                             "nonfinite reference-policy logprobs")
                     for ex, ref_lp in zip(batch, reference_logprobs):
-                        ex["rank_reference_logprob"] = float(
-                            ref_lp.double().sum().item())
+                        ex["rank_reference_logprob"] = ref_lp.detach()
         if fb_on:
             for ex in examples:
                 if not ex.get("reprompt_text"):
@@ -2180,8 +2212,494 @@ class ReplicatedDataParallelTrainer:
             model.zero_grad(set_to_none=True)
         return value
 
+    @staticmethod
+    def _padded_token_count(batch):
+        if not batch:
+            return 0
+        return max(
+            int(example["prompt_ids"].shape[1]
+                + example["response_ids"].shape[1])
+            for example in batch
+        ) * len(batch)
+
+    def _train_rank_fast(self, examples, cfg, step_idx, *, fb_cfg=None,
+                         fb_on=False, fb_lambda=0.0):
+        """Adaptive, work-stealing rank update selected only by --fast.
+
+        Each replica repeatedly claims a length-bucketed batch from one shared
+        CPU queue. Its padded-token budget is learned from real peak allocator
+        use on that GPU and persists across steps. The controller aims below
+        90% total device occupancy, while the normal OOM splitter remains the
+        final guard for nonlinear attention/output-head memory spikes.
+        """
+        import threading
+        import torch
+        from feedback import (FeedbackStats, bound_feedback_advantage,
+                              feedback_advantage)
+
+        started = time.time()
+        if self._offloaded:
+            print(f"[train-fast] restoring {self.world_size} trainer "
+                  "replicas for the update", flush=True)
+            self.restore_after_generation()
+
+        epochs = int(getattr(cfg, "rank_update_epochs",
+                             RANK_UPDATE_EPOCHS_DEFAULT))
+        if epochs != 1:
+            raise ValueError("--fast requires rank_update_epochs=1")
+        epsilon = float(getattr(cfg, "rank_clip_epsilon",
+                                RANK_CLIP_EPSILON_DEFAULT))
+        entropy_coef = float(getattr(cfg, "rank_entropy_coef",
+                                     RANK_ENTROPY_COEF_DEFAULT))
+        kl_coef = float(cfg.kl_penalty_coef)
+
+        cpu_examples = self._cpu_examples(examples)
+        supplied_old = sum(
+            _valid_example_token_logprobs(example, "behavior_logprobs")
+            for example in cpu_examples)
+        supplied_reference = sum(
+            _valid_example_token_logprobs(example, "reference_logprobs")
+            for example in cpu_examples) if kl_coef else len(cpu_examples)
+        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+              f"{supplied_old}/{len(cpu_examples)}, reference="
+              f"{supplied_reference}/{len(cpu_examples)}; HF fallback runs only "
+              "for missing values", flush=True)
+
+        partitions = {False: [], True: []}
+        for example in cpu_examples:
+            gate = bool(example["rank_entropy_gate"] and entropy_coef > 0.0)
+            partitions[gate].append(example)
+        for partition in partitions.values():
+            partition.sort(
+                key=lambda example: int(
+                    example["prompt_ids"].shape[1]
+                    + example["response_ids"].shape[1]))
+
+        queue_lock = threading.Lock()
+        # A token budget is the real memory controller. This loose count guard
+        # only prevents pathological thousands-of-tiny-sequences batches.
+        max_examples_per_batch = min(64, max(1, len(cpu_examples)))
+
+        def take_batch(token_budget):
+            with queue_lock:
+                available = [key for key, value in partitions.items() if value]
+                if not available:
+                    return []
+                partition_key = max(
+                    available,
+                    key=lambda key: int(
+                        partitions[key][-1]["prompt_ids"].shape[1]
+                        + partitions[key][-1]["response_ids"].shape[1]))
+                pending = partitions[partition_key]
+                batch = [pending.pop()]
+                maximum = int(
+                    batch[0]["prompt_ids"].shape[1]
+                    + batch[0]["response_ids"].shape[1])
+                while pending and len(batch) < max_examples_per_batch:
+                    candidate = pending[-1]
+                    candidate_length = int(
+                        candidate["prompt_ids"].shape[1]
+                        + candidate["response_ids"].shape[1])
+                    next_maximum = max(maximum, candidate_length)
+                    if next_maximum * (len(batch) + 1) > token_budget:
+                        break
+                    batch.append(pending.pop())
+                    maximum = next_maximum
+                return batch
+
+        initial_budget = max(1, int(cfg.max_seq_length))
+        budgets = getattr(self, "_fast_token_budgets", None)
+        if not isinstance(budgets, list) or len(budgets) != self.world_size:
+            budgets = [initial_budget for _ in self.replicas]
+            self._fast_token_budgets = budgets
+        else:
+            for replica_index in range(self.world_size):
+                budgets[replica_index] = max(
+                    1, int(budgets[replica_index] or initial_budget))
+
+        print(f"[train-fast] shared adaptive queue on {self.world_size} GPUs; "
+              "memory target=90%; initial padded-token budgets/GPU="
+              f"{list(budgets)}", flush=True)
+        self._zero_gradients()
+
+        metric_keys = (
+            "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+            "ratio", "clipped_fraction",
+        )
+
+        def work(replica_index):
+            backend, model, tokenizer, logical_id = self.replicas[replica_index]
+            backend.set_training_mode()
+            parameters = [parameter for _, parameter in
+                          self._trainable_parameters(model)]
+            # Keep already-computed LoRA gradients outside model.grad so the
+            # existing OOM retry helper can safely clear a partial next batch.
+            gradient_accumulators = [None for _ in parameters]
+            totals = {key: 0.0 for key in metric_keys}
+            max_ratio = 0.0
+            max_prefix_ratio = 0.0
+            entropy_examples = 0
+            quarantined_examples = 0
+            scheduled_batches = 0
+            backward_batches = 0
+            trained_examples = 0
+            peak_memory_fraction = 0.0
+            feedback_parts = []
+            budget = max(1, int(budgets[replica_index]))
+
+            while True:
+                cpu_batch = take_batch(budget)
+                if not cpu_batch:
+                    break
+                scheduled_batches += 1
+                requested_padded_tokens = self._padded_token_count(cpu_batch)
+
+                with torch.cuda.device(logical_id):
+                    base_allocated = int(torch.cuda.memory_allocated())
+                    base_reserved = int(torch.cuda.memory_reserved())
+                    free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    external_bytes = max(
+                        0, int(total_bytes) - int(free_bytes) - base_reserved)
+                    torch.cuda.reset_peak_memory_stats()
+                    local_batch = self._move_shard(cpu_batch, logical_id)
+
+                    def attempt(active_batches):
+                        attempt_values = {key: [] for key in metric_keys}
+                        attempt_ratio_values = []
+                        attempt_prefix_ratio_values = []
+                        attempt_entropy_examples = 0
+                        attempt_feedback = FeedbackStats()
+
+                        with _rank_dropout_disabled(model):
+                            for batch in active_batches:
+                                missing_old, missing_reference = (
+                                    _initialize_rank_logprob_caches(batch))
+                                for fallback_batch in (
+                                        [example] for example in missing_old):
+                                    old_logprobs = (
+                                        compute_batched_token_logprobs(
+                                            model, fallback_batch,
+                                            with_grad=False,
+                                            chunk=cfg.logprob_chunk,
+                                            pad_token_id=(
+                                                tokenizer.pad_token_id)))
+                                    if any(not torch.isfinite(value).all()
+                                           for value in old_logprobs):
+                                        raise FloatingPointError(
+                                            "nonfinite old-policy logprobs")
+                                    for example, old_lp in zip(
+                                            fallback_batch, old_logprobs):
+                                        example["rank_old_logprobs"] = (
+                                            old_lp.detach())
+
+                                if kl_coef and missing_reference:
+                                    with backend.disable_adapter(), torch.no_grad():
+                                        for fallback_batch in (
+                                                [example] for example in
+                                                missing_reference):
+                                            reference_logprobs = (
+                                                compute_batched_token_logprobs(
+                                                    model, fallback_batch,
+                                                    with_grad=False,
+                                                    chunk=cfg.logprob_chunk,
+                                                    pad_token_id=(
+                                                        tokenizer.pad_token_id)))
+                                            if any(
+                                                    not torch.isfinite(value).all()
+                                                    for value in
+                                                    reference_logprobs):
+                                                raise FloatingPointError(
+                                                    "nonfinite reference-policy "
+                                                    "logprobs")
+                                            for example, reference_lp in zip(
+                                                    fallback_batch,
+                                                    reference_logprobs):
+                                                example[
+                                                    "rank_reference_logprob"
+                                                ] = reference_lp.detach()
+
+                                if fb_on:
+                                    for example in batch:
+                                        if not example.get("reprompt_text"):
+                                            continue
+                                        old_lp = example[
+                                            "rank_old_logprobs"].to(
+                                                example["response_ids"].device)
+                                        fb_advantage = feedback_advantage(
+                                            compute_token_logprobs, model,
+                                            tokenizer,
+                                            example["reprompt_text"],
+                                            example["response_ids"], old_lp,
+                                            fb_cfg, lam=fb_lambda,
+                                            chunk=cfg.logprob_chunk)
+                                        if fb_advantage is None:
+                                            attempt_feedback.skipped += 1
+                                        else:
+                                            fb_advantage, _ = (
+                                                bound_feedback_advantage(
+                                                    fb_advantage,
+                                                    reward_advantage=example[
+                                                        "advantage"],
+                                                    cfg=fb_cfg))
+                                            attempt_feedback.add(fb_advantage)
+                                            example[
+                                                "rank_feedback_advantage"
+                                            ] = fb_advantage.detach().cpu()
+
+                                gate = bool(
+                                    batch[0]["rank_entropy_gate"]
+                                    and entropy_coef > 0.0)
+                                result = compute_batched_token_logprobs(
+                                    model, batch, with_grad=True,
+                                    chunk=cfg.logprob_chunk,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                    return_entropy=gate)
+                                if gate:
+                                    current_logprobs, token_entropies = result
+                                else:
+                                    current_logprobs = result
+                                    token_entropies = [None] * len(batch)
+
+                                weighted_losses = []
+                                for example, current_lp, token_entropy in zip(
+                                        batch, current_logprobs,
+                                        token_entropies):
+                                    loss, metrics = rank_grpo_loss(
+                                        current_lp,
+                                        example["rank_old_logprobs"],
+                                        example["rank_reference_logprob"],
+                                        example["advantage"],
+                                        clip_epsilon=epsilon,
+                                        kl_coef=kl_coef,
+                                        entropy_coef=(entropy_coef
+                                                      if gate else 0.0),
+                                        token_entropies=token_entropy,
+                                        return_tensor_metrics=True)
+                                    fb_advantage = example[
+                                        "rank_feedback_advantage"]
+                                    if fb_advantage is not None:
+                                        loss = loss - (
+                                            fb_advantage.to(current_lp.device)
+                                            * current_lp).mean()
+                                    weight = float(example["sample_weight"])
+                                    if not torch.isfinite(loss).all():
+                                        raise FloatingPointError(
+                                            "nonfinite rank/feedback loss")
+                                    weighted_losses.append(weight * loss)
+                                    attempt_values["loss"].append(
+                                        weight * loss.detach())
+                                    for key in (
+                                            "policy_loss", "kl_estimate",
+                                            "entropy_estimate", "ratio"):
+                                        attempt_values[key].append(
+                                            weight * metrics[key])
+                                    attempt_values[
+                                        "clipped_fraction"].append(
+                                            weight * metrics["clipped"])
+                                    attempt_ratio_values.append(
+                                        metrics["ratio"])
+                                    attempt_prefix_ratio_values.append(
+                                        metrics["prefix_ratio_max"])
+                                    attempt_entropy_examples += int(gate)
+                                if weighted_losses:
+                                    sum(weighted_losses[1:],
+                                        weighted_losses[0]).backward()
+
+                        zero = torch.zeros(
+                            (), dtype=torch.float64,
+                            device=torch.device(f"cuda:{logical_id}"))
+                        reduced = [
+                            (torch.stack(attempt_values[key]).sum()
+                             if attempt_values[key] else zero)
+                            for key in metric_keys
+                        ]
+                        reduced.extend((
+                            (torch.stack(attempt_ratio_values).max()
+                             if attempt_ratio_values else zero),
+                            (torch.stack(attempt_prefix_ratio_values).max()
+                             if attempt_prefix_ratio_values else zero),
+                        ))
+                        packed = torch.stack([
+                            value.to(dtype=torch.float64)
+                            for value in reduced
+                        ]).detach().cpu().tolist()
+                        attempt_totals = dict(zip(
+                            metric_keys, packed[:len(metric_keys)]))
+                        attempt_max_ratio = packed[len(metric_keys)]
+                        attempt_max_prefix_ratio = packed[
+                            len(metric_keys) + 1]
+                        return (
+                            attempt_totals, attempt_max_ratio,
+                            attempt_max_prefix_ratio,
+                            attempt_entropy_examples, attempt_feedback,
+                        )
+
+                    result, effective_batches, quarantined = (
+                        _run_oom_resilient_backward(
+                            model, [local_batch], attempt,
+                            device_label=f"cuda:{logical_id}"))
+
+                    peak_allocated = int(
+                        torch.cuda.max_memory_allocated())
+                    peak_reserved = int(torch.cuda.max_memory_reserved())
+                    used_at_peak = min(
+                        int(total_bytes), external_bytes + peak_reserved)
+                    peak_memory_fraction = max(
+                        peak_memory_fraction,
+                        used_at_peak / max(1, int(total_bytes)))
+
+                    if result is not None:
+                        with torch.no_grad():
+                            for parameter_index, parameter in enumerate(
+                                    parameters):
+                                gradient = parameter.grad
+                                if gradient is None:
+                                    continue
+                                accumulator = gradient_accumulators[
+                                    parameter_index]
+                                if accumulator is None:
+                                    gradient_accumulators[
+                                        parameter_index] = gradient.detach()
+                                else:
+                                    accumulator.add_(gradient)
+                                parameter.grad = None
+                        for key in metric_keys:
+                            totals[key] += result[0][key]
+                        max_ratio = max(max_ratio, result[1])
+                        max_prefix_ratio = max(
+                            max_prefix_ratio, result[2])
+                        entropy_examples += result[3]
+                        feedback_parts.append(result[4])
+
+                    model.zero_grad(set_to_none=True)
+                    quarantined_examples += len(quarantined)
+                    backward_batches += len(effective_batches)
+                    trained_examples += sum(
+                        len(batch) for batch in effective_batches)
+
+                    successful_padded_tokens = max(
+                        (self._padded_token_count(batch)
+                         for batch in effective_batches),
+                        default=0)
+                    longest_successful = max(
+                        (int(example["prompt_ids"].shape[1]
+                             + example["response_ids"].shape[1])
+                         for batch in effective_batches
+                         for example in batch),
+                        default=1)
+                    backed_off = bool(
+                        len(effective_batches) > 1 or quarantined)
+                    if not effective_batches:
+                        budget = max(1, budget // 2)
+                    elif backed_off:
+                        budget = max(
+                            longest_successful,
+                            min(budget, successful_padded_tokens))
+                    else:
+                        active_bytes = max(
+                            1, peak_allocated - base_allocated)
+                        target_process_bytes = max(
+                            base_allocated + 1,
+                            int(0.90 * int(total_bytes)) - external_bytes)
+                        available_for_batch = max(
+                            1, target_process_bytes - base_allocated)
+                        desired_budget = int(
+                            requested_padded_tokens
+                            * available_for_batch / active_bytes * 0.96)
+                        lower = max(
+                            longest_successful, int(budget * 0.70))
+                        upper = max(lower, int(budget * 1.35))
+                        desired_budget = min(
+                            upper, max(lower, desired_budget))
+                        budget = max(
+                            longest_successful,
+                            int(round(0.5 * budget
+                                      + 0.5 * desired_budget)))
+                    budgets[replica_index] = budget
+
+                del local_batch, effective_batches, quarantined
+
+            with torch.cuda.device(logical_id), torch.no_grad():
+                for parameter, accumulator in zip(
+                        parameters, gradient_accumulators):
+                    parameter.grad = accumulator
+                torch.cuda.synchronize(logical_id)
+
+            return {
+                "totals": totals,
+                "max_ratio": max_ratio,
+                "max_prefix_ratio": max_prefix_ratio,
+                "entropy_examples": entropy_examples,
+                "quarantined_examples": quarantined_examples,
+                "scheduled_batches": scheduled_batches,
+                "backward_batches": backward_batches,
+                "trained_examples": trained_examples,
+                "peak_memory_fraction": peak_memory_fraction,
+                "feedback_stats": self._merge_feedback_stats(feedback_parts),
+            }
+
+        results = self._run_replicas(work, range(self.world_size))
+        totals = {
+            key: sum(result["totals"][key] for result in results)
+            for key in metric_keys
+        }
+        max_ratio = max(result["max_ratio"] for result in results)
+        max_prefix_ratio = max(
+            result["max_prefix_ratio"] for result in results)
+        entropy_examples = sum(
+            result["entropy_examples"] for result in results)
+        quarantined_examples = sum(
+            result["quarantined_examples"] for result in results)
+        feedback_stats = self._merge_feedback_stats(
+            [result["feedback_stats"] for result in results])
+        grad_norm = self._clip_step_and_sync(cfg)
+        history = [{
+            "epoch": 1, **totals, "ratio_max": max_ratio,
+            "prefix_ratio_max": max_prefix_ratio,
+            "entropy_examples": entropy_examples,
+            "oom_quarantined_examples": quarantined_examples,
+            "grad_norm": grad_norm,
+        }]
+        trained_per_gpu = [
+            result["trained_examples"] for result in results]
+        batches_per_gpu = [
+            result["backward_batches"] for result in results]
+        peak_percentages = [
+            round(100.0 * result["peak_memory_fraction"], 1)
+            for result in results]
+        print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
+              f"backward batches/GPU={batches_per_gpu}; final padded-token "
+              f"budgets/GPU={list(budgets)}; peak memory/GPU="
+              f"{peak_percentages}%", flush=True)
+        print(f"[step {step_idx}] rank epoch 1/1: "
+              f"loss={totals['loss']:.6f} "
+              f"KL estimate={totals['kl_estimate']:.6f} "
+              f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+              f"clipped={totals['clipped_fraction']:.1%} "
+              f"entropy examples={entropy_examples} "
+              f"OOM-quarantined={quarantined_examples}", flush=True)
+        if fb_on:
+            print(feedback_stats.line(step_idx, fb_lambda))
+        return {
+            "rank_updates": history,
+            "rank_train_seconds": time.time() - started,
+            "training_parallel_gpus": self.world_size,
+            "training_fast": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(budgets),
+            "fast_peak_memory_fraction": [
+                result["peak_memory_fraction"] for result in results],
+            "oom_quarantined_examples": quarantined_examples,
+        }
+
     def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
                    fb_on=False, fb_lambda=0.0):
+        if bool(getattr(cfg, "fast", False)):
+            return self._train_rank_fast(
+                examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
+                fb_lambda=fb_lambda)
+
         import torch
         from feedback import (FeedbackStats, bound_feedback_advantage,
                               feedback_advantage)
@@ -2260,8 +2778,8 @@ class ReplicatedDataParallelTrainer:
                                     "nonfinite reference-policy logprobs")
                             for example, reference_lp in zip(
                                     batch, reference_logprobs):
-                                example["rank_reference_logprob"] = float(
-                                    reference_lp.double().sum().item())
+                                example["rank_reference_logprob"] = (
+                                    reference_lp.detach())
                 if fb_on:
                     for example in shard:
                         if example.get("reprompt_text"):
@@ -3928,6 +4446,8 @@ def main():
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
     print(f"Training layout:    "
           f"{'replicated data parallel' if use_replicated_training else 'model parallel/single GPU'}")
+    print(f"Training scheduler: "
+          f"{'adaptive shared queue (--fast)' if cfg.fast else 'default'}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
