@@ -752,9 +752,13 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     at_limit = len(tokens) == int(max_seq_length)
                     # Offline vLLM requires at least one generated token. For
                     # an exact-limit sequence, leave the observed final token
-                    # out of the prompt and request its full-vocabulary
-                    # logprobs as that one generated position. This scores all
-                    # 32k observed tokens without exceeding max_model_len.
+                    # out of the prompt and request that specific token's
+                    # unmodified base-model logprob at the generated position.
+                    # Requesting the token explicitly is exact and avoids the
+                    # full-vocabulary `logprobs=-1` payload, which vLLM rejects
+                    # when its configured max_logprobs is smaller than the
+                    # vocabulary. This scores all observed tokens without
+                    # exceeding max_model_len.
                     prompt_tokens = tokens[:-1] if at_limit else tokens
                     prompts.append({"prompt_token_ids": prompt_tokens})
                     kwargs = dict(
@@ -764,7 +768,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         detokenize=False,
                     )
                     if at_limit:
-                        kwargs["logprobs"] = -1
+                        kwargs["logprob_token_ids"] = [
+                            int(response_ids[-1])
+                        ]
                     score_params.append(SamplingParams(**kwargs))
                     exact_limit.append(at_limit)
                 outputs = llm.generate(
