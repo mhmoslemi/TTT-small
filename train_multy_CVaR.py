@@ -153,7 +153,8 @@ def _route_dependency_notices(log_path):
 ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank")
 CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
 CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
-RANK_GAMMA_DEFAULT = math.log(4)
+# RANK_GAMMA_DEFAULT = math.log(4) # cirlce pack
+RANK_GAMMA_DEFAULT = math.log(8) # erdos
 RANK_CLIP_EPSILON_DEFAULT = 0.2
 RANK_ENTROPY_COEF_DEFAULT = 0.001
 RANK_UPDATE_EPOCHS_DEFAULT = 1
