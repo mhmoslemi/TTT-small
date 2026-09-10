@@ -41,6 +41,9 @@ memory_version="${MEMORY_VERSION:-V2}"
 #   sh run.sh --isolate-eval
 # It can be combined with the fast trainer:
 #   sh run.sh --fast --isolate-eval
+# Skip adapter training completely while keeping rollout, evaluation, search,
+# memory, and result/checkpoint persistence:
+#   sh run.sh --no-train
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 case "${1:-}" in

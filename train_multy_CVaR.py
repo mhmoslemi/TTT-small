@@ -279,6 +279,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
     p.add_argument(
+        "--no-train", action="store_const", const=True, default=None,
+        help="Run rollout, evaluation, search/archive, and memory updates but "
+             "skip training-only logprob scoring, backward passes, and "
+             "optimizer updates entirely.")
+    p.add_argument(
         "--isolate-eval", action="store_const", const=True, default=None,
         help="Run every CPU candidate in its own one-CPU-affined sandbox. "
              "In this mode reward_workers is concurrent processes per CPU, "
@@ -773,6 +778,7 @@ def load_config():
     # These modes are deliberately launch-scoped. Saved/YAML values must not
     # silently change a later invocation's trainer or evaluator.
     merged["fast"] = bool(args.fast)
+    merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
@@ -958,7 +964,7 @@ def load_config():
         print(f"[memory] training weight budgets by logical GPU: "
               f"{training_budgets} GiB")
 
-    if merged["fast"]:
+    if merged["fast"] and not merged["no_train"]:
         if merged["advantage_mode"] != "rank":
             raise ValueError("--fast currently requires --advantage-mode rank")
         if int(merged["rank_update_epochs"]) != 1:
@@ -3957,10 +3963,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     save_ctor = (bool(getattr(problem, "saves_construction", False))
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
-    fb_base_lambda = fb_cfg.lambda_at(step_idx) if fb_cfg is not None else 0.0
+    training_enabled = not bool(getattr(cfg, "no_train", False))
+    fb_base_lambda = (
+        fb_cfg.lambda_at(step_idx)
+        if training_enabled and fb_cfg is not None else 0.0
+    )
     fb_candidate_on = bool(
-        fb_cfg is not None and fb_cfg.enabled and fb_base_lambda > 0.0)
-    if (fb_cfg is not None and fb_cfg.enabled and not fb_candidate_on):
+        training_enabled and fb_cfg is not None
+        and fb_cfg.enabled and fb_base_lambda > 0.0)
+    if (training_enabled and fb_cfg is not None
+            and fb_cfg.enabled and not fb_candidate_on):
         print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
     reprompt_by_key = {}    # (group, rollout) -> reprompt for a code failure
 
@@ -4176,7 +4188,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
         }
-        if cfg.generation_backend == "vllm" and token_ids:
+        if (training_enabled and cfg.generation_backend == "vllm"
+                and token_ids):
             vllm_logprob_records.append(record)
         if defer_gpu_evaluation:
             deferred_rollouts.append(record)
@@ -4206,7 +4219,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "step_idx": step_idx,
                 }
                 if cfg.generation_backend == "vllm":
-                    generation_options["return_logprobs"] = True
+                    generation_options["return_logprobs"] = training_enabled
                 for job_idx, job_results in gen_pool.iter_group_jobs(
                         **generation_options):
                     for result in job_results:
@@ -4593,6 +4606,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 zip(responses, advantages)):
             token_ids = record["token_ids"]
             job_idx = record["job_idx"]
+            if not training_enabled:
+                continue
             if len(token_ids) == 0:
                 continue
             if job_idx not in prompt_ids_by_job:
@@ -4635,15 +4650,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # intentionally separate from stepXX.summary.json, which is the completion
     # marker and therefore can only be written after the trained adapter and
     # resumable checkpoint have both been saved by the caller.
+    save_suffix = ("with training disabled"
+                   if not training_enabled else "before adapter training")
     print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
-          f"pairs before adapter training", flush=True)
+          f"pairs {save_suffix}", flush=True)
 
     valid_fraction = (step_valid_count / step_rollout_count
                       if step_rollout_count else 0.0)
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count
                            if step_rollout_count else 1.0)
-    fb_lambda = (fb_cfg.effective_lambda(step_idx, code_valid_fraction)
-                 if fb_cfg is not None and fb_cfg.enabled else 0.0)
+    fb_lambda = (
+        fb_cfg.effective_lambda(step_idx, code_valid_fraction)
+        if training_enabled and fb_cfg is not None and fb_cfg.enabled else 0.0
+    )
     fb_on = bool(fb_candidate_on and fb_lambda > 0.0)
     if fb_candidate_on:
         print(f"[step {step_idx}] feedback: code-validity="
@@ -4712,8 +4731,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   "records from the rank update", flush=True)
 
     rollout_time = time.time() - rollout_t0
+    training_label = (str(len(all_examples))
+                      if training_enabled else "disabled")
     print(f"[step {step_idx}] rollout+eval time: {rollout_time:.1f}s  "
-          f"training examples: {len(all_examples)}  new children: {len(all_children)}")
+          f"training examples: {training_label}  "
+          f"new children: {len(all_children)}")
 
     # Update archive
     sampler.update(all_children)
@@ -4771,6 +4793,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     if rank_mode:
         step_stats["rank_groups"] = rank_group_stats
+
+    if not training_enabled:
+        step_stats["training_disabled"] = True
+        step_stats["training_seconds"] = 0.0
+        print(f"[step {step_idx}] training disabled (--no-train); "
+              "skipping training-only logprobs, backward, and optimizer update",
+              flush=True)
+        return step_stats
 
     if not all_examples:
         print(f"[step {step_idx}] no training signal (all groups had constant reward)")
@@ -5024,7 +5054,8 @@ def main():
     # runs concurrently. vLLM phase sharing gives these replicas exclusive use
     # of the cards during training and requires them to offload for generation.
     use_replicated_training = bool(
-        int(cfg.num_training_gpus) > 1
+        not cfg.no_train
+        and int(cfg.num_training_gpus) > 1
         and cfg.backend == "hf"
         and cfg.generation_backend == "vllm"
     )
@@ -5058,10 +5089,18 @@ def main():
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
-    print(f"Training layout:    "
-          f"{'process-distributed LoRA' if cfg.fast else ('replicated data parallel' if use_replicated_training else 'model parallel/single GPU')}")
-    print(f"Training scheduler: "
-          f"{'adaptive process-per-GPU (--fast)' if cfg.fast else 'default'}")
+    training_layout = (
+        "disabled (--no-train)" if cfg.no_train
+        else ("process-distributed LoRA" if cfg.fast
+              else ("replicated data parallel" if use_replicated_training
+                    else "model parallel/single GPU"))
+    )
+    training_scheduler = (
+        "disabled (--no-train)" if cfg.no_train
+        else ("adaptive process-per-GPU (--fast)" if cfg.fast else "default")
+    )
+    print(f"Training layout:    {training_layout}")
+    print(f"Training scheduler: {training_scheduler}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
     print(f"Evaluation GPU:     "
           f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
@@ -5098,8 +5137,11 @@ def main():
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
     print(f"Memory:             {'on' if mem_cfg.enabled else 'off'}")
-    print(f"Feedback signal:    "
-          f"{'on' if bool(merged['feedback']) else 'off'}")
+    feedback_label = (
+        "disabled (--no-train)" if cfg.no_train
+        else ("on" if bool(merged["feedback"]) else "off")
+    )
+    print(f"Feedback signal:    {feedback_label}")
     print("=" * 70)
 
     # ---- experiment dir ----
@@ -5252,9 +5294,11 @@ def main():
                     return
                 if parallel_trainer is None and trainer_offloaded:
                     return
-                replica_label = (f"all {parallel_trainer.world_size} trainer "
-                                 "replicas" if parallel_trainer is not None
-                                 else "trainer")
+                replica_label = (
+                    "inactive training model" if cfg.no_train
+                    else (f"all {parallel_trainer.world_size} trainer replicas"
+                          if parallel_trainer is not None else "trainer")
+                )
                 print(f"[gpu] offloading {replica_label} to CPU before "
                       "shared-GPU vLLM generation", flush=True)
                 try:
@@ -5285,6 +5329,10 @@ def main():
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
+                if cfg.no_train:
+                    print("[gpu] keeping inactive training model offloaded "
+                          "(--no-train)", flush=True)
+                    return
                 if parallel_trainer is not None:
                     # Memory lookup, rollouts, extraction, and curation may each
                     # open a separate vLLM phase in one step. Keep replicas on
@@ -5390,7 +5438,7 @@ def main():
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
     print(f"[init] {fb_cfg.describe()}")
-    if fb_cfg.enabled and fb_cfg.anneal_steps > 0:
+    if not cfg.no_train and fb_cfg.enabled and fb_cfg.anneal_steps > 0:
         print(f"[init] lambda schedule: {fb_cfg.schedule_preview()}")
 
     # ---- Elo re-ranker (retired and explicitly disabled) ----
