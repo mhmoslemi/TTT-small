@@ -3,6 +3,7 @@
 Names accepted:
   circle_packing | circle          -> CirclePacking
   erdos | erdos_min_overlap        -> ErdosMinOverlap
+  erdos-c4 | c4 | uncertainty-ineq -> ErdosC4Uncertainty
   ac1 | ac2 | ac_inequalities      -> ACInequalities      (problem_type in cfg)
   denoising | single_cell          -> Denoising
   gpu_mode | kernel | trimul        -> GpuMode             (problem_type in cfg)
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 def available_problems():
     return [
-        "circle_packing", "erdos", "ac1", "ac2",
+        "circle_packing", "erdos", "erdos-c4", "ac1", "ac2",
         "denoising", "gpu_mode", "ahc",
     ]
 
@@ -31,6 +32,13 @@ def get_problem(name: str, cfg: dict):
     if key in ("erdos", "erdos_min_overlap", "erdos_minimum_overlap"):
         from problems.erdos import ErdosMinOverlap
         return ErdosMinOverlap(cfg)
+
+    if key in (
+        "erdos-c4", "erdos_c4", "c4", "uncertainty-ineq",
+        "uncertainty_ineq", "uncertainty",
+    ):
+        from problems.erdos_c4 import ErdosC4Uncertainty
+        return ErdosC4Uncertainty(cfg)
 
     if key in ("ac1", "ac2", "ac_inequalities", "autocorrelation", "autocorrelation_inequalities"):
         from problems.ac_inequalities import ACInequalities

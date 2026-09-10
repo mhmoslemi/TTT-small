@@ -250,7 +250,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Problem name. Loads configs/<problem>.yaml unless --config "
                         "is given. Defaults to erdos. "
                         "One of: circle_packing, "
-                        "erdos, ac1, ac2, denoising, gpu_mode.")
+                        "erdos, erdos-c4, ac1, ac2, denoising, gpu_mode.")
     p.add_argument("--config", default=None,
                    help="Explicit path to a YAML config (overrides the --problem lookup).")
     p.add_argument("--resume", "--resume-from", dest="resume", default=None,

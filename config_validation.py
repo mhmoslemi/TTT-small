@@ -71,7 +71,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
 })
 
 CPU_PROBLEMS = frozenset({
-    "circle_packing", "erdos", "ac1", "ac2", "denoising",
+    "circle_packing", "erdos", "erdos-c4", "ac1", "ac2", "denoising",
 })
 
 PROBLEM_REQUIRED_KEYS = {
@@ -79,6 +79,9 @@ PROBLEM_REQUIRED_KEYS = {
         "num_circles", "degenerate_threshold", "eval_cpus",
     }),
     "erdos": frozenset({"budget_s", "eval_cpus"}),
+    "erdos-c4": frozenset({
+        "budget_s", "eval_cpus", "max_coeff_count", "benchmark_c4",
+    }),
     "ac1": frozenset({"problem_type", "budget_s", "eval_cpus"}),
     "ac2": frozenset({"problem_type", "budget_s", "eval_cpus"}),
     "denoising": frozenset({"eval_seed", "eval_cpus"}),
@@ -92,6 +95,7 @@ PROBLEM_REQUIRED_KEYS = {
 PROBLEM_OPTIONAL_KEYS = {
     "circle_packing": frozenset(),
     "erdos": frozenset(),
+    "erdos-c4": frozenset(),
     "ac1": frozenset(),
     "ac2": frozenset(),
     "denoising": frozenset(),
@@ -105,8 +109,10 @@ EXCLUSIVE_KEY_OWNERS = {
     "num_circles": frozenset({"circle_packing"}),
     "degenerate_threshold": frozenset({"circle_packing"}),
     "eval_seed": frozenset({"denoising"}),
-    "budget_s": frozenset({"erdos", "ac1", "ac2"}),
+    "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
     "eval_cpus": CPU_PROBLEMS,
+    "max_coeff_count": frozenset({"erdos-c4"}),
+    "benchmark_c4": frozenset({"erdos-c4"}),
     "problem_type": frozenset({"ac1", "ac2", "gpu_mode"}),
     "score_scale": frozenset({"gpu_mode"}),
     "gpu_type": frozenset({"gpu_mode"}),
@@ -202,8 +208,14 @@ def validate_problem_config(
         _positive_int(data, "eval_cpus", source)
     if "num_circles" in data:
         _positive_int(data, "num_circles", source)
+    if "max_coeff_count" in data:
+        _positive_int(data, "max_coeff_count", source)
+        if int(data["max_coeff_count"]) < 3:
+            raise ValueError(
+                f"{_label(source)}: max_coeff_count must be at least 3"
+            )
     for key in ("sandbox_timeout_s", "budget_s", "score_scale",
-                "kernel_timeout_s"):
+                "kernel_timeout_s", "benchmark_c4"):
         if key in data:
             _positive_number(data, key, source)
 
@@ -236,7 +248,7 @@ def validate_problem_config(
         raise ValueError(
             f"{_label(source)}: gpu_mode requires reward_workers=1"
         )
-    if problem in {"erdos", "ac1", "ac2"} and all(
+    if problem in {"erdos", "erdos-c4", "ac1", "ac2"} and all(
         key in data for key in ("budget_s", "sandbox_timeout_s")
     ) and float(data["sandbox_timeout_s"]) <= float(data["budget_s"]):
         raise ValueError(
