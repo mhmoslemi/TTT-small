@@ -1482,7 +1482,7 @@ class PhasedVLLMGenerationPool:
                     # 8B replicas need ~46 GiB and can kill engine cores under a
                     # scheduler memory limit. Level 2 discards base weights and
                     # reloads them on wake instead.
-                    vllm_sleep_level=2,
+                    vllm_sleep_level=1,
                 )
                 self.num_workers = self._pool.num_workers
                 self._persistent = self._pool.sleep_supported
