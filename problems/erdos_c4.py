@@ -37,19 +37,6 @@ from problems.base import (
 
 _C4_X = sp.symbols("x")
 
-# Published free coefficients.  In both cases the verifier derives one more
-# coefficient (of H_12) to impose Q(0) = 0.
-_GONCALVES_FREE_COEFFICIENTS = (
-    -113.0 / 100.0,
-    1.0 / 25.0,
-    1.0 / 3240.0,
-)
-_ALPHAEVOLVE_FREE_COEFFICIENTS = (
-    0.3292519302257546,
-    -0.01158510802599293,
-    -8.921606035407065e-05,
-)
-
 
 def _coerce_c4_coefficients(coefficients: Any, max_coeff_count: int) -> np.ndarray:
     """Return a finite, nonzero, one-dimensional float coefficient vector."""
@@ -404,7 +391,7 @@ prose may follow the closing fence, and there must be no other code block.
 
         result.valid = True
         result.raw_score = c4_bound
-        result.reward = float(self.benchmark_c4 / c4_bound)
+        result.reward = float(1.0 / c4_bound)
         result.construction = coefficients.tolist()
         result.msg = (
             f"C4 upper bound: {c4_bound:.12g}; "
@@ -413,27 +400,10 @@ prose may follow the closing fence, and there must be no other code block.
         return result
 
     def seed_states(self) -> List[SeedState]:
-        published = (
-            _GONCALVES_FREE_COEFFICIENTS,
-            _ALPHAEVOLVE_FREE_COEFFICIENTS,
-        )
-        evaluated = []
-        for coefficients in published:
-            c4_bound, _ = compute_c4_bound(
-                coefficients,
-                self.max_coeff_count,
-            )
-            evaluated.append((list(coefficients), c4_bound))
-
-        seeds: List[SeedState] = []
-        for index in range(self.num_seed_states):
-            coefficients, c4_bound = evaluated[index % len(evaluated)]
-            seeds.append(
-                SeedState(
-                    code="",
-                    value=float(self.benchmark_c4 / c4_bound),
-                    raw_score=c4_bound,
-                    construction=list(coefficients),
-                )
-            )
-        return seeds
+        # Begin every search arm from a genuinely blank state.  The first
+        # generation receives neither a published program nor coefficients,
+        # so it must devise its own construction from the problem statement.
+        return [
+            SeedState(code="", value=0.0, raw_score=None, construction=None)
+            for _ in range(self.num_seed_states)
+        ]
