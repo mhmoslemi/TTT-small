@@ -192,6 +192,129 @@ def _move_examples(examples, logical_id):
     return moved
 
 
+def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
+                             logical_id, group_count, *, group_ids=None):
+    """Evaluate this rank's diagnostic groups and cross-fit through NCCL sums."""
+    import gc
+    import math
+    import torch
+    import torch.distributed as dist
+    import train_multy_CVaR as training
+
+    group_count = int(group_count)
+    if group_count < 3:
+        raise ValueError("X-GRPO calibration requires at least three groups")
+    backend.set_training_mode()
+    set_total_memory_ceiling(logical_id, 0.80)
+    local_examples = _move_examples(list(examples), logical_id)
+    expected_group_ids = (
+        sorted({int(group_id) for group_id in group_ids})
+        if group_ids is not None else
+        sorted({int(example["group_id"]) for example in local_examples})
+    )
+    local_groups = {group_id: [] for group_id in expected_group_ids}
+    for example in local_examples:
+        group_id = int(example["group_id"])
+        if group_id not in local_groups:
+            raise ValueError(
+                f"unexpected local X-GRPO diagnostic group {group_id}")
+        local_groups[group_id].append(example)
+
+    parameters = trainable_parameters(model)
+    flat_count = sum(parameter.numel() for parameter in parameters)
+    if flat_count < 1:
+        raise RuntimeError("X-GRPO found no trainable parameters")
+    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
+    selected = {group_id: 0.0 for group_id in local_groups}
+    diagnostics = {group_id: [] for group_id in local_groups}
+    quarantined_total = 0
+    heldout_count = group_count - 1
+    error_denominator = heldout_count * (heldout_count - 1)
+    relative_error = float(cfg.x_grpo_relative_error)
+    device = torch.device(f"cuda:{int(logical_id)}")
+
+    try:
+        for budget_index, budget in enumerate(budgets):
+            gradients = {}
+            for group_id in sorted(local_groups):
+                gradient, quarantined = training._x_grpo_flat_group_gradient(
+                    model, tokenizer, local_groups[group_id], cfg,
+                    budget_index, device_label=str(device))
+                gradients[group_id] = gradient
+                quarantined_total += quarantined
+
+            if gradients:
+                local_sum = next(iter(gradients.values())).clone()
+                for gradient in list(gradients.values())[1:]:
+                    local_sum.add_(gradient)
+                local_squared_norms = sum(
+                    float(torch.dot(gradient, gradient).item())
+                    for gradient in gradients.values())
+            else:
+                local_sum = torch.zeros(flat_count, dtype=torch.float32)
+                local_squared_norms = 0.0
+
+            with torch.cuda.device(int(logical_id)), torch.no_grad():
+                total = local_sum.to(device, non_blocking=True)
+                dist.all_reduce(total, op=dist.ReduceOp.SUM)
+                squared_norms = torch.tensor(
+                    local_squared_norms, dtype=torch.float64, device=device)
+                dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+                total_norm_squared = float(torch.dot(total, total).item())
+                all_squared_norms = float(squared_norms.item())
+                total_cpu = total.cpu()
+
+            for group_id, gradient in gradients.items():
+                gradient_norm_squared = float(
+                    torch.dot(gradient, gradient).item())
+                total_dot_gradient = float(torch.dot(total_cpu, gradient).item())
+                heldout_sum_norm_squared = max(
+                    0.0,
+                    total_norm_squared + gradient_norm_squared
+                    - 2.0 * total_dot_gradient,
+                )
+                heldout_squared_norms = max(
+                    0.0, all_squared_norms - gradient_norm_squared)
+                centered_sum = max(
+                    0.0,
+                    heldout_squared_norms
+                    - heldout_sum_norm_squared / heldout_count,
+                )
+                signal_squared = (
+                    heldout_sum_norm_squared / (heldout_count ** 2))
+                error_squared = centered_sum / error_denominator
+                accepted = bool(
+                    signal_squared > 0.0
+                    and error_squared
+                    <= relative_error ** 2 * signal_squared)
+                signal_norm = math.sqrt(signal_squared)
+                standard_error = math.sqrt(error_squared)
+                diagnostics[group_id].append({
+                    "budget": budget,
+                    "gradient_norm": signal_norm,
+                    "standard_error": standard_error,
+                    "relative_error": (
+                        standard_error / signal_norm
+                        if signal_norm > 0.0 else None),
+                    "accepted": accepted,
+                })
+                if accepted:
+                    selected[group_id] = max(selected[group_id], budget)
+
+            del gradients, local_sum, total, total_cpu, squared_norms
+            gc.collect()
+            with torch.cuda.device(int(logical_id)):
+                torch.cuda.empty_cache()
+    finally:
+        model.zero_grad(set_to_none=True)
+
+    return {
+        "selected_budgets": selected,
+        "groups": diagnostics,
+        "diagnostic_quarantined_examples": quarantined_total,
+    }
+
+
 def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                       token_budget, *, memory_fraction=0.80, fb_cfg=None,
                       fb_on=False, fb_lambda=0.0, work_queue=None):
@@ -211,8 +334,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         cfg, "rank_clip_epsilon", training.RANK_CLIP_EPSILON_DEFAULT))
     epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
     epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
-    entropy_coef = float(getattr(
-        cfg, "rank_entropy_coef", training.RANK_ENTROPY_COEF_DEFAULT))
+    entropy_coef = training._rank_entropy_coefficient(cfg)
     kl_coef = float(cfg.kl_penalty_coef)
     parameters = trainable_parameters(model)
     gradient_accumulators = [None for _ in parameters]
@@ -657,6 +779,18 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
+                })
+            elif kind == "calibrate_x_grpo":
+                if offloaded:
+                    raise RuntimeError(
+                        "fast worker received calibration while offloaded")
+                calibration = local_x_grpo_calibration(
+                    backend, model, tokenizer, command["examples"], cfg,
+                    int(rank), int(command["group_count"]),
+                    group_ids=command["group_ids"])
+                result_queue.put({
+                    "event": "calibrated", "rank": int(rank),
+                    "calibration": calibration,
                 })
             elif kind == "finish_update":
                 reduce_trainable_gradients(model, destination_rank=0)

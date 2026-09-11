@@ -93,5 +93,5 @@ esac
 
 # exec python3 train_multy.py --config "$config_path" "$@"
 # exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank
-exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank \
-    --fast --rank-clip-epsilon-low 0.2 --rank-clip-epsilon-high 0.35 --isolate-eval  # --no-train
+exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode rank \
+    --fast --rank-clip-epsilon-low 0.2 --rank-clip-epsilon-high 0.35 --isolate-eval "$@"  # --no-train

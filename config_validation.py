@@ -68,6 +68,8 @@ feedback_max_per_signature feedback_auto_signature_fraction
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
+    "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
+    "x_grpo_contexts_per_step",
 })
 
 CPU_PROBLEMS = frozenset({

@@ -145,6 +145,109 @@ def rank_adaptive_advantages(
     return advantages, eta, info
 
 
+def x_grpo_advantages(
+    rewards: np.ndarray,
+    budget: float,
+    n_bisect: int = 80,
+    *,
+    return_info: bool = False,
+):
+    """Minimum-norm X-GRPO advantages for one reward group and budget."""
+    r = np.asarray(rewards, dtype=np.float64)
+    if r.ndim != 1 or not np.all(np.isfinite(r)):
+        raise ValueError("X-GRPO rewards must be a finite one-dimensional array")
+    budget = float(budget)
+    if not math.isfinite(budget) or budget < 0.0:
+        raise ValueError("X-GRPO concentration budget must be finite and nonnegative")
+    if isinstance(n_bisect, (bool, np.bool_)) or not isinstance(
+            n_bisect, (int, np.integer)) or n_bisect < 1:
+        raise ValueError("n_bisect must be a positive integer")
+
+    group_size = int(r.size)
+    if group_size:
+        _, inverse, counts = np.unique(
+            r, return_inverse=True, return_counts=True)
+        below = np.cumsum(counts) - counts
+        scores = (below[inverse] + 0.5 * counts[inverse]) / group_size
+        top = inverse == len(counts) - 1
+        top_count = int(counts[-1])
+        all_tied = len(counts) == 1
+        maximum_budget = float(group_size / top_count - 1.0)
+    else:
+        scores = np.empty(0, dtype=np.float64)
+        top = np.empty(0, dtype=bool)
+        top_count = 0
+        all_tied = True
+        maximum_budget = 0.0
+
+    cutoff = None
+    saturated = False
+    if not group_size:
+        weights = np.empty(0, dtype=np.float64)
+    elif budget == 0.0 or all_tied:
+        weights = np.full(group_size, 1.0 / group_size, dtype=np.float64)
+    elif budget >= maximum_budget:
+        weights = top.astype(np.float64) / top_count
+        saturated = True
+    else:
+        distinct_scores = np.unique(scores)
+        upper = float(distinct_scores[-2])
+
+        def second_moment(tau):
+            positive = np.maximum(scores - tau, 0.0)
+            total = float(positive.sum())
+            if total <= 0.0:
+                return maximum_budget
+            value = (group_size * float(np.dot(positive, positive))
+                     / (total * total) - 1.0)
+            return max(0.0, value)
+
+        span = max(1.0, float(scores.max() - scores.min()))
+        lower = float(scores.min() - span)
+        for _ in range(1024):
+            if second_moment(lower) <= budget:
+                break
+            span *= 2.0
+            lower = float(scores.min() - span)
+        else:
+            raise RuntimeError("could not bracket the X-GRPO cutoff")
+
+        for _ in range(n_bisect):
+            middle = 0.5 * (lower + upper)
+            if second_moment(middle) <= budget:
+                lower = middle
+            else:
+                upper = middle
+        cutoff = 0.5 * (lower + upper)
+        positive = np.maximum(scores - cutoff, 0.0)
+        weights = positive / positive.sum()
+
+    advantages = group_size * weights - 1.0
+    if all_tied or budget == 0.0:
+        advantages = np.zeros_like(r)
+    if not return_info:
+        return advantages, cutoff
+
+    effective_budget = min(budget, maximum_budget)
+    info = {
+        "budget": budget,
+        "effective_budget": effective_budget,
+        "maximum_budget": maximum_budget,
+        "cutoff": cutoff,
+        "top_count": top_count,
+        "all_tied": all_tied,
+        "saturated": saturated,
+        "active_count": int(np.count_nonzero(weights)) if group_size else 0,
+        "ess": (float(1.0 / np.dot(weights, weights))
+                if group_size else 0.0),
+        "advantage_second_moment": (
+            float(np.mean(advantages * advantages)) if group_size else 0.0),
+        "ranks": scores,
+        "weights": weights,
+    }
+    return advantages, cutoff, info
+
+
 def _kl_to_uniform(beta: float, rewards: np.ndarray) -> float:
     """
     KL(q_\beta || uniform) where q_\beta(i) ->  exp(\beta * r_i).

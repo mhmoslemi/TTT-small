@@ -150,7 +150,8 @@ def _route_dependency_notices(log_path):
 # ======================================================================
 # CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
-ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank")
+ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank", "x-grpo")
+RANK_POLICY_MODES = frozenset(("rank", "x-grpo"))
 CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
 CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
 # RANK_GAMMA_DEFAULT = math.log(4) # cirlce pack
@@ -158,6 +159,14 @@ RANK_GAMMA_DEFAULT = math.log(8) # erdos
 RANK_CLIP_EPSILON_DEFAULT = 0.2
 RANK_ENTROPY_COEF_DEFAULT = 0.001
 RANK_UPDATE_EPOCHS_DEFAULT = 1
+X_GRPO_RELATIVE_ERROR_DEFAULT = 0.5
+X_GRPO_ENTROPY_COEF_DEFAULT = 0.001
+X_GRPO_CONTEXTS_PER_STEP_DEFAULT = 1
+X_GRPO_BASE_BUDGETS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+
+
+def _uses_rank_policy_loss(mode):
+    return str(mode or "entropic").lower() in RANK_POLICY_MODES
 
 
 def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
@@ -230,18 +239,81 @@ def _resolve_rank_options(merged):
             or epochs < 1):
         raise ValueError("rank_update_epochs must be a positive integer")
     merged["rank_update_epochs"] = int(epochs)
-    if merged.get("advantage_mode") == "rank":
+    if _uses_rank_policy_loss(merged.get("advantage_mode")):
         if int(merged["group_size"]) < 2:
-            raise ValueError("rank mode requires group_size >= 2")
+            raise ValueError("rank-style modes require group_size >= 2")
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
-            raise ValueError("rank mode requires a finite nonnegative kl_penalty_coef")
+            raise ValueError(
+                "rank-style modes require a finite nonnegative kl_penalty_coef")
         if (float(merged["temperature"]) != 1.0
                 or float(merged["top_p"]) != 1.0):
-            print("[config] rank mode sets temperature=1 and top_p=1 "
+            print("[config] rank-style mode sets temperature=1 and top_p=1 "
                   "to match the policy likelihood used by the loss")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
+
+
+def _resolve_x_grpo_options(merged):
+    if merged.get("advantage_mode") != "x-grpo":
+        return
+
+    group_size = int(merged["group_size"])
+    contexts = merged.get("x_grpo_contexts_per_step")
+    contexts = (X_GRPO_CONTEXTS_PER_STEP_DEFAULT
+                if contexts is None else contexts)
+    if (isinstance(contexts, bool)
+            or not isinstance(contexts, (int, np.integer))
+            or contexts < 1):
+        raise ValueError("x_grpo_contexts_per_step must be a positive integer")
+    merged["x_grpo_contexts_per_step"] = int(contexts)
+
+    raw_budgets = merged.get("x_grpo_budgets")
+    if raw_budgets is None:
+        maximum = float(group_size - 1)
+        budgets = [value for value in X_GRPO_BASE_BUDGETS
+                   if value <= maximum]
+        if not budgets or budgets[-1] != maximum:
+            budgets.append(maximum)
+    elif isinstance(raw_budgets, str):
+        pieces = [piece.strip() for piece in raw_budgets.split(",")]
+        if not pieces or any(not piece for piece in pieces):
+            raise ValueError(
+                "x_grpo_budgets must be a comma-separated list of numbers")
+        budgets = [float(piece) for piece in pieces]
+    elif isinstance(raw_budgets, (list, tuple)):
+        budgets = [float(value) for value in raw_budgets]
+    else:
+        raise ValueError("x_grpo_budgets must be a sequence or comma-separated string")
+
+    budgets = sorted(set(budgets))
+    if not budgets:
+        raise ValueError("x_grpo_budgets must not be empty")
+    maximum = float(group_size - 1)
+    if any(not math.isfinite(value) or value <= 0.0 or value > maximum
+           for value in budgets):
+        raise ValueError(
+            f"x_grpo_budgets must be finite and in (0, {maximum}]")
+    merged["x_grpo_budgets"] = tuple(budgets)
+
+    relative_error = merged.get("x_grpo_relative_error")
+    relative_error = (X_GRPO_RELATIVE_ERROR_DEFAULT
+                      if relative_error is None else float(relative_error))
+    if not math.isfinite(relative_error) or not 0.0 < relative_error < 1.0:
+        raise ValueError("x_grpo_relative_error must be finite and in (0, 1)")
+    merged["x_grpo_relative_error"] = relative_error
+
+    entropy_coef = merged.get("x_grpo_entropy_coef")
+    entropy_coef = (X_GRPO_ENTROPY_COEF_DEFAULT
+                    if entropy_coef is None else float(entropy_coef))
+    if not math.isfinite(entropy_coef) or entropy_coef < 0.0:
+        raise ValueError("x_grpo_entropy_coef must be finite and nonnegative")
+    if merged.get("advantage_mode") == "x-grpo":
+        if int(merged["groups_per_step"]) < 3:
+            raise ValueError("X-GRPO requires groups_per_step >= 3")
+        if entropy_coef <= 0.0:
+            raise ValueError("X-GRPO requires x_grpo_entropy_coef > 0")
+    merged["x_grpo_entropy_coef"] = entropy_coef
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -310,15 +382,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-steps", type=int, default=None,
                    help="Number of TTT-Discover steps (paper: 50)")
     p.add_argument("--groups-per-step", type=int, default=None,
-                   help="Number of parent states sampled per step (paper: 8)")
+                   help="Parent states per step; in X-GRPO, K independent "
+                        "groups per fixed context (paper default: 8)")
     p.add_argument("--group-size", type=int, default=None,
-                   help="Rollouts per parent per step (paper: 64)")
+                   help="Rollouts per parent group; in X-GRPO, group size G "
+                        "(paper default: 64)")
     p.add_argument("--num-seed-states", type=int, default=None)
     # ---- adaptive batch growth (groups-per-step / group-size are the START) --
     p.add_argument("--max-groups-per-step", type=int, default=None,
-                   help="Cap that G ratchets up to. Omit to use the starting G.")
+                   help="Cap for groups_per_step; in X-GRPO this is max K.")
     p.add_argument("--max-group-size", type=int, default=None,
-                   help="Cap that K ratchets up to. Omit to use the starting K.")
+                   help="Cap for group_size; in X-GRPO this is max G.")
     p.add_argument("--growth-force-step", type=int, default=None,
                    help="From this step on, run at (max G, max K) no matter what.")
     p.add_argument("--growth-valid-yield", type=float, default=None,
@@ -334,12 +408,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--adam-epsilon", type=float, default=None)
     p.add_argument("--weight-decay", type=float, default=None)
     p.add_argument("--kl-penalty-coef", type=float, default=None)
-    p.add_argument("--advantage-mode", choices=list(ADVANTAGE_MODES), default=None,
+    p.add_argument("--advantage-mode", type=str.lower,
+                   choices=list(ADVANTAGE_MODES), default=None,
                    help="Group advantage estimator: 'entropic' (adaptive-beta "
                         "entropic objective, default), 'grpo' (mean/std "
                         "normalized), or 'cvar' (grpo blended with an "
                         "upper-tail term above the (1-alpha)-quantile), or "
-                        "'rank' (KL-budgeted midranks and clipped GRPO).")
+                        "'rank'/'x-grpo' (midrank objectives with clipped GRPO).")
     p.add_argument("--rank-gamma", type=float, default=None,
                    help="rank mode: selection KL budget (default log(2)); "
                         "distinct from --kl-penalty-coef.")
@@ -360,6 +435,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="rank mode: updates per rollout batch using a frozen "
                         "old policy (default 1); clipping becomes active after "
                         "the first update when this is greater than 1.")
+    p.add_argument("--x-grpo-budgets", default=None,
+                   help="X-GRPO: comma-separated concentration-budget grid. "
+                        "Defaults to a geometric grid capped by group_size-1.")
+    p.add_argument("--x-grpo-contexts-per-step", type=int, default=None,
+                   help="X-GRPO: number P of independently conditioned parent "
+                        "contexts per step (default 1). groups_per_step is K "
+                        "cross-fit groups per context and group_size is G.")
+    p.add_argument("--x-grpo-relative-error", type=float, default=None,
+                   help="X-GRPO: tolerated leave-one-group-out relative "
+                        "gradient-estimation error c (default 0.5).")
+    p.add_argument("--x-grpo-entropy-coef", type=float, default=None,
+                   help="X-GRPO: exploration coefficient for rejected-budget "
+                        "or completely tied groups (default 0.001).")
     p.add_argument("--cvar-alpha", type=float, default=None,
                    help="cvar mode: tail mass alpha in (0,1); cutoff is the "
                         f"(1-alpha)-quantile (default {CVAR_ALPHA_DEFAULT}).")
@@ -810,6 +898,7 @@ def load_config():
         raise ValueError("cvar_lambda must be in [0, 1]")
     merged["cvar_lambda"] = cvar_lambda
     _resolve_rank_options(merged)
+    _resolve_x_grpo_options(merged)
     train_microbatch = int(merged["train_examples_per_microbatch"])
     if train_microbatch < 1:
         raise ValueError("train_examples_per_microbatch must be >= 1")
@@ -966,8 +1055,9 @@ def load_config():
               f"{training_budgets} GiB")
 
     if merged["fast"] and not merged["no_train"]:
-        if merged["advantage_mode"] != "rank":
-            raise ValueError("--fast currently requires --advantage-mode rank")
+        if not _uses_rank_policy_loss(merged["advantage_mode"]):
+            raise ValueError(
+                "--fast requires --advantage-mode rank or x-grpo")
         if int(merged["rank_update_epochs"]) != 1:
             raise ValueError("--fast requires rank_update_epochs=1")
         if not (int(merged["num_training_gpus"]) > 1
@@ -1136,7 +1226,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             **({"top_k": 0, "repetition_penalty": 1.0}
-               if getattr(cfg, "advantage_mode", "entropic") == "rank" else {}),
+               if _uses_rank_policy_loss(
+                   getattr(cfg, "advantage_mode", "entropic")) else {}),
             pad_token_id=pad_id,
             num_return_sequences=n_samples,
         )
@@ -1196,7 +1287,7 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
     """Stream locally generated rollouts from cross-prompt HF batches."""
     if len(prompts_by_group) != len(counts_by_group):
         raise ValueError("counts_by_group must align with prompts_by_group")
-    if getattr(cfg, "advantage_mode", "entropic") == "rank":
+    if _uses_rank_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
         # This local path owns its sampling arguments, including top_k=0.
         # Use the existing per-prompt OOM-aware micro-batcher instead of an
         # external HF helper that may inherit a top-k generation default.
@@ -1865,6 +1956,249 @@ def _rank_dropout_disabled(model):
             setattr(module, name, value)
 
 
+def _rank_entropy_coefficient(cfg):
+    if getattr(cfg, "advantage_mode", "entropic") == "x-grpo":
+        return float(getattr(
+            cfg, "x_grpo_entropy_coef", X_GRPO_ENTROPY_COEF_DEFAULT))
+    return float(getattr(
+        cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
+
+
+def _x_grpo_flat_group_gradient(model, tokenizer, examples, cfg,
+                                budget_index, *, device_label):
+    """Compute one frozen diagnostic g_k(v), without regularizer gradients."""
+    import torch
+
+    group_examples = list(examples)
+    if not group_examples:
+        pieces = [
+            torch.zeros(parameter.numel(), dtype=torch.float32, device="cpu")
+            for parameter in model.parameters() if parameter.requires_grad
+        ]
+        model.zero_grad(set_to_none=True)
+        if not pieces:
+            raise RuntimeError("X-GRPO found no trainable parameters")
+        return torch.cat(pieces), 0
+    group_sizes = {int(example["x_grpo_group_size"])
+                   for example in group_examples}
+    if len(group_sizes) != 1:
+        raise ValueError("X-GRPO examples disagree about their sampled group size")
+    sampled_group_size = group_sizes.pop()
+    if sampled_group_size < 2:
+        raise ValueError("X-GRPO sampled group size must be at least two")
+
+    batches = _training_microbatches(group_examples, cfg)
+
+    def attempt(active_batches):
+        for batch in active_batches:
+            current_logprobs = compute_batched_token_logprobs(
+                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
+                pad_token_id=tokenizer.pad_token_id)
+            terms = []
+            for example, current_lp in zip(batch, current_logprobs):
+                trial_advantages = example["x_grpo_trial_advantages"]
+                advantage = float(trial_advantages[int(budget_index)])
+                terms.append(
+                    (advantage / sampled_group_size) * current_lp.mean())
+            if terms:
+                sum(terms[1:], terms[0]).backward()
+        return True
+
+    with _rank_dropout_disabled(model):
+        _result, _effective, quarantined = _run_oom_resilient_backward(
+            model, batches, attempt, device_label=device_label)
+
+    pieces = []
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if not parameter.requires_grad:
+                continue
+            gradient = parameter.grad
+            if gradient is None:
+                pieces.append(torch.zeros(
+                    parameter.numel(), dtype=torch.float32, device="cpu"))
+            else:
+                pieces.append(
+                    gradient.detach().reshape(-1).float().cpu())
+    model.zero_grad(set_to_none=True)
+    if not pieces:
+        raise RuntimeError("X-GRPO found no trainable parameters")
+    flat = torch.cat(pieces)
+    if not torch.isfinite(flat).all():
+        raise FloatingPointError("nonfinite X-GRPO diagnostic gradient")
+    return flat, len(quarantined)
+
+
+def _x_grpo_crossfit_metrics(gradients, relative_error):
+    """Return leave-one-group-out precision diagnostics for one trial budget."""
+    import torch
+
+    group_ids = sorted(gradients)
+    group_count = len(group_ids)
+    if group_count < 3:
+        raise ValueError("X-GRPO calibration requires at least three groups")
+    total = gradients[group_ids[0]].clone()
+    total_squared_norms = float(
+        torch.dot(gradients[group_ids[0]], gradients[group_ids[0]]).item())
+    for group_id in group_ids[1:]:
+        gradient = gradients[group_id]
+        total.add_(gradient)
+        total_squared_norms += float(torch.dot(gradient, gradient).item())
+    total_norm_squared = float(torch.dot(total, total).item())
+
+    heldout_count = group_count - 1
+    denominator = heldout_count * (heldout_count - 1)
+    results = {}
+    for group_id in group_ids:
+        gradient = gradients[group_id]
+        gradient_norm_squared = float(torch.dot(gradient, gradient).item())
+        total_dot_gradient = float(torch.dot(total, gradient).item())
+        heldout_sum_norm_squared = max(
+            0.0,
+            total_norm_squared + gradient_norm_squared
+            - 2.0 * total_dot_gradient,
+        )
+        heldout_squared_norms = max(
+            0.0, total_squared_norms - gradient_norm_squared)
+        centered_sum = max(
+            0.0,
+            heldout_squared_norms
+            - heldout_sum_norm_squared / heldout_count,
+        )
+        signal_squared = heldout_sum_norm_squared / (heldout_count ** 2)
+        error_squared = centered_sum / denominator
+        accepted = bool(
+            signal_squared > 0.0
+            and error_squared
+            <= float(relative_error) ** 2 * signal_squared)
+        signal_norm = math.sqrt(signal_squared)
+        standard_error = math.sqrt(error_squared)
+        results[group_id] = {
+            "gradient_norm": signal_norm,
+            "standard_error": standard_error,
+            "relative_error": (
+                standard_error / signal_norm if signal_norm > 0.0
+                else None),
+            "accepted": accepted,
+        }
+    return results
+
+
+def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
+                            *, group_ids=None):
+    """Serial calibration path for a single/model-parallel training model."""
+    import gc
+
+    expected_group_ids = (
+        sorted({int(group_id) for group_id in group_ids})
+        if group_ids is not None else
+        sorted({int(example["group_id"]) for example in examples})
+    )
+    groups = {group_id: [] for group_id in expected_group_ids}
+    for example in examples:
+        group_id = int(example["group_id"])
+        if group_id not in groups:
+            raise ValueError(
+                f"unexpected X-GRPO diagnostic group {group_id}")
+        groups[group_id].append(example)
+    if len(groups) < 3:
+        raise ValueError("X-GRPO calibration requires at least three groups")
+
+    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
+    selected = {group_id: 0.0 for group_id in groups}
+    diagnostics = {group_id: [] for group_id in groups}
+    quarantined_total = 0
+    backend.set_training_mode()
+    print(f"[step {step_idx}] X-GRPO calibration: {len(groups)} groups x "
+          f"{len(budgets)} budgets on the primary trainer", flush=True)
+    try:
+        for budget_index, budget in enumerate(budgets):
+            gradients = {}
+            budget_quarantined = 0
+            for group_id in sorted(groups):
+                gradient, quarantined = _x_grpo_flat_group_gradient(
+                    model, tokenizer, groups[group_id], cfg, budget_index,
+                    device_label=str(model.device))
+                gradients[group_id] = gradient
+                budget_quarantined += quarantined
+            trial = _x_grpo_crossfit_metrics(
+                gradients, cfg.x_grpo_relative_error)
+            for group_id, metrics in trial.items():
+                diagnostics[group_id].append({"budget": budget, **metrics})
+                if metrics["accepted"]:
+                    selected[group_id] = max(selected[group_id], budget)
+            quarantined_total += budget_quarantined
+            accepted_count = sum(item["accepted"] for item in trial.values())
+            print(f"[step {step_idx}] X-GRPO budget {budget:g}: accepted "
+                  f"for {accepted_count}/{len(groups)} held-out groups", flush=True)
+            del gradients
+            gc.collect()
+    finally:
+        model.zero_grad(set_to_none=True)
+    return {
+        "selected_budgets": selected,
+        "groups": diagnostics,
+        "diagnostic_quarantined_examples": quarantined_total,
+        "distributed": False,
+    }
+
+
+def _apply_x_grpo_calibration(examples, group_data, calibration, cfg):
+    from advantage import x_grpo_advantages
+
+    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
+    budget_indices = {value: index for index, value in enumerate(budgets)}
+    selected = {
+        int(group_id): float(value)
+        for group_id, value in calibration["selected_budgets"].items()
+    }
+    expected_groups = set(group_data)
+    if set(selected) != expected_groups:
+        raise RuntimeError(
+            "X-GRPO calibration did not return every sampled group: "
+            f"expected {sorted(expected_groups)}, got {sorted(selected)}")
+
+    final_by_group = {}
+    summaries = []
+    for group_id in sorted(group_data):
+        data = group_data[group_id]
+        selected_budget = selected[group_id]
+        if selected_budget == 0.0:
+            final_advantages, _cutoff, final_info = x_grpo_advantages(
+                data["rewards"], 0.0, return_info=True)
+        else:
+            budget_index = budget_indices[selected_budget]
+            final_advantages = data["trial_advantages"][budget_index]
+            final_info = data["trial_info"][budget_index]
+        entropy_gate = bool(
+            (selected_budget == 0.0 or final_info["all_tied"])
+            and data["entropy_eligible"])
+        final_by_group[group_id] = (
+            final_advantages, entropy_gate, final_info)
+        serializable_info = {
+            key: value for key, value in final_info.items()
+            if key not in ("ranks", "weights")
+        }
+        summaries.append({
+            "group": group_id,
+            "context": int(data["context"]),
+            "fold": int(data["fold"]),
+            "selected_budget": selected_budget,
+            "entropy_gate": entropy_gate,
+            **serializable_info,
+            "calibration": calibration["groups"][group_id],
+        })
+
+    for example in examples:
+        group_id = int(example["group_id"])
+        rollout_index = int(example["rollout_index"])
+        advantages, entropy_gate, _info = final_by_group[group_id]
+        example["advantage"] = float(advantages[rollout_index])
+        example["rank_entropy_gate"] = entropy_gate
+
+    return summaries
+
+
 def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                          cfg, step_idx, *, fb_cfg=None, fb_on=False,
                          fb_lambda=0.0):
@@ -1875,7 +2209,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
     epsilon = float(getattr(cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
     epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
     epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
-    entropy_coef = float(getattr(cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
+    entropy_coef = _rank_entropy_coefficient(cfg)
     kl_coef = float(cfg.kl_penalty_coef)
     fb_stats = None
     if fb_on:
@@ -1895,7 +2229,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
           f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
     missing_old, missing_reference = _initialize_rank_logprob_caches(examples)
     reference_fallback = missing_reference if kl_coef else []
-    print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+    print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: vLLM supplied old="
           f"{len(examples) - len(missing_old)}/{len(examples)}, reference="
           f"{len(examples) - len(reference_fallback)}/{len(examples)}; "
           f"HF fallback old={len(missing_old)}, "
@@ -2032,7 +2366,8 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                             "entropy_examples": entropy_examples,
                             "oom_quarantined_examples": len(quarantined),
                             "grad_norm": float(grad_norm.item())})
-            print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
+            print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
+                  f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
                   f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
@@ -2334,8 +2669,7 @@ class ReplicatedDataParallelTrainer:
                                 RANK_CLIP_EPSILON_DEFAULT))
         epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
         epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
-        entropy_coef = float(getattr(cfg, "rank_entropy_coef",
-                                     RANK_ENTROPY_COEF_DEFAULT))
+        entropy_coef = _rank_entropy_coefficient(cfg)
         kl_coef = float(cfg.kl_penalty_coef)
 
         cpu_examples = self._cpu_examples(examples)
@@ -2345,7 +2679,8 @@ class ReplicatedDataParallelTrainer:
         supplied_reference = sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in cpu_examples) if kl_coef else len(cpu_examples)
-        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+              "vLLM supplied old="
               f"{supplied_old}/{len(cpu_examples)}, reference="
               f"{supplied_reference}/{len(cpu_examples)}; HF fallback runs only "
               "for missing values", flush=True)
@@ -2758,7 +3093,7 @@ class ReplicatedDataParallelTrainer:
               f"backward batches/GPU={batches_per_gpu}; final padded-token "
               f"budgets/GPU={list(budgets)}; peak memory/GPU="
               f"{peak_percentages}%", flush=True)
-        print(f"[step {step_idx}] rank epoch 1/1: "
+        print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
               f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
@@ -2802,8 +3137,7 @@ class ReplicatedDataParallelTrainer:
                                 RANK_CLIP_EPSILON_DEFAULT))
         epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
         epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
-        entropy_coef = float(getattr(cfg, "rank_entropy_coef",
-                                     RANK_ENTROPY_COEF_DEFAULT))
+        entropy_coef = _rank_entropy_coefficient(cfg)
         kl_coef = float(cfg.kl_penalty_coef)
         local_shards = self._prepare_shards(examples)
         update_batches = [
@@ -2827,7 +3161,8 @@ class ReplicatedDataParallelTrainer:
         supplied_reference = sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in examples) if kl_coef else len(examples)
-        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+              "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
               f"{supplied_reference}/{len(examples)}; HF fallback runs only "
               f"for missing values before {epochs} update(s)", flush=True)
@@ -3002,7 +3337,8 @@ class ReplicatedDataParallelTrainer:
                 "oom_quarantined_examples": quarantined_examples,
                 "grad_norm": grad_norm,
             })
-            print(f"[step {step_idx}] rank epoch {epoch + 1}/{epochs}: "
+            print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
+                  f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
                   f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
@@ -3429,6 +3765,101 @@ class ProcessDistributedTrainer:
                 merged.max_abs, float(item.get("max_abs", 0.0)))
         return merged
 
+    def calibrate_x_grpo(self, examples, cfg, step_idx, *, group_ids=None):
+        from fast_distributed import local_x_grpo_calibration
+
+        if self._offloaded:
+            print(f"[train-fast] restoring {self._world_size} process "
+                  "trainers for X-GRPO calibration", flush=True)
+            self.restore_after_generation()
+
+        cpu_examples = self._cpu_examples(examples)
+        expected_group_ids = (
+            sorted({int(group_id) for group_id in group_ids})
+            if group_ids is not None else
+            sorted({int(example["group_id"]) for example in cpu_examples})
+        )
+        groups = {group_id: [] for group_id in expected_group_ids}
+        for example in cpu_examples:
+            group_id = int(example["group_id"])
+            if group_id not in groups:
+                raise ValueError(
+                    f"unexpected X-GRPO diagnostic group {group_id}")
+            groups[group_id].append(example)
+        if len(groups) < 3:
+            raise ValueError("X-GRPO calibration requires at least three groups")
+
+        shards = [[] for _ in range(self._world_size)]
+        shard_group_ids = [[] for _ in range(self._world_size)]
+        loads = [0 for _ in range(self._world_size)]
+        group_items = []
+        for group_id, group_examples in groups.items():
+            cost = sum(
+                int(example["prompt_ids"].shape[1]
+                    + example["response_ids"].shape[1])
+                for example in group_examples)
+            group_items.append((cost, group_id, group_examples))
+        for cost, group_id, group_examples in sorted(
+                group_items, reverse=True):
+            rank = min(range(self._world_size), key=lambda item: loads[item])
+            shards[rank].extend(group_examples)
+            shard_group_ids[rank].append(group_id)
+            loads[rank] += cost
+
+        print(f"[step {step_idx}] X-GRPO distributed calibration: "
+              f"{len(groups)} groups x {len(cfg.x_grpo_budgets)} budgets; "
+              f"group-token loads/GPU={loads}", flush=True)
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "calibrate_x_grpo",
+                "examples": shards[rank],
+                "group_ids": shard_group_ids[rank],
+                "group_count": len(groups),
+            })
+
+        local = local_x_grpo_calibration(
+            self.backend, self.model, self.tokenizer, shards[0], cfg, 0,
+            len(groups), group_ids=shard_group_ids[0])
+        child_messages = self._collect_event(
+            "calibrated", range(1, self._world_size))
+        self._workers_idle = True
+        parts = [local] + [
+            child_messages[rank]["calibration"]
+            for rank in range(1, self._world_size)
+        ]
+        selected = {}
+        diagnostics = {}
+        quarantined = 0
+        for part in parts:
+            selected.update({
+                int(group_id): float(value)
+                for group_id, value in part["selected_budgets"].items()
+            })
+            diagnostics.update({
+                int(group_id): values
+                for group_id, values in part["groups"].items()
+            })
+            quarantined += int(
+                part.get("diagnostic_quarantined_examples", 0))
+        if set(selected) != set(groups):
+            raise RuntimeError(
+                "distributed X-GRPO calibration lost a group: "
+                f"expected {sorted(groups)}, got {sorted(selected)}")
+        for budget_index, budget in enumerate(cfg.x_grpo_budgets):
+            accepted = sum(
+                bool(diagnostics[group_id][budget_index]["accepted"])
+                for group_id in diagnostics)
+            print(f"[step {step_idx}] X-GRPO budget {float(budget):g}: "
+                  f"accepted for {accepted}/{len(groups)} held-out groups",
+                  flush=True)
+        return {
+            "selected_budgets": selected,
+            "groups": diagnostics,
+            "diagnostic_quarantined_examples": quarantined,
+            "distributed": True,
+        }
+
     def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
                    fb_on=False, fb_lambda=0.0):
         import torch
@@ -3452,7 +3883,8 @@ class ProcessDistributedTrainer:
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued_examples)
             if float(cfg.kl_penalty_coef) else len(examples))
-        print(f"[step {step_idx}] rank logprobs: vLLM supplied old="
+        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+              "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
               f"{supplied_reference}/{len(examples)}", flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling=80%; "
@@ -3558,7 +3990,7 @@ class ProcessDistributedTrainer:
               f"budgets/GPU={self._token_budgets}; peak memory/GPU="
               f"{peak_percentages}%; allocator caps/GPU="
               f"{allocator_percentages}%", flush=True)
-        print(f"[step {step_idx}] rank epoch 1/1: "
+        print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
               f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
@@ -3582,7 +4014,8 @@ class ProcessDistributedTrainer:
         }
 
     def train_policy(self, *args, **kwargs):
-        raise RuntimeError("process-distributed --fast supports rank mode only")
+        raise RuntimeError(
+            "process-distributed --fast supports rank-style modes only")
 
     def offload_for_generation(self):
         if self._offloaded:
@@ -3934,8 +4367,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                           is_code_failure, render_chat, select_balanced)
 
     step_t0 = time.time()
+    active_advantage_mode = str(
+        getattr(cfg, "advantage_mode", "entropic")).lower()
+    rank_mode = active_advantage_mode == "rank"
+    x_grpo_mode = active_advantage_mode == "x-grpo"
+    rank_policy_mode = _uses_rank_policy_loss(active_advantage_mode)
+    x_grpo_groups_per_context = (
+        int(cfg.groups_per_step) if x_grpo_mode else 1)
+    requested_parent_contexts = (
+        int(cfg.x_grpo_contexts_per_step)
+        if x_grpo_mode else int(cfg.groups_per_step))
     sampler.set_current_step(step_idx)
-    parents = sampler.sample_states(cfg.groups_per_step)
+    parents = sampler.sample_states(requested_parent_contexts)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
@@ -3978,8 +4421,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     reprompt_by_key = {}    # (group, rollout) -> reprompt for a code failure
 
     all_examples = []
-    rank_mode = getattr(cfg, "advantage_mode", "entropic") == "rank"
     rank_group_stats = []
+    x_grpo_groups = {}
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
@@ -3994,7 +4437,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     base_messages = []
 
     for g, parent in enumerate(parents):
-        sampler.record_expansion(parent, count=cfg.group_size)
+        sampler.record_expansion(
+            parent,
+            count=int(cfg.group_size) * x_grpo_groups_per_context)
         pc = ParentContext(
             code=parent.code,
             value=parent.value if parent.value is not None else 0.0,
@@ -4041,14 +4486,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 messages, tokenize=False, add_generation_prompt=True,
             )
 
-    # One parent can now own several prompt arms, but their counts still sum to
-    # exactly cfg.group_size. Advantages are computed over the parent union;
-    # each example's likelihood still conditions on its actual prompt arm.
     prompt_jobs = []
     for g, _parent in enumerate(parents):
         pc = parent_ctxs[g]
         chosen = chosen_by_group.get(g, [])
-        if memory is not None and mem_cfg is not None:
+        if x_grpo_mode:
+            fixed_lessons = (
+                list(chosen)[:max(0, int(mem_cfg.arm_max_lessons))]
+                if memory is not None and mem_cfg is not None
+                and getattr(mem_cfg, "lookup_mode", "select") != "none"
+                else [])
+            arms = [MemoryArm(
+                "selected" if fixed_lessons else "no_memory",
+                fixed_lessons,
+                int(cfg.group_size) * x_grpo_groups_per_context,
+            )]
+        elif memory is not None and mem_cfg is not None:
             if memory_v2:
                 arms = allocate_memory_arms(
                     cfg.group_size, chosen, memory, mem_cfg, step_idx,
@@ -4112,7 +4565,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
 
-    num_groups = len(parents)
+    group_specs = []
+    for parent_group in range(len(parents)):
+        for fold_index in range(x_grpo_groups_per_context):
+            group_specs.append({
+                "group_id": len(group_specs),
+                "parent_group": parent_group,
+                "context_id": parent_group,
+                "fold_index": fold_index,
+            })
+    num_groups = len(group_specs)
     total_rollouts = num_groups * cfg.group_size
 
     # ----- REWARD POOL (CPU), runs concurrently with generation -----
@@ -4155,6 +4617,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     reward_futures = {g: [] for g in range(num_groups)}    # aligned RewardResult futures
     deferred_rollouts = []
     vllm_logprob_records = []
+    queued_by_parent = {g: 0 for g in range(len(parents))}
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
 
@@ -4169,21 +4632,44 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     def _submit_rollout(record):
         job = prompt_jobs[record["job_idx"]]
-        g = job["parent_group"]
+        g = int(record["group_id"])
+        parent_group = int(job["parent_group"])
         group_responses[g].append(record)
         if isolated_eval:
             fut = reward_pool.submit(
-                _run_isolated_reward, record["text"], parent_ctxs[g])
+                _run_isolated_reward, record["text"],
+                parent_ctxs[parent_group])
         else:
             fut = reward_pool.submit(
-                problem.compute_reward, record["text"], parent_ctxs[g],
+                problem.compute_reward, record["text"],
+                parent_ctxs[parent_group],
                 cfg.sandbox_timeout_s
             )
         reward_futures[g].append(fut)
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
+        job = prompt_jobs[int(job_idx)]
+        parent_group = int(job["parent_group"])
+        parent_ordinal = queued_by_parent[parent_group]
+        if x_grpo_mode:
+            maximum = x_grpo_groups_per_context * int(cfg.group_size)
+            if parent_ordinal >= maximum:
+                raise RuntimeError(
+                    "X-GRPO generation returned more than K*G rollouts for "
+                    f"context {parent_group}")
+            fold_index = parent_ordinal // int(cfg.group_size)
+            group_id = (
+                parent_group * x_grpo_groups_per_context + fold_index)
+        else:
+            fold_index = 0
+            group_id = parent_group
+        queued_by_parent[parent_group] = parent_ordinal + 1
         record = {
             "job_idx": int(job_idx),
+            "parent_group": parent_group,
+            "group_id": int(group_id),
+            "context_id": parent_group,
+            "fold_index": int(fold_index),
             "text": text,
             "token_ids": list(token_ids),
             "behavior_logprobs": behavior_logprobs,
@@ -4252,6 +4738,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cfg._local_generation_cap = int(cap_state["value"])
                 finally:
                     gen_bar.close()
+
+            if x_grpo_mode:
+                expected_per_context = (
+                    x_grpo_groups_per_context * int(cfg.group_size))
+                incomplete = {
+                    context_id: count
+                    for context_id, count in queued_by_parent.items()
+                    if count != expected_per_context
+                }
+                if incomplete:
+                    raise RuntimeError(
+                        "X-GRPO requires exactly K*G rollouts from every fixed "
+                        f"context; expected {expected_per_context}, got "
+                        f"{incomplete}")
 
             # CPU reward processes were submitted as each rollout arrived and
             # continue running here. Keep vLLM awake and use that same interval
@@ -4373,7 +4873,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_code_failure_count = 0
     prompt_ids_by_job = {}
 
-    for g, parent in enumerate(parents):
+    for group_spec in group_specs:
+        g = int(group_spec["group_id"])
+        parent_group = int(group_spec["parent_group"])
+        context_id = int(group_spec["context_id"])
+        fold_index = int(group_spec["fold_index"])
+        parent = parents[parent_group]
         responses = group_responses[g]          # streamed mutable rollout records
         futs = reward_futures[g]                 # aligned RewardResult futures
 
@@ -4392,13 +4897,47 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if rewards_np.size == 0:
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
-        adv_mode = getattr(cfg, "advantage_mode", "entropic")
-        advantages, adv_scale, adv_scale_label, adv_info = compute_group_advantages(
-            rewards_np, adv_mode,
-            cvar_alpha=getattr(cfg, "cvar_alpha", None),
-            cvar_lambda=getattr(cfg, "cvar_lambda", None),
-            rank_gamma=getattr(cfg, "rank_gamma", None), return_info=True)
-        constant = (bool(adv_info["all_tied"]) if rank_mode else
+        if x_grpo_mode and len(responses) != int(cfg.group_size):
+            raise RuntimeError(
+                f"X-GRPO context {context_id} fold {fold_index} returned "
+                f"{len(responses)} rollouts; expected G={int(cfg.group_size)}")
+        adv_mode = active_advantage_mode
+        x_trial_advantages = None
+        x_trial_info = None
+        if x_grpo_mode:
+            from advantage import x_grpo_advantages
+            x_trial_advantages = []
+            x_trial_info = []
+            for budget in cfg.x_grpo_budgets:
+                trial_advantages, _cutoff, trial_info = x_grpo_advantages(
+                    rewards_np, budget, return_info=True)
+                x_trial_advantages.append(trial_advantages)
+                x_trial_info.append(trial_info)
+            advantages = np.zeros_like(rewards_np)
+            adv_scale = float(len(cfg.x_grpo_budgets))
+            adv_scale_label = "trial_budgets"
+            adv_info = x_trial_info[0]
+            x_grpo_groups[g] = {
+                "group": g,
+                "context": context_id,
+                "fold": fold_index,
+                "rewards": rewards_np,
+                "trial_advantages": x_trial_advantages,
+                "trial_info": x_trial_info,
+                "entropy_eligible": bool(
+                    any(valids)
+                    and float(rewards_np.max()) > float(cfg.fail_score)),
+            }
+        else:
+            advantages, adv_scale, adv_scale_label, adv_info = (
+                compute_group_advantages(
+                    rewards_np, adv_mode,
+                    cvar_alpha=getattr(cfg, "cvar_alpha", None),
+                    cvar_lambda=getattr(cfg, "cvar_lambda", None),
+                    rank_gamma=getattr(cfg, "rank_gamma", None),
+                    return_info=True))
+        constant = (bool(adv_info["all_tied"])
+                    if rank_policy_mode else
                     float(rewards_np.max() - rewards_np.min()) < 1e-12)
         rank_entropy_gate = bool(
             rank_mode
@@ -4426,7 +4965,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val:
                 distinct_good_hashes.add(hash(codes[r_idx].strip()))
 
-        print(f"  group {g}: rewards min={rewards_np.min():.9f} "
+        group_label = (f"context {context_id} fold {fold_index}"
+                       if x_grpo_mode else f"group {g}")
+        print(f"  {group_label}: rewards min={rewards_np.min():.9f} "
               f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
               f"valid={sum(valids)}/{len(valids)}  "
               f"{adv_scale_label}={adv_scale:.9f}")
@@ -4436,6 +4977,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"top ties={adv_info['top_count']} "
                   f"saturated={adv_info['saturated']} "
                   f"entropy gate={rank_entropy_gate}")
+        elif x_grpo_mode:
+            print(f"    X-GRPO candidates={list(cfg.x_grpo_budgets)} "
+                  f"top ties={adv_info['top_count']} "
+                  f"all tied={adv_info['all_tied']}")
 
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
@@ -4481,11 +5026,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
-            pick_info = (sampler.last_picks_info[g]
-                         if g < len(sampler.last_picks_info) else {})
+            pick_info = (sampler.last_picks_info[parent_group]
+                         if parent_group < len(sampler.last_picks_info) else {})
             meta = {
                 "step": step_idx,
                 "group": g,
+                "parent_group": parent_group,
                 "rollout": r_idx,
                 "node_id": child.id,
                 "parent_id": parent.id,
@@ -4543,6 +5089,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "score": float(adv_info["ranks"][r_idx]),
                     "weight": float(adv_info["weights"][r_idx]),
                 }
+            elif x_grpo_mode:
+                meta["x_grpo_context"] = context_id
+                meta["x_grpo_fold"] = fold_index
+                meta["x_grpo_rank"] = float(adv_info["ranks"][r_idx])
+                meta["x_grpo_trial_advantages"] = [
+                    float(values[r_idx]) for values in x_trial_advantages]
             if memory_v2:
                 meta["memory_version"] = "V2"
                 meta["memory_comparison_n"] = int(
@@ -4599,7 +5151,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Rank mode uses exact equality and retains fully tied groups for
         # reference updates. Entropy is gated separately above: an all-failure
         # tie at fail_score must not receive an entropy update.
-        if (constant and not rank_mode
+        if (constant and not rank_policy_mode
                 and not (fb_candidate_on and fb_cfg.include_constant_groups)):
             continue
 
@@ -4641,9 +5193,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "reward_constant": constant,
                 "rank_entropy_gate": rank_entropy_gate,
                 "group_id": g,
+                "x_grpo_context_id": context_id,
+                "x_grpo_fold_index": fold_index,
+                "rollout_index": r_idx,
                 "prompt_job_id": job_idx,
-                # Implements mean_over_parents(mean_over_rollouts(loss)).
-                "sample_weight": 1.0 / (len(parents) * len(responses)),
+                "x_grpo_group_size": len(responses),
+                "x_grpo_all_tied": bool(constant) if x_grpo_mode else False,
+                "x_grpo_trial_advantages": (
+                    tuple(float(values[r_idx])
+                          for values in x_trial_advantages)
+                    if x_grpo_mode else ()),
+                "sample_weight": 1.0 / (num_groups * len(responses)),
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before
@@ -4674,7 +5234,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Constant groups only carry a feedback signal. Drop them when the adaptive
     # controller turns feedback off after seeing this step's code validity.
-    if not fb_on and not rank_mode:
+    if not fb_on and not rank_policy_mode:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     # Cap the teacher forwards. Applied to all_examples rather than to
@@ -4687,12 +5247,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     feedback_signature_cap = 0
     if fb_on:
         feedback_step_cap, feedback_signature_cap = fb_cfg.resolve_caps(
-            cfg.groups_per_step, cfg.group_size)
+            num_groups, cfg.group_size)
         total_label = feedback_step_cap or "all"
         signature_label = feedback_signature_cap or "all"
         print(f"[step {step_idx}] feedback budget: total={total_label}, "
               f"per-signature={signature_label} for "
-              f"G={cfg.groups_per_step}, K={cfg.group_size}")
+              f"{num_groups} groups x {cfg.group_size} rollouts")
         with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt_text")]
         signatures = [ex.get("failure_signature", "unknown") for ex in all_examples]
         keep = set(select_balanced(
@@ -4711,10 +5271,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # and reference forwards for a KL-only update and dilute the batch.
         all_examples = [
             ex for ex in all_examples
-            if rank_mode or not (ex["reward_constant"] and not ex.get("reprompt_text"))
+            if (rank_policy_mode
+                or not (ex["reward_constant"] and not ex.get("reprompt_text")))
         ]
 
-    if rank_mode and cfg.generation_backend == "vllm":
+    if rank_policy_mode and cfg.generation_backend == "vllm":
         # Rank/PPO requires the frozen behavior probability. A malformed vLLM
         # payload cannot be reconstructed safely after the adapter changes and
         # must never force a full-context HF cache pass. Rollouts remain saved;
@@ -4729,7 +5290,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if unusable:
             print(f"[step {step_idx}] vLLM omitted behavior logprobs for "
                   f"{unusable} rollout(s); saved them but excluded only those "
-                  "records from the rank update", flush=True)
+                  "records from the rank-style update", flush=True)
 
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples))
@@ -4804,10 +5365,70 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return step_stats
 
     if not all_examples:
-        print(f"[step {step_idx}] no training signal (all groups had constant reward)")
+        print(f"[step {step_idx}] no usable training examples")
         return step_stats
 
-    if rank_mode:
+    if x_grpo_mode:
+        group_ids_by_context = {}
+        for group_id, group_data in x_grpo_groups.items():
+            group_ids_by_context.setdefault(
+                int(group_data["context"]), []).append(int(group_id))
+        calibration = {
+            "selected_budgets": {},
+            "groups": {},
+            "diagnostic_quarantined_examples": 0,
+            "distributed": False,
+        }
+        for context_id in sorted(group_ids_by_context):
+            context_group_ids = tuple(sorted(group_ids_by_context[context_id]))
+            if len(context_group_ids) != x_grpo_groups_per_context:
+                raise RuntimeError(
+                    f"X-GRPO context {context_id} has "
+                    f"{len(context_group_ids)} groups; expected "
+                    f"K={x_grpo_groups_per_context}")
+            context_examples = [
+                example for example in all_examples
+                if int(example["x_grpo_context_id"]) == context_id
+            ]
+            if (parallel_trainer is not None
+                    and hasattr(parallel_trainer, "calibrate_x_grpo")):
+                context_calibration = parallel_trainer.calibrate_x_grpo(
+                    context_examples, cfg, step_idx,
+                    group_ids=context_group_ids)
+            else:
+                if (parallel_trainer is not None
+                        and parallel_trainer.is_offloaded):
+                    parallel_trainer.restore_after_generation()
+                context_calibration = _calibrate_x_grpo_local(
+                    backend, model, tokenizer, context_examples, cfg, step_idx,
+                    group_ids=context_group_ids)
+            calibration["selected_budgets"].update(
+                context_calibration["selected_budgets"])
+            calibration["groups"].update(context_calibration["groups"])
+            calibration["diagnostic_quarantined_examples"] += int(
+                context_calibration.get(
+                    "diagnostic_quarantined_examples", 0))
+            calibration["distributed"] = bool(
+                calibration["distributed"]
+                or context_calibration.get("distributed", False))
+        x_grpo_group_stats = _apply_x_grpo_calibration(
+            all_examples, x_grpo_groups, calibration, cfg)
+        selected_label = ", ".join(
+            f"p{item['context']}/k{item['fold']}="
+            f"{item['selected_budget']:g}"
+            for item in x_grpo_group_stats)
+        print(f"[step {step_idx}] X-GRPO selected budgets: "
+              f"{selected_label}", flush=True)
+        step_stats["x_grpo_groups"] = x_grpo_group_stats
+        step_stats["x_grpo_calibration_distributed"] = bool(
+            calibration.get("distributed", False))
+        step_stats["x_grpo_diagnostic_quarantined_examples"] = int(
+            calibration.get("diagnostic_quarantined_examples", 0))
+        step_stats["x_grpo_contexts"] = len(group_ids_by_context)
+        step_stats["x_grpo_groups_per_context"] = (
+            x_grpo_groups_per_context)
+
+    if rank_policy_mode:
         if parallel_trainer is not None:
             step_stats.update(parallel_trainer.train_rank(
                 all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
@@ -5114,22 +5735,35 @@ def main():
               f"PP={cfg.vllm_pipeline_parallel_size}")
     print(f"Target:             {cfg.target}")
     print(f"Steps:              {cfg.num_steps}")
-    print(f"Groups per step:    {cfg.groups_per_step}")
-    print(f"Group size:         {cfg.group_size}")
-    print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
+    configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
+    if configured_advantage_mode == "x-grpo":
+        print(f"X-GRPO contexts P:  {cfg.x_grpo_contexts_per_step}")
+        print(f"X-GRPO groups K:    {cfg.groups_per_step} per context")
+        print(f"X-GRPO group size G: {cfg.group_size}")
+        print(f"Total rollouts/step: "
+              f"{cfg.x_grpo_contexts_per_step * cfg.groups_per_step * cfg.group_size}")
+    else:
+        print(f"Groups per step:    {cfg.groups_per_step}")
+        print(f"Group size:         {cfg.group_size}")
+        print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
     print(f"LR:                 {cfg.learning_rate}")
     print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
     if getattr(cfg, "advantage_mode", "entropic") == "cvar":
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
-    if getattr(cfg, "advantage_mode", "entropic") == "rank":
-        print(f"Rank gamma:         {cfg.rank_gamma}")
+    if _uses_rank_policy_loss(configured_advantage_mode):
         print(f"Rank clip eps low/high: "
               f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
               f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
               f"{1.0 + cfg.rank_clip_epsilon_high:.4f})")
-        print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
         print(f"Rank update epochs: {cfg.rank_update_epochs}")
+    if configured_advantage_mode == "rank":
+        print(f"Rank gamma:         {cfg.rank_gamma}")
+        print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
+    elif configured_advantage_mode == "x-grpo":
+        print(f"X-GRPO budgets:     {list(cfg.x_grpo_budgets)}")
+        print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
+        print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     print(f"Train microbatch:   up to "
@@ -5457,8 +6091,15 @@ def main():
     else:
         cur_g = int(cfg.groups_per_step)
         cur_k = int(cfg.group_size)
-    print(f"[init] batch growth: start G={cur_g} K={cur_k} -> "
-          f"max G={cfg.max_groups_per_step} K={cfg.max_group_size}; "
+    if configured_advantage_mode == "x-grpo":
+        growth_shape = (
+            f"P={cfg.x_grpo_contexts_per_step}, K={cur_g}, G={cur_k} -> "
+            f"max K={cfg.max_groups_per_step}, G={cfg.max_group_size}")
+    else:
+        growth_shape = (
+            f"G={cur_g} K={cur_k} -> max G={cfg.max_groups_per_step} "
+            f"K={cfg.max_group_size}")
+    print(f"[init] batch growth: start {growth_shape}; "
           f"grow when best-valid-yield>={cfg.growth_valid_yield} and "
           f"distinct-good>={cfg.growth_distinct_min} (x{cfg.growth_factor}); "
           f"forced to max at step {cfg.growth_force_step}")
@@ -5490,8 +6131,15 @@ def main():
                 cur_g, cur_k = int(cfg.max_groups_per_step), int(cfg.max_group_size)
             cfg.groups_per_step = cur_g
             cfg.group_size = cur_k
-            print(f"[step {step}] batch: G={cur_g} K={cur_k} "
-                  f"({cur_g * cur_k} rollouts)")
+            if configured_advantage_mode == "x-grpo":
+                rollout_count = (
+                    int(cfg.x_grpo_contexts_per_step) * cur_g * cur_k)
+                print(f"[step {step}] batch: "
+                      f"P={cfg.x_grpo_contexts_per_step} K={cur_g} G={cur_k} "
+                      f"({rollout_count} rollouts)")
+            else:
+                print(f"[step {step}] batch: G={cur_g} K={cur_k} "
+                      f"({cur_g * cur_k} rollouts)")
 
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
                                cfg, exp_dir, problem, gen_pool,
