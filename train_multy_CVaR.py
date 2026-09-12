@@ -1964,21 +1964,38 @@ def _rank_entropy_coefficient(cfg):
         cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
 
 
-def _x_grpo_flat_group_gradient(model, tokenizer, examples, cfg,
-                                budget_index, *, device_label):
-    """Compute one frozen diagnostic g_k(v), without regularizer gradients."""
+def _x_grpo_flat_group_gradients(model, tokenizer, examples, cfg,
+                                 budget_indices, *, device_label,
+                                 batches=None, parameters=None,
+                                 zero_gradient=None):
+    """Compute a block of frozen diagnostic gradients from shared forwards."""
     import torch
 
     group_examples = list(examples)
+    indices = tuple(int(index) for index in budget_indices)
+    if not indices:
+        raise ValueError("X-GRPO diagnostic budget block must not be empty")
+    if len(set(indices)) != len(indices) or min(indices) < 0:
+        raise ValueError("X-GRPO diagnostic budget indices must be unique and nonnegative")
+    parameters = (
+        tuple(parameter for parameter in model.parameters()
+              if parameter.requires_grad)
+        if parameters is None else tuple(parameters))
+    flat_count = sum(parameter.numel() for parameter in parameters)
+    if flat_count < 1:
+        raise RuntimeError("X-GRPO found no trainable parameters")
+    if zero_gradient is None:
+        zero_gradient = torch.zeros(
+            flat_count, dtype=torch.float32, device="cpu")
+    elif (zero_gradient.device.type != "cpu"
+          or zero_gradient.dtype != torch.float32
+          or zero_gradient.ndim != 1
+          or zero_gradient.numel() != flat_count):
+        raise ValueError("invalid shared X-GRPO zero-gradient buffer")
+    zeros = {index: zero_gradient for index in indices}
     if not group_examples:
-        pieces = [
-            torch.zeros(parameter.numel(), dtype=torch.float32, device="cpu")
-            for parameter in model.parameters() if parameter.requires_grad
-        ]
         model.zero_grad(set_to_none=True)
-        if not pieces:
-            raise RuntimeError("X-GRPO found no trainable parameters")
-        return torch.cat(pieces), 0
+        return zeros, 0, []
     group_sizes = {int(example["x_grpo_group_size"])
                    for example in group_examples}
     if len(group_sizes) != 1:
@@ -1987,46 +2004,91 @@ def _x_grpo_flat_group_gradient(model, tokenizer, examples, cfg,
     if sampled_group_size < 2:
         raise ValueError("X-GRPO sampled group size must be at least two")
 
-    batches = _training_microbatches(group_examples, cfg)
+    advantage_vectors = {}
+    representative_for = {}
+    representatives = []
+    for index in indices:
+        vector = tuple(
+            float(example["x_grpo_trial_advantages"][index])
+            for example in group_examples)
+        if not all(math.isfinite(value) for value in vector):
+            raise ValueError("X-GRPO diagnostic advantages must be finite")
+        if not any(value != 0.0 for value in vector):
+            representative_for[index] = None
+            continue
+        representative = advantage_vectors.get(vector)
+        if representative is None:
+            representative = index
+            advantage_vectors[vector] = index
+            representatives.append(index)
+        representative_for[index] = representative
+
+    if not representatives:
+        model.zero_grad(set_to_none=True)
+        planned = (_training_microbatches(group_examples, cfg)
+                   if batches is None else [list(batch) for batch in batches])
+        return zeros, 0, planned
+
+    planned_batches = (
+        _training_microbatches(group_examples, cfg)
+        if batches is None else [list(batch) for batch in batches])
 
     def attempt(active_batches):
+        accumulators = {
+            index: [torch.zeros_like(parameter) for parameter in parameters]
+            for index in representatives
+        }
         for batch in active_batches:
             current_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=True, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
-            terms = []
-            for example, current_lp in zip(batch, current_logprobs):
-                trial_advantages = example["x_grpo_trial_advantages"]
-                advantage = float(trial_advantages[int(budget_index)])
-                terms.append(
-                    (advantage / sampled_group_size) * current_lp.mean())
-            if terms:
-                sum(terms[1:], terms[0]).backward()
-        return True
+            losses = []
+            for index in representatives:
+                terms = []
+                for example, current_lp in zip(batch, current_logprobs):
+                    advantage = float(
+                        example["x_grpo_trial_advantages"][index])
+                    if advantage != 0.0:
+                        terms.append(
+                            (advantage / sampled_group_size)
+                            * current_lp.mean())
+                if terms:
+                    losses.append((index, sum(terms[1:], terms[0])))
+            for loss_position, (index, loss) in enumerate(losses):
+                model.zero_grad(set_to_none=True)
+                loss.backward(retain_graph=loss_position + 1 < len(losses))
+                with torch.no_grad():
+                    for accumulator, parameter in zip(
+                            accumulators[index], parameters):
+                        gradient = parameter.grad
+                        if gradient is not None:
+                            accumulator.add_(gradient.detach())
+            model.zero_grad(set_to_none=True)
+        return {
+            index: torch.cat([
+                accumulator.detach().reshape(-1).float().cpu()
+                for accumulator in accumulators[index]
+            ])
+            for index in representatives
+        }
 
-    with _rank_dropout_disabled(model):
-        _result, _effective, quarantined = _run_oom_resilient_backward(
-            model, batches, attempt, device_label=device_label)
-
-    pieces = []
-    with torch.no_grad():
-        for parameter in model.parameters():
-            if not parameter.requires_grad:
-                continue
-            gradient = parameter.grad
-            if gradient is None:
-                pieces.append(torch.zeros(
-                    parameter.numel(), dtype=torch.float32, device="cpu"))
-            else:
-                pieces.append(
-                    gradient.detach().reshape(-1).float().cpu())
+    result, effective, quarantined = _run_oom_resilient_backward(
+        model, planned_batches, attempt, device_label=device_label)
     model.zero_grad(set_to_none=True)
-    if not pieces:
-        raise RuntimeError("X-GRPO found no trainable parameters")
-    flat = torch.cat(pieces)
-    if not torch.isfinite(flat).all():
-        raise FloatingPointError("nonfinite X-GRPO diagnostic gradient")
-    return flat, len(quarantined)
+    if result is None:
+        result = {
+            index: torch.zeros(flat_count, dtype=torch.float32, device="cpu")
+            for index in representatives
+        }
+    gradients = {}
+    for index in indices:
+        representative = representative_for[index]
+        gradient = (zeros[index] if representative is None
+                    else result[representative])
+        if not torch.isfinite(gradient).all():
+            raise FloatingPointError("nonfinite X-GRPO diagnostic gradient")
+        gradients[index] = gradient
+    return gradients, len(quarantined), effective
 
 
 def _x_grpo_crossfit_metrics(gradients, relative_error):
@@ -2087,7 +2149,7 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
 def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
                             *, group_ids=None):
     """Serial calibration path for a single/model-parallel training model."""
-    import gc
+    import torch
 
     expected_group_ids = (
         sorted({int(group_id) for group_id in group_ids})
@@ -2108,31 +2170,59 @@ def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
     selected = {group_id: 0.0 for group_id in groups}
     diagnostics = {group_id: [] for group_id in groups}
     quarantined_total = 0
+    parameters = tuple(
+        parameter for parameter in model.parameters() if parameter.requires_grad)
+    flat_count = sum(parameter.numel() for parameter in parameters)
+    if flat_count < 1:
+        raise RuntimeError("X-GRPO found no trainable parameters")
+    zero_gradient = torch.zeros(
+        flat_count, dtype=torch.float32, device="cpu")
+    batch_plans = {
+        group_id: _training_microbatches(group_examples, cfg)
+        for group_id, group_examples in groups.items()
+    }
+    budget_block_size = min(2, len(budgets))
     backend.set_training_mode()
     print(f"[step {step_idx}] X-GRPO calibration: {len(groups)} groups x "
           f"{len(budgets)} budgets on the primary trainer", flush=True)
     try:
-        for budget_index, budget in enumerate(budgets):
-            gradients = {}
-            budget_quarantined = 0
-            for group_id in sorted(groups):
-                gradient, quarantined = _x_grpo_flat_group_gradient(
-                    model, tokenizer, groups[group_id], cfg, budget_index,
-                    device_label=str(model.device))
-                gradients[group_id] = gradient
-                budget_quarantined += quarantined
-            trial = _x_grpo_crossfit_metrics(
-                gradients, cfg.x_grpo_relative_error)
-            for group_id, metrics in trial.items():
-                diagnostics[group_id].append({"budget": budget, **metrics})
-                if metrics["accepted"]:
-                    selected[group_id] = max(selected[group_id], budget)
-            quarantined_total += budget_quarantined
-            accepted_count = sum(item["accepted"] for item in trial.values())
-            print(f"[step {step_idx}] X-GRPO budget {budget:g}: accepted "
-                  f"for {accepted_count}/{len(groups)} held-out groups", flush=True)
-            del gradients
-            gc.collect()
+        with _rank_dropout_disabled(model):
+            for block_start in range(0, len(budgets), budget_block_size):
+                block_indices = tuple(range(
+                    block_start,
+                    min(block_start + budget_block_size, len(budgets))))
+                gradients_by_budget = {
+                    index: {} for index in block_indices}
+                for group_id in sorted(groups):
+                    block_gradients, quarantined, effective = (
+                        _x_grpo_flat_group_gradients(
+                            model, tokenizer, groups[group_id], cfg,
+                            block_indices, device_label=str(model.device),
+                            batches=batch_plans[group_id],
+                            parameters=parameters,
+                            zero_gradient=zero_gradient))
+                    batch_plans[group_id] = effective
+                    quarantined_total += quarantined
+                    for index, gradient in block_gradients.items():
+                        gradients_by_budget[index][group_id] = gradient
+
+                for budget_index in block_indices:
+                    budget = budgets[budget_index]
+                    trial = _x_grpo_crossfit_metrics(
+                        gradients_by_budget[budget_index],
+                        cfg.x_grpo_relative_error)
+                    for group_id, metrics in trial.items():
+                        diagnostics[group_id].append({
+                            "budget": budget, **metrics})
+                        if metrics["accepted"]:
+                            selected[group_id] = max(
+                                selected[group_id], budget)
+                    accepted_count = sum(
+                        item["accepted"] for item in trial.values())
+                    print(f"[step {step_idx}] X-GRPO budget {budget:g}: "
+                          f"accepted for {accepted_count}/{len(groups)} "
+                          "held-out groups", flush=True)
+                del gradients_by_budget
     finally:
         model.zero_grad(set_to_none=True)
     return {
