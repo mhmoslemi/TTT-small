@@ -1983,9 +1983,8 @@ def _x_grpo_batched_autograd_unavailable(error):
     return any(marker in message for marker in markers)
 
 
-def _x_grpo_per_example_parameter_gradients(scores, parameters, *,
-                                             vectorized):
-    """Differentiate every scalar rollout score once through one shared graph."""
+def _x_grpo_scalar_parameter_gradients(scores, parameters, *, vectorized):
+    """Differentiate scalar score aggregates through one shared graph."""
     import torch
 
     if scores.ndim != 1 or scores.numel() < 1:
@@ -2021,7 +2020,7 @@ def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
                                   budget_indices, *, group_id, cache_dir,
                                   device_label, batches=None,
                                   parameters=None):
-    """Compute rollout LoRA gradients once and cache all budget combinations."""
+    """Cache budget gradients from shared advantage-stratum derivatives."""
     import torch
 
     group_examples = list(examples)
@@ -2097,18 +2096,30 @@ def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
                 pad_token_id=tokenizer.pad_token_id)
             scores = torch.stack(
                 [current_lp.mean() for current_lp in current_logprobs])
-            per_example_gradients = _x_grpo_per_example_parameter_gradients(
-                scores, parameters, vectorized=vectorized)
-            weights = scores.new_tensor([
-                [float(example["x_grpo_trial_advantages"][index])
-                 / sampled_group_size
-                 for example in batch]
-                for index in representatives
+            strata = {}
+            for row, example in enumerate(batch):
+                signature = tuple(
+                    float(example["x_grpo_trial_advantages"][index])
+                    for index in representatives)
+                if any(value != 0.0 for value in signature):
+                    strata.setdefault(signature, []).append(row)
+            if not strata:
+                model.zero_grad(set_to_none=True)
+                del current_logprobs, scores
+                continue
+
+            signatures = tuple(strata)
+            stratum_scores = torch.stack([
+                scores[rows].sum() for rows in strata.values()
             ])
+            stratum_gradients = _x_grpo_scalar_parameter_gradients(
+                stratum_scores, parameters, vectorized=vectorized)
+            weights = scores.new_tensor(signatures).transpose(0, 1)
+            weights.div_(sampled_group_size)
             with torch.no_grad():
                 weights_by_device_dtype = {}
                 for accumulator, gradient in zip(
-                        accumulators, per_example_gradients):
+                        accumulators, stratum_gradients):
                     if gradient is None:
                         continue
                     weight_key = (gradient.device, gradient.dtype)
@@ -2119,10 +2130,11 @@ def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
                         weights_by_device_dtype[weight_key] = dtype_weights
                     accumulator.reshape(accumulator_count, -1).addmm_(
                         dtype_weights, gradient.detach().reshape(
-                            len(batch), -1))
+                            len(signatures), -1))
             model.zero_grad(set_to_none=True)
             del accumulator, gradient
-            del current_logprobs, scores, per_example_gradients, weights
+            del current_logprobs, scores, stratum_scores, stratum_gradients
+            del signatures, strata, weights
             del weights_by_device_dtype
 
         cached = {}
@@ -2153,9 +2165,9 @@ def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
         retry_without_vectorized_autograd = True
     if retry_without_vectorized_autograd:
         model.zero_grad(set_to_none=True)
-        print(f"[X-GRPO] {device_label}: batched per-rollout autograd is "
-              "unavailable; retrying with one backward per rollout within "
-              "each shared forward", flush=True)
+        print(f"[X-GRPO] {device_label}: batched diagnostic autograd is "
+              "unavailable; retrying with one backward per distinct "
+              "advantage stratum within each shared forward", flush=True)
         result, effective, quarantined = _run_oom_resilient_backward(
             model, planned_batches, attempt, device_label=device_label)
     model.zero_grad(set_to_none=True)
@@ -2262,26 +2274,91 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
     return results
 
 
+def _x_grpo_context_group_map(examples, *, context_group_ids=None,
+                              group_ids=None):
+    if context_group_ids is not None and group_ids is not None:
+        raise ValueError(
+            "pass X-GRPO context groups or flat group ids, not both")
+
+    examples = list(examples)
+    if context_group_ids is None:
+        allowed = (
+            {int(group_id) for group_id in group_ids}
+            if group_ids is not None else
+            {int(example["group_id"]) for example in examples}
+        )
+        inferred = {}
+        for example in examples:
+            group_id = int(example["group_id"])
+            if group_id not in allowed:
+                raise ValueError(
+                    f"unexpected X-GRPO diagnostic group {group_id}")
+            context_id = int(example.get("x_grpo_context_id", 0))
+            inferred.setdefault(context_id, set()).add(group_id)
+        missing = allowed - {
+            group_id for ids in inferred.values() for group_id in ids
+        }
+        if missing:
+            if len(inferred) > 1:
+                raise ValueError(
+                    "cannot infer the context of empty X-GRPO groups; pass "
+                    "context_group_ids")
+            context_id = next(iter(inferred), 0)
+            inferred.setdefault(context_id, set()).update(missing)
+        context_group_ids = inferred
+
+    normalized = {}
+    owners = {}
+    for context_id, ids in context_group_ids.items():
+        context_id = int(context_id)
+        ordered = tuple(sorted({int(group_id) for group_id in ids}))
+        if len(ordered) < 3:
+            raise ValueError(
+                f"X-GRPO context {context_id} requires at least three groups")
+        for group_id in ordered:
+            previous = owners.get(group_id)
+            if previous is not None:
+                raise ValueError(
+                    f"X-GRPO group {group_id} belongs to contexts "
+                    f"{previous} and {context_id}")
+            owners[group_id] = context_id
+        normalized[context_id] = ordered
+    if not normalized:
+        raise ValueError("X-GRPO calibration requires at least one context")
+    return dict(sorted(normalized.items()))
+
+
 def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
-                            *, group_ids=None):
+                            *, context_group_ids=None, group_ids=None):
     """Serial calibration path for a single/model-parallel training model."""
     from tempfile import TemporaryDirectory
     import torch
 
-    expected_group_ids = (
-        sorted({int(group_id) for group_id in group_ids})
-        if group_ids is not None else
-        sorted({int(example["group_id"]) for example in examples})
+    examples = list(examples)
+    contexts = _x_grpo_context_group_map(
+        examples, context_group_ids=context_group_ids, group_ids=group_ids)
+    expected_group_ids = sorted(
+        group_id for ids in contexts.values() for group_id in ids
     )
     groups = {group_id: [] for group_id in expected_group_ids}
+    context_for_group = {
+        group_id: context_id
+        for context_id, ids in contexts.items()
+        for group_id in ids
+    }
     for example in examples:
         group_id = int(example["group_id"])
         if group_id not in groups:
             raise ValueError(
                 f"unexpected X-GRPO diagnostic group {group_id}")
+        example_context = int(example.get(
+            "x_grpo_context_id", context_for_group[group_id]))
+        if example_context != context_for_group[group_id]:
+            raise ValueError(
+                f"X-GRPO group {group_id} was assigned to context "
+                f"{context_for_group[group_id]} but contains context "
+                f"{example_context}")
         groups[group_id].append(example)
-    if len(groups) < 3:
-        raise ValueError("X-GRPO calibration requires at least three groups")
 
     budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
     selected = {group_id: 0.0 for group_id in groups}
@@ -2300,9 +2377,10 @@ def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
     }
     budget_indices = tuple(range(len(budgets)))
     backend.set_training_mode()
-    print(f"[step {step_idx}] X-GRPO calibration: {len(groups)} groups x "
-          f"{len(budgets)} budgets on the primary trainer; computing each "
-          "rollout LoRA gradient once", flush=True)
+    print(f"[step {step_idx}] X-GRPO calibration: {len(contexts)} contexts, "
+          f"{len(groups)} groups x {len(budgets)} budgets on the primary "
+          "trainer; identical advantage strata share one aggregate backward",
+          flush=True)
     try:
         with TemporaryDirectory(prefix="x-grpo-gradients-") as cache_dir:
             cached_by_group = {}
@@ -2320,29 +2398,35 @@ def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
                     quarantined_total += quarantined
                     cached_by_group[group_id] = cached
 
-            for budget_index, budget in enumerate(budgets):
-                gradients = {
-                    group_id: _x_grpo_load_cached_gradient(
-                        cached_by_group[group_id][budget_index],
-                        zero_gradient)
-                    for group_id in sorted(groups)
+            for context_id, context_ids in contexts.items():
+                context_caches = {
+                    group_id: cached_by_group[group_id]
+                    for group_id in context_ids
                 }
-                trial = _x_grpo_crossfit_metrics(
-                    gradients, cfg.x_grpo_relative_error)
-                for group_id, metrics in trial.items():
-                    diagnostics[group_id].append({
-                        "budget": budget, **metrics})
-                    if metrics["accepted"]:
-                        selected[group_id] = max(
-                            selected[group_id], budget)
-                accepted_count = sum(
-                    item["accepted"] for item in trial.values())
-                print(f"[step {step_idx}] X-GRPO budget {budget:g}: "
-                      f"accepted for {accepted_count}/{len(groups)} "
-                      "held-out groups", flush=True)
-                del gradients
-                _x_grpo_delete_consumed_cache(
-                    cached_by_group, budget_index)
+                for budget_index, budget in enumerate(budgets):
+                    gradients = {
+                        group_id: _x_grpo_load_cached_gradient(
+                            cached_by_group[group_id][budget_index],
+                            zero_gradient)
+                        for group_id in context_ids
+                    }
+                    trial = _x_grpo_crossfit_metrics(
+                        gradients, cfg.x_grpo_relative_error)
+                    for group_id, metrics in trial.items():
+                        diagnostics[group_id].append({
+                            "budget": budget, **metrics})
+                        if metrics["accepted"]:
+                            selected[group_id] = max(
+                                selected[group_id], budget)
+                    accepted_count = sum(
+                        item["accepted"] for item in trial.values())
+                    print(f"[step {step_idx}] X-GRPO context {context_id} "
+                          f"budget {budget:g}: accepted for "
+                          f"{accepted_count}/{len(context_ids)} held-out "
+                          "groups", flush=True)
+                    del gradients
+                    _x_grpo_delete_consumed_cache(
+                        context_caches, budget_index)
     finally:
         model.zero_grad(set_to_none=True)
     return {
@@ -3975,7 +4059,8 @@ class ProcessDistributedTrainer:
                 merged.max_abs, float(item.get("max_abs", 0.0)))
         return merged
 
-    def calibrate_x_grpo(self, examples, cfg, step_idx, *, group_ids=None):
+    def calibrate_x_grpo(self, examples, cfg, step_idx, *,
+                         context_group_ids=None, group_ids=None):
         from fast_distributed import local_x_grpo_calibration
 
         if self._offloaded:
@@ -3984,20 +4069,31 @@ class ProcessDistributedTrainer:
             self.restore_after_generation()
 
         cpu_examples = self._cpu_examples(examples)
-        expected_group_ids = (
-            sorted({int(group_id) for group_id in group_ids})
-            if group_ids is not None else
-            sorted({int(example["group_id"]) for example in cpu_examples})
+        contexts = _x_grpo_context_group_map(
+            cpu_examples, context_group_ids=context_group_ids,
+            group_ids=group_ids)
+        expected_group_ids = sorted(
+            group_id for ids in contexts.values() for group_id in ids
         )
         groups = {group_id: [] for group_id in expected_group_ids}
+        context_for_group = {
+            group_id: context_id
+            for context_id, ids in contexts.items()
+            for group_id in ids
+        }
         for example in cpu_examples:
             group_id = int(example["group_id"])
             if group_id not in groups:
                 raise ValueError(
                     f"unexpected X-GRPO diagnostic group {group_id}")
+            example_context = int(example.get(
+                "x_grpo_context_id", context_for_group[group_id]))
+            if example_context != context_for_group[group_id]:
+                raise ValueError(
+                    f"X-GRPO group {group_id} was assigned to context "
+                    f"{context_for_group[group_id]} but contains context "
+                    f"{example_context}")
             groups[group_id].append(example)
-        if len(groups) < 3:
-            raise ValueError("X-GRPO calibration requires at least three groups")
 
         shards = [[] for _ in range(self._world_size)]
         shard_group_ids = [[] for _ in range(self._world_size)]
@@ -4017,22 +4113,23 @@ class ProcessDistributedTrainer:
             loads[rank] += cost
 
         print(f"[step {step_idx}] X-GRPO distributed calibration: "
-              f"{len(groups)} groups x {len(cfg.x_grpo_budgets)} budgets; "
+              f"{len(contexts)} contexts, {len(groups)} groups x "
+              f"{len(cfg.x_grpo_budgets)} budgets in one dispatch; "
               f"group-token loads/GPU={loads}; rollout LoRA gradients are "
-              "computed once and temporary aggregates are deleted after "
-              "this context", flush=True)
+              "collapsed by identical advantage stratum and temporary "
+              "aggregates are deleted after use", flush=True)
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
                 "kind": "calibrate_x_grpo",
                 "examples": shards[rank],
                 "group_ids": shard_group_ids[rank],
-                "group_count": len(groups),
+                "context_group_ids": contexts,
             })
 
         local = local_x_grpo_calibration(
             self.backend, self.model, self.tokenizer, shards[0], cfg, 0,
-            len(groups), group_ids=shard_group_ids[0])
+            context_group_ids=contexts, group_ids=shard_group_ids[0])
         child_messages = self._collect_event(
             "calibrated", range(1, self._world_size))
         self._workers_idle = True
@@ -4058,13 +4155,15 @@ class ProcessDistributedTrainer:
             raise RuntimeError(
                 "distributed X-GRPO calibration lost a group: "
                 f"expected {sorted(groups)}, got {sorted(selected)}")
-        for budget_index, budget in enumerate(cfg.x_grpo_budgets):
-            accepted = sum(
-                bool(diagnostics[group_id][budget_index]["accepted"])
-                for group_id in diagnostics)
-            print(f"[step {step_idx}] X-GRPO budget {float(budget):g}: "
-                  f"accepted for {accepted}/{len(groups)} held-out groups",
-                  flush=True)
+        for context_id, context_ids in contexts.items():
+            for budget_index, budget in enumerate(cfg.x_grpo_budgets):
+                accepted = sum(
+                    bool(diagnostics[group_id][budget_index]["accepted"])
+                    for group_id in context_ids)
+                print(f"[step {step_idx}] X-GRPO context {context_id} "
+                      f"budget {float(budget):g}: accepted for "
+                      f"{accepted}/{len(context_ids)} held-out groups",
+                      flush=True)
         return {
             "selected_budgets": selected,
             "groups": diagnostics,
@@ -5585,44 +5684,27 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         for group_id, group_data in x_grpo_groups.items():
             group_ids_by_context.setdefault(
                 int(group_data["context"]), []).append(int(group_id))
-        calibration = {
-            "selected_budgets": {},
-            "groups": {},
-            "diagnostic_quarantined_examples": 0,
-            "distributed": False,
-        }
         for context_id in sorted(group_ids_by_context):
-            context_group_ids = tuple(sorted(group_ids_by_context[context_id]))
-            if len(context_group_ids) != x_grpo_groups_per_context:
+            group_ids_by_context[context_id] = tuple(sorted(
+                group_ids_by_context[context_id]))
+            if (len(group_ids_by_context[context_id])
+                    != x_grpo_groups_per_context):
                 raise RuntimeError(
                     f"X-GRPO context {context_id} has "
-                    f"{len(context_group_ids)} groups; expected "
+                    f"{len(group_ids_by_context[context_id])} groups; expected "
                     f"K={x_grpo_groups_per_context}")
-            context_examples = [
-                example for example in all_examples
-                if int(example["x_grpo_context_id"]) == context_id
-            ]
+        if (parallel_trainer is not None
+                and hasattr(parallel_trainer, "calibrate_x_grpo")):
+            calibration = parallel_trainer.calibrate_x_grpo(
+                all_examples, cfg, step_idx,
+                context_group_ids=group_ids_by_context)
+        else:
             if (parallel_trainer is not None
-                    and hasattr(parallel_trainer, "calibrate_x_grpo")):
-                context_calibration = parallel_trainer.calibrate_x_grpo(
-                    context_examples, cfg, step_idx,
-                    group_ids=context_group_ids)
-            else:
-                if (parallel_trainer is not None
-                        and parallel_trainer.is_offloaded):
-                    parallel_trainer.restore_after_generation()
-                context_calibration = _calibrate_x_grpo_local(
-                    backend, model, tokenizer, context_examples, cfg, step_idx,
-                    group_ids=context_group_ids)
-            calibration["selected_budgets"].update(
-                context_calibration["selected_budgets"])
-            calibration["groups"].update(context_calibration["groups"])
-            calibration["diagnostic_quarantined_examples"] += int(
-                context_calibration.get(
-                    "diagnostic_quarantined_examples", 0))
-            calibration["distributed"] = bool(
-                calibration["distributed"]
-                or context_calibration.get("distributed", False))
+                    and parallel_trainer.is_offloaded):
+                parallel_trainer.restore_after_generation()
+            calibration = _calibrate_x_grpo_local(
+                backend, model, tokenizer, all_examples, cfg, step_idx,
+                context_group_ids=group_ids_by_context)
         x_grpo_group_stats = _apply_x_grpo_calibration(
             all_examples, x_grpo_groups, calibration, cfg)
         selected_label = ", ".join(

@@ -193,31 +193,50 @@ def _move_examples(examples, logical_id):
 
 
 def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
-                             logical_id, group_count, *, group_ids=None):
-    """Evaluate this rank's diagnostic groups and cross-fit through NCCL sums."""
+                             logical_id, *, context_group_ids,
+                             group_ids=None):
+    """Evaluate assigned groups while cross-fitting each context separately."""
     import math
     from tempfile import TemporaryDirectory
     import torch
     import torch.distributed as dist
     import train_multy_CVaR as training
 
-    group_count = int(group_count)
-    if group_count < 3:
-        raise ValueError("X-GRPO calibration requires at least three groups")
     backend.set_training_mode()
     set_total_memory_ceiling(logical_id, 0.80)
     local_examples = _move_examples(list(examples), logical_id)
+    contexts = training._x_grpo_context_group_map(
+        (), context_group_ids=context_group_ids)
+    all_group_ids = {
+        group_id for ids in contexts.values() for group_id in ids
+    }
     expected_group_ids = (
         sorted({int(group_id) for group_id in group_ids})
         if group_ids is not None else
         sorted({int(example["group_id"]) for example in local_examples})
     )
+    unexpected = set(expected_group_ids) - all_group_ids
+    if unexpected:
+        raise ValueError(
+            f"unexpected local X-GRPO groups: {sorted(unexpected)}")
     local_groups = {group_id: [] for group_id in expected_group_ids}
+    context_for_group = {
+        group_id: context_id
+        for context_id, ids in contexts.items()
+        for group_id in ids
+    }
     for example in local_examples:
         group_id = int(example["group_id"])
         if group_id not in local_groups:
             raise ValueError(
                 f"unexpected local X-GRPO diagnostic group {group_id}")
+        example_context = int(example.get(
+            "x_grpo_context_id", context_for_group[group_id]))
+        if example_context != context_for_group[group_id]:
+            raise ValueError(
+                f"X-GRPO group {group_id} was assigned to context "
+                f"{context_for_group[group_id]} but contains context "
+                f"{example_context}")
         local_groups[group_id].append(example)
 
     parameters = trainable_parameters(model)
@@ -235,8 +254,6 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
         for group_id, group_examples in local_groups.items()
     }
     budget_indices = tuple(range(len(budgets)))
-    heldout_count = group_count - 1
-    error_denominator = heldout_count * (heldout_count - 1)
     relative_error = float(cfg.x_grpo_relative_error)
     device = torch.device(f"cuda:{int(logical_id)}")
 
@@ -257,79 +274,91 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
                     quarantined_total += quarantined
                     cached_by_group[group_id] = cached
 
-            for budget_index, budget in enumerate(budgets):
-                gradients = {
-                    group_id: training._x_grpo_load_cached_gradient(
-                        cached_by_group[group_id][budget_index],
-                        zero_gradient)
-                    for group_id in sorted(local_groups)
+            for context_id, context_ids in contexts.items():
+                group_count = len(context_ids)
+                heldout_count = group_count - 1
+                error_denominator = heldout_count * (heldout_count - 1)
+                local_context_ids = tuple(
+                    group_id for group_id in context_ids
+                    if group_id in local_groups
+                )
+                context_caches = {
+                    group_id: cached_by_group[group_id]
+                    for group_id in local_context_ids
                 }
-                if gradients:
-                    local_sum = next(iter(gradients.values())).clone()
-                    for gradient in list(gradients.values())[1:]:
-                        local_sum.add_(gradient)
-                    local_squared_norms = sum(
-                        float(torch.dot(gradient, gradient).item())
-                        for gradient in gradients.values())
-                else:
-                    local_sum = torch.zeros(
-                        flat_count, dtype=torch.float32)
-                    local_squared_norms = 0.0
+                for budget_index, budget in enumerate(budgets):
+                    gradients = {
+                        group_id: training._x_grpo_load_cached_gradient(
+                            cached_by_group[group_id][budget_index],
+                            zero_gradient)
+                        for group_id in local_context_ids
+                    }
+                    if gradients:
+                        local_sum = next(iter(gradients.values())).clone()
+                        for gradient in list(gradients.values())[1:]:
+                            local_sum.add_(gradient)
+                        local_squared_norms = sum(
+                            float(torch.dot(gradient, gradient).item())
+                            for gradient in gradients.values())
+                    else:
+                        local_sum = torch.zeros(
+                            flat_count, dtype=torch.float32)
+                        local_squared_norms = 0.0
 
-                with torch.cuda.device(int(logical_id)), torch.no_grad():
-                    total = local_sum.to(device, non_blocking=True)
-                    dist.all_reduce(total, op=dist.ReduceOp.SUM)
-                    squared_norms = torch.tensor(
-                        local_squared_norms, dtype=torch.float64,
-                        device=device)
-                    dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
-                    total_norm_squared = float(
-                        torch.dot(total, total).item())
-                    all_squared_norms = float(squared_norms.item())
-                    total_cpu = total.cpu()
+                    with torch.cuda.device(int(logical_id)), torch.no_grad():
+                        total = local_sum.to(device, non_blocking=True)
+                        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+                        squared_norms = torch.tensor(
+                            local_squared_norms, dtype=torch.float64,
+                            device=device)
+                        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+                        total_norm_squared = float(
+                            torch.dot(total, total).item())
+                        all_squared_norms = float(squared_norms.item())
+                        total_cpu = total.cpu()
 
-                for group_id, gradient in gradients.items():
-                    gradient_norm_squared = float(
-                        torch.dot(gradient, gradient).item())
-                    total_dot_gradient = float(
-                        torch.dot(total_cpu, gradient).item())
-                    heldout_sum_norm_squared = max(
-                        0.0,
-                        total_norm_squared + gradient_norm_squared
-                        - 2.0 * total_dot_gradient,
-                    )
-                    heldout_squared_norms = max(
-                        0.0, all_squared_norms - gradient_norm_squared)
-                    centered_sum = max(
-                        0.0,
-                        heldout_squared_norms
-                        - heldout_sum_norm_squared / heldout_count,
-                    )
-                    signal_squared = (
-                        heldout_sum_norm_squared / (heldout_count ** 2))
-                    error_squared = centered_sum / error_denominator
-                    accepted = bool(
-                        signal_squared > 0.0
-                        and error_squared
-                        <= relative_error ** 2 * signal_squared)
-                    signal_norm = math.sqrt(signal_squared)
-                    standard_error = math.sqrt(error_squared)
-                    diagnostics[group_id].append({
-                        "budget": budget,
-                        "gradient_norm": signal_norm,
-                        "standard_error": standard_error,
-                        "relative_error": (
-                            standard_error / signal_norm
-                            if signal_norm > 0.0 else None),
-                        "accepted": accepted,
-                    })
-                    if accepted:
-                        selected[group_id] = max(
-                            selected[group_id], budget)
+                    for group_id, gradient in gradients.items():
+                        gradient_norm_squared = float(
+                            torch.dot(gradient, gradient).item())
+                        total_dot_gradient = float(
+                            torch.dot(total_cpu, gradient).item())
+                        heldout_sum_norm_squared = max(
+                            0.0,
+                            total_norm_squared + gradient_norm_squared
+                            - 2.0 * total_dot_gradient,
+                        )
+                        heldout_squared_norms = max(
+                            0.0, all_squared_norms - gradient_norm_squared)
+                        centered_sum = max(
+                            0.0,
+                            heldout_squared_norms
+                            - heldout_sum_norm_squared / heldout_count,
+                        )
+                        signal_squared = (
+                            heldout_sum_norm_squared / (heldout_count ** 2))
+                        error_squared = centered_sum / error_denominator
+                        accepted = bool(
+                            signal_squared > 0.0
+                            and error_squared
+                            <= relative_error ** 2 * signal_squared)
+                        signal_norm = math.sqrt(signal_squared)
+                        standard_error = math.sqrt(error_squared)
+                        diagnostics[group_id].append({
+                            "budget": budget,
+                            "gradient_norm": signal_norm,
+                            "standard_error": standard_error,
+                            "relative_error": (
+                                standard_error / signal_norm
+                                if signal_norm > 0.0 else None),
+                            "accepted": accepted,
+                        })
+                        if accepted:
+                            selected[group_id] = max(
+                                selected[group_id], budget)
 
-                del gradients, local_sum, total, total_cpu, squared_norms
-                training._x_grpo_delete_consumed_cache(
-                    cached_by_group, budget_index)
+                    del gradients, local_sum, total, total_cpu, squared_norms
+                    training._x_grpo_delete_consumed_cache(
+                        context_caches, budget_index)
     finally:
         model.zero_grad(set_to_none=True)
 
@@ -811,7 +840,8 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                         "fast worker received calibration while offloaded")
                 calibration = local_x_grpo_calibration(
                     backend, model, tokenizer, command["examples"], cfg,
-                    int(rank), int(command["group_count"]),
+                    int(rank),
+                    context_group_ids=command["context_group_ids"],
                     group_ids=command["group_ids"])
                 result_queue.put({
                     "event": "calibrated", "rank": int(rank),
