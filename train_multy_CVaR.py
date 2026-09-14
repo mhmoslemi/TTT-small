@@ -2228,12 +2228,15 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
     if group_count < 3:
         raise ValueError("X-GRPO calibration requires at least three groups")
     total = gradients[group_ids[0]].clone()
-    total_squared_norms = float(
-        torch.dot(gradients[group_ids[0]], gradients[group_ids[0]]).item())
+    gradient_squared_norms = {
+        group_id: float(torch.dot(gradient, gradient).item())
+        for group_id, gradient in gradients.items()
+    }
+    total_squared_norms = gradient_squared_norms[group_ids[0]]
     for group_id in group_ids[1:]:
         gradient = gradients[group_id]
         total.add_(gradient)
-        total_squared_norms += float(torch.dot(gradient, gradient).item())
+        total_squared_norms += gradient_squared_norms[group_id]
     total_norm_squared = float(torch.dot(total, total).item())
 
     heldout_count = group_count - 1
@@ -2241,13 +2244,14 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
     results = {}
     for group_id in group_ids:
         gradient = gradients[group_id]
-        gradient_norm_squared = float(torch.dot(gradient, gradient).item())
-        total_dot_gradient = float(torch.dot(total, gradient).item())
-        heldout_sum_norm_squared = max(
-            0.0,
-            total_norm_squared + gradient_norm_squared
-            - 2.0 * total_dot_gradient,
-        )
+        gradient_norm_squared = gradient_squared_norms[group_id]
+        heldout_sum = None
+        if gradient_norm_squared == 0.0:
+            heldout_sum_norm_squared = total_norm_squared
+        else:
+            heldout_sum = total - gradient
+            heldout_sum_norm_squared = float(
+                torch.dot(heldout_sum, heldout_sum).item())
         heldout_squared_norms = max(
             0.0, total_squared_norms - gradient_norm_squared)
         centered_sum = max(
@@ -2271,6 +2275,8 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
                 else None),
             "accepted": accepted,
         }
+        if heldout_sum is not None:
+            del heldout_sum
     return results
 
 

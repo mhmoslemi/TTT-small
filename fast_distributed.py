@@ -293,13 +293,17 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
                             zero_gradient)
                         for group_id in local_context_ids
                     }
+                    gradient_squared_norms = {
+                        group_id: float(torch.dot(
+                            gradient, gradient).item())
+                        for group_id, gradient in gradients.items()
+                    }
                     if gradients:
                         local_sum = next(iter(gradients.values())).clone()
                         for gradient in list(gradients.values())[1:]:
                             local_sum.add_(gradient)
                         local_squared_norms = sum(
-                            float(torch.dot(gradient, gradient).item())
-                            for gradient in gradients.values())
+                            gradient_squared_norms.values())
                     else:
                         local_sum = torch.zeros(
                             flat_count, dtype=torch.float32)
@@ -312,21 +316,20 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
                             local_squared_norms, dtype=torch.float64,
                             device=device)
                         dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
-                        total_norm_squared = float(
-                            torch.dot(total, total).item())
                         all_squared_norms = float(squared_norms.item())
                         total_cpu = total.cpu()
+                        total_norm_squared = float(
+                            torch.dot(total_cpu, total_cpu).item())
 
                     for group_id, gradient in gradients.items():
-                        gradient_norm_squared = float(
-                            torch.dot(gradient, gradient).item())
-                        total_dot_gradient = float(
-                            torch.dot(total_cpu, gradient).item())
-                        heldout_sum_norm_squared = max(
-                            0.0,
-                            total_norm_squared + gradient_norm_squared
-                            - 2.0 * total_dot_gradient,
-                        )
+                        gradient_norm_squared = gradient_squared_norms[group_id]
+                        heldout_sum = None
+                        if gradient_norm_squared == 0.0:
+                            heldout_sum_norm_squared = total_norm_squared
+                        else:
+                            heldout_sum = total_cpu - gradient
+                            heldout_sum_norm_squared = float(
+                                torch.dot(heldout_sum, heldout_sum).item())
                         heldout_squared_norms = max(
                             0.0, all_squared_norms - gradient_norm_squared)
                         centered_sum = max(
@@ -355,8 +358,11 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
                         if accepted:
                             selected[group_id] = max(
                                 selected[group_id], budget)
+                        if heldout_sum is not None:
+                            del heldout_sum
 
-                    del gradients, local_sum, total, total_cpu, squared_norms
+                    del gradients, gradient_squared_norms, local_sum
+                    del total, total_cpu, squared_norms
                     training._x_grpo_delete_consumed_cache(
                         context_caches, budget_index)
     finally:
