@@ -771,6 +771,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         import train_multy_CVaR as training
         from model_backend import load_backend
 
+        training._install_console_timestamps()
         torch.set_num_threads(max(
             1, int(os.cpu_count() or world_size) // int(world_size)))
         torch.cuda.set_device(int(rank))

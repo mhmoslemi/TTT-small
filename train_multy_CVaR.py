@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import random
+import threading
 import time
 from contextlib import (contextmanager, nullcontext, redirect_stderr,
                         redirect_stdout)
@@ -39,6 +40,43 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import yaml
+
+
+class _TimestampedLineStream:
+    def __init__(self, stream):
+        self.stream = stream
+        self._line_start = True
+        self._lock = threading.Lock()
+
+    def write(self, value):
+        value = str(value)
+        if not value:
+            return 0
+        parts = value.split("\n")
+        with self._lock:
+            for index, part in enumerate(parts):
+                if part and self._line_start:
+                    self.stream.write(time.strftime("[%H:%M:%S] "))
+                if part:
+                    self.stream.write(part)
+                    self._line_start = False
+                if index + 1 < len(parts):
+                    self.stream.write("\n")
+                    self._line_start = True
+        return len(value)
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def _install_console_timestamps():
+    if not isinstance(sys.stdout, _TimestampedLineStream):
+        sys.stdout = _TimestampedLineStream(sys.stdout)
+    if not isinstance(sys.stderr, _TimestampedLineStream):
+        sys.stderr = _TimestampedLineStream(sys.stderr)
 
 
 _ROUTED_DEPENDENCY_NOTICES = (
@@ -5686,6 +5724,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return step_stats
 
     if x_grpo_mode:
+        calibration_t0 = time.time()
         group_ids_by_context = {}
         for group_id, group_data in x_grpo_groups.items():
             group_ids_by_context.setdefault(
@@ -5717,8 +5756,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             f"p{item['context']}/k{item['fold']}="
             f"{item['selected_budget']:g}"
             for item in x_grpo_group_stats)
+        calibration_seconds = time.time() - calibration_t0
         print(f"[step {step_idx}] X-GRPO selected budgets: "
-              f"{selected_label}", flush=True)
+              f"{selected_label}  (calibration: {calibration_seconds:.1f}s)",
+              flush=True)
         step_stats["x_grpo_groups"] = x_grpo_group_stats
         step_stats["x_grpo_calibration_distributed"] = bool(
             calibration.get("distributed", False))
@@ -5916,6 +5957,7 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 # Main
 # ======================================================================
 def main():
+    _install_console_timestamps()
     cfg, merged = load_config()
     # This must precede every import path that can initialize CUDA. Worker and
     # evaluation children replace CUDA_VISIBLE_DEVICES with their own physical
