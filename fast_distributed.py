@@ -196,6 +196,7 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
                              logical_id, group_count, *, group_ids=None):
     """Evaluate this rank's diagnostic groups and cross-fit through NCCL sums."""
     import math
+    from tempfile import TemporaryDirectory
     import torch
     import torch.distributed as dist
     import train_multy_CVaR as training
@@ -233,101 +234,102 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
         group_id: training._training_microbatches(group_examples, cfg)
         for group_id, group_examples in local_groups.items()
     }
-    budget_block_size = min(2, len(budgets))
+    budget_indices = tuple(range(len(budgets)))
     heldout_count = group_count - 1
     error_denominator = heldout_count * (heldout_count - 1)
     relative_error = float(cfg.x_grpo_relative_error)
     device = torch.device(f"cuda:{int(logical_id)}")
 
     try:
-        with training._rank_dropout_disabled(model):
-            for block_start in range(0, len(budgets), budget_block_size):
-                block_indices = tuple(range(
-                    block_start,
-                    min(block_start + budget_block_size, len(budgets))))
-                gradients_by_budget = {
-                    index: {} for index in block_indices}
+        with TemporaryDirectory(prefix="x-grpo-gradients-") as cache_dir:
+            cached_by_group = {}
+            with training._rank_dropout_disabled(model):
                 for group_id in sorted(local_groups):
-                    block_gradients, quarantined, effective = (
-                        training._x_grpo_flat_group_gradients(
+                    cached, quarantined, effective = (
+                        training._x_grpo_cache_group_gradients(
                             model, tokenizer, local_groups[group_id], cfg,
-                            block_indices, device_label=str(device),
+                            budget_indices, group_id=group_id,
+                            cache_dir=cache_dir,
+                            device_label=str(device),
                             batches=batch_plans[group_id],
-                            parameters=parameters,
-                            zero_gradient=zero_gradient))
+                            parameters=parameters))
                     batch_plans[group_id] = effective
                     quarantined_total += quarantined
-                    for index, gradient in block_gradients.items():
-                        gradients_by_budget[index][group_id] = gradient
+                    cached_by_group[group_id] = cached
 
-                for budget_index in block_indices:
-                    budget = budgets[budget_index]
-                    gradients = gradients_by_budget[budget_index]
-                    if gradients:
-                        local_sum = next(iter(gradients.values())).clone()
-                        for gradient in list(gradients.values())[1:]:
-                            local_sum.add_(gradient)
-                        local_squared_norms = sum(
-                            float(torch.dot(gradient, gradient).item())
-                            for gradient in gradients.values())
-                    else:
-                        local_sum = torch.zeros(
-                            flat_count, dtype=torch.float32)
-                        local_squared_norms = 0.0
+            for budget_index, budget in enumerate(budgets):
+                gradients = {
+                    group_id: training._x_grpo_load_cached_gradient(
+                        cached_by_group[group_id][budget_index],
+                        zero_gradient)
+                    for group_id in sorted(local_groups)
+                }
+                if gradients:
+                    local_sum = next(iter(gradients.values())).clone()
+                    for gradient in list(gradients.values())[1:]:
+                        local_sum.add_(gradient)
+                    local_squared_norms = sum(
+                        float(torch.dot(gradient, gradient).item())
+                        for gradient in gradients.values())
+                else:
+                    local_sum = torch.zeros(
+                        flat_count, dtype=torch.float32)
+                    local_squared_norms = 0.0
 
-                    with torch.cuda.device(int(logical_id)), torch.no_grad():
-                        total = local_sum.to(device, non_blocking=True)
-                        dist.all_reduce(total, op=dist.ReduceOp.SUM)
-                        squared_norms = torch.tensor(
-                            local_squared_norms, dtype=torch.float64,
-                            device=device)
-                        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
-                        total_norm_squared = float(
-                            torch.dot(total, total).item())
-                        all_squared_norms = float(squared_norms.item())
-                        total_cpu = total.cpu()
+                with torch.cuda.device(int(logical_id)), torch.no_grad():
+                    total = local_sum.to(device, non_blocking=True)
+                    dist.all_reduce(total, op=dist.ReduceOp.SUM)
+                    squared_norms = torch.tensor(
+                        local_squared_norms, dtype=torch.float64,
+                        device=device)
+                    dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+                    total_norm_squared = float(
+                        torch.dot(total, total).item())
+                    all_squared_norms = float(squared_norms.item())
+                    total_cpu = total.cpu()
 
-                    for group_id, gradient in gradients.items():
-                        gradient_norm_squared = float(
-                            torch.dot(gradient, gradient).item())
-                        total_dot_gradient = float(
-                            torch.dot(total_cpu, gradient).item())
-                        heldout_sum_norm_squared = max(
-                            0.0,
-                            total_norm_squared + gradient_norm_squared
-                            - 2.0 * total_dot_gradient,
-                        )
-                        heldout_squared_norms = max(
-                            0.0, all_squared_norms - gradient_norm_squared)
-                        centered_sum = max(
-                            0.0,
-                            heldout_squared_norms
-                            - heldout_sum_norm_squared / heldout_count,
-                        )
-                        signal_squared = (
-                            heldout_sum_norm_squared / (heldout_count ** 2))
-                        error_squared = centered_sum / error_denominator
-                        accepted = bool(
-                            signal_squared > 0.0
-                            and error_squared
-                            <= relative_error ** 2 * signal_squared)
-                        signal_norm = math.sqrt(signal_squared)
-                        standard_error = math.sqrt(error_squared)
-                        diagnostics[group_id].append({
-                            "budget": budget,
-                            "gradient_norm": signal_norm,
-                            "standard_error": standard_error,
-                            "relative_error": (
-                                standard_error / signal_norm
-                                if signal_norm > 0.0 else None),
-                            "accepted": accepted,
-                        })
-                        if accepted:
-                            selected[group_id] = max(
-                                selected[group_id], budget)
+                for group_id, gradient in gradients.items():
+                    gradient_norm_squared = float(
+                        torch.dot(gradient, gradient).item())
+                    total_dot_gradient = float(
+                        torch.dot(total_cpu, gradient).item())
+                    heldout_sum_norm_squared = max(
+                        0.0,
+                        total_norm_squared + gradient_norm_squared
+                        - 2.0 * total_dot_gradient,
+                    )
+                    heldout_squared_norms = max(
+                        0.0, all_squared_norms - gradient_norm_squared)
+                    centered_sum = max(
+                        0.0,
+                        heldout_squared_norms
+                        - heldout_sum_norm_squared / heldout_count,
+                    )
+                    signal_squared = (
+                        heldout_sum_norm_squared / (heldout_count ** 2))
+                    error_squared = centered_sum / error_denominator
+                    accepted = bool(
+                        signal_squared > 0.0
+                        and error_squared
+                        <= relative_error ** 2 * signal_squared)
+                    signal_norm = math.sqrt(signal_squared)
+                    standard_error = math.sqrt(error_squared)
+                    diagnostics[group_id].append({
+                        "budget": budget,
+                        "gradient_norm": signal_norm,
+                        "standard_error": standard_error,
+                        "relative_error": (
+                            standard_error / signal_norm
+                            if signal_norm > 0.0 else None),
+                        "accepted": accepted,
+                    })
+                    if accepted:
+                        selected[group_id] = max(
+                            selected[group_id], budget)
 
-                    del local_sum, total, total_cpu, squared_norms
-                del gradients_by_budget
+                del gradients, local_sum, total, total_cpu, squared_norms
+                training._x_grpo_delete_consumed_cache(
+                    cached_by_group, budget_index)
     finally:
         model.zero_grad(set_to_none=True)
 

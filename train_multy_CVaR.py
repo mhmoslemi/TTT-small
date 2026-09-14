@@ -1964,17 +1964,68 @@ def _rank_entropy_coefficient(cfg):
         cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
 
 
-def _x_grpo_flat_group_gradients(model, tokenizer, examples, cfg,
-                                 budget_indices, *, device_label,
-                                 batches=None, parameters=None,
-                                 zero_gradient=None):
-    """Compute a block of frozen diagnostic gradients from shared forwards."""
+def _x_grpo_batched_autograd_unavailable(error):
+    """Whether PyTorch cannot vectorize per-example VJPs on this model."""
+    message = str(error).lower()
+    markers = (
+        "is_grads_batched",
+        "batched grad",
+        "batching rule",
+        "batchingrule",
+        "inside of vmap",
+        "functorch",
+        "vmap",
+        "vmap-incompatible",
+        "vmap incompatible",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _x_grpo_per_example_parameter_gradients(scores, parameters, *,
+                                             vectorized):
+    """Differentiate every scalar rollout score once through one shared graph."""
+    import torch
+
+    if scores.ndim != 1 or scores.numel() < 1:
+        raise ValueError("X-GRPO rollout scores must be a nonempty vector")
+    count = int(scores.numel())
+    if count == 1:
+        gradients = torch.autograd.grad(
+            scores[0], parameters, allow_unused=True)
+        return tuple(
+            None if gradient is None else gradient.unsqueeze(0)
+            for gradient in gradients)
+
+    if vectorized:
+        basis = torch.eye(count, dtype=scores.dtype, device=scores.device)
+        return torch.autograd.grad(
+            scores, parameters, grad_outputs=basis,
+            is_grads_batched=True, allow_unused=True)
+
+    rows = [[] for _ in parameters]
+    for row_index in range(count):
+        gradients = torch.autograd.grad(
+            scores[row_index], parameters, allow_unused=True,
+            retain_graph=row_index + 1 < count)
+        for parameter_index, (parameter, gradient) in enumerate(
+                zip(parameters, gradients)):
+            rows[parameter_index].append(
+                torch.zeros_like(parameter) if gradient is None else gradient)
+    return tuple(torch.stack(parameter_rows, dim=0)
+                 for parameter_rows in rows)
+
+
+def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
+                                  budget_indices, *, group_id, cache_dir,
+                                  device_label, batches=None,
+                                  parameters=None):
+    """Compute rollout LoRA gradients once and cache all budget combinations."""
     import torch
 
     group_examples = list(examples)
     indices = tuple(int(index) for index in budget_indices)
     if not indices:
-        raise ValueError("X-GRPO diagnostic budget block must not be empty")
+        raise ValueError("X-GRPO diagnostic budgets must not be empty")
     if len(set(indices)) != len(indices) or min(indices) < 0:
         raise ValueError("X-GRPO diagnostic budget indices must be unique and nonnegative")
     parameters = (
@@ -1984,18 +2035,12 @@ def _x_grpo_flat_group_gradients(model, tokenizer, examples, cfg,
     flat_count = sum(parameter.numel() for parameter in parameters)
     if flat_count < 1:
         raise RuntimeError("X-GRPO found no trainable parameters")
-    if zero_gradient is None:
-        zero_gradient = torch.zeros(
-            flat_count, dtype=torch.float32, device="cpu")
-    elif (zero_gradient.device.type != "cpu"
-          or zero_gradient.dtype != torch.float32
-          or zero_gradient.ndim != 1
-          or zero_gradient.numel() != flat_count):
-        raise ValueError("invalid shared X-GRPO zero-gradient buffer")
-    zeros = {index: zero_gradient for index in indices}
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    empty_cache = {index: None for index in indices}
     if not group_examples:
         model.zero_grad(set_to_none=True)
-        return zeros, 0, []
+        return empty_cache, 0, []
     group_sizes = {int(example["x_grpo_group_size"])
                    for example in group_examples}
     if len(group_sizes) != 1:
@@ -2027,68 +2072,137 @@ def _x_grpo_flat_group_gradients(model, tokenizer, examples, cfg,
         model.zero_grad(set_to_none=True)
         planned = (_training_microbatches(group_examples, cfg)
                    if batches is None else [list(batch) for batch in batches])
-        return zeros, 0, planned
+        return empty_cache, 0, planned
 
     planned_batches = (
         _training_microbatches(group_examples, cfg)
         if batches is None else [list(batch) for batch in batches])
+    representative_rows = {
+        index: row for row, index in enumerate(representatives)}
+    vectorized = True
 
     def attempt(active_batches):
-        accumulators = {
-            index: [torch.zeros_like(parameter) for parameter in parameters]
-            for index in representatives
-        }
+        accumulator_count = len(representatives)
+        accumulators = [
+            torch.zeros(
+                (accumulator_count, *parameter.shape),
+                dtype=parameter.dtype, device=parameter.device)
+            for parameter in parameters
+        ]
         for batch in active_batches:
             current_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=True, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
-            losses = []
-            for index in representatives:
-                terms = []
-                for example, current_lp in zip(batch, current_logprobs):
-                    advantage = float(
-                        example["x_grpo_trial_advantages"][index])
-                    if advantage != 0.0:
-                        terms.append(
-                            (advantage / sampled_group_size)
-                            * current_lp.mean())
-                if terms:
-                    losses.append((index, sum(terms[1:], terms[0])))
-            for loss_position, (index, loss) in enumerate(losses):
-                model.zero_grad(set_to_none=True)
-                loss.backward(retain_graph=loss_position + 1 < len(losses))
-                with torch.no_grad():
-                    for accumulator, parameter in zip(
-                            accumulators[index], parameters):
-                        gradient = parameter.grad
-                        if gradient is not None:
-                            accumulator.add_(gradient.detach())
-            model.zero_grad(set_to_none=True)
-        return {
-            index: torch.cat([
-                accumulator.detach().reshape(-1).float().cpu()
-                for accumulator in accumulators[index]
+            scores = torch.stack(
+                [current_lp.mean() for current_lp in current_logprobs])
+            per_example_gradients = _x_grpo_per_example_parameter_gradients(
+                scores, parameters, vectorized=vectorized)
+            weights = scores.new_tensor([
+                [float(example["x_grpo_trial_advantages"][index])
+                 / sampled_group_size
+                 for example in batch]
+                for index in representatives
             ])
-            for index in representatives
-        }
+            with torch.no_grad():
+                weights_by_device_dtype = {}
+                for accumulator, gradient in zip(
+                        accumulators, per_example_gradients):
+                    if gradient is None:
+                        continue
+                    weight_key = (gradient.device, gradient.dtype)
+                    dtype_weights = weights_by_device_dtype.get(weight_key)
+                    if dtype_weights is None:
+                        dtype_weights = weights.to(
+                            device=gradient.device, dtype=gradient.dtype)
+                        weights_by_device_dtype[weight_key] = dtype_weights
+                    accumulator.reshape(accumulator_count, -1).addmm_(
+                        dtype_weights, gradient.detach().reshape(
+                            len(batch), -1))
+            model.zero_grad(set_to_none=True)
+            del accumulator, gradient
+            del current_logprobs, scores, per_example_gradients, weights
+            del weights_by_device_dtype
 
-    result, effective, quarantined = _run_oom_resilient_backward(
-        model, planned_batches, attempt, device_label=device_label)
+        cached = {}
+        for index in representatives:
+            row = representative_rows[index]
+            flat = torch.cat([
+                accumulator[row].detach().reshape(-1).float().cpu()
+                for accumulator in accumulators
+            ])
+            if flat.numel() != flat_count or not torch.isfinite(flat).all():
+                raise FloatingPointError(
+                    "nonfinite X-GRPO diagnostic gradient")
+            cache_path = cache_root / (
+                f"group-{int(group_id)}-budget-{int(index)}.pt")
+            torch.save(flat, cache_path)
+            cached[index] = str(cache_path)
+            del flat
+        return cached
+
+    retry_without_vectorized_autograd = False
+    try:
+        result, effective, quarantined = _run_oom_resilient_backward(
+            model, planned_batches, attempt, device_label=device_label)
+    except (RuntimeError, TypeError) as error:
+        if not vectorized or not _x_grpo_batched_autograd_unavailable(error):
+            raise
+        vectorized = False
+        retry_without_vectorized_autograd = True
+    if retry_without_vectorized_autograd:
+        model.zero_grad(set_to_none=True)
+        print(f"[X-GRPO] {device_label}: batched per-rollout autograd is "
+              "unavailable; retrying with one backward per rollout within "
+              "each shared forward", flush=True)
+        result, effective, quarantined = _run_oom_resilient_backward(
+            model, planned_batches, attempt, device_label=device_label)
     model.zero_grad(set_to_none=True)
     if result is None:
-        result = {
-            index: torch.zeros(flat_count, dtype=torch.float32, device="cpu")
-            for index in representatives
-        }
-    gradients = {}
+        result = {index: None for index in representatives}
+    cached = {}
     for index in indices:
         representative = representative_for[index]
-        gradient = (zeros[index] if representative is None
-                    else result[representative])
-        if not torch.isfinite(gradient).all():
-            raise FloatingPointError("nonfinite X-GRPO diagnostic gradient")
-        gradients[index] = gradient
-    return gradients, len(quarantined), effective
+        cached[index] = (None if representative is None
+                         else result[representative])
+    return cached, len(quarantined), effective
+
+
+def _x_grpo_load_cached_gradient(cache_path, zero_gradient):
+    """Load one self-generated aggregate and validate its exact layout."""
+    import torch
+
+    if cache_path is None:
+        return zero_gradient
+    try:
+        gradient = torch.load(
+            cache_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        gradient = torch.load(cache_path, map_location="cpu")
+    if (not torch.is_tensor(gradient)
+            or gradient.device.type != "cpu"
+            or gradient.dtype != torch.float32
+            or gradient.ndim != 1
+            or gradient.numel() != zero_gradient.numel()
+            or not torch.isfinite(gradient).all()):
+        raise RuntimeError("invalid cached X-GRPO diagnostic gradient")
+    return gradient
+
+
+def _x_grpo_delete_consumed_cache(cached_by_group, budget_index):
+    """Unlink aggregates once no later budget aliases the same cache file."""
+    current_paths = {
+        cache[budget_index]
+        for cache in cached_by_group.values()
+        if cache.get(budget_index) is not None
+    }
+    future_paths = {
+        cache[index]
+        for cache in cached_by_group.values()
+        for index in cache
+        if index > budget_index and cache[index] is not None
+    }
+    for cache_path in current_paths - future_paths:
+        Path(cache_path).unlink(missing_ok=True)
 
 
 def _x_grpo_crossfit_metrics(gradients, relative_error):
@@ -2149,6 +2263,7 @@ def _x_grpo_crossfit_metrics(gradients, relative_error):
 def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
                             *, group_ids=None):
     """Serial calibration path for a single/model-parallel training model."""
+    from tempfile import TemporaryDirectory
     import torch
 
     expected_group_ids = (
@@ -2181,48 +2296,51 @@ def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
         group_id: _training_microbatches(group_examples, cfg)
         for group_id, group_examples in groups.items()
     }
-    budget_block_size = min(2, len(budgets))
+    budget_indices = tuple(range(len(budgets)))
     backend.set_training_mode()
     print(f"[step {step_idx}] X-GRPO calibration: {len(groups)} groups x "
-          f"{len(budgets)} budgets on the primary trainer", flush=True)
+          f"{len(budgets)} budgets on the primary trainer; computing each "
+          "rollout LoRA gradient once", flush=True)
     try:
-        with _rank_dropout_disabled(model):
-            for block_start in range(0, len(budgets), budget_block_size):
-                block_indices = tuple(range(
-                    block_start,
-                    min(block_start + budget_block_size, len(budgets))))
-                gradients_by_budget = {
-                    index: {} for index in block_indices}
+        with TemporaryDirectory(prefix="x-grpo-gradients-") as cache_dir:
+            cached_by_group = {}
+            with _rank_dropout_disabled(model):
                 for group_id in sorted(groups):
-                    block_gradients, quarantined, effective = (
-                        _x_grpo_flat_group_gradients(
+                    cached, quarantined, effective = (
+                        _x_grpo_cache_group_gradients(
                             model, tokenizer, groups[group_id], cfg,
-                            block_indices, device_label=str(model.device),
+                            budget_indices, group_id=group_id,
+                            cache_dir=cache_dir,
+                            device_label=str(model.device),
                             batches=batch_plans[group_id],
-                            parameters=parameters,
-                            zero_gradient=zero_gradient))
+                            parameters=parameters))
                     batch_plans[group_id] = effective
                     quarantined_total += quarantined
-                    for index, gradient in block_gradients.items():
-                        gradients_by_budget[index][group_id] = gradient
+                    cached_by_group[group_id] = cached
 
-                for budget_index in block_indices:
-                    budget = budgets[budget_index]
-                    trial = _x_grpo_crossfit_metrics(
-                        gradients_by_budget[budget_index],
-                        cfg.x_grpo_relative_error)
-                    for group_id, metrics in trial.items():
-                        diagnostics[group_id].append({
-                            "budget": budget, **metrics})
-                        if metrics["accepted"]:
-                            selected[group_id] = max(
-                                selected[group_id], budget)
-                    accepted_count = sum(
-                        item["accepted"] for item in trial.values())
-                    print(f"[step {step_idx}] X-GRPO budget {budget:g}: "
-                          f"accepted for {accepted_count}/{len(groups)} "
-                          "held-out groups", flush=True)
-                del gradients_by_budget
+            for budget_index, budget in enumerate(budgets):
+                gradients = {
+                    group_id: _x_grpo_load_cached_gradient(
+                        cached_by_group[group_id][budget_index],
+                        zero_gradient)
+                    for group_id in sorted(groups)
+                }
+                trial = _x_grpo_crossfit_metrics(
+                    gradients, cfg.x_grpo_relative_error)
+                for group_id, metrics in trial.items():
+                    diagnostics[group_id].append({
+                        "budget": budget, **metrics})
+                    if metrics["accepted"]:
+                        selected[group_id] = max(
+                            selected[group_id], budget)
+                accepted_count = sum(
+                    item["accepted"] for item in trial.values())
+                print(f"[step {step_idx}] X-GRPO budget {budget:g}: "
+                      f"accepted for {accepted_count}/{len(groups)} "
+                      "held-out groups", flush=True)
+                del gradients
+                _x_grpo_delete_consumed_cache(
+                    cached_by_group, budget_index)
     finally:
         model.zero_grad(set_to_none=True)
     return {
@@ -3898,7 +4016,9 @@ class ProcessDistributedTrainer:
 
         print(f"[step {step_idx}] X-GRPO distributed calibration: "
               f"{len(groups)} groups x {len(cfg.x_grpo_budgets)} budgets; "
-              f"group-token loads/GPU={loads}", flush=True)
+              f"group-token loads/GPU={loads}; rollout LoRA gradients are "
+              "computed once and temporary aggregates are deleted after "
+              "this context", flush=True)
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
