@@ -70,6 +70,9 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
+    "spo_rs_beta", "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
+    "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
+    "spo_rs_clip_epsilon_high",
 })
 
 CPU_PROBLEMS = frozenset({

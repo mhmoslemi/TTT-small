@@ -687,6 +687,19 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # path a unique positive id prevents vLLM from serving a stale cached LoRA.
     adapter_ids = {}
     next_adapter_id = 1
+
+    def _lora_request(adapter_path):
+        nonlocal next_adapter_id
+        if adapter_path is None:
+            return None
+        adapter_key = os.path.realpath(os.fspath(adapter_path))
+        if adapter_key not in adapter_ids:
+            adapter_ids[adapter_key] = next_adapter_id
+            next_adapter_id += 1
+        adapter_id = adapter_ids[adapter_key]
+        return LoRARequest(
+            f"ttt_adapter_{adapter_id}", adapter_id, adapter_key)
+
     sleep_level = int(sleep_level)
     basic_sleep = bool(hasattr(llm, "sleep") and hasattr(llm, "wake_up"))
     # Level 2 avoids keeping another full copy of every replica's weights in
@@ -738,9 +751,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     control_queue.put(
                         ("error", rank, command, detail))
             continue
-        if (isinstance(task, tuple) and len(task) == 2
+        if (isinstance(task, tuple) and len(task) in (2, 3)
                 and task[0] == "__score__"):
             score_jobs = task[1]
+            score_adapter_path = task[2] if len(task) == 3 else None
             if not score_jobs:
                 continue
             try:
@@ -776,7 +790,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 outputs = llm.generate(
                     prompts,
                     sampling_params=score_params,
-                    lora_request=None,
+                    lora_request=_lora_request(score_adapter_path),
                     use_tqdm=False,
                 )
                 scored = []
@@ -831,15 +845,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             continue
 
         try:
-            lora_request = None
-            if adapter_path is not None:
-                adapter_key = os.path.realpath(os.fspath(adapter_path))
-                if adapter_key not in adapter_ids:
-                    adapter_ids[adapter_key] = next_adapter_id
-                    next_adapter_id += 1
-                adapter_id = adapter_ids[adapter_key]
-                lora_request = LoRARequest(
-                    f"ttt_adapter_{adapter_id}", adapter_id, adapter_key)
+            lora_request = _lora_request(adapter_path)
 
             # One call gives vLLM the whole worker workload so its scheduler can
             # batch different prompts and all n samples under the memory limit.
@@ -1206,12 +1212,13 @@ class GenerationPool:
             if bar is not None:
                 bar.close()
 
-    def score_token_logprobs(self, prompt_response_pairs, show_progress=True):
-        """Score observed response tokens with the base vLLM model.
+    def score_token_logprobs(self, prompt_response_pairs, show_progress=True,
+                             adapter_path=None):
+        """Score observed response tokens with the base model or one LoRA.
 
-        Calls are length-balanced over the already-awake engines and omit the
-        rollout LoRA adapter. Results align with prompt_response_pairs; None
-        marks an input that must fall back to HF scoring.
+        Calls are length-balanced over the already-awake engines. Omitting
+        ``adapter_path`` scores the fixed base model. Results align with
+        prompt_response_pairs; None marks an input that must fall back to HF.
         """
         if self.backend != "vllm":
             raise RuntimeError("token scoring is only available on vLLM pools")
@@ -1244,10 +1251,13 @@ class GenerationPool:
             return scores
         for worker, jobs in enumerate(worker_jobs):
             if jobs:
-                self.task_queues[worker].put(("__score__", jobs))
+                self.task_queues[worker].put(
+                    ("__score__", jobs, adapter_path))
 
         completed_workers = set()
-        bar = (make_progress_bar(len(pairs), desc="vllm reference logprobs")
+        score_label = ("vllm policy logprobs" if adapter_path is not None
+                       else "vllm reference logprobs")
+        bar = (make_progress_bar(len(pairs), desc=score_label)
                if show_progress else None)
         if bar is not None and skipped:
             bar.update(skipped)

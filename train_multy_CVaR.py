@@ -188,8 +188,8 @@ def _route_dependency_notices(log_path):
 # ======================================================================
 # CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
-ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank", "x-grpo")
-RANK_POLICY_MODES = frozenset(("rank", "x-grpo"))
+ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank", "x-grpo", "spo-rs")
+CLIPPED_POLICY_MODES = frozenset(("rank", "x-grpo", "spo-rs"))
 CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
 CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
 # RANK_GAMMA_DEFAULT = math.log(4) # cirlce pack
@@ -203,10 +203,17 @@ X_GRPO_ENTROPY_COEF_DEFAULT = 0.001
 X_GRPO_CONTEXTS_PER_STEP_DEFAULT = 3
 X_GRPO_BASE_BUDGETS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 # X_GRPO_BASE_BUDGETS = (0.25, 0.5, 1.0, 2.0, 4.0)
+SPO_RS_BETA_DEFAULT = 1.0
+SPO_RS_D_HALF_DEFAULT = 0.06
+SPO_RS_RHO_MIN_DEFAULT = 0.875
+SPO_RS_RHO_MAX_DEFAULT = 0.96
+SPO_RS_CLIP_EPSILON_DEFAULT = 0.2
+SPO_RS_CLIP_EPSILON_LOW_DEFAULT = 0.2
+SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
 
 
-def _uses_rank_policy_loss(mode):
-    return str(mode or "entropic").lower() in RANK_POLICY_MODES
+def _uses_clipped_policy_loss(mode):
+    return str(mode or "entropic").lower() in CLIPPED_POLICY_MODES
 
 
 def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
@@ -279,16 +286,16 @@ def _resolve_rank_options(merged):
             or epochs < 1):
         raise ValueError("rank_update_epochs must be a positive integer")
     merged["rank_update_epochs"] = int(epochs)
-    if _uses_rank_policy_loss(merged.get("advantage_mode")):
+    if _uses_clipped_policy_loss(merged.get("advantage_mode")):
         if int(merged["group_size"]) < 2:
-            raise ValueError("rank-style modes require group_size >= 2")
+            raise ValueError("clipped-policy modes require group_size >= 2")
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
             raise ValueError(
-                "rank-style modes require a finite nonnegative kl_penalty_coef")
+                "clipped-policy modes require a finite nonnegative kl_penalty_coef")
         if (float(merged["temperature"]) != 1.0
                 or float(merged["top_p"]) != 1.0):
-            print("[config] rank-style mode sets temperature=1 and top_p=1 "
+            print("[config] clipped-policy mode sets temperature=1 and top_p=1 "
                   "to match the policy likelihood used by the loss")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
@@ -356,6 +363,51 @@ def _resolve_x_grpo_options(merged):
     merged["x_grpo_entropy_coef"] = entropy_coef
 
 
+def _resolve_spo_rs_options(merged):
+    if merged.get("advantage_mode") != "spo-rs":
+        return
+
+    raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
+    defaults = {
+        "spo_rs_beta": SPO_RS_BETA_DEFAULT,
+        "spo_rs_d_half": SPO_RS_D_HALF_DEFAULT,
+        "spo_rs_rho_min": SPO_RS_RHO_MIN_DEFAULT,
+        "spo_rs_rho_max": SPO_RS_RHO_MAX_DEFAULT,
+        "spo_rs_clip_epsilon": SPO_RS_CLIP_EPSILON_DEFAULT,
+    }
+    for name, default in defaults.items():
+        raw = merged.get(name)
+        value = default if raw is None else float(raw)
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        merged[name] = value
+    if merged["spo_rs_beta"] <= 0.0:
+        raise ValueError("spo_rs_beta must be positive")
+    if merged["spo_rs_d_half"] <= 0.0:
+        raise ValueError("spo_rs_d_half must be positive")
+    if not (0.0 < merged["spo_rs_rho_min"]
+            <= merged["spo_rs_rho_max"] < 1.0):
+        raise ValueError(
+            "SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
+    if not 0.0 < merged["spo_rs_clip_epsilon"] < 1.0:
+        raise ValueError("spo_rs_clip_epsilon must be in (0, 1)")
+    side_defaults = {
+        "low": SPO_RS_CLIP_EPSILON_LOW_DEFAULT,
+        "high": SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
+    }
+    for side, default in side_defaults.items():
+        name = f"spo_rs_clip_epsilon_{side}"
+        raw = merged.get(name)
+        if raw is None:
+            value = (merged["spo_rs_clip_epsilon"]
+                     if raw_clip_epsilon is not None else default)
+        else:
+            value = float(raw)
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be finite and in (0, 1)")
+        merged[name] = value
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TTT-Discover multi-problem runner")
     # Problem selection
@@ -387,7 +439,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
         "--fast", action="store_const", const=True, default=None,
-        help="Use the opt-in process-per-GPU rank trainer: work is balanced "
+        help="Use the opt-in process-per-GPU clipped-policy trainer: work is balanced "
              "by sequence cost and every GPU independently learns a padded-"
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
@@ -454,7 +506,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "entropic objective, default), 'grpo' (mean/std "
                         "normalized), or 'cvar' (grpo blended with an "
                         "upper-tail term above the (1-alpha)-quantile), or "
-                        "'rank'/'x-grpo' (midrank objectives with clipped GRPO).")
+                        "'rank'/'x-grpo' (midrank objectives with clipped GRPO), "
+                        "or 'spo-rs' (KL-adaptive entropic value tracking with "
+                        "symmetric PPO clipping).")
     p.add_argument("--rank-gamma", type=float, default=None,
                    help="rank mode: selection KL budget (default log(2)); "
                         "distinct from --kl-penalty-coef.")
@@ -488,6 +542,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--x-grpo-entropy-coef", type=float, default=None,
                    help="X-GRPO: exploration coefficient for rejected-budget "
                         "or completely tied groups (default 0.001).")
+    p.add_argument("--spo-rs-beta", type=float, default=None,
+                   help="SPO-RS: fixed entropic reward coefficient beta "
+                        f"(default {SPO_RS_BETA_DEFAULT}).")
+    p.add_argument("--spo-rs-d-half", type=float, default=None,
+                   help="SPO-RS: policy-KL half-life D_half "
+                        f"(default {SPO_RS_D_HALF_DEFAULT}).")
+    p.add_argument("--spo-rs-rho-min", type=float, default=None,
+                   help="SPO-RS: minimum retained-history factor "
+                        f"(default {SPO_RS_RHO_MIN_DEFAULT}).")
+    p.add_argument("--spo-rs-rho-max", type=float, default=None,
+                   help="SPO-RS: maximum retained-history factor "
+                        f"(default {SPO_RS_RHO_MAX_DEFAULT}).")
+    p.add_argument("--spo-rs-clip-epsilon", type=float, default=None,
+                   help="SPO-RS: symmetric shorthand that sets both clipping "
+                        "distances unless a side is specified explicitly.")
+    p.add_argument("--spo-rs-clip-epsilon-low", type=float, default=None,
+                   help="SPO-RS: distance below ratio 1 "
+                        f"(default {SPO_RS_CLIP_EPSILON_LOW_DEFAULT}).")
+    p.add_argument("--spo-rs-clip-epsilon-high", type=float, default=None,
+                   help="SPO-RS: distance above ratio 1 "
+                        f"(default {SPO_RS_CLIP_EPSILON_HIGH_DEFAULT}).")
     p.add_argument("--cvar-alpha", type=float, default=None,
                    help="cvar mode: tail mass alpha in (0,1); cutoff is the "
                         f"(1-alpha)-quantile (default {CVAR_ALPHA_DEFAULT}).")
@@ -904,6 +979,11 @@ def load_config():
             merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
         if args.rank_clip_epsilon_high is None:
             merged["rank_clip_epsilon_high"] = args.rank_clip_epsilon
+    if args.spo_rs_clip_epsilon is not None:
+        if args.spo_rs_clip_epsilon_low is None:
+            merged["spo_rs_clip_epsilon_low"] = args.spo_rs_clip_epsilon
+        if args.spo_rs_clip_epsilon_high is None:
+            merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
     # These modes are deliberately launch-scoped. Saved/YAML values must not
     # silently change a later invocation's trainer or evaluator.
     merged["fast"] = bool(args.fast)
@@ -939,6 +1019,7 @@ def load_config():
     merged["cvar_lambda"] = cvar_lambda
     _resolve_rank_options(merged)
     _resolve_x_grpo_options(merged)
+    _resolve_spo_rs_options(merged)
     train_microbatch = int(merged["train_examples_per_microbatch"])
     if train_microbatch < 1:
         raise ValueError("train_examples_per_microbatch must be >= 1")
@@ -1095,11 +1176,11 @@ def load_config():
               f"{training_budgets} GiB")
 
     if merged["fast"] and not merged["no_train"]:
-        if not _uses_rank_policy_loss(merged["advantage_mode"]):
+        if not _uses_clipped_policy_loss(merged["advantage_mode"]):
             raise ValueError(
-                "--fast requires --advantage-mode rank or x-grpo")
+                "--fast requires --advantage-mode rank, x-grpo, or spo-rs")
         if int(merged["rank_update_epochs"]) != 1:
-            raise ValueError("--fast requires rank_update_epochs=1")
+            raise ValueError("--fast requires one clipped-policy update epoch")
         if not (int(merged["num_training_gpus"]) > 1
                 and merged["backend"] == "hf"
                 and merged["generation_backend"] == "vllm"):
@@ -1266,7 +1347,7 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             **({"top_k": 0, "repetition_penalty": 1.0}
-               if _uses_rank_policy_loss(
+               if _uses_clipped_policy_loss(
                    getattr(cfg, "advantage_mode", "entropic")) else {}),
             pad_token_id=pad_id,
             num_return_sequences=n_samples,
@@ -1327,7 +1408,7 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
     """Stream locally generated rollouts from cross-prompt HF batches."""
     if len(prompts_by_group) != len(counts_by_group):
         raise ValueError("counts_by_group must align with prompts_by_group")
-    if _uses_rank_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
+    if _uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic")):
         # This local path owns its sampling arguments, including top_k=0.
         # Use the existing per-prompt OOM-aware micro-batcher instead of an
         # external HF helper that may inherit a top-k generation default.
@@ -1904,7 +1985,7 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         raise ValueError("current and old logprobs must be matching nonempty vectors")
     adv = torch.as_tensor(advantage, dtype=cur.dtype, device=cur.device).detach()
     if adv.numel() != 1 or not torch.isfinite(adv).all():
-        raise ValueError("rank advantage must be a finite scalar")
+        raise ValueError("policy advantage must be a finite scalar")
     if not torch.isfinite(cur).all() or not torch.isfinite(old).all():
         raise ValueError("rank policy logprobs must be finite")
 
@@ -1953,8 +2034,8 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     loss = policy_loss + kl_policy_loss - entropy_coef * entropy_estimate
     if not torch.isfinite(loss).all() or not torch.isfinite(ratio).all():
         raise FloatingPointError(
-            "nonfinite rank objective/trajectory ratio; reduce learning rate or "
-            "rank_update_epochs and inspect model logprobs")
+            "nonfinite clipped objective/trajectory ratio; reduce learning "
+            "rate or update epochs and inspect model logprobs")
     tensor_metrics = {
         "policy_loss": policy_loss.detach(),
         # Retain the metric key for checkpoint/log compatibility. Its value now
@@ -1997,11 +2078,44 @@ def _rank_dropout_disabled(model):
 
 
 def _rank_entropy_coefficient(cfg):
+    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+        return 0.0
     if getattr(cfg, "advantage_mode", "entropic") == "x-grpo":
         return float(getattr(
             cfg, "x_grpo_entropy_coef", X_GRPO_ENTROPY_COEF_DEFAULT))
     return float(getattr(
         cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
+
+
+def _clipped_policy_options(cfg):
+    """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
+    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+        epsilon = float(getattr(
+            cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
+        epsilon_low = float(getattr(
+            cfg, "spo_rs_clip_epsilon_low",
+            SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
+        epsilon_high = float(getattr(
+            cfg, "spo_rs_clip_epsilon_high",
+            SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
+        return epsilon, epsilon_low, epsilon_high, 0.0
+    epsilon = float(getattr(
+        cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
+    epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
+    epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+    return epsilon, epsilon_low, epsilon_high, float(cfg.kl_penalty_coef)
+
+
+def _clipped_reference_count(cfg, supplied, total):
+    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+        return "off"
+    return f"{int(supplied)}/{int(total)}"
+
+
+def _clipped_reference_metric(cfg, value):
+    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+        return "reference=off"
+    return f"avg logpi_theta-logpi_base={float(value):.6f}"
 
 
 def _x_grpo_batched_autograd_unavailable(error):
@@ -2544,11 +2658,9 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
     import torch
 
     epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
-    epsilon = float(getattr(cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
-    epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
-    epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+    epsilon, epsilon_low, epsilon_high, kl_coef = (
+        _clipped_policy_options(cfg))
     entropy_coef = _rank_entropy_coefficient(cfg)
-    kl_coef = float(cfg.kl_penalty_coef)
     fb_stats = None
     if fb_on:
         from feedback import (FeedbackStats, bound_feedback_advantage,
@@ -2567,11 +2679,16 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
           f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
     missing_old, missing_reference = _initialize_rank_logprob_caches(examples)
     reference_fallback = missing_reference if kl_coef else []
+    supplied_reference = len(examples) - len(reference_fallback)
+    reference_label = _clipped_reference_count(
+        cfg, supplied_reference, len(examples))
+    fallback_reference_label = (
+        "off" if cfg.advantage_mode == "spo-rs"
+        else str(len(reference_fallback)))
     print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: vLLM supplied old="
           f"{len(examples) - len(missing_old)}/{len(examples)}, reference="
-          f"{len(examples) - len(reference_fallback)}/{len(examples)}; "
-          f"HF fallback old={len(missing_old)}, "
-          f"reference={len(reference_fallback)} before {epochs} update(s)",
+          f"{reference_label}; HF fallback old={len(missing_old)}, "
+          f"reference={fallback_reference_label} before {epochs} update(s)",
           flush=True)
 
     with _rank_dropout_disabled(model):
@@ -2707,7 +2824,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
             print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
                   f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
+                  f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
@@ -3002,13 +3119,10 @@ class ReplicatedDataParallelTrainer:
         epochs = int(getattr(cfg, "rank_update_epochs",
                              RANK_UPDATE_EPOCHS_DEFAULT))
         if epochs != 1:
-            raise ValueError("--fast requires rank_update_epochs=1")
-        epsilon = float(getattr(cfg, "rank_clip_epsilon",
-                                RANK_CLIP_EPSILON_DEFAULT))
-        epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
-        epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+            raise ValueError("--fast requires one clipped-policy update epoch")
+        epsilon, epsilon_low, epsilon_high, kl_coef = (
+            _clipped_policy_options(cfg))
         entropy_coef = _rank_entropy_coefficient(cfg)
-        kl_coef = float(cfg.kl_penalty_coef)
 
         cpu_examples = self._cpu_examples(examples)
         supplied_old = sum(
@@ -3020,7 +3134,8 @@ class ReplicatedDataParallelTrainer:
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(cpu_examples)}, reference="
-              f"{supplied_reference}/{len(cpu_examples)}; HF fallback runs only "
+              f"{_clipped_reference_count(cfg, supplied_reference, len(cpu_examples))}; "
+              "HF fallback runs only "
               "for missing values", flush=True)
 
         partitions = {False: [], True: []}
@@ -3433,7 +3548,7 @@ class ReplicatedDataParallelTrainer:
               f"{peak_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
+              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
@@ -3471,12 +3586,9 @@ class ReplicatedDataParallelTrainer:
             self.restore_after_generation()
         epochs = int(getattr(cfg, "rank_update_epochs",
                              RANK_UPDATE_EPOCHS_DEFAULT))
-        epsilon = float(getattr(cfg, "rank_clip_epsilon",
-                                RANK_CLIP_EPSILON_DEFAULT))
-        epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
-        epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+        epsilon, epsilon_low, epsilon_high, kl_coef = (
+            _clipped_policy_options(cfg))
         entropy_coef = _rank_entropy_coefficient(cfg)
-        kl_coef = float(cfg.kl_penalty_coef)
         local_shards = self._prepare_shards(examples)
         update_batches = [
             _training_microbatches(
@@ -3502,7 +3614,8 @@ class ReplicatedDataParallelTrainer:
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
-              f"{supplied_reference}/{len(examples)}; HF fallback runs only "
+              f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}; "
+              "HF fallback runs only "
               f"for missing values before {epochs} update(s)", flush=True)
 
         def cache(item):
@@ -3678,7 +3791,7 @@ class ReplicatedDataParallelTrainer:
             print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
                   f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
+                  f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
@@ -4227,21 +4340,24 @@ class ProcessDistributedTrainer:
                   "trainers for the update", flush=True)
             self.restore_after_generation()
         if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
-            raise ValueError("--fast requires rank_update_epochs=1")
+            raise ValueError("--fast requires one clipped-policy update epoch")
 
         started = time.time()
         queued_examples = self._queue_examples(examples)
         supplied_old = sum(
             _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in queued_examples)
+        _epsilon, _epsilon_low, _epsilon_high, policy_kl_coef = (
+            _clipped_policy_options(cfg))
         supplied_reference = (sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued_examples)
-            if float(cfg.kl_penalty_coef) else len(examples))
+            if policy_kl_coef else len(examples))
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
-              f"{supplied_reference}/{len(examples)}", flush=True)
+              f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}",
+              flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling=80%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
@@ -4347,7 +4463,7 @@ class ProcessDistributedTrainer:
               f"{allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"avg logpi_theta-logpi_base={totals['kl_estimate']:.6f} "
+              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
@@ -4370,7 +4486,7 @@ class ProcessDistributedTrainer:
 
     def train_policy(self, *args, **kwargs):
         raise RuntimeError(
-            "process-distributed --fast supports rank-style modes only")
+            "process-distributed --fast supports clipped-policy modes only")
 
     def offload_for_generation(self):
         if self._offloaded:
@@ -4562,7 +4678,8 @@ def _load_adapter(model, adapter_dir):
 
 
 def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
-                              optimizer, next_g, next_k, memory_path=None):
+                              optimizer, next_g, next_k, memory_path=None,
+                              spo_rs_tracker=None):
     """Atomically save the state required for an exact next-step resume."""
     import torch
 
@@ -4577,6 +4694,8 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
         "next_groups_per_step": int(next_g),
         "next_group_size": int(next_k),
         "memory_file": Path(memory_path).name if memory_path is not None else None,
+        "spo_rs_tracker": (spo_rs_tracker.state_dict()
+                           if spo_rs_tracker is not None else None),
     }
     torch.save(payload, tmp)
     tmp.replace(target)
@@ -4703,7 +4822,8 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
-               curator=None, fb_cfg=None, parallel_trainer=None):
+               curator=None, fb_cfg=None, parallel_trainer=None,
+               spo_rs_tracker=None):
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -4726,7 +4846,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         getattr(cfg, "advantage_mode", "entropic")).lower()
     rank_mode = active_advantage_mode == "rank"
     x_grpo_mode = active_advantage_mode == "x-grpo"
-    rank_policy_mode = _uses_rank_policy_loss(active_advantage_mode)
+    spo_rs_mode = active_advantage_mode == "spo-rs"
+    if spo_rs_mode and spo_rs_tracker is None:
+        raise ValueError("SPO-RS mode requires its persistent value tracker")
+    clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
     x_grpo_groups_per_context = (
         int(cfg.groups_per_step) if x_grpo_mode else 1)
     requested_parent_contexts = (
@@ -4778,6 +4901,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     all_examples = []
     rank_group_stats = []
     x_grpo_groups = {}
+    spo_rs_updates = []
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
@@ -4902,13 +5026,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     messages = inject_block(
                         messages, block,
                         mode=getattr(mem_cfg, "inject_mode", "append"))
+            prompt_text = _render(messages)
             prompt_jobs.append({
                 "parent_group": g,
                 "arm": arm.name,
                 "memory_ids": [lesson.id for lesson in kept],
                 "memory_tokens": int(n_tok),
                 "messages": messages,
-                "prompt_text": _render(messages),
+                "prompt_text": prompt_text,
+                "spo_rs_key": (spo_rs_tracker.prompt_key(prompt_text)
+                               if spo_rs_mode else None),
                 "count": int(arm.count),
             })
             mem_arm_rollouts[arm.name] = (
@@ -4919,6 +5046,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] memory arms {mem_arm_rollouts}; injected "
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
+
+    spo_rs_prompt_keys = (
+        [job["spo_rs_key"] for job in prompt_jobs] if spo_rs_mode else [])
+    spo_rs_anchor_requests = (
+        spo_rs_tracker.anchor_requests(spo_rs_prompt_keys)
+        if spo_rs_mode else [])
+    spo_rs_divergences = {}
+    spo_rs_missing_anchor_scores = 0
 
     group_specs = []
     for parent_group in range(len(parents)):
@@ -5125,19 +5260,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             prompt_jobs[job_idx]["prompt_text"]).input_ids
                     score_pairs.append((
                         prompt_token_ids[job_idx], record["token_ids"]))
-                try:
-                    reference_scores = gen_pool.score_token_logprobs(
-                        score_pairs, show_progress=True)
-                except Exception as error:
+                if spo_rs_mode:
                     reference_scores = [None] * len(score_pairs)
-                    print(f"[warn] vLLM reference scoring failed ({error!r}); "
-                          "missing values will use their frozen rollout-policy "
-                          "scores", flush=True)
+                else:
+                    try:
+                        reference_scores = gen_pool.score_token_logprobs(
+                            score_pairs, show_progress=True)
+                    except Exception as error:
+                        reference_scores = [None] * len(score_pairs)
+                        print(f"[warn] vLLM reference scoring failed ({error!r}); "
+                              "missing values will use their frozen "
+                              "rollout-policy scores", flush=True)
                 reference_behavior_fallbacks = 0
                 for record, values in zip(
                         vllm_logprob_records, reference_scores):
                     behavior_values = record["behavior_logprobs"]
-                    if (values is None and behavior_values is not None
+                    if (not spo_rs_mode and values is None
+                            and behavior_values is not None
                             and len(behavior_values)
                             == len(record["token_ids"])):
                         # Never send an extreme context back through the HF
@@ -5156,15 +5295,44 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 eval_done_after = sum(
                     future.done() for futures in reward_futures.values()
                     for future in futures)
+                reference_label = (
+                    "off for SPO-RS" if spo_rs_mode
+                    else f"{reference_count}/{len(vllm_logprob_records)}")
                 print(f"[step {step_idx}] vLLM logprobs: rollout "
                       f"{behavior_count}/{len(vllm_logprob_records)}, "
-                      f"reference {reference_count}/"
-                      f"{len(vllm_logprob_records)} in "
+                      f"reference {reference_label} in "
                       f"{time.time() - scoring_started:.1f}s "
                       f"(rollout-policy fallbacks: "
                       f"{reference_behavior_fallbacks}; "
                       f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
+
+            if (spo_rs_mode and training_enabled
+                    and cfg.generation_backend == "vllm"
+                    and spo_rs_anchor_requests):
+                drift_t0 = time.time()
+                anchor_pairs = [
+                    (request["prompt_ids"], request["response_ids"])
+                    for request in spo_rs_anchor_requests
+                ]
+                try:
+                    current_anchor_scores = gen_pool.score_token_logprobs(
+                        anchor_pairs, show_progress=True,
+                        adapter_path=adapter_path)
+                except Exception as error:
+                    current_anchor_scores = [None] * len(anchor_pairs)
+                    print(f"[warn] SPO-RS policy-drift scoring failed "
+                          f"({error!r}); affected prompts use rho_min",
+                          flush=True)
+                (spo_rs_divergences,
+                 spo_rs_missing_anchor_scores) = (
+                    spo_rs_tracker.divergences_from_scores(
+                        spo_rs_prompt_keys, spo_rs_anchor_requests,
+                        current_anchor_scores))
+                print(f"[step {step_idx}] SPO-RS policy drift: "
+                      f"{len(anchor_pairs) - spo_rs_missing_anchor_scores}/"
+                      f"{len(anchor_pairs)} prior trajectories scored in "
+                      f"{time.time() - drift_t0:.1f}s", flush=True)
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
                 gen_pool.release()
@@ -5216,6 +5384,78 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             _restore_optimizer_state_to_parameters(optimizer)
             backend.set_training_mode()
 
+    if spo_rs_mode and not training_enabled:
+        spo_rs_divergences = {
+            key: 0.0 for key in spo_rs_prompt_keys
+            if spo_rs_tracker.baseline(key) is not None
+        }
+
+    if (spo_rs_mode and training_enabled
+            and cfg.generation_backend != "vllm"):
+        drift_t0 = time.time()
+        with _rank_dropout_disabled(model):
+            current_anchor_scores = []
+            for request in spo_rs_anchor_requests:
+                anchor_example = {
+                    "prompt_ids": torch.tensor(
+                        [request["prompt_ids"]], device=model.device),
+                    "response_ids": torch.tensor(
+                        [request["response_ids"]], device=model.device),
+                }
+                try:
+                    score = compute_batched_token_logprobs(
+                        model, [anchor_example], with_grad=False,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)[0]
+                    current_anchor_scores.append(score.detach().cpu())
+                except Exception as error:
+                    current_anchor_scores.append(None)
+                    if not hasattr(train_step, "_spo_drift_warned"):
+                        print(f"[warn] SPO-RS policy-drift scoring failed "
+                              f"({error!r}); affected prompts use rho_min",
+                              flush=True)
+                        train_step._spo_drift_warned = True
+            (spo_rs_divergences,
+             spo_rs_missing_anchor_scores) = (
+                spo_rs_tracker.divergences_from_scores(
+                    spo_rs_prompt_keys, spo_rs_anchor_requests,
+                    current_anchor_scores))
+
+            current_records = [
+                record for responses in group_responses.values()
+                for record in responses
+                if record["token_ids"] and record["behavior_logprobs"] is None
+            ]
+            if current_records:
+                prompt_cache = {}
+                score_examples = []
+                for record in current_records:
+                    job_idx = int(record["job_idx"])
+                    if job_idx not in prompt_cache:
+                        prompt_cache[job_idx] = tokenizer(
+                            prompt_jobs[job_idx]["prompt_text"],
+                            return_tensors="pt").input_ids.to(model.device)
+                    score_examples.append({
+                        "prompt_ids": prompt_cache[job_idx],
+                        "response_ids": torch.tensor(
+                            [record["token_ids"]], device=model.device),
+                        "_spo_rs_record": record,
+                    })
+                for batch in _training_microbatches(score_examples, cfg):
+                    scores = compute_batched_token_logprobs(
+                        model, batch, with_grad=False,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
+                    for example, score in zip(batch, scores):
+                        example["_spo_rs_record"]["behavior_logprobs"] = (
+                            score.detach().cpu())
+        print(f"[step {step_idx}] SPO-RS local policy scoring: "
+              f"{len(spo_rs_anchor_requests) - spo_rs_missing_anchor_scores}/"
+              f"{len(spo_rs_anchor_requests)} prior trajectories and "
+              f"{sum(record['behavior_logprobs'] is not None for record in current_records)}/"
+              f"{len(current_records)} current trajectories in "
+              f"{time.time() - drift_t0:.1f}s", flush=True)
+
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
     # ---- signals for adaptive batch growth ----
     # best_valid_yield: the single best group's valid fraction this step.
@@ -5227,6 +5467,92 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_rollout_count = 0
     step_code_failure_count = 0
     prompt_ids_by_job = {}
+
+    # Resolve every SPO-RS prompt against one immutable, pre-step tracker
+    # snapshot. The same rendered prompt can occur in more than one job (for
+    # example, two memory arms whose rendered text is identical). Combining
+    # those rollouts here prevents a current-batch reward from entering the
+    # baseline of another rollout sampled by the same policy.
+    spo_rs_prepared = {}
+    spo_rs_updates_by_group = {}
+    if spo_rs_mode:
+        pending_by_prompt = {}
+        for group_spec in group_specs:
+            group_id = int(group_spec["group_id"])
+            responses = group_responses[group_id]
+            futures = reward_futures[group_id]
+            if len(responses) != len(futures):
+                raise RuntimeError(
+                    f"SPO-RS group {group_id} has {len(responses)} responses "
+                    f"but {len(futures)} reward results")
+            for rollout_index, record in enumerate(responses):
+                job_idx = int(record["job_idx"])
+                job = prompt_jobs[job_idx]
+                prompt_key = job["spo_rs_key"]
+                pending_by_prompt.setdefault(prompt_key, []).append({
+                    "group": group_id,
+                    "rollout": rollout_index,
+                    "job": job_idx,
+                    "record": record,
+                    "reward": float(futures[rollout_index].result().reward),
+                })
+
+        for prompt_key, samples in pending_by_prompt.items():
+            transformed = spo_rs_tracker.transformed_rewards(
+                [sample["reward"] for sample in samples])
+            normalized = spo_rs_tracker.normalized_advantages(
+                prompt_key, transformed)
+            initialized = normalized is None
+            if initialized:
+                normalized = np.zeros_like(transformed)
+
+            policy_anchors = []
+            for sample in samples:
+                old_values = sample["record"].get("behavior_logprobs")
+                if old_values is None:
+                    continue
+                if hasattr(old_values, "detach"):
+                    old_values = old_values.detach().cpu().tolist()
+                else:
+                    old_values = list(old_values)
+                policy_anchors.append(
+                    (sample["record"]["token_ids"], old_values))
+
+            representative = samples[0]
+            representative_job = prompt_jobs[representative["job"]]
+            prompt_token_ids = tokenizer(
+                representative_job["prompt_text"]).input_ids
+            update = spo_rs_tracker.update(
+                prompt_key, transformed,
+                divergence=spo_rs_divergences.get(prompt_key, math.inf),
+                prompt_ids=prompt_token_ids,
+                anchors=policy_anchors,
+                step=step_idx,
+            )
+            update.update({
+                "prompt_key": prompt_key,
+                "group": representative["group"],
+                "parent_group": int(representative_job["parent_group"]),
+                "prompt_job": representative["job"],
+                "memory_arm": representative_job["arm"],
+                "groups": sorted({sample["group"] for sample in samples}),
+                "prompt_jobs": sorted({sample["job"] for sample in samples}),
+            })
+            spo_rs_updates.append(update)
+            spo_rs_updates_by_group.setdefault(
+                representative["group"], []).append(update)
+
+            for sample_index, sample in enumerate(samples):
+                rollout_key = (sample["group"], sample["rollout"])
+                spo_rs_prepared[rollout_key] = {
+                    "advantage": float(normalized[sample_index]),
+                    "trainable": not initialized,
+                    "info": {
+                        **update,
+                        "transformed_reward": float(transformed[sample_index]),
+                        "used_for_policy_update": not initialized,
+                    },
+                }
 
     for group_spec in group_specs:
         g = int(group_spec["group_id"])
@@ -5259,6 +5585,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         adv_mode = active_advantage_mode
         x_trial_advantages = None
         x_trial_info = None
+        spo_rs_group_updates = spo_rs_updates_by_group.get(g, [])
+        spo_rs_rollout_info = [None] * len(responses)
+        spo_rs_trainable = [True] * len(responses)
         if x_grpo_mode:
             from advantage import x_grpo_advantages
             x_trial_advantages = []
@@ -5283,6 +5612,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     any(valids)
                     and float(rewards_np.max()) > float(cfg.fail_score)),
             }
+        elif spo_rs_mode:
+            prepared = [spo_rs_prepared[(g, r_idx)]
+                        for r_idx in range(len(responses))]
+            advantages = np.asarray(
+                [item["advantage"] for item in prepared],
+                dtype=np.float64)
+            spo_rs_trainable = [item["trainable"] for item in prepared]
+            spo_rs_rollout_info = [item["info"] for item in prepared]
+            adv_scale = float(cfg.spo_rs_beta)
+            adv_scale_label = "beta"
+            adv_info = {}
         else:
             advantages, adv_scale, adv_scale_label, adv_info = (
                 compute_group_advantages(
@@ -5291,9 +5631,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     cvar_lambda=getattr(cfg, "cvar_lambda", None),
                     rank_gamma=getattr(cfg, "rank_gamma", None),
                     return_info=True))
-        constant = (bool(adv_info["all_tied"])
-                    if rank_policy_mode else
-                    float(rewards_np.max() - rewards_np.min()) < 1e-12)
+        constant = (
+            bool(adv_info["all_tied"])
+            if rank_mode or x_grpo_mode else
+            float(rewards_np.max() - rewards_np.min()) < 1e-12)
         rank_entropy_gate = bool(
             rank_mode
             and constant
@@ -5336,6 +5677,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             print(f"    X-GRPO candidates={list(cfg.x_grpo_budgets)} "
                   f"top ties={adv_info['top_count']} "
                   f"all tied={adv_info['all_tied']}")
+        elif spo_rs_mode:
+            for update in spo_rs_group_updates:
+                if update["initialized"]:
+                    print(f"    SPO-RS {update['memory_arm']}: initialized "
+                          f"v={update['value_after']:.9f} "
+                          f"N_eff={update['effective_count_after']:.2f}; "
+                          "policy update starts on its next visit")
+                else:
+                    divergence_label = (
+                        "missing" if update["divergence"] is None
+                        else f"{update['divergence']:.6f}")
+                    print(f"    SPO-RS {update['memory_arm']}: "
+                          f"v={update['value_before']:.9f}->"
+                          f"{update['value_after']:.9f} "
+                          f"D={divergence_label} "
+                          f"rho={update['rho']:.6f} "
+                          f"eta={update['eta']:.6f}")
 
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
@@ -5400,7 +5758,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "msg": res.msg,
                 "failure_kind": res.failure_kind,
                 "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
-                "beta": float(adv_scale) if adv_mode == "entropic" else 0.0,
+                "beta": (float(adv_scale)
+                         if adv_mode in ("entropic", "spo-rs") else 0.0),
                 "advantage_mode": adv_mode,
                 "advantage_scale": (float(adv_scale)
                                     if math.isfinite(adv_scale) else None),
@@ -5450,6 +5809,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 meta["x_grpo_rank"] = float(adv_info["ranks"][r_idx])
                 meta["x_grpo_trial_advantages"] = [
                     float(values[r_idx]) for values in x_trial_advantages]
+            elif spo_rs_mode:
+                meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if memory_v2:
                 meta["memory_version"] = "V2"
                 meta["memory_comparison_n"] = int(
@@ -5506,7 +5867,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Rank mode uses exact equality and retains fully tied groups for
         # reference updates. Entropy is gated separately above: an all-failure
         # tie at fail_score must not receive an entropy update.
-        if (constant and not rank_policy_mode
+        if (constant and not clipped_policy_mode
                 and not (fb_candidate_on and fb_cfg.include_constant_groups)):
             continue
 
@@ -5515,6 +5876,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             token_ids = record["token_ids"]
             job_idx = record["job_idx"]
             if not training_enabled:
+                continue
+            if spo_rs_mode and not spo_rs_trainable[r_idx]:
                 continue
             if len(token_ids) == 0:
                 continue
@@ -5552,6 +5915,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "x_grpo_fold_index": fold_index,
                 "rollout_index": r_idx,
                 "prompt_job_id": job_idx,
+                "spo_rs_prompt_key": (
+                    prompt_jobs[job_idx]["spo_rs_key"]
+                    if spo_rs_mode else None),
                 "x_grpo_group_size": len(responses),
                 "x_grpo_all_tied": bool(constant) if x_grpo_mode else False,
                 "x_grpo_trial_advantages": (
@@ -5589,7 +5955,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Constant groups only carry a feedback signal. Drop them when the adaptive
     # controller turns feedback off after seeing this step's code validity.
-    if not fb_on and not rank_policy_mode:
+    if not fb_on and not clipped_policy_mode:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     # Cap the teacher forwards. Applied to all_examples rather than to
@@ -5626,11 +5992,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # and reference forwards for a KL-only update and dilute the batch.
         all_examples = [
             ex for ex in all_examples
-            if (rank_policy_mode
+            if (clipped_policy_mode
                 or not (ex["reward_constant"] and not ex.get("reprompt_text")))
         ]
 
-    if rank_policy_mode and cfg.generation_backend == "vllm":
+    if clipped_policy_mode and cfg.generation_backend == "vllm":
         # Rank/PPO requires the frozen behavior probability. A malformed vLLM
         # payload cannot be reconstructed safely after the adapter changes and
         # must never force a full-context HF cache pass. Rollouts remain saved;
@@ -5645,7 +6011,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if unusable:
             print(f"[step {step_idx}] vLLM omitted behavior logprobs for "
                   f"{unusable} rollout(s); saved them but excluded only those "
-                  "records from the rank-style update", flush=True)
+                  "records from the clipped-policy update", flush=True)
+
+    if spo_rs_mode and all_examples:
+        trajectory_weight = 1.0 / len(all_examples)
+        for example in all_examples:
+            example["sample_weight"] = trajectory_weight
 
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples))
@@ -5710,6 +6081,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     if rank_mode:
         step_stats["rank_groups"] = rank_group_stats
+    elif spo_rs_mode:
+        step_stats["spo_rs_updates"] = spo_rs_updates
+        step_stats["spo_rs_tracker_size"] = len(spo_rs_tracker)
+        step_stats["spo_rs_missing_anchor_scores"] = int(
+            spo_rs_missing_anchor_scores)
 
     if not training_enabled:
         step_stats["training_disabled"] = True
@@ -5769,7 +6145,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["x_grpo_groups_per_context"] = (
             x_grpo_groups_per_context)
 
-    if rank_policy_mode:
+    if clipped_policy_mode:
         if parallel_trainer is not None:
             step_stats.update(parallel_trainer.train_rank(
                 all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
@@ -6089,11 +6465,24 @@ def main():
         print(f"Group size:         {cfg.group_size}")
         print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
     print(f"LR:                 {cfg.learning_rate}")
-    print(f"KL coef:            {cfg.kl_penalty_coef}")
+    if configured_advantage_mode == "spo-rs":
+        print("Reference KL:        off (SPO-RS PPO objective)")
+    else:
+        print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
     if getattr(cfg, "advantage_mode", "entropic") == "cvar":
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
-    if _uses_rank_policy_loss(configured_advantage_mode):
+    if configured_advantage_mode == "spo-rs":
+        print(f"SPO-RS beta:        {cfg.spo_rs_beta}")
+        print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
+        print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
+        print(f"SPO-RS clip eps low/high: "
+              f"{cfg.spo_rs_clip_epsilon_low} / "
+              f"{cfg.spo_rs_clip_epsilon_high} "
+              f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
+              f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
+        print(f"SPO-RS update epochs: {cfg.rank_update_epochs}")
+    elif _uses_clipped_policy_loss(configured_advantage_mode):
         print(f"Rank clip eps low/high: "
               f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
               f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
@@ -6227,6 +6616,25 @@ def main():
         print(f"[resume] reconstructed {n_states} valid archived candidates "
               f"from {n_rollouts} earlier rollouts")
     print(f"[init] sampler archive size = {sampler.archive_size()}")
+
+    spo_rs_tracker = None
+    if configured_advantage_mode == "spo-rs":
+        from spo_rs import SPORSTracker
+        spo_rs_tracker = SPORSTracker(
+            entropic_beta=cfg.spo_rs_beta,
+            d_half=cfg.spo_rs_d_half,
+            rho_min=cfg.spo_rs_rho_min,
+            rho_max=cfg.spo_rs_rho_max,
+        )
+        if resume_payload is not None:
+            tracker_state = resume_payload.get("spo_rs_tracker")
+            if tracker_state is None and start_step:
+                raise ValueError(
+                    "SPO-RS resume checkpoint is missing its value tracker")
+            if tracker_state is not None:
+                spo_rs_tracker.load_state_dict(tracker_state)
+                print(f"[resume] restored {len(spo_rs_tracker)} SPO-RS "
+                      "prompt trackers")
 
     # ---- generation pool ----
     gen_pool = None
@@ -6487,7 +6895,8 @@ def main():
                                cfg, exp_dir, problem, gen_pool,
                                memory=memory, extractor=extractor, mem_cfg=mem_cfg,
                                lookup=lookup, curator=curator, fb_cfg=fb_cfg,
-                               parallel_trainer=parallel_trainer)
+                               parallel_trainer=parallel_trainer,
+                               spo_rs_tracker=spo_rs_tracker)
 
             stats = stats or {}
             step_training_seconds = float(
@@ -6518,6 +6927,7 @@ def main():
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
                 next_g=cur_g, next_k=cur_k, memory_path=memory_path,
+                spo_rs_tracker=spo_rs_tracker,
             )
             save_step_summary(exp_dir, step, {
                 "step": step,

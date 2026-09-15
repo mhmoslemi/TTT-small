@@ -390,12 +390,9 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     backend.set_training_mode()
     allocator_fraction = set_total_memory_ceiling(
         logical_id, float(memory_fraction))
-    epsilon = float(getattr(
-        cfg, "rank_clip_epsilon", training.RANK_CLIP_EPSILON_DEFAULT))
-    epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
-    epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+    epsilon, epsilon_low, epsilon_high, kl_coef = (
+        training._clipped_policy_options(cfg))
     entropy_coef = training._rank_entropy_coefficient(cfg)
-    kl_coef = float(cfg.kl_penalty_coef)
     parameters = trainable_parameters(model)
     gradient_accumulators = [None for _ in parameters]
     metric_keys = (
