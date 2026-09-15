@@ -480,6 +480,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Rollouts per parent group; in X-GRPO, group size G "
                         "(paper default: 64)")
     p.add_argument("--num-seed-states", type=int, default=None)
+    p.add_argument("--uct", action="store_const", const=True, default=None,
+                   help="Use UCT parent selection instead of PUCT. Both use "
+                        "the same puct_c configuration value as c.")
     # ---- adaptive batch growth (groups-per-step / group-size are the START) --
     p.add_argument("--max-groups-per-step", type=int, default=None,
                    help="Cap for groups_per_step; in X-GRPO this is max K.")
@@ -508,7 +511,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "upper-tail term above the (1-alpha)-quantile), or "
                         "'rank'/'x-grpo' (midrank objectives with clipped GRPO), "
                         "or 'spo-rs' (KL-adaptive entropic value tracking with "
-                        "symmetric PPO clipping).")
+                        "configurable asymmetric PPO clipping).")
     p.add_argument("--rank-gamma", type=float, default=None,
                    help="rank mode: selection KL budget (default log(2)); "
                         "distinct from --kl-penalty-coef.")
@@ -1007,6 +1010,7 @@ def load_config():
     if advantage_mode not in ADVANTAGE_MODES:
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
+    merged["uct"] = bool(merged.get("uct", False))
     cvar_alpha = merged.get("cvar_alpha")
     cvar_alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
     if not (0.0 < cvar_alpha < 1.0):
@@ -4860,14 +4864,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
+        prior_label = ("" if info.get("selection_mode") == "uct"
+                       else f"  P={info['P']:.9f}")
         print(f"  parent {i} [{tag}]  value={info['value']:.9f}  n={info['n']}  "
-              f"Q={info['Q']:.9f}  P={info['P']:.9f}  bonus={info['bonus']:.9f}  "
-              f"score={info['score']:.9f}")
+              f"Q={info['Q']:.9f}{prior_label}  "
+              f"bonus={info['bonus']:.9f}  score={info['score']:.9f}")
 
     # Save the selection event immediately. Unlike the sampler checkpoint,
     # this survives later archive pruning and also exists if generation or
     # adapter training is interrupted.
-    sampler_type = type(sampler).__name__
+    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
+                    else type(sampler).__name__)
     save_parent_selections(
         exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info)
     print(f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
@@ -5163,6 +5170,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "text": text,
             "token_ids": list(token_ids),
             "behavior_logprobs": behavior_logprobs,
+            "spo_rs_anchor_logprobs": None,
             "reference_logprobs": None,
         }
         if (training_enabled and cfg.generation_backend == "vllm"
@@ -5261,8 +5269,34 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     score_pairs.append((
                         prompt_token_ids[job_idx], record["token_ids"]))
                 if spo_rs_mode:
+                    anchor_pairs = [
+                        (request["prompt_ids"], request["response_ids"])
+                        for request in spo_rs_anchor_requests
+                    ]
+                    combined_pairs = score_pairs + anchor_pairs
+                    try:
+                        combined_policy_scores = (
+                            gen_pool.score_token_logprobs(
+                                combined_pairs, show_progress=True,
+                                adapter_path=adapter_path))
+                    except Exception as error:
+                        combined_policy_scores = [None] * len(combined_pairs)
+                        print(f"[warn] SPO-RS policy scoring failed "
+                              f"({error!r}); missing current anchors are "
+                              "discarded and affected prior prompts use "
+                              "rho_min", flush=True)
+                    current_policy_scores = combined_policy_scores[
+                        :len(score_pairs)]
+                    prior_policy_scores = combined_policy_scores[
+                        len(score_pairs):]
                     reference_scores = [None] * len(score_pairs)
+                    (spo_rs_divergences,
+                     spo_rs_missing_anchor_scores) = (
+                        spo_rs_tracker.divergences_from_scores(
+                            spo_rs_prompt_keys, spo_rs_anchor_requests,
+                            prior_policy_scores))
                 else:
+                    current_policy_scores = [None] * len(score_pairs)
                     try:
                         reference_scores = gen_pool.score_token_logprobs(
                             score_pairs, show_progress=True)
@@ -5272,9 +5306,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                               "missing values will use their frozen "
                               "rollout-policy scores", flush=True)
                 reference_behavior_fallbacks = 0
-                for record, values in zip(
-                        vllm_logprob_records, reference_scores):
+                for record, values, policy_values in zip(
+                        vllm_logprob_records, reference_scores,
+                        current_policy_scores):
                     behavior_values = record["behavior_logprobs"]
+                    if (spo_rs_mode and policy_values is not None
+                            and len(policy_values)
+                            == len(record["token_ids"])):
+                        # Store drift anchors from the same explicit scoring
+                        # path used on the next visit. Sampling-time logprobs
+                        # remain untouched for the PPO behavior ratio.
+                        record["spo_rs_anchor_logprobs"] = policy_values
                     if (not spo_rs_mode and values is None
                             and behavior_values is not None
                             and len(behavior_values)
@@ -5292,47 +5334,30 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 reference_count = sum(
                     record["reference_logprobs"] is not None
                     for record in vllm_logprob_records)
+                current_anchor_count = sum(
+                    record["spo_rs_anchor_logprobs"] is not None
+                    for record in vllm_logprob_records)
                 eval_done_after = sum(
                     future.done() for futures in reward_futures.values()
                     for future in futures)
                 reference_label = (
                     "off for SPO-RS" if spo_rs_mode
                     else f"{reference_count}/{len(vllm_logprob_records)}")
+                anchor_label = (
+                    f", SPO-RS anchors current={current_anchor_count}/"
+                    f"{len(vllm_logprob_records)}, prior="
+                    f"{len(spo_rs_anchor_requests) - spo_rs_missing_anchor_scores}/"
+                    f"{len(spo_rs_anchor_requests)}"
+                    if spo_rs_mode else "")
                 print(f"[step {step_idx}] vLLM logprobs: rollout "
                       f"{behavior_count}/{len(vllm_logprob_records)}, "
-                      f"reference {reference_label} in "
+                      f"reference {reference_label}{anchor_label} in "
                       f"{time.time() - scoring_started:.1f}s "
                       f"(rollout-policy fallbacks: "
                       f"{reference_behavior_fallbacks}; "
                       f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
 
-            if (spo_rs_mode and training_enabled
-                    and cfg.generation_backend == "vllm"
-                    and spo_rs_anchor_requests):
-                drift_t0 = time.time()
-                anchor_pairs = [
-                    (request["prompt_ids"], request["response_ids"])
-                    for request in spo_rs_anchor_requests
-                ]
-                try:
-                    current_anchor_scores = gen_pool.score_token_logprobs(
-                        anchor_pairs, show_progress=True,
-                        adapter_path=adapter_path)
-                except Exception as error:
-                    current_anchor_scores = [None] * len(anchor_pairs)
-                    print(f"[warn] SPO-RS policy-drift scoring failed "
-                          f"({error!r}); affected prompts use rho_min",
-                          flush=True)
-                (spo_rs_divergences,
-                 spo_rs_missing_anchor_scores) = (
-                    spo_rs_tracker.divergences_from_scores(
-                        spo_rs_prompt_keys, spo_rs_anchor_requests,
-                        current_anchor_scores))
-                print(f"[step {step_idx}] SPO-RS policy drift: "
-                      f"{len(anchor_pairs) - spo_rs_missing_anchor_scores}/"
-                      f"{len(anchor_pairs)} prior trajectories scored in "
-                      f"{time.time() - drift_t0:.1f}s", flush=True)
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
                 gen_pool.release()
@@ -5508,7 +5533,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
             policy_anchors = []
             for sample in samples:
-                old_values = sample["record"].get("behavior_logprobs")
+                old_values = sample["record"].get(
+                    "spo_rs_anchor_logprobs")
+                if (old_values is None
+                        and cfg.generation_backend != "vllm"):
+                    old_values = sample["record"].get("behavior_logprobs")
                 if old_values is None:
                     continue
                 if hasattr(old_values, "detach"):
@@ -6453,6 +6482,8 @@ def main():
               f"PP={cfg.vllm_pipeline_parallel_size}")
     print(f"Target:             {cfg.target}")
     print(f"Steps:              {cfg.num_steps}")
+    print(f"Search selection:   {'UCT' if cfg.uct else 'PUCT'} "
+          f"(c={cfg.puct_c})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     if configured_advantage_mode == "x-grpo":
         print(f"X-GRPO contexts P:  {cfg.x_grpo_contexts_per_step}")
@@ -6605,10 +6636,12 @@ def main():
         topk_children=cfg.topk_children_per_parent,
         seed_value=0.0,
         seed_states=seeds,
+        use_uct=cfg.uct,
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
-        print("[resume] restored exact PUCT archive and visit statistics")
+        print(f"[resume] restored exact "
+              f"{'UCT' if cfg.uct else 'PUCT'} archive and visit statistics")
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(
             sampler, exp_dir, before_step=start_step

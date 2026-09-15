@@ -68,6 +68,7 @@ feedback_max_per_signature feedback_auto_signature_fraction
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
+    "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
     "spo_rs_beta", "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
@@ -242,6 +243,8 @@ def validate_problem_config(
         _positive_number(data, "adam_epsilon", source)
     if "weight_decay" in data and float(data["weight_decay"]) < 0:
         raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
+    if "uct" in data and not isinstance(data["uct"], bool):
+        raise ValueError(f"{_label(source)}: uct must be true or false")
     if "reranker_enabled" in data and data["reranker_enabled"] is not False:
         raise ValueError(
             f"{_label(source)}: reranker_enabled must be false; the Elo "

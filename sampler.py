@@ -1,9 +1,13 @@
 """
-PUCT-style state archive.
+PUCT/UCT state archive.
 
-For each candidate state s in the archive, the selection score is:
+For each candidate state s in the archive, PUCT uses:
 
     score(s) = Q(s) + c * scale * P(s) * sqrt(1 + T) / (1 + n(s))
+
+UCT uses the same c and reward scale but removes the prior:
+
+    score(s) = Q(s) + c * scale * sqrt(log(1 + T) / (1 + n(s)))
 
   Q(s)   = max child reward seen so far from s (or R(s) if never expanded)
   P(s)   = rank-based prior by default; the top states may be re-weighted by an
@@ -76,8 +80,10 @@ class PUCTSampler:
         topk_children: int = 2,
         seed_value: float = 0.0,
         seed_states: list = None,
+        use_uct: bool = False,
     ):
         self.puct_c = float(puct_c)
+        self.use_uct = bool(use_uct)
         self.max_buffer_size = max_buffer_size
         self.topk_children = topk_children
 
@@ -283,15 +289,26 @@ class PUCTSampler:
         values = np.array([s.value if s.value is not None else -np.inf
                            for s in self._states])
         scale = self._scale()
-        P = self._blended_prior(values)        # <-- rank prior + (optional) Elo re-ranking
-        sqrtT = np.sqrt(1.0 + self._T)
+        if self.use_uct:
+            # This archive has one global expansion count rather than a local
+            # tree-parent count, so T and n(s) are the direct archive analogues
+            # of the usual UCT N(parent) and N(parent, action).
+            P = np.zeros(len(values), dtype=np.float64)
+            uct_numerator = np.log1p(self._T)
+        else:
+            P = self._blended_prior(values)
+            sqrtT = np.sqrt(1.0 + self._T)
 
         scored = []
         for i, s in enumerate(self._states):
             n = self._n.get(s.id, 0)
             m = self._m.get(s.id, values[i])
             Q = m if n > 0 else values[i]
-            bonus = self.puct_c * scale * P[i] * sqrtT / (1.0 + n)
+            if self.use_uct:
+                bonus = self.puct_c * scale * np.sqrt(
+                    uct_numerator / (1.0 + n))
+            else:
+                bonus = self.puct_c * scale * P[i] * sqrtT / (1.0 + n)
             scored.append((Q + bonus, values[i], s, n, Q, P[i], bonus))
 
         # Sort by (score, value) descending
@@ -309,7 +326,9 @@ class PUCTSampler:
             picks.append(s)
             info.append({
                 "value": entry[1], "n": entry[3], "Q": entry[4],
-                "P": entry[5], "bonus": entry[6], "score": entry[0],
+                "P": None if self.use_uct else entry[5],
+                "bonus": entry[6], "score": entry[0],
+                "selection_mode": "uct" if self.use_uct else "puct",
                 "is_seed": s.id in self._seed_ids,
             })
             blocked.update(self._full_lineage(s, children_map))
@@ -328,7 +347,9 @@ class PUCTSampler:
                 picks.append(s)
                 info.append({
                     "value": entry[1], "n": entry[3], "Q": entry[4],
-                    "P": entry[5], "bonus": entry[6], "score": entry[0],
+                    "P": None if self.use_uct else entry[5],
+                    "bonus": entry[6], "score": entry[0],
+                    "selection_mode": "uct" if self.use_uct else "puct",
                     "is_seed": s.id in self._seed_ids,
                 })
 
@@ -452,6 +473,7 @@ class PUCTSampler:
                 "current_step": int(self._current_step),
                 "external_prior": dict(self._external_prior),
                 "external_prior_alpha": float(self._external_prior_alpha),
+                "selection_mode": "uct" if self.use_uct else "puct",
                 "best_raw_min": (asdict(self._best_raw_min)
                                  if self._best_raw_min is not None else None),
                 "best_raw_max": (asdict(self._best_raw_max)
@@ -462,6 +484,12 @@ class PUCTSampler:
         """Restore a snapshot produced by :meth:`state_dict`."""
         if not isinstance(payload, dict) or payload.get("version") != 1:
             raise ValueError("unsupported or invalid sampler checkpoint")
+        saved_mode = payload.get("selection_mode")
+        current_mode = "uct" if self.use_uct else "puct"
+        if saved_mode is not None and saved_mode != current_mode:
+            raise ValueError(
+                f"sampler checkpoint uses {saved_mode}, but this run uses "
+                f"{current_mode}")
         states = payload.get("states")
         if not isinstance(states, list) or not states:
             raise ValueError("sampler checkpoint contains no states")

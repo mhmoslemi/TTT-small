@@ -14,6 +14,7 @@ class SPORSTracker:
     """Track the entropic value of each exact rendered conditioning prompt."""
 
     VERSION = 1
+    POLICY_LOGPROB_SOURCE = "forward-score-v1"
 
     def __init__(self, *, entropic_beta: float, d_half: float,
                  rho_min: float, rho_max: float):
@@ -75,6 +76,13 @@ class SPORSTracker:
         for prompt_key in dict.fromkeys(str(key) for key in prompt_keys):
             entry = self._entries.get(prompt_key)
             if entry is None:
+                continue
+            # Sampling-time logprobs and explicit forward rescoring are not
+            # numerically interchangeable. Older checkpoints did not record
+            # the source, so discard those anchors once instead of reporting
+            # false policy drift for an unchanged model.
+            if (entry.get("policy_logprob_source")
+                    != self.POLICY_LOGPROB_SOURCE):
                 continue
             prompt_ids = list(entry.get("prompt_ids", ()))
             responses = entry.get("response_ids", ())
@@ -208,6 +216,7 @@ class SPORSTracker:
             "prompt_ids": compact_prompt,
             "response_ids": compact_responses,
             "policy_logprobs": compact_logprobs,
+            "policy_logprob_source": self.POLICY_LOGPROB_SOURCE,
             "last_step": int(step),
             "visits": visits,
         }
@@ -276,6 +285,8 @@ class SPORSTracker:
                 "prompt_ids": prompt_ids,
                 "response_ids": responses,
                 "policy_logprobs": logprobs,
+                "policy_logprob_source": str(entry.get(
+                    "policy_logprob_source", "legacy-sampling")),
                 "last_step": int(entry.get("last_step", -1)),
                 "visits": int(entry.get("visits", 1)),
             }
