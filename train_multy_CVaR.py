@@ -5056,10 +5056,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     spo_rs_prompt_keys = (
         [job["spo_rs_key"] for job in prompt_jobs] if spo_rs_mode else [])
-    spo_rs_anchor_requests = (
-        spo_rs_tracker.anchor_requests(spo_rs_prompt_keys)
+    spo_rs_unchanged_policy_keys = (
+        spo_rs_tracker.unchanged_policy_keys(spo_rs_prompt_keys)
+        if spo_rs_mode else set())
+    spo_rs_changed_policy_keys = (
+        [key for key in spo_rs_prompt_keys
+         if key not in spo_rs_unchanged_policy_keys]
         if spo_rs_mode else [])
-    spo_rs_divergences = {}
+    spo_rs_anchor_requests = (
+        spo_rs_tracker.anchor_requests(spo_rs_changed_policy_keys)
+        if spo_rs_mode else [])
+    spo_rs_divergences = {
+        key: 0.0 for key in spo_rs_unchanged_policy_keys
+    }
     spo_rs_missing_anchor_scores = 0
 
     group_specs = []
@@ -5293,8 +5302,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     (spo_rs_divergences,
                      spo_rs_missing_anchor_scores) = (
                         spo_rs_tracker.divergences_from_scores(
-                            spo_rs_prompt_keys, spo_rs_anchor_requests,
+                            spo_rs_changed_policy_keys,
+                            spo_rs_anchor_requests,
                             prior_policy_scores))
+                    spo_rs_divergences.update({
+                        key: 0.0 for key in spo_rs_unchanged_policy_keys
+                    })
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -5347,7 +5360,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f", SPO-RS anchors current={current_anchor_count}/"
                     f"{len(vllm_logprob_records)}, prior="
                     f"{len(spo_rs_anchor_requests) - spo_rs_missing_anchor_scores}/"
-                    f"{len(spo_rs_anchor_requests)}"
+                    f"{len(spo_rs_anchor_requests)}, unchanged-policy="
+                    f"{len(spo_rs_unchanged_policy_keys)}"
                     if spo_rs_mode else "")
                 print(f"[step {step_idx}] vLLM logprobs: rollout "
                       f"{behavior_count}/{len(vllm_logprob_records)}, "
@@ -5443,8 +5457,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             (spo_rs_divergences,
              spo_rs_missing_anchor_scores) = (
                 spo_rs_tracker.divergences_from_scores(
-                    spo_rs_prompt_keys, spo_rs_anchor_requests,
+                    spo_rs_changed_policy_keys, spo_rs_anchor_requests,
                     current_anchor_scores))
+            spo_rs_divergences.update({
+                key: 0.0 for key in spo_rs_unchanged_policy_keys
+            })
 
             current_records = [
                 record for responses in group_responses.values()
@@ -6132,6 +6149,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_stats["spo_rs_tracker_size"] = len(spo_rs_tracker)
         step_stats["spo_rs_missing_anchor_scores"] = int(
             spo_rs_missing_anchor_scores)
+        step_stats["spo_rs_unchanged_policy_prompts"] = int(
+            len(spo_rs_unchanged_policy_keys))
+        step_stats["spo_rs_policy_revision"] = int(
+            spo_rs_tracker.policy_revision)
 
     if not training_enabled:
         step_stats["training_disabled"] = True
@@ -6144,6 +6165,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if not all_examples:
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
+
+    if spo_rs_mode:
+        has_reward_signal = any(
+            float(example["advantage"]) != 0.0
+            for example in all_examples)
+        has_feedback_signal = bool(
+            fb_on and any(
+                example.get("reprompt_text") for example in all_examples))
+        if not has_reward_signal and not has_feedback_signal:
+            step_stats["training_seconds"] = 0.0
+            step_stats["spo_rs_policy_updated"] = False
+            print(f"[step {step_idx}] SPO-RS policy signal is exactly zero; "
+                  "skipping backward and optimizer update", flush=True)
+            return step_stats
 
     if x_grpo_mode:
         calibration_t0 = time.time()
@@ -6193,14 +6228,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     if clipped_policy_mode:
         if parallel_trainer is not None:
-            step_stats.update(parallel_trainer.train_rank(
+            training_stats = parallel_trainer.train_rank(
                 all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda))
+                fb_lambda=fb_lambda)
         else:
-            step_stats.update(_train_rank_examples(
+            training_stats = _train_rank_examples(
                 backend, model, tokenizer, optimizer, all_examples, cfg,
                 step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda))
+                fb_lambda=fb_lambda)
+        step_stats.update(training_stats)
+        if spo_rs_mode:
+            revision = spo_rs_tracker.advance_policy_revision()
+            step_stats["spo_rs_policy_updated"] = True
+            step_stats["spo_rs_policy_revision"] = int(revision)
         return step_stats
 
     # ----- TRAIN STEP -----

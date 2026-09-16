@@ -24,6 +24,7 @@ class SPORSTracker:
         self.rho_max = float(rho_max)
         self._validate_options()
         self._entries: dict[str, dict] = {}
+        self._policy_revision = 0
 
     def _validate_options(self) -> None:
         if not math.isfinite(self.entropic_beta) or self.entropic_beta <= 0.0:
@@ -41,6 +42,28 @@ class SPORSTracker:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    @property
+    def policy_revision(self) -> int:
+        return int(self._policy_revision)
+
+    def advance_policy_revision(self) -> int:
+        self._policy_revision += 1
+        return int(self._policy_revision)
+
+    def unchanged_policy_keys(
+        self, prompt_keys: Iterable[str],
+    ) -> set[str]:
+        unchanged = set()
+        for prompt_key in dict.fromkeys(str(key) for key in prompt_keys):
+            entry = self._entries.get(prompt_key)
+            if (entry is not None
+                    and entry.get("policy_logprob_source")
+                    == self.POLICY_LOGPROB_SOURCE
+                    and entry.get("policy_revision")
+                    == self._policy_revision):
+                unchanged.add(prompt_key)
+        return unchanged
 
     def baseline(self, prompt_key: str) -> float | None:
         entry = self._entries.get(str(prompt_key))
@@ -254,6 +277,7 @@ class SPORSTracker:
             "response_ids": compact_responses,
             "policy_logprobs": compact_logprobs,
             "policy_logprob_source": self.POLICY_LOGPROB_SOURCE,
+            "policy_revision": int(self._policy_revision),
             "last_step": int(step),
             "visits": visits,
         }
@@ -283,6 +307,7 @@ class SPORSTracker:
             "d_half": self.d_half,
             "rho_min": self.rho_min,
             "rho_max": self.rho_max,
+            "policy_revision": int(self._policy_revision),
             "entries": self._entries,
         }
 
@@ -324,7 +349,13 @@ class SPORSTracker:
                 "policy_logprobs": logprobs,
                 "policy_logprob_source": str(entry.get(
                     "policy_logprob_source", "legacy-sampling")),
+                "policy_revision": (
+                    int(entry["policy_revision"])
+                    if entry.get("policy_revision") is not None else None),
                 "last_step": int(entry.get("last_step", -1)),
                 "visits": int(entry.get("visits", 1)),
             }
         self._entries = restored
+        self._policy_revision = int(state.get("policy_revision", 0))
+        if self._policy_revision < 0:
+            raise ValueError("invalid SPO-RS policy revision")
