@@ -5495,9 +5495,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Resolve every SPO-RS prompt against one immutable, pre-step tracker
     # snapshot. The same rendered prompt can occur in more than one job (for
-    # example, two memory arms whose rendered text is identical). Combining
-    # those rollouts here prevents a current-batch reward from entering the
-    # baseline of another rollout sampled by the same policy.
+    # example, two memory arms whose rendered text is identical). On a first
+    # visit, combining them also lets every rollout use all *other* rollouts as
+    # its independent leave-one-out initialization baseline.
     spo_rs_prepared = {}
     spo_rs_updates_by_group = {}
     if spo_rs_mode:
@@ -5528,8 +5528,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             normalized = spo_rs_tracker.normalized_advantages(
                 prompt_key, transformed)
             initialized = normalized is None
+            first_visit_trains = False
             if initialized:
-                normalized = np.zeros_like(transformed)
+                normalized = spo_rs_tracker.initial_advantages(transformed)
+                first_visit_trains = normalized is not None
+                if normalized is None:
+                    normalized = np.zeros_like(transformed)
 
             policy_anchors = []
             for sample in samples:
@@ -5566,6 +5570,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "memory_arm": representative_job["arm"],
                 "groups": sorted({sample["group"] for sample in samples}),
                 "prompt_jobs": sorted({sample["job"] for sample in samples}),
+                "first_visit_cross_fit": bool(first_visit_trains),
             })
             spo_rs_updates.append(update)
             spo_rs_updates_by_group.setdefault(
@@ -5575,11 +5580,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 rollout_key = (sample["group"], sample["rollout"])
                 spo_rs_prepared[rollout_key] = {
                     "advantage": float(normalized[sample_index]),
-                    "trainable": not initialized,
+                    "trainable": bool(not initialized or first_visit_trains),
                     "info": {
                         **update,
                         "transformed_reward": float(transformed[sample_index]),
-                        "used_for_policy_update": not initialized,
+                        "used_for_policy_update": bool(
+                            not initialized or first_visit_trains),
                     },
                 }
 
@@ -5709,10 +5715,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         elif spo_rs_mode:
             for update in spo_rs_group_updates:
                 if update["initialized"]:
-                    print(f"    SPO-RS {update['memory_arm']}: initialized "
-                          f"v={update['value_after']:.9f} "
-                          f"N_eff={update['effective_count_after']:.2f}; "
-                          "policy update starts on its next visit")
+                    if update["first_visit_cross_fit"]:
+                        print(
+                            f"    SPO-RS {update['memory_arm']}: initialized "
+                            f"v={update['value_after']:.9f} "
+                            f"N_eff={update['effective_count_after']:.2f}; "
+                            f"first-visit leave-one-out policy update uses "
+                            f"{update['group_size']}/{update['group_size']} "
+                            "rollouts")
+                    else:
+                        print(
+                            f"    SPO-RS {update['memory_arm']}: initialized "
+                            f"v={update['value_after']:.9f} "
+                            f"N_eff={update['effective_count_after']:.2f}; "
+                            "one rollout cannot form an independent "
+                            "first-visit baseline")
                 else:
                     divergence_label = (
                         "missing" if update["divergence"] is None

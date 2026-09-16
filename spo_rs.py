@@ -70,6 +70,43 @@ class SPORSTracker:
             raise FloatingPointError("nonfinite SPO-RS normalized advantages")
         return advantages
 
+    @staticmethod
+    def initial_advantages(
+        transformed_rewards: Sequence[float],
+    ) -> np.ndarray | None:
+        """Cross-fit a first-visit baseline without using a sample on itself."""
+        values = np.asarray(transformed_rewards, dtype=np.float64)
+        if (values.ndim != 1 or values.size == 0
+                or not np.isfinite(values).all() or np.any(values <= 0.0)):
+            raise ValueError(
+                "SPO-RS transformed rewards must be finite and positive")
+        if values.size < 2:
+            return None
+
+        # For sample i, the mean of all j != i is independent of y_i under
+        # the frozen sampling policy. It can therefore initialize the positive
+        # value scale without turning the sample's own reward into its baseline.
+        count = int(values.size - 1)
+        baselines = np.empty_like(values)
+        for index in range(values.size):
+            try:
+                other_sum = math.fsum(
+                    float(value) for offset, value in enumerate(values)
+                    if offset != index)
+            except OverflowError as error:
+                raise FloatingPointError(
+                    "nonfinite SPO-RS first-visit baseline") from error
+            baselines[index] = other_sum / count
+        if (not np.isfinite(baselines).all()
+                or np.any(baselines <= 0.0)):
+            raise FloatingPointError(
+                "nonfinite SPO-RS first-visit baseline")
+        advantages = values / baselines - 1.0
+        if not np.isfinite(advantages).all():
+            raise FloatingPointError(
+                "nonfinite SPO-RS first-visit advantages")
+        return advantages
+
     def anchor_requests(self, prompt_keys: Iterable[str]) -> list[dict]:
         """Return prior-policy trajectories that need current-policy scores."""
         requests = []
