@@ -4622,14 +4622,17 @@ def _adapter_exists(exp_dir):
     return any(p.glob("adapter_step*"))
 
 
-def _save_adapter(model, exp_dir, step_idx, generation_model_name=None):
+def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
+                  directory_name=None):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
     Adapters are retained because completed checkpoints refer to their matching
     step directory; an interrupted write can therefore never invalidate the
     previous resumable checkpoint.
     """
-    out_dir = _adapter_dir(exp_dir, step_idx)
+    out_dir = (str(Path(exp_dir) / str(directory_name))
+               if directory_name is not None
+               else _adapter_dir(exp_dir, step_idx))
     # PEFT/Unsloth models support save_pretrained, which writes just the adapter
     model.save_pretrained(out_dir)
     # The trainable GPT-OSS copy may be a BnB conversion while vLLM hosts the
@@ -4645,7 +4648,7 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None):
     return out_dir
 
 
-def _load_adapter(model, adapter_dir):
+def _load_adapter(model, adapter_dir, *, announce=True):
     """Load saved LoRA weights into the already-created trainable adapter."""
     import torch
     from peft import set_peft_model_state_dict
@@ -4678,7 +4681,8 @@ def _load_adapter(model, adapter_dir):
             raise FileNotFoundError(f"no adapter weights found under {adapter_dir}")
 
     set_peft_model_state_dict(model, weights)
-    print(f"[resume] loaded LoRA adapter from {adapter_dir}")
+    if announce:
+        print(f"[resume] loaded LoRA adapter from {adapter_dir}")
 
 
 def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
@@ -4786,6 +4790,23 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
     return len(states), total_rollouts
 
 
+def _logged_step_rewards(exp_dir, step_idx):
+    """Read one completed step's finite rewards for tracker migration."""
+    step_dir = Path(exp_dir) / f"step{int(step_idx):02d}"
+    rewards = []
+    for meta_path in sorted(
+            step_dir.glob(f"step{int(step_idx):02d}_group*_rollout*.meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text())
+            reward = float(meta["reward"])
+        except (OSError, KeyError, TypeError, ValueError,
+                json.JSONDecodeError):
+            continue
+        if math.isfinite(reward):
+            rewards.append(reward)
+    return rewards
+
+
 # ======================================================================
 # One training step
 #
@@ -4827,7 +4848,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
                curator=None, fb_cfg=None, parallel_trainer=None,
-               spo_rs_tracker=None):
+               spo_rs_tracker=None, sampling_adapter_path=None):
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -4935,11 +4956,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
 
-    # The adapter is saved BEFORE the lookup, not just before generation, so the
-    # selection call runs on the same policy the rollouts will. Same file either
-    # way, so this only moves the write earlier.
+    # SPO-RS needs immutable consecutive policy versions. Reuse the adapter
+    # saved after the preceding update; only a fresh run needs an initial
+    # snapshot. Other objectives retain their existing per-step save.
     adapter_path = None
-    if gen_pool is not None:
+    if spo_rs_mode:
+        if sampling_adapter_path is None:
+            adapter_path = _save_adapter(
+                model, exp_dir, step_idx, cfg.model_name,
+                directory_name="adapter_initial")
+        else:
+            adapter_path = str(Path(sampling_adapter_path))
+            if not Path(adapter_path).is_dir():
+                raise FileNotFoundError(
+                    f"SPO-RS sampling adapter not found: {adapter_path}")
+    elif gen_pool is not None:
         adapter_path = _save_adapter(
             model, exp_dir, step_idx, cfg.model_name)
 
@@ -5041,8 +5072,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "memory_tokens": int(n_tok),
                 "messages": messages,
                 "prompt_text": prompt_text,
-                "spo_rs_key": (spo_rs_tracker.prompt_key(prompt_text)
-                               if spo_rs_mode else None),
                 "count": int(arm.count),
             })
             mem_arm_rollouts[arm.name] = (
@@ -5054,22 +5083,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
 
-    spo_rs_prompt_keys = (
-        [job["spo_rs_key"] for job in prompt_jobs] if spo_rs_mode else [])
-    spo_rs_unchanged_policy_keys = (
-        spo_rs_tracker.unchanged_policy_keys(spo_rs_prompt_keys)
-        if spo_rs_mode else set())
-    spo_rs_changed_policy_keys = (
-        [key for key in spo_rs_prompt_keys
-         if key not in spo_rs_unchanged_policy_keys]
-        if spo_rs_mode else [])
-    spo_rs_anchor_requests = (
-        spo_rs_tracker.anchor_requests(spo_rs_changed_policy_keys)
-        if spo_rs_mode else [])
-    spo_rs_divergences = {
-        key: 0.0 for key in spo_rs_unchanged_policy_keys
-    }
-    spo_rs_missing_anchor_scores = 0
+    spo_rs_divergence = 0.0
+    spo_rs_context_divergences = {}
+    spo_rs_missing_policy_scores = 0
+    spo_rs_previous_adapter_path = None
+    if spo_rs_mode and spo_rs_tracker.initialized:
+        previous_name = spo_rs_tracker.last_policy_adapter
+        if previous_name is not None:
+            spo_rs_previous_adapter_path = Path(exp_dir) / previous_name
 
     group_specs = []
     for parent_group in range(len(parents)):
@@ -5179,7 +5200,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "text": text,
             "token_ids": list(token_ids),
             "behavior_logprobs": behavior_logprobs,
-            "spo_rs_anchor_logprobs": None,
             "reference_logprobs": None,
         }
         if (training_enabled and cfg.generation_backend == "vllm"
@@ -5278,36 +5298,55 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     score_pairs.append((
                         prompt_token_ids[job_idx], record["token_ids"]))
                 if spo_rs_mode:
-                    anchor_pairs = [
-                        (request["prompt_ids"], request["response_ids"])
-                        for request in spo_rs_anchor_requests
-                    ]
-                    combined_pairs = score_pairs + anchor_pairs
-                    try:
-                        combined_policy_scores = (
-                            gen_pool.score_token_logprobs(
-                                combined_pairs, show_progress=True,
-                                adapter_path=adapter_path))
-                    except Exception as error:
-                        combined_policy_scores = [None] * len(combined_pairs)
-                        print(f"[warn] SPO-RS policy scoring failed "
-                              f"({error!r}); missing current anchors are "
-                              "discarded and affected prior prompts use "
-                              "rho_min", flush=True)
-                    current_policy_scores = combined_policy_scores[
-                        :len(score_pairs)]
-                    prior_policy_scores = combined_policy_scores[
-                        len(score_pairs):]
                     reference_scores = [None] * len(score_pairs)
-                    (spo_rs_divergences,
-                     spo_rs_missing_anchor_scores) = (
-                        spo_rs_tracker.divergences_from_scores(
-                            spo_rs_changed_policy_keys,
-                            spo_rs_anchor_requests,
-                            prior_policy_scores))
-                    spo_rs_divergences.update({
-                        key: 0.0 for key in spo_rs_unchanged_policy_keys
-                    })
+                    current_policy_scores = [None] * len(score_pairs)
+                    previous_policy_scores = [None] * len(score_pairs)
+                    same_policy = bool(
+                        spo_rs_tracker.initialized
+                        and spo_rs_previous_adapter_path is not None
+                        and Path(adapter_path).resolve()
+                        == spo_rs_previous_adapter_path.resolve())
+                    if same_policy:
+                        spo_rs_divergence = 0.0
+                        spo_rs_context_divergences = {
+                            int(record["context_id"]): 0.0
+                            for record in vllm_logprob_records
+                        }
+                    elif spo_rs_tracker.initialized:
+                        if (spo_rs_previous_adapter_path is None
+                                or not spo_rs_previous_adapter_path.is_dir()):
+                            spo_rs_divergence = math.inf
+                            spo_rs_missing_policy_scores = len(score_pairs)
+                            print("[warn] SPO-RS previous policy adapter is "
+                                  "missing; this step uses rho_min", flush=True)
+                        else:
+                            try:
+                                current_policy_scores = (
+                                    gen_pool.score_token_logprobs(
+                                        score_pairs, show_progress=True,
+                                        adapter_path=adapter_path))
+                                previous_policy_scores = (
+                                    gen_pool.score_token_logprobs(
+                                        score_pairs, show_progress=True,
+                                        adapter_path=str(
+                                            spo_rs_previous_adapter_path)))
+                                (spo_rs_divergence,
+                                 spo_rs_missing_policy_scores,
+                                 spo_rs_context_divergences) = (
+                                    spo_rs_tracker.consecutive_policy_divergence(
+                                        current_policy_scores,
+                                        previous_policy_scores,
+                                        [record["context_id"] for record
+                                         in vllm_logprob_records],
+                                        required_context_ids=[
+                                            spec["context_id"]
+                                            for spec in group_specs]))
+                            except Exception as error:
+                                spo_rs_divergence = math.inf
+                                spo_rs_missing_policy_scores = len(score_pairs)
+                                print(f"[warn] SPO-RS consecutive-policy "
+                                      f"scoring failed ({error!r}); this step "
+                                      "uses rho_min", flush=True)
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -5319,17 +5358,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                               "missing values will use their frozen "
                               "rollout-policy scores", flush=True)
                 reference_behavior_fallbacks = 0
-                for record, values, policy_values in zip(
-                        vllm_logprob_records, reference_scores,
-                        current_policy_scores):
+                for record, values in zip(
+                        vllm_logprob_records, reference_scores):
                     behavior_values = record["behavior_logprobs"]
-                    if (spo_rs_mode and policy_values is not None
-                            and len(policy_values)
-                            == len(record["token_ids"])):
-                        # Store drift anchors from the same explicit scoring
-                        # path used on the next visit. Sampling-time logprobs
-                        # remain untouched for the PPO behavior ratio.
-                        record["spo_rs_anchor_logprobs"] = policy_values
                     if (not spo_rs_mode and values is None
                             and behavior_values is not None
                             and len(behavior_values)
@@ -5347,25 +5378,29 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 reference_count = sum(
                     record["reference_logprobs"] is not None
                     for record in vllm_logprob_records)
-                current_anchor_count = sum(
-                    record["spo_rs_anchor_logprobs"] is not None
-                    for record in vllm_logprob_records)
                 eval_done_after = sum(
                     future.done() for futures in reward_futures.values()
                     for future in futures)
                 reference_label = (
                     "off for SPO-RS" if spo_rs_mode
                     else f"{reference_count}/{len(vllm_logprob_records)}")
-                anchor_label = (
-                    f", SPO-RS anchors current={current_anchor_count}/"
-                    f"{len(vllm_logprob_records)}, prior="
-                    f"{len(spo_rs_anchor_requests) - spo_rs_missing_anchor_scores}/"
-                    f"{len(spo_rs_anchor_requests)}, unchanged-policy="
-                    f"{len(spo_rs_unchanged_policy_keys)}"
-                    if spo_rs_mode else "")
+                if spo_rs_mode and not spo_rs_tracker.initialized:
+                    policy_label = ", SPO-RS policy KL=initialization"
+                elif spo_rs_mode and same_policy:
+                    policy_label = ", SPO-RS policy KL=0 (same adapter)"
+                elif spo_rs_mode:
+                    divergence_label = (
+                        "missing" if not math.isfinite(spo_rs_divergence)
+                        else f"{spo_rs_divergence:.6f}")
+                    policy_label = (
+                        f", SPO-RS policy KL={divergence_label} "
+                        f"on {len(spo_rs_context_divergences)} contexts, "
+                        f"missing={spo_rs_missing_policy_scores}")
+                else:
+                    policy_label = ""
                 print(f"[step {step_idx}] vLLM logprobs: rollout "
                       f"{behavior_count}/{len(vllm_logprob_records)}, "
-                      f"reference {reference_label}{anchor_label} in "
+                      f"reference {reference_label}{policy_label} in "
                       f"{time.time() - scoring_started:.1f}s "
                       f"(rollout-policy fallbacks: "
                       f"{reference_behavior_fallbacks}; "
@@ -5424,78 +5459,107 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             backend.set_training_mode()
 
     if spo_rs_mode and not training_enabled:
-        spo_rs_divergences = {
-            key: 0.0 for key in spo_rs_prompt_keys
-            if spo_rs_tracker.baseline(key) is not None
+        # With policy optimization disabled, consecutive policies are exactly
+        # identical even though the selected parents may be new.
+        spo_rs_divergence = 0.0
+        spo_rs_context_divergences = {
+            int(spec["context_id"]): 0.0 for spec in group_specs
         }
 
     if (spo_rs_mode and training_enabled
             and cfg.generation_backend != "vllm"):
         drift_t0 = time.time()
-        with _rank_dropout_disabled(model):
-            current_anchor_scores = []
-            for request in spo_rs_anchor_requests:
-                anchor_example = {
-                    "prompt_ids": torch.tensor(
-                        [request["prompt_ids"]], device=model.device),
-                    "response_ids": torch.tensor(
-                        [request["response_ids"]], device=model.device),
-                }
-                try:
-                    score = compute_batched_token_logprobs(
-                        model, [anchor_example], with_grad=False,
-                        chunk=cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id)[0]
-                    current_anchor_scores.append(score.detach().cpu())
-                except Exception as error:
-                    current_anchor_scores.append(None)
-                    if not hasattr(train_step, "_spo_drift_warned"):
-                        print(f"[warn] SPO-RS policy-drift scoring failed "
-                              f"({error!r}); affected prompts use rho_min",
-                              flush=True)
-                        train_step._spo_drift_warned = True
-            (spo_rs_divergences,
-             spo_rs_missing_anchor_scores) = (
-                spo_rs_tracker.divergences_from_scores(
-                    spo_rs_changed_policy_keys, spo_rs_anchor_requests,
-                    current_anchor_scores))
-            spo_rs_divergences.update({
-                key: 0.0 for key in spo_rs_unchanged_policy_keys
+        current_records = [
+            record for responses in group_responses.values()
+            for record in responses if record["token_ids"]
+        ]
+        prompt_cache = {}
+        score_examples = []
+        for record in current_records:
+            job_idx = int(record["job_idx"])
+            if job_idx not in prompt_cache:
+                prompt_cache[job_idx] = tokenizer(
+                    prompt_jobs[job_idx]["prompt_text"],
+                    return_tensors="pt").input_ids.to(model.device)
+            score_examples.append({
+                "prompt_ids": prompt_cache[job_idx],
+                "response_ids": torch.tensor(
+                    [record["token_ids"]], device=model.device),
+                "_spo_rs_record": record,
             })
 
-            current_records = [
-                record for responses in group_responses.values()
-                for record in responses
-                if record["token_ids"] and record["behavior_logprobs"] is None
-            ]
-            if current_records:
-                prompt_cache = {}
-                score_examples = []
+        def _score_local_policy(field_name):
+            for batch in _training_microbatches(score_examples, cfg):
+                scores = compute_batched_token_logprobs(
+                    model, batch, with_grad=False,
+                    chunk=cfg.logprob_chunk,
+                    pad_token_id=tokenizer.pad_token_id)
+                for example, score in zip(batch, scores):
+                    example["_spo_rs_record"][field_name] = (
+                        score.detach().cpu())
+
+        with _rank_dropout_disabled(model):
+            try:
+                _score_local_policy("_spo_rs_current_score")
                 for record in current_records:
-                    job_idx = int(record["job_idx"])
-                    if job_idx not in prompt_cache:
-                        prompt_cache[job_idx] = tokenizer(
-                            prompt_jobs[job_idx]["prompt_text"],
-                            return_tensors="pt").input_ids.to(model.device)
-                    score_examples.append({
-                        "prompt_ids": prompt_cache[job_idx],
-                        "response_ids": torch.tensor(
-                            [record["token_ids"]], device=model.device),
-                        "_spo_rs_record": record,
-                    })
-                for batch in _training_microbatches(score_examples, cfg):
-                    scores = compute_batched_token_logprobs(
-                        model, batch, with_grad=False,
-                        chunk=cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id)
-                    for example, score in zip(batch, scores):
-                        example["_spo_rs_record"]["behavior_logprobs"] = (
-                            score.detach().cpu())
+                    record["behavior_logprobs"] = record.get(
+                        "_spo_rs_current_score")
+
+                same_policy = bool(
+                    spo_rs_tracker.initialized
+                    and spo_rs_previous_adapter_path is not None
+                    and Path(adapter_path).resolve()
+                    == spo_rs_previous_adapter_path.resolve())
+                if same_policy:
+                    spo_rs_divergence = 0.0
+                    spo_rs_context_divergences = {
+                        int(record["context_id"]): 0.0
+                        for record in current_records
+                    }
+                elif spo_rs_tracker.initialized:
+                    if (spo_rs_previous_adapter_path is None
+                            or not spo_rs_previous_adapter_path.is_dir()):
+                        spo_rs_divergence = math.inf
+                        spo_rs_missing_policy_scores = len(current_records)
+                    else:
+                        try:
+                            _load_adapter(
+                                model, spo_rs_previous_adapter_path,
+                                announce=False)
+                            _score_local_policy("_spo_rs_previous_score")
+                        finally:
+                            _load_adapter(model, adapter_path, announce=False)
+                        (spo_rs_divergence,
+                         spo_rs_missing_policy_scores,
+                         spo_rs_context_divergences) = (
+                            spo_rs_tracker.consecutive_policy_divergence(
+                                [record.get("_spo_rs_current_score")
+                                 for record in current_records],
+                                [record.get("_spo_rs_previous_score")
+                                 for record in current_records],
+                                [record["context_id"]
+                                 for record in current_records],
+                                required_context_ids=[
+                                    spec["context_id"]
+                                    for spec in group_specs]))
+            except Exception as error:
+                spo_rs_divergence = math.inf
+                spo_rs_missing_policy_scores = len(current_records)
+                print(f"[warn] SPO-RS consecutive-policy scoring failed "
+                      f"({error!r}); this step uses rho_min", flush=True)
+            finally:
+                for record in current_records:
+                    record.pop("_spo_rs_current_score", None)
+                    record.pop("_spo_rs_previous_score", None)
+        divergence_label = (
+            "initialization" if not spo_rs_tracker.initialized
+            else ("missing" if not math.isfinite(spo_rs_divergence)
+                  else f"{spo_rs_divergence:.6f}"))
         print(f"[step {step_idx}] SPO-RS local policy scoring: "
-              f"{len(spo_rs_anchor_requests) - spo_rs_missing_anchor_scores}/"
-              f"{len(spo_rs_anchor_requests)} prior trajectories and "
-              f"{sum(record['behavior_logprobs'] is not None for record in current_records)}/"
-              f"{len(current_records)} current trajectories in "
+              f"current={sum(record['behavior_logprobs'] is not None for record in current_records)}/"
+              f"{len(current_records)}, KL={divergence_label} on "
+              f"{len(spo_rs_context_divergences)} contexts, "
+              f"missing={spo_rs_missing_policy_scores} in "
               f"{time.time() - drift_t0:.1f}s", flush=True)
 
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
@@ -5510,15 +5574,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_code_failure_count = 0
     prompt_ids_by_job = {}
 
-    # Resolve every SPO-RS prompt against one immutable, pre-step tracker
-    # snapshot. The same rendered prompt can occur in more than one job (for
-    # example, two memory arms whose rendered text is identical). On a first
-    # visit, combining them also lets every rollout use all *other* rollouts as
-    # its independent leave-one-out initialization baseline.
+    # Resolve every rollout against one immutable, run-wide pre-step tracker
+    # value. Only after all advantages are fixed does this step enter history.
     spo_rs_prepared = {}
-    spo_rs_updates_by_group = {}
     if spo_rs_mode:
-        pending_by_prompt = {}
+        samples = []
         for group_spec in group_specs:
             group_id = int(group_spec["group_id"])
             responses = group_responses[group_id]
@@ -5529,82 +5589,66 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"but {len(futures)} reward results")
             for rollout_index, record in enumerate(responses):
                 job_idx = int(record["job_idx"])
-                job = prompt_jobs[job_idx]
-                prompt_key = job["spo_rs_key"]
-                pending_by_prompt.setdefault(prompt_key, []).append({
+                samples.append({
                     "group": group_id,
                     "rollout": rollout_index,
                     "job": job_idx,
                     "record": record,
                     "reward": float(futures[rollout_index].result().reward),
                 })
-
-        for prompt_key, samples in pending_by_prompt.items():
+        if samples:
             transformed = spo_rs_tracker.transformed_rewards(
                 [sample["reward"] for sample in samples])
-            normalized = spo_rs_tracker.normalized_advantages(
-                prompt_key, transformed)
+            normalized = spo_rs_tracker.normalized_advantages(transformed)
             initialized = normalized is None
-            first_visit_trains = False
             if initialized:
-                normalized = spo_rs_tracker.initial_advantages(transformed)
-                first_visit_trains = normalized is not None
-                if normalized is None:
-                    normalized = np.zeros_like(transformed)
-
-            policy_anchors = []
-            for sample in samples:
-                old_values = sample["record"].get(
-                    "spo_rs_anchor_logprobs")
-                if (old_values is None
-                        and cfg.generation_backend != "vllm"):
-                    old_values = sample["record"].get("behavior_logprobs")
-                if old_values is None:
-                    continue
-                if hasattr(old_values, "detach"):
-                    old_values = old_values.detach().cpu().tolist()
-                else:
-                    old_values = list(old_values)
-                policy_anchors.append(
-                    (sample["record"]["token_ids"], old_values))
-
-            representative = samples[0]
-            representative_job = prompt_jobs[representative["job"]]
-            prompt_token_ids = tokenizer(
-                representative_job["prompt_text"]).input_ids
+                normalized = np.zeros_like(transformed)
             update = spo_rs_tracker.update(
-                prompt_key, transformed,
-                divergence=spo_rs_divergences.get(prompt_key, math.inf),
-                prompt_ids=prompt_token_ids,
-                anchors=policy_anchors,
+                transformed,
+                divergence=(0.0 if initialized else spo_rs_divergence),
+                policy_adapter=adapter_path,
                 step=step_idx,
             )
             update.update({
-                "prompt_key": prompt_key,
-                "group": representative["group"],
-                "parent_group": int(representative_job["parent_group"]),
-                "prompt_job": representative["job"],
-                "memory_arm": representative_job["arm"],
                 "groups": sorted({sample["group"] for sample in samples}),
                 "prompt_jobs": sorted({sample["job"] for sample in samples}),
-                "first_visit_cross_fit": bool(first_visit_trains),
+                "contexts": sorted({
+                    int(sample["record"]["context_id"])
+                    for sample in samples}),
+                "context_divergences": spo_rs_context_divergences,
+                "missing_policy_scores": int(
+                    spo_rs_missing_policy_scores),
             })
             spo_rs_updates.append(update)
-            spo_rs_updates_by_group.setdefault(
-                representative["group"], []).append(update)
 
             for sample_index, sample in enumerate(samples):
                 rollout_key = (sample["group"], sample["rollout"])
                 spo_rs_prepared[rollout_key] = {
                     "advantage": float(normalized[sample_index]),
-                    "trainable": bool(not initialized or first_visit_trains),
+                    "trainable": not initialized,
                     "info": {
                         **update,
                         "transformed_reward": float(transformed[sample_index]),
-                        "used_for_policy_update": bool(
-                            not initialized or first_visit_trains),
+                        "used_for_policy_update": not initialized,
                     },
                 }
+
+            if initialized:
+                print(f"[step {step_idx}] SPO-RS global tracker: initialized "
+                      f"v={update['value_after']:.9f} "
+                      f"N_eff={update['effective_count_after']:.2f} from "
+                      f"M={update['group_size']} rollouts; policy update "
+                      "starts on the next step", flush=True)
+            else:
+                divergence_label = (
+                    "missing" if update["divergence"] is None
+                    else f"{update['divergence']:.6f}")
+                print(f"[step {step_idx}] SPO-RS global tracker: "
+                      f"v={update['value_before']:.9f}->"
+                      f"{update['value_after']:.9f} "
+                      f"M={update['group_size']} D={divergence_label} "
+                      f"rho={update['rho']:.6f} "
+                      f"eta={update['eta']:.6f}", flush=True)
 
     for group_spec in group_specs:
         g = int(group_spec["group_id"])
@@ -5637,7 +5681,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         adv_mode = active_advantage_mode
         x_trial_advantages = None
         x_trial_info = None
-        spo_rs_group_updates = spo_rs_updates_by_group.get(g, [])
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
         if x_grpo_mode:
@@ -5729,34 +5772,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             print(f"    X-GRPO candidates={list(cfg.x_grpo_budgets)} "
                   f"top ties={adv_info['top_count']} "
                   f"all tied={adv_info['all_tied']}")
-        elif spo_rs_mode:
-            for update in spo_rs_group_updates:
-                if update["initialized"]:
-                    if update["first_visit_cross_fit"]:
-                        print(
-                            f"    SPO-RS {update['memory_arm']}: initialized "
-                            f"v={update['value_after']:.9f} "
-                            f"N_eff={update['effective_count_after']:.2f}; "
-                            f"first-visit leave-one-out policy update uses "
-                            f"{update['group_size']}/{update['group_size']} "
-                            "rollouts")
-                    else:
-                        print(
-                            f"    SPO-RS {update['memory_arm']}: initialized "
-                            f"v={update['value_after']:.9f} "
-                            f"N_eff={update['effective_count_after']:.2f}; "
-                            "one rollout cannot form an independent "
-                            "first-visit baseline")
-                else:
-                    divergence_label = (
-                        "missing" if update["divergence"] is None
-                        else f"{update['divergence']:.6f}")
-                    print(f"    SPO-RS {update['memory_arm']}: "
-                          f"v={update['value_before']:.9f}->"
-                          f"{update['value_after']:.9f} "
-                          f"D={divergence_label} "
-                          f"rho={update['rho']:.6f} "
-                          f"eta={update['eta']:.6f}")
 
         # Outcome-based memory credit. All arms share this parent and the same
         # total K budget; expected_subsample_max corrects unequal arm sizes.
@@ -5978,9 +5993,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "x_grpo_fold_index": fold_index,
                 "rollout_index": r_idx,
                 "prompt_job_id": job_idx,
-                "spo_rs_prompt_key": (
-                    prompt_jobs[job_idx]["spo_rs_key"]
-                    if spo_rs_mode else None),
                 "x_grpo_group_size": len(responses),
                 "x_grpo_all_tied": bool(constant) if x_grpo_mode else False,
                 "x_grpo_trial_advantages": (
@@ -6147,12 +6159,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     elif spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
         step_stats["spo_rs_tracker_size"] = len(spo_rs_tracker)
-        step_stats["spo_rs_missing_anchor_scores"] = int(
-            spo_rs_missing_anchor_scores)
-        step_stats["spo_rs_unchanged_policy_prompts"] = int(
-            len(spo_rs_unchanged_policy_keys))
-        step_stats["spo_rs_policy_revision"] = int(
-            spo_rs_tracker.policy_revision)
+        step_stats["spo_rs_divergence"] = (
+            None if not math.isfinite(spo_rs_divergence)
+            else float(spo_rs_divergence))
+        step_stats["spo_rs_context_divergences"] = (
+            spo_rs_context_divergences)
+        step_stats["spo_rs_missing_policy_scores"] = int(
+            spo_rs_missing_policy_scores)
+        step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
+        step_stats["spo_rs_policy_updated"] = False
 
     if not training_enabled:
         step_stats["training_disabled"] = True
@@ -6165,20 +6180,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if not all_examples:
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
-
-    if spo_rs_mode:
-        has_reward_signal = any(
-            float(example["advantage"]) != 0.0
-            for example in all_examples)
-        has_feedback_signal = bool(
-            fb_on and any(
-                example.get("reprompt_text") for example in all_examples))
-        if not has_reward_signal and not has_feedback_signal:
-            step_stats["training_seconds"] = 0.0
-            step_stats["spo_rs_policy_updated"] = False
-            print(f"[step {step_idx}] SPO-RS policy signal is exactly zero; "
-                  "skipping backward and optimizer update", flush=True)
-            return step_stats
 
     if x_grpo_mode:
         calibration_t0 = time.time()
@@ -6228,19 +6229,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     if clipped_policy_mode:
         if parallel_trainer is not None:
-            training_stats = parallel_trainer.train_rank(
+            step_stats.update(parallel_trainer.train_rank(
                 all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda)
+                fb_lambda=fb_lambda))
         else:
-            training_stats = _train_rank_examples(
+            step_stats.update(_train_rank_examples(
                 backend, model, tokenizer, optimizer, all_examples, cfg,
                 step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda)
-        step_stats.update(training_stats)
+                fb_lambda=fb_lambda))
         if spo_rs_mode:
-            revision = spo_rs_tracker.advance_policy_revision()
             step_stats["spo_rs_policy_updated"] = True
-            step_stats["spo_rs_policy_revision"] = int(revision)
         return step_stats
 
     # ----- TRAIN STEP -----
@@ -6638,17 +6636,20 @@ def main():
     resume_payload = None
     legacy_resume = None
     start_step = 0
+    current_policy_adapter_path = None
     if resume_dir:
         resume_payload = _load_training_checkpoint(exp_dir)
         if resume_payload is not None:
             start_step = int(resume_payload["next_step"])
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
             _load_adapter(model, adapter_path)
+            current_policy_adapter_path = adapter_path
             print(f"[resume] exact checkpoint found; next step is {start_step}")
         else:
             legacy_resume = _legacy_resume_info(exp_dir)
             start_step, adapter_path = legacy_resume
             _load_adapter(model, adapter_path)
+            current_policy_adapter_path = adapter_path
             print(
                 f"[resume] legacy run (no training_state.pt): restarting step "
                 f"{start_step} from {adapter_path.name}. The archive will be "
@@ -6716,15 +6717,39 @@ def main():
             rho_min=cfg.spo_rs_rho_min,
             rho_max=cfg.spo_rs_rho_max,
         )
-        if resume_payload is not None:
-            tracker_state = resume_payload.get("spo_rs_tracker")
-            if tracker_state is None and start_step:
+        tracker_state = (resume_payload.get("spo_rs_tracker")
+                         if resume_payload is not None else None)
+        if tracker_state is not None and tracker_state.get("version") == 2:
+            spo_rs_tracker.load_state_dict(tracker_state)
+            print("[resume] restored the run-wide SPO-RS tracker")
+        elif start_step:
+            # Version 1 attached history to rendered prompts. It cannot be
+            # merged into the requested global statistic, so initialize the
+            # new tracker once from the most recent completed rollout batch.
+            last_step = start_step - 1
+            rewards = _logged_step_rewards(exp_dir, last_step)
+            if not rewards:
                 raise ValueError(
-                    "SPO-RS resume checkpoint is missing its value tracker")
-            if tracker_state is not None:
-                spo_rs_tracker.load_state_dict(tracker_state)
-                print(f"[resume] restored {len(spo_rs_tracker)} SPO-RS "
-                      "prompt trackers")
+                    "cannot initialize the run-wide SPO-RS tracker: no finite "
+                    f"rewards were logged for completed step {last_step}")
+            prior_sampling_adapter = Path(exp_dir) / (
+                "adapter_step000" if last_step == 0
+                else f"adapter_step{last_step - 1:03d}")
+            if not prior_sampling_adapter.is_dir():
+                raise FileNotFoundError(
+                    "cannot initialize the run-wide SPO-RS tracker: the "
+                    f"sampling adapter for step {last_step} is missing at "
+                    f"{prior_sampling_adapter}")
+            transformed = spo_rs_tracker.transformed_rewards(rewards)
+            spo_rs_tracker.update(
+                transformed, divergence=0.0,
+                policy_adapter=prior_sampling_adapter,
+                step=last_step)
+            source = ("legacy prompt trackers" if tracker_state is not None
+                      else "logged rollout history")
+            print(f"[resume] replaced {source} with one run-wide SPO-RS "
+                  f"tracker initialized from {len(rewards)} rewards in step "
+                  f"{last_step}")
 
     # ---- generation pool ----
     gen_pool = None
@@ -6986,7 +7011,11 @@ def main():
                                memory=memory, extractor=extractor, mem_cfg=mem_cfg,
                                lookup=lookup, curator=curator, fb_cfg=fb_cfg,
                                parallel_trainer=parallel_trainer,
-                               spo_rs_tracker=spo_rs_tracker)
+                               spo_rs_tracker=spo_rs_tracker,
+                               sampling_adapter_path=(
+                                   current_policy_adapter_path
+                                   if configured_advantage_mode == "spo-rs"
+                                   else None))
 
             stats = stats or {}
             step_training_seconds = float(
@@ -7012,8 +7041,16 @@ def main():
             if memory is not None:
                 memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
                 memory.save(memory_path)
-            adapter_path = _save_adapter(
-                model, exp_dir, step, cfg.model_name)
+            if configured_advantage_mode == "spo-rs":
+                if stats.get("spo_rs_policy_updated", False):
+                    adapter_path = _save_adapter(
+                        model, exp_dir, step, cfg.model_name)
+                else:
+                    adapter_path = (Path(exp_dir)
+                                    / stats["spo_rs_sampling_adapter"])
+            else:
+                adapter_path = _save_adapter(
+                    model, exp_dir, step, cfg.model_name)
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
                 next_g=cur_g, next_k=cur_k, memory_path=memory_path,
@@ -7030,6 +7067,7 @@ def main():
                 "next_group_size": cur_k,
                 **(stats or {}),
             })
+            current_policy_adapter_path = Path(adapter_path)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
     finally:
         if reranker is not None:

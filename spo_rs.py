@@ -1,20 +1,18 @@
-"""Persistent KL-adaptive entropic value tracker for SPO-RS."""
+"""Run-wide KL-adaptive entropic value tracker for SPO-RS."""
 
 from __future__ import annotations
 
-from array import array
-import hashlib
 import math
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
 
 class SPORSTracker:
-    """Track the entropic value of each exact rendered conditioning prompt."""
+    """Track one entropic value for the entire discovery run."""
 
-    VERSION = 1
-    POLICY_LOGPROB_SOURCE = "forward-score-v1"
+    VERSION = 2
 
     def __init__(self, *, entropic_beta: float, d_half: float,
                  rho_min: float, rho_max: float):
@@ -23,8 +21,11 @@ class SPORSTracker:
         self.rho_min = float(rho_min)
         self.rho_max = float(rho_max)
         self._validate_options()
-        self._entries: dict[str, dict] = {}
-        self._policy_revision = 0
+        self._value: float | None = None
+        self._effective_count = 0.0
+        self._last_policy_adapter: str | None = None
+        self._last_step = -1
+        self._updates = 0
 
     def _validate_options(self) -> None:
         if not math.isfinite(self.entropic_beta) or self.entropic_beta <= 0.0:
@@ -36,38 +37,19 @@ class SPORSTracker:
                 or not 0.0 < self.rho_min <= self.rho_max < 1.0):
             raise ValueError("SPO-RS rho bounds must satisfy 0 < min <= max < 1")
 
-    @staticmethod
-    def prompt_key(prompt_text: str) -> str:
-        return hashlib.sha256(str(prompt_text).encode("utf-8")).hexdigest()
-
     def __len__(self) -> int:
-        return len(self._entries)
+        return int(self._value is not None)
 
     @property
-    def policy_revision(self) -> int:
-        return int(self._policy_revision)
+    def initialized(self) -> bool:
+        return self._value is not None
 
-    def advance_policy_revision(self) -> int:
-        self._policy_revision += 1
-        return int(self._policy_revision)
+    @property
+    def last_policy_adapter(self) -> str | None:
+        return self._last_policy_adapter
 
-    def unchanged_policy_keys(
-        self, prompt_keys: Iterable[str],
-    ) -> set[str]:
-        unchanged = set()
-        for prompt_key in dict.fromkeys(str(key) for key in prompt_keys):
-            entry = self._entries.get(prompt_key)
-            if (entry is not None
-                    and entry.get("policy_logprob_source")
-                    == self.POLICY_LOGPROB_SOURCE
-                    and entry.get("policy_revision")
-                    == self._policy_revision):
-                unchanged.add(prompt_key)
-        return unchanged
-
-    def baseline(self, prompt_key: str) -> float | None:
-        entry = self._entries.get(str(prompt_key))
-        return None if entry is None else float(entry["value"])
+    def baseline(self) -> float | None:
+        return None if self._value is None else float(self._value)
 
     def transformed_rewards(self, rewards: Sequence[float]) -> np.ndarray:
         values = np.asarray(rewards, dtype=np.float64)
@@ -80,224 +62,134 @@ class SPORSTracker:
         return transformed
 
     def normalized_advantages(
-        self, prompt_key: str, transformed_rewards: Sequence[float]
+        self, transformed_rewards: Sequence[float]
     ) -> np.ndarray | None:
-        baseline = self.baseline(prompt_key)
+        """Use the saved pre-step value for every rollout in this step."""
+        baseline = self.baseline()
         if baseline is None:
             return None
-        if not math.isfinite(baseline) or baseline <= 0.0:
-            raise ValueError("SPO-RS tracker contains a nonpositive value")
-        values = np.asarray(transformed_rewards, dtype=np.float64)
-        advantages = values / baseline - 1.0
-        if not np.isfinite(advantages).all():
-            raise FloatingPointError("nonfinite SPO-RS normalized advantages")
-        return advantages
-
-    @staticmethod
-    def initial_advantages(
-        transformed_rewards: Sequence[float],
-    ) -> np.ndarray | None:
-        """Cross-fit a first-visit baseline without using a sample on itself."""
         values = np.asarray(transformed_rewards, dtype=np.float64)
         if (values.ndim != 1 or values.size == 0
                 or not np.isfinite(values).all() or np.any(values <= 0.0)):
             raise ValueError(
                 "SPO-RS transformed rewards must be finite and positive")
-        if values.size < 2:
-            return None
-
-        # For sample i, the mean of all j != i is independent of y_i under
-        # the frozen sampling policy. It can therefore initialize the positive
-        # value scale without turning the sample's own reward into its baseline.
-        count = int(values.size - 1)
-        baselines = np.empty_like(values)
-        for index in range(values.size):
-            try:
-                other_sum = math.fsum(
-                    float(value) for offset, value in enumerate(values)
-                    if offset != index)
-            except OverflowError as error:
-                raise FloatingPointError(
-                    "nonfinite SPO-RS first-visit baseline") from error
-            baselines[index] = other_sum / count
-        if (not np.isfinite(baselines).all()
-                or np.any(baselines <= 0.0)):
-            raise FloatingPointError(
-                "nonfinite SPO-RS first-visit baseline")
-        advantages = values / baselines - 1.0
+        advantages = (values / baseline - 1.0) / self.entropic_beta
         if not np.isfinite(advantages).all():
-            raise FloatingPointError(
-                "nonfinite SPO-RS first-visit advantages")
+            raise FloatingPointError("nonfinite SPO-RS normalized advantages")
         return advantages
 
-    def anchor_requests(self, prompt_keys: Iterable[str]) -> list[dict]:
-        """Return prior-policy trajectories that need current-policy scores."""
-        requests = []
-        for prompt_key in dict.fromkeys(str(key) for key in prompt_keys):
-            entry = self._entries.get(prompt_key)
-            if entry is None:
-                continue
-            # Sampling-time logprobs and explicit forward rescoring are not
-            # numerically interchangeable. Older checkpoints did not record
-            # the source, so discard those anchors once instead of reporting
-            # false policy drift for an unchanged model.
-            if (entry.get("policy_logprob_source")
-                    != self.POLICY_LOGPROB_SOURCE):
-                continue
-            prompt_ids = list(entry.get("prompt_ids", ()))
-            responses = entry.get("response_ids", ())
-            old_logprobs = entry.get("policy_logprobs", ())
-            for response_ids, old_values in zip(responses, old_logprobs):
-                response_ids = list(response_ids)
-                old_values = list(old_values)
-                if response_ids and len(response_ids) == len(old_values):
-                    requests.append({
-                        "prompt_key": prompt_key,
-                        "prompt_ids": prompt_ids,
-                        "response_ids": response_ids,
-                        "old_logprobs": old_values,
-                    })
-        return requests
-
     @staticmethod
-    def divergences_from_scores(
-        prompt_keys: Iterable[str], requests: Sequence[dict],
+    def consecutive_policy_divergence(
         current_scores: Sequence[Sequence[float] | None],
-    ) -> tuple[dict[str, float], int]:
-        """Estimate current-to-prior token KL on prior-policy trajectories.
+        previous_scores: Sequence[Sequence[float] | None],
+        context_ids: Sequence[int],
+        *, required_context_ids: Sequence[int] | None = None,
+    ) -> tuple[float, int, dict[int, float]]:
+        """Estimate mean KL(pi_t || pi_{t-1}) on current-step contexts.
 
-        For a sampled prior-policy token and ``r = pi_current / pi_prior``, the
-        nonnegative f-divergence integrand ``r log r - r + 1`` has expectation
-        ``KL(pi_current || pi_prior)`` at that prefix. Prefix importance ratios
-        move the state-prefix expectation from the prior policy to the current
-        policy; summing over tokens gives a trajectory-level KL estimate.
+        Current responses are sampled from ``pi_t``. Their trajectory
+        log-likelihood difference is therefore a direct Monte Carlo estimate
+        of the forward KL. Trajectories are first averaged within a selected
+        parent and then the parents are weighted equally.
         """
-        if len(requests) != len(current_scores):
-            raise ValueError("SPO-RS anchor requests and scores must align")
-        terms: dict[str, list[float]] = {}
+        if not (len(current_scores) == len(previous_scores) == len(context_ids)):
+            raise ValueError("SPO-RS policy scores and contexts must align")
+        required_contexts = tuple(dict.fromkeys(
+            int(x) for x in (
+                context_ids if required_context_ids is None
+                else required_context_ids)))
+        by_context: dict[int, list[float]] = {
+            context_id: [] for context_id in required_contexts
+        }
         missing = 0
-        for request, current_values in zip(requests, current_scores):
-            old = np.asarray(request["old_logprobs"], dtype=np.float64)
-            if current_values is None:
+        for current_values, previous_values, context_id in zip(
+                current_scores, previous_scores, context_ids):
+            if current_values is None or previous_values is None:
                 missing += 1
                 continue
             current = np.asarray(current_values, dtype=np.float64)
-            if (current.shape != old.shape or current.ndim != 1
-                    or current.size == 0 or not np.isfinite(current).all()
-                    or not np.isfinite(old).all()):
+            previous = np.asarray(previous_values, dtype=np.float64)
+            if (current.ndim != 1 or current.size == 0
+                    or current.shape != previous.shape
+                    or not np.isfinite(current).all()
+                    or not np.isfinite(previous).all()):
                 missing += 1
                 continue
-            log_ratio = current - old
-            prefix_log_ratio = np.concatenate((
-                np.zeros(1, dtype=np.float64),
-                np.cumsum(log_ratio[:-1], dtype=np.float64),
-            ))
-            if (np.any(log_ratio > 700.0)
-                    or np.any(prefix_log_ratio > 700.0)):
-                trajectory_term = math.inf
-            else:
-                ratio = np.exp(log_ratio)
-                token_terms = ratio * log_ratio - ratio + 1.0
-                token_terms = np.maximum(token_terms, 0.0)
-                prefix_ratio = np.exp(prefix_log_ratio)
-                trajectory_term = float(np.sum(prefix_ratio * token_terms))
-            terms.setdefault(str(request["prompt_key"]), []).append(
-                trajectory_term)
+            by_context[int(context_id)].append(float(np.sum(
+                current - previous, dtype=np.float64)))
 
-        divergences = {}
-        for prompt_key in dict.fromkeys(str(key) for key in prompt_keys):
-            chunks = terms.get(prompt_key)
-            if not chunks:
-                divergences[prompt_key] = math.inf
-                continue
-            divergences[prompt_key] = max(
-                0.0, float(sum(chunks)) / len(chunks))
-        return divergences, missing
+        if any(not values for values in by_context.values()):
+            return math.inf, missing, {}
+        context_estimates = {
+            context_id: float(math.fsum(values) / len(values))
+            for context_id, values in by_context.items()
+        }
+        divergence = float(
+            math.fsum(context_estimates.values()) / len(context_estimates))
+        # A finite Monte Carlo estimate can be slightly negative even though
+        # the population KL is nonnegative.
+        return max(0.0, divergence), missing, context_estimates
 
-    @staticmethod
-    def _compact_anchors(prompt_ids, anchors) -> tuple[array, list[array], list[array]]:
-        compact_prompt = array("I", (int(value) for value in prompt_ids))
-        compact_responses = []
-        compact_logprobs = []
-        for response_ids, policy_logprobs in anchors:
-            ids = [int(value) for value in response_ids]
-            values = [float(value) for value in policy_logprobs]
-            if (not ids or len(ids) != len(values)
-                    or not all(math.isfinite(value) for value in values)):
-                continue
-            compact_responses.append(array("I", ids))
-            compact_logprobs.append(array("f", values))
-        return compact_prompt, compact_responses, compact_logprobs
-
-    def update(self, prompt_key: str, transformed_rewards: Sequence[float], *,
-               divergence: float, prompt_ids: Sequence[int], anchors,
+    def update(self, transformed_rewards: Sequence[float], *,
+               divergence: float, policy_adapter: str | Path,
                step: int) -> dict:
-        """Update after advantages were formed from the pre-update value."""
+        """Update once, after this step's advantages have been formed."""
         values = np.asarray(transformed_rewards, dtype=np.float64)
-        if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
-            raise ValueError("SPO-RS transformed rewards must be finite and nonempty")
-        if np.any(values <= 0.0):
-            raise ValueError("SPO-RS transformed rewards must be positive")
-        prompt_key = str(prompt_key)
-        current_mean = float(values.mean())
-        group_size = int(values.size)
-        previous = self._entries.get(prompt_key)
-        compact_prompt, compact_responses, compact_logprobs = (
-            self._compact_anchors(prompt_ids, anchors))
+        if (values.ndim != 1 or values.size == 0
+                or not np.isfinite(values).all() or np.any(values <= 0.0)):
+            raise ValueError(
+                "SPO-RS transformed rewards must be finite and positive")
+        current_sum = float(math.fsum(float(value) for value in values))
+        current_count = int(values.size)
+        current_mean = current_sum / current_count
+        value_before = self._value
+        count_before = float(self._effective_count)
 
-        if previous is None:
-            value_before = None
-            count_before = 0.0
+        if value_before is None:
             rho = None
             eta = 1.0
             value_after = current_mean
-            count_after = group_size / (1.0 - self.rho_min)
-            visits = 1
+            count_after = current_count / (1.0 - self.rho_min)
         else:
-            value_before = float(previous["value"])
-            count_before = float(previous["effective_count"])
             divergence = float(divergence)
             if math.isnan(divergence) or divergence < 0.0:
                 raise ValueError("SPO-RS policy divergence must be nonnegative")
             raw_rho = (0.0 if math.isinf(divergence)
                        else 2.0 ** (-divergence / self.d_half))
             rho = min(self.rho_max, max(self.rho_min, raw_rho))
-            count_after = rho * count_before + group_size
-            eta = group_size / count_after
-            value_after = value_before + eta * (current_mean - value_before)
-            visits = int(previous.get("visits", 0)) + 1
+            retained_count = rho * count_before
+            count_after = retained_count + current_count
+            value_after = (
+                retained_count * value_before + current_sum
+            ) / count_after
+            eta = current_count / count_after
 
         if (not math.isfinite(value_after) or value_after <= 0.0
                 or not math.isfinite(count_after) or count_after <= 0.0):
             raise FloatingPointError("nonfinite SPO-RS tracker update")
-        self._entries[prompt_key] = {
-            "value": value_after,
-            "effective_count": count_after,
-            "prompt_ids": compact_prompt,
-            "response_ids": compact_responses,
-            "policy_logprobs": compact_logprobs,
-            "policy_logprob_source": self.POLICY_LOGPROB_SOURCE,
-            "policy_revision": int(self._policy_revision),
-            "last_step": int(step),
-            "visits": visits,
-        }
+        self._value = float(value_after)
+        self._effective_count = float(count_after)
+        self._last_policy_adapter = Path(policy_adapter).name
+        self._last_step = int(step)
+        self._updates += 1
         return {
-            "initialized": previous is None,
+            "initialized": value_before is None,
             "value_before": value_before,
             "value_after": value_after,
             "effective_count_before": count_before,
             "effective_count_after": count_after,
             "group_mean": current_mean,
-            "group_size": group_size,
+            "group_size": current_count,
             "divergence": (
-                None if previous is None or not math.isfinite(divergence)
+                None if value_before is None or not math.isfinite(divergence)
                 else float(divergence)),
             "divergence_missing": bool(
-                previous is not None and not math.isfinite(divergence)),
+                value_before is not None and not math.isfinite(divergence)),
             "rho": rho,
             "eta": eta,
-            "anchor_count": len(compact_responses),
-            "visits": visits,
+            "policy_adapter": self._last_policy_adapter,
+            "step": self._last_step,
+            "updates": self._updates,
         }
 
     def state_dict(self) -> dict:
@@ -307,8 +199,11 @@ class SPORSTracker:
             "d_half": self.d_half,
             "rho_min": self.rho_min,
             "rho_max": self.rho_max,
-            "policy_revision": int(self._policy_revision),
-            "entries": self._entries,
+            "value": self._value,
+            "effective_count": self._effective_count,
+            "last_policy_adapter": self._last_policy_adapter,
+            "last_step": self._last_step,
+            "updates": self._updates,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -325,37 +220,23 @@ class SPORSTracker:
             if not math.isclose(saved, value, rel_tol=0.0, abs_tol=1e-15):
                 raise ValueError(
                     f"SPO-RS tracker {name}={saved} does not match config {value}")
-        entries = state.get("entries")
-        if not isinstance(entries, dict):
-            raise ValueError("SPO-RS tracker entries are missing")
-        restored = {}
-        for prompt_key, entry in entries.items():
-            value = float(entry["value"])
-            effective_count = float(entry["effective_count"])
+
+        value = state.get("value")
+        effective_count = float(state.get("effective_count", 0.0))
+        if value is None:
+            if effective_count != 0.0:
+                raise ValueError("uninitialized SPO-RS tracker has history")
+            self._value = None
+            self._effective_count = 0.0
+        else:
+            value = float(value)
             if (not math.isfinite(value) or value <= 0.0
                     or not math.isfinite(effective_count)
                     or effective_count <= 0.0):
-                raise ValueError("invalid SPO-RS tracker entry")
-            prompt_ids, responses, logprobs = self._compact_anchors(
-                entry.get("prompt_ids", ()),
-                zip(entry.get("response_ids", ()),
-                    entry.get("policy_logprobs", ())),
-            )
-            restored[str(prompt_key)] = {
-                "value": value,
-                "effective_count": effective_count,
-                "prompt_ids": prompt_ids,
-                "response_ids": responses,
-                "policy_logprobs": logprobs,
-                "policy_logprob_source": str(entry.get(
-                    "policy_logprob_source", "legacy-sampling")),
-                "policy_revision": (
-                    int(entry["policy_revision"])
-                    if entry.get("policy_revision") is not None else None),
-                "last_step": int(entry.get("last_step", -1)),
-                "visits": int(entry.get("visits", 1)),
-            }
-        self._entries = restored
-        self._policy_revision = int(state.get("policy_revision", 0))
-        if self._policy_revision < 0:
-            raise ValueError("invalid SPO-RS policy revision")
+                raise ValueError("invalid SPO-RS tracker state")
+            self._value = value
+            self._effective_count = effective_count
+        adapter = state.get("last_policy_adapter")
+        self._last_policy_adapter = None if adapter is None else Path(adapter).name
+        self._last_step = int(state.get("last_step", -1))
+        self._updates = int(state.get("updates", int(self._value is not None)))
