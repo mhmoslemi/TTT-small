@@ -3,7 +3,7 @@ set -eu
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3,4,5,6,7}"
-config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
+config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
 memory_version="${MEMORY_VERSION:-V2}"
 
