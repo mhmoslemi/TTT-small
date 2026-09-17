@@ -444,6 +444,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
     p.add_argument(
+        "--fused-long-attention", action="store_const", const=True,
+        default=None,
+        help="Use exact fused causal SDPA for eligible unpadded long training "
+             "sequences, with the existing exact blockwise attention as the "
+             "automatic fallback. Without this flag attention is unchanged.")
+    p.add_argument(
         "--no-train", action="store_const", const=True, default=None,
         help="Run rollout, evaluation, search/archive, and memory updates but "
              "skip training-only logprob scoring, backward passes, and "
@@ -990,6 +996,7 @@ def load_config():
     # These modes are deliberately launch-scoped. Saved/YAML values must not
     # silently change a later invocation's trainer or evaluator.
     merged["fast"] = bool(args.fast)
+    merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
     if args.problem_type is not None:
@@ -6583,6 +6590,8 @@ def main():
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     print(f"Max seq length:     {cfg.max_seq_length}")
+    print(f"Fused long attention: "
+          f"{'on' if cfg.fused_long_attention else 'off'}")
     print(f"Train microbatch:   up to "
           f"{cfg.train_examples_per_microbatch} examples/GPU")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")

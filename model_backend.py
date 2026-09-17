@@ -5,6 +5,12 @@ import os
 import torch
 
 
+_FUSED_LONG_ATTENTION = False
+_FUSED_LONG_ATTENTION_DISABLED = False
+_FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
+_FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
+
+
 # ======================================================================
 # Common helpers
 # ======================================================================
@@ -94,6 +100,90 @@ def _hf_training_attention_implementation():
     return "ttt_blockwise_attention"
 
 
+def _configure_fused_long_attention(enabled):
+    global _FUSED_LONG_ATTENTION
+    global _FUSED_LONG_ATTENTION_DISABLED
+    global _FUSED_LONG_ATTENTION_ACTIVE_REPORTED
+    global _FUSED_LONG_ATTENTION_FALLBACK_REPORTED
+
+    _FUSED_LONG_ATTENTION = bool(enabled)
+    _FUSED_LONG_ATTENTION_DISABLED = False
+    _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
+    _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
+
+
+def _disable_fused_long_attention(reason):
+    global _FUSED_LONG_ATTENTION_DISABLED
+    global _FUSED_LONG_ATTENTION_FALLBACK_REPORTED
+
+    _FUSED_LONG_ATTENTION_DISABLED = True
+    if not _FUSED_LONG_ATTENTION_FALLBACK_REPORTED:
+        print(f"[memory] fused long attention unavailable ({reason}); "
+              "using exact blockwise fallback", flush=True)
+        _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = True
+
+
+def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
+    """Return exact fused causal attention, or None when unsupported.
+
+    This path is called only for full, unmasked self-attention. Forcing the
+    FLASH_ATTENTION SDPA backend prevents PyTorch from silently selecting the
+    quadratic-memory math kernel. GQA is kept native so long key/value tensors
+    are not physically repeated across query heads.
+    """
+    global _FUSED_LONG_ATTENTION_ACTIVE_REPORTED
+
+    if not _FUSED_LONG_ATTENTION or _FUSED_LONG_ATTENTION_DISABLED:
+        return None
+    try:
+        import torch.nn.functional as F
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except (ImportError, AttributeError) as error:
+        _disable_fused_long_attention(type(error).__name__)
+        return None
+
+    try:
+        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            output = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=None,
+                dropout_p=float(dropout),
+                scale=scale,
+                is_causal=True,
+                enable_gqa=bool(groups != 1),
+            )
+    except torch.OutOfMemoryError:
+        # The outer OOM-resilient trainer will retry this batch. Disable this
+        # path first so that retry immediately uses bounded blockwise attention.
+        _disable_fused_long_attention("CUDA OOM")
+        raise
+    except (TypeError, RuntimeError) as error:
+        message = str(error).lower()
+        unsupported = (
+            isinstance(error, TypeError)
+            or "no available kernel" in message
+            or "no viable backend" in message
+            or "flash attention" in message
+            or "flash_attention" in message
+            or "enable_gqa" in message
+            or "grouped query" in message
+            or "not supported" in message
+        )
+        if not unsupported:
+            raise
+        _disable_fused_long_attention(
+            str(error).strip().splitlines()[0] or type(error).__name__)
+        return None
+
+    if not _FUSED_LONG_ATTENTION_ACTIVE_REPORTED:
+        print(f"[memory] fused exact long attention active: "
+              f"sequence={int(query.shape[2])} tokens, "
+              f"query_heads={int(query.shape[1])}, "
+              f"kv_heads={int(key.shape[1])}", flush=True)
+        _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = True
+    return output
+
+
 def _raw_padding_attention_mask(*args, attention_mask=None, **kwargs):
     """Keep only the compact 2D padding mask for blockwise attention."""
     return attention_mask
@@ -161,6 +251,21 @@ def _ttt_blockwise_attention_forward(
     query_offset = key_length - query_length
     score_elements = batch * query_heads * query_length * key_length
     native_limit = 134_217_728
+
+    fused_eligible = bool(
+        score_elements > native_limit
+        and batch == 1
+        and attention_mask is None
+        and sliding_window is None
+        and query_length == key_length
+        and query_length > 1
+    )
+    if fused_eligible:
+        fused = _try_fused_long_attention(
+            query, key, value,
+            dropout=dropout, scale=scale, groups=groups)
+        if fused is not None:
+            return fused.transpose(1, 2).contiguous(), None
 
     if score_elements <= native_limit:
         native_key = _repeat_kv_heads(key, groups)
@@ -233,11 +338,12 @@ def _ttt_blockwise_attention_forward(
     return output.transpose(1, 2).contiguous(), None
 
 
-def _register_ttt_attention_backend():
+def _register_ttt_attention_backend(*, fused_long_attention=False):
     """Register runtime and mask functions before Transformers builds a model."""
     from transformers import AttentionInterface
     from transformers.masking_utils import AttentionMaskInterface
 
+    _configure_fused_long_attention(fused_long_attention)
     name = _hf_training_attention_implementation()
     AttentionInterface.register(name, _ttt_blockwise_attention_forward)
     AttentionMaskInterface.register(name, _raw_padding_attention_mask)
@@ -462,7 +568,10 @@ class HFBackend(_ModelPlacementBackend):
         # GPU-mode's exclusive evaluation card was removed from visibility by
         # role allocation. "balanced" therefore uses every rollout/training GPU
         # without ever placing weights on the benchmark card.
-        _register_ttt_attention_backend()
+        fused_long_attention = bool(
+            getattr(self.cfg, "fused_long_attention", False))
+        _register_ttt_attention_backend(
+            fused_long_attention=fused_long_attention)
         attention_implementation = _hf_training_attention_implementation()
         model_kwargs = dict(
             dtype=torch.bfloat16,
@@ -470,9 +579,15 @@ class HFBackend(_ModelPlacementBackend):
             trust_remote_code=True,
             attn_implementation=attention_implementation,
         )
+        attention_detail = (
+            "native SDPA + exact fused long-context attention + exact "
+            "bounded fallback"
+            if fused_long_attention else
+            "native SDPA + exact bounded long-context blocks"
+        )
         print(f"[memory] HF training attention: "
-              f"{attention_implementation} (native SDPA + exact bounded "
-              "long-context blocks; no external package)")
+              f"{attention_implementation} ({attention_detail}; "
+              "no external package)")
         max_memory = _training_max_memory(self.cfg)
         if max_memory:
             model_kwargs["max_memory"] = max_memory

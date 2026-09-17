@@ -240,9 +240,9 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 ## Output format
 
-Plan the solution internally before answering. Do not print chain-of-thought or
-intermediate reasoning. Output only a single strategy sentence of at most 25
-words between <strategy> and </strategy>, followed by the final program.
+
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+
 
 - Exactly ONE ```python block, containing the complete program. It is extracted
   verbatim and executed as written.
