@@ -1296,6 +1296,225 @@ class VLLMBackendTests(unittest.TestCase):
             ("shutdown", None),
         ])
 
+    def test_gpt_oss_20b_uses_persistent_level_one_sleep(self):
+        events = []
+
+        class FakePool:
+            num_workers = 8
+            sleep_supported = True
+
+            def __init__(self, **kwargs):
+                events.append(("start", (
+                    kwargs["vllm_enable_sleep_mode"],
+                    kwargs["vllm_sleep_level"],
+                )))
+
+            def sleep(self):
+                events.append(("sleep", None))
+
+            def wake_up(self):
+                events.append(("wake", None))
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", None))
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: events.append(("offload", None)),
+                after_stop=lambda: events.append(("restore", None)),
+                model_name="openai/gpt-oss-20b",
+                num_workers=8,
+                gpu_ids=list(range(8)),
+                vllm_sleep_level=2,
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(events, [
+            ("offload", None), ("start", (True, 1)),
+            ("sleep", None), ("restore", None),
+            ("offload", None), ("wake", None),
+            ("sleep", None), ("restore", None),
+            ("shutdown", None),
+        ])
+
+    def test_qwen25_coder_7b_uses_persistent_level_one_sleep(self):
+        created = []
+
+        class FakePool:
+            num_workers = 8
+            sleep_supported = True
+
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+            def sleep(self):
+                pass
+
+            def wake_up(self):
+                pass
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                pass
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: None,
+                after_stop=lambda: None,
+                model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
+                num_workers=8,
+                gpu_ids=list(range(8)),
+                vllm_sleep_level=2,
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(created[0]["vllm_enable_sleep_mode"], True)
+        self.assertEqual(created[0]["vllm_sleep_level"], 1)
+
+    def test_any_bitsandbytes_pool_avoids_unsupported_level_two_reload(self):
+        created = []
+
+        class FakePool:
+            num_workers = 1
+            sleep_supported = True
+
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+            def sleep(self):
+                pass
+
+            def wake_up(self):
+                pass
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                pass
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: None,
+                after_stop=lambda: None,
+                model_name="org/previous-dense-model",
+                num_workers=1,
+                gpu_ids=[0],
+                load_in_4bit=True,
+                vllm_quantization="bitsandbytes",
+                vllm_sleep_level=2,
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["vllm_sleep_level"], 1)
+
+    def test_gpt_oss_120b_keeps_transient_level_two_fallback(self):
+        events = []
+
+        class FakePool:
+            num_workers = 4
+            sleep_supported = False
+
+            def __init__(self, **kwargs):
+                events.append(("start", kwargs.get(
+                    "vllm_enable_sleep_mode", False)))
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", None))
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: events.append(("offload", None)),
+                after_stop=lambda: events.append(("restore", None)),
+                model_name="openai/gpt-oss-120b",
+                num_workers=4,
+                gpu_ids=list(range(8)),
+                vllm_sleep_level=2,
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+
+        self.assertEqual(events, [
+            ("offload", None), ("start", False),
+            ("shutdown", None), ("restore", None),
+            ("offload", None), ("start", False),
+            ("shutdown", None), ("restore", None),
+        ])
+
+    def test_level_two_wake_failure_recovers_with_level_one_pool(self):
+        events = []
+        starts = {"count": 0}
+
+        class FakePool:
+            num_workers = 1
+            sleep_supported = True
+
+            def __init__(self, **kwargs):
+                self.instance = starts["count"]
+                starts["count"] += 1
+                events.append(("start", kwargs["vllm_sleep_level"]))
+
+            def sleep(self):
+                events.append(("sleep", self.instance))
+
+            def wake_up(self):
+                events.append(("wake", self.instance))
+                if self.instance == 0:
+                    raise RuntimeError("reload unsupported")
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", self.instance))
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: events.append(("offload", None)),
+                after_stop=lambda: events.append(("restore", None)),
+                model_name="org/model",
+                num_workers=1,
+                gpu_ids=[0],
+                vllm_sleep_level=2,
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(events, [
+            ("offload", None), ("start", 2),
+            ("sleep", 0), ("restore", None),
+            ("offload", None), ("wake", 0), ("shutdown", 0),
+            ("start", 1), ("sleep", 1), ("restore", None),
+            ("shutdown", 1),
+        ])
+
     def test_hybrid_hf_pool_splits_every_prompt_across_all_cards(self):
         calls = {}
 

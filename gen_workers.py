@@ -402,6 +402,21 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     print(f"[worker {rank}] shutting down", flush=True)
 
 
+def _resolve_vllm_quantization(model_name, load_in_4bit, quantization):
+    """Resolve only the explicit rollout-engine quantization setting.
+
+    ``load_in_4bit`` belongs to the differentiable training copy.  Propagating
+    it into vLLM silently changes the separately configured rollout model and,
+    for BitsAndBytes, selects a loader whose weights vLLM cannot reload after
+    level-2 sleep.
+    """
+    del model_name, load_in_4bit
+    requested = str(quantization or "").strip()
+    if not requested or requested.lower() in ("auto", "none"):
+        return None
+    return requested
+
+
 def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         lora_rank, gpu_memory_utilization,
                         enforce_eager=False, enable_prefix_caching=True,
@@ -470,28 +485,10 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             kwargs["enable_chunked_prefill"] = True
     if seed is not None:
         kwargs["seed"] = int(seed)
-    # An explicit vllm_quantization value always wins.  Ordinarily the training
-    # QLoRA flag also selects dynamic BitsAndBytes for the rollout copy, but
-    # vLLM's BitsAndBytes loader cannot reshape the packed expert tensors used
-    # by Qwen3 MoE checkpoints (for example Qwen3-Coder-30B-A3B).  Loading the
-    # original checkpoint precision is both supported and well within the
-    # memory layout already computed for these models.
-    quantization = str(quantization or "").strip()
-    if not quantization and load_in_4bit:
-        normalized_name = str(model_name).lower()
-        packed_qwen3_moe = (
-            "qwen3" in normalized_name
-            and ("a3b" in normalized_name
-                 or "coder-next" in normalized_name)
-        )
-        if packed_qwen3_moe:
-            print("[vllm] Qwen3 packed-MoE checkpoint: not propagating "
-                  "training load_in_4bit to the incompatible dynamic "
-                  "BitsAndBytes rollout loader; using checkpoint precision",
-                  flush=True)
-        else:
-            quantization = "bitsandbytes"
-    if quantization and quantization.lower() not in ("auto", "none"):
+    # Rollout quantization is independent of the training copy's QLoRA format.
+    quantization = _resolve_vllm_quantization(
+        model_name, load_in_4bit, quantization)
+    if quantization:
         kwargs["quantization"] = quantization
     return kwargs
 
@@ -1557,11 +1554,36 @@ class PhasedVLLMGenerationPool:
         self._before_start = before_start
         self._after_stop = after_stop
         self._pool_kwargs = dict(pool_kwargs)
-        self._sleep_level = int(
+        requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 2))
-        if self._sleep_level not in (1, 2):
+        if requested_sleep_level not in (1, 2):
             raise ValueError("vllm_sleep_level must be 1 or 2")
         model_name = str(self._pool_kwargs.get("model_name", "")).lower()
+        effective_quantization = _resolve_vllm_quantization(
+            model_name,
+            bool(self._pool_kwargs.get("load_in_4bit", False)),
+            self._pool_kwargs.get("vllm_quantization"),
+        )
+        uses_bitsandbytes = bool(
+            effective_quantization
+            and effective_quantization.lower() == "bitsandbytes")
+        # The lightweight debug models are small enough to retain level-1 CPU
+        # weight backups.  This avoids rereading either checkpoint every step;
+        # for GPT-OSS it also bypasses the broken native-MXFP4 level-2 reload.
+        # BitsAndBytes gets the same treatment because vLLM explicitly does
+        # not implement reload_weights for that loader.
+        level_one_model = None
+        if uses_bitsandbytes:
+            level_one_model = "BitsAndBytes"
+        elif "gpt-oss-20b" in model_name:
+            level_one_model = "GPT-OSS-20B"
+        elif "qwen2.5-coder-7b" in model_name:
+            level_one_model = "Qwen2.5-Coder-7B"
+        self._level_one_override_model = (
+            level_one_model if requested_sleep_level == 2 else None)
+        self._sleep_level = (
+            1 if self._level_one_override_model is not None
+            else requested_sleep_level)
         # Native GPT-OSS MXFP4 parameters are transformed while vLLM first
         # loads the model.  vLLM's level-2 wake path then tries to reload the
         # original parameter names and fails (for example, w2_bias is no
@@ -1613,15 +1635,42 @@ class PhasedVLLMGenerationPool:
                             "weights discarded; no host-RAM backups"
                             if self._sleep_level == 2 else
                             "weights backed up in host RAM")
-                        print(f"[pool] vLLM sleep level {self._sleep_level} "
-                              f"ready; {detail}", flush=True)
+                        prefix = (
+                            f"{self._level_one_override_model} persistent "
+                            "vLLM sleep level 1"
+                            if self._level_one_override_model is not None else
+                            f"vLLM sleep level {self._sleep_level}")
+                        print(f"[pool] {prefix} ready; {detail}", flush=True)
                     else:
                         print("[pool] installed vLLM lacks safe deep sleep; "
                               "using transient engines for phase sharing",
                               flush=True)
                     self._sleep_mode_announced = True
             elif self._persistent:
-                self._pool.wake_up()
+                try:
+                    self._pool.wake_up()
+                except Exception as exc:
+                    # Some vLLM loaders advertise level-2 sleep but do not
+                    # implement reload_weights. Recover in the same phase
+                    # instead of losing the completed training step.
+                    failed_pool, self._pool = self._pool, None
+                    failed_pool.shutdown()
+                    self._sleep_level = 1
+                    self._force_transient = False
+                    self._level_one_override_model = "reload-fallback"
+                    print(
+                        "[pool] level-2 vLLM wake failed "
+                        f"({type(exc).__name__}); restarting once with "
+                        "persistent level-1 sleep",
+                        flush=True,
+                    )
+                    self._pool = GenerationPool(
+                        **self._pool_kwargs,
+                        vllm_enable_sleep_mode=True,
+                        vllm_sleep_level=1,
+                    )
+                    self.num_workers = self._pool.num_workers
+                    self._persistent = self._pool.sleep_supported
             else:
                 self._pool = GenerationPool(**self._pool_kwargs)
                 self.num_workers = self._pool.num_workers
