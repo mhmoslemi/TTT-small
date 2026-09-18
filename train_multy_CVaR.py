@@ -6548,6 +6548,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
           f"training examples: {training_label}  "
           f"new children: {len(all_children)}")
 
+    # Keep the previous raw optimum so the status line can distinguish a new
+    # run best from a step that merely repeats the best-ever value.
+    previous_best_raw = sampler.best_raw_state(
+        maximize=bool(problem.maximize))
+    previous_best_value = (
+        float(previous_best_raw.raw_score)
+        if previous_best_raw is not None else None)
+
     # Update archive
     sampler.update(all_children)
 
@@ -6557,15 +6565,45 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
     if best_raw is not None:
         direction = "higher is better" if problem.maximize else "lower is better"
-        print(
-            f"[step {step_idx}] best-ever raw {problem.metric_name}: "
-            f"{float(best_raw.raw_score):.9f} ({direction}; "
-            f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})",
-            flush=True,
+        best_value = float(best_raw.raw_score)
+        improved = (
+            previous_best_value is None
+            or (best_value > previous_best_value if problem.maximize
+                else best_value < previous_best_value)
         )
+        target = getattr(problem, "target", None)
+        try:
+            target = float(target) if target is not None else None
+        except (TypeError, ValueError):
+            target = None
+        beats_sota = bool(
+            improved and target is not None and math.isfinite(target)
+            and (best_value > target if problem.maximize
+                 else best_value < target)
+        )
+        message = (
+            f"[step {step_idx}] best-ever raw {problem.metric_name}: "
+            f"{best_value:.9f} ({direction}; "
+            f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})"
+        )
+        if beats_sota:
+            margin = (best_value - target if problem.maximize
+                      else target - best_value)
+            message += (
+                f"  🏆 CONGRATULATIONS — NEW SOTA! "
+                f"target={target:.9f}, beaten by {margin:.9f} 🏆")
+            color = "\033[32m"       # dark green
+        elif improved:
+            message += "  ★ NEW RUN BEST"
+            color = "\033[92m"       # light green
+        else:
+            message += "  no improvement this step"
+            color = "\033[93m"       # yellow
+        print(f"{color}{message}\033[0m", flush=True)
     else:
-        print(f"[step {step_idx}] best-ever raw {problem.metric_name}: unavailable",
-              flush=True)
+        message = (f"[step {step_idx}] best-ever raw "
+                   f"{problem.metric_name}: unavailable")
+        print(f"\033[93m{message}\033[0m", flush=True)
 
     # ----- MEMORY (Sec. 2.2) ---------------------------------------------
     # Deliberately above the early return below. A step where every group had
