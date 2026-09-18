@@ -3,7 +3,8 @@ set -eu
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3,4,5,6,7}"
-config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
+# config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
+config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
 memory_version="${MEMORY_VERSION:-V2}"
 
@@ -94,4 +95,4 @@ esac
 # exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode spo-rs \
     --fast --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
-    --isolate-eval  --fused-long-attention "$@"  # --no-train
+    --isolate-eval  "$@"  # --no-train --fused-long-attention
