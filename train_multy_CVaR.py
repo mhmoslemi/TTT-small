@@ -5090,6 +5090,51 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
 
+    two_stage_rollouts = bool(
+        getattr(problem, "two_stage_rollouts", False))
+    strategy_max_new_tokens = min(
+        int(cfg.max_new_tokens),
+        int(getattr(problem, "strategy_max_new_tokens", 2048)),
+    )
+
+    def _strategy_body(response_text):
+        text = str(response_text or "").strip()
+        lowered = text.lower()
+        opening = lowered.find("<strategy>")
+        if opening >= 0:
+            opening += len("<strategy>")
+            closing = lowered.find("</strategy>", opening)
+            if closing >= 0:
+                text = text[opening:closing].strip()
+        if not text:
+            text = ("No usable strategy was returned. Derive the implementation "
+                    "directly from the task specification.")
+        return text
+
+    def _code_prompt_jobs(source_jobs, strategy_results):
+        code_jobs = []
+        for source_idx, source_job in enumerate(source_jobs):
+            results = strategy_results.get(source_idx, [])
+            expected = int(source_job["count"])
+            if len(results) != expected:
+                raise RuntimeError(
+                    "two-stage generation requires one base strategy per "
+                    f"program; prompt job {source_idx} expected {expected}, "
+                    f"received {len(results)}")
+            for response_text in results:
+                strategy = _strategy_body(response_text)
+                messages = problem.build_code_messages(
+                    source_job["messages"], strategy)
+                code_jobs.append({
+                    **source_job,
+                    "messages": messages,
+                    "prompt_text": _render(messages),
+                    "count": 1,
+                    "strategy": strategy,
+                    "strategy_response": str(response_text or ""),
+                })
+        return code_jobs
+
     spo_rs_divergence = 0.0
     spo_rs_context_divergences = {}
     spo_rs_missing_policy_scores = 0
@@ -5227,6 +5272,41 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # above). CPU rewards and rewards on a distinct evaluation GPU
                 # start immediately. A one-card GPU problem defers evaluation
                 # until generation releases that same physical card.
+                if two_stage_rollouts:
+                    source_prompt_jobs = prompt_jobs
+                    strategy_results = {
+                        job_idx: []
+                        for job_idx in range(len(source_prompt_jobs))
+                    }
+                    strategy_count = sum(
+                        int(job["count"]) for job in source_prompt_jobs)
+                    strategy_prompts = [
+                        _render(problem.build_strategy_messages(job["messages"]))
+                        for job in source_prompt_jobs
+                    ]
+                    print(f"[step {step_idx}] two-stage planning: generating "
+                          f"{strategy_count} base-policy strategies with LoRA "
+                          f"disabled (max {strategy_max_new_tokens} tokens each)",
+                          flush=True)
+                    for job_idx, job_results in gen_pool.iter_group_jobs(
+                            prompts_by_group=strategy_prompts,
+                            group_size=cfg.group_size,
+                            counts_by_group=[
+                                job["count"] for job in source_prompt_jobs],
+                            adapter_path=None,
+                            max_new_tokens=strategy_max_new_tokens,
+                            temperature=cfg.temperature,
+                            top_p=cfg.top_p,
+                            step_idx=int(step_idx) + 2_000_000,
+                            progress_desc="strategies"):
+                        strategy_results[int(job_idx)].extend(
+                            result[0] for result in job_results)
+                    prompt_jobs = _code_prompt_jobs(
+                        source_prompt_jobs, strategy_results)
+                    print(f"[step {step_idx}] two-stage coding: generating "
+                          f"{len(prompt_jobs)} LoRA-policy programs conditioned "
+                          "on the base strategies", flush=True)
+
                 generation_options = {
                     "prompts_by_group": [
                         job["prompt_text"] for job in prompt_jobs],
@@ -5254,13 +5334,56 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # than draining one parent at a time. Ordinary CPU verification
                 # overlaps later batches; one-card GPU-mode verification waits.
                 backend.set_inference_mode()
-                if cfg.deterministic:
-                    torch.manual_seed((int(cfg.seed) * 1_000_003
-                                       + step_idx * 1009 + 13) % (2**31 - 1))
+                cap_state = {"value": int(
+                    getattr(cfg, "_local_generation_cap", 0) or 0)}
+
+                def _seed_local_generation(seed_step):
+                    if cfg.deterministic:
+                        torch.manual_seed((int(cfg.seed) * 1_000_003
+                                           + int(seed_step) * 1009 + 13)
+                                          % (2**31 - 1))
+
+                if two_stage_rollouts:
+                    source_prompt_jobs = prompt_jobs
+                    strategy_results = {
+                        job_idx: []
+                        for job_idx in range(len(source_prompt_jobs))
+                    }
+                    strategy_count = sum(
+                        int(job["count"]) for job in source_prompt_jobs)
+                    strategy_prompts = [
+                        _render(problem.build_strategy_messages(job["messages"]))
+                        for job in source_prompt_jobs
+                    ]
+                    print(f"[step {step_idx}] two-stage planning: generating "
+                          f"{strategy_count} base-policy strategies with LoRA "
+                          f"disabled (max {strategy_max_new_tokens} tokens each)",
+                          flush=True)
+                    _seed_local_generation(int(step_idx) + 2_000_000)
+                    strategy_bar = make_progress_bar(
+                        strategy_count, desc="strategies")
+                    try:
+                        with backend.disable_adapter():
+                            for job_idx, responses in generate_prompt_jobs(
+                                    model, tokenizer, strategy_prompts,
+                                    [job["count"]
+                                     for job in source_prompt_jobs], cfg,
+                                    max_new_tokens=strategy_max_new_tokens,
+                                    cap_state=cap_state):
+                                strategy_results[int(job_idx)].extend(
+                                    text for text, _token_ids in responses)
+                                strategy_bar.update(len(responses))
+                    finally:
+                        strategy_bar.close()
+                    prompt_jobs = _code_prompt_jobs(
+                        source_prompt_jobs, strategy_results)
+                    print(f"[step {step_idx}] two-stage coding: generating "
+                          f"{len(prompt_jobs)} LoRA-policy programs conditioned "
+                          "on the base strategies", flush=True)
+
+                _seed_local_generation(step_idx)
                 gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
                 try:
-                    cap_state = {"value": int(
-                        getattr(cfg, "_local_generation_cap", 0) or 0)}
                     for job_idx, responses in generate_prompt_jobs(
                             model, tokenizer,
                             [job["prompt_text"] for job in prompt_jobs],
@@ -5867,6 +5990,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "memory_arm": job["arm"],
                 "memory_ids": job["memory_ids"],
                 "memory_tokens": job["memory_tokens"],
+                "two_stage_rollout": bool(two_stage_rollouts),
+                "strategy": (job.get("strategy")
+                             if two_stage_rollouts else None),
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -5901,7 +6027,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 meta["memory_comparison_n"] = int(
                     getattr(mem_cfg, "arm_comparison_n", 0) or 0)
             save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
-                         prompt_text=job["prompt_text"])
+                         prompt_text=job["prompt_text"],
+                         strategy_text=(job.get("strategy_response")
+                                        if two_stage_rollouts else None))
             saved_rollouts += 1
             if memory is not None:
                 mem_records.append(RolloutRecord(
@@ -6589,6 +6717,9 @@ def main():
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
+    if getattr(problem, "two_stage_rollouts", False):
+        print(f"Rollout pipeline:   base strategy -> LoRA code "
+              f"(strategy max {min(int(cfg.max_new_tokens), int(getattr(problem, 'strategy_max_new_tokens', 2048)))} tokens)")
     print(f"Max seq length:     {cfg.max_seq_length}")
     print(f"Fused long attention: "
           f"{'on' if cfg.fused_long_attention else 'off'}")
@@ -6880,6 +7011,7 @@ def main():
             local_cap = {"value": 0}
 
             def _local_hf_rollouts(prompts_by_group, counts_by_group,
+                                   adapter_path,
                                    max_new_tokens, temperature, top_p,
                                    step_idx):
                 backend.set_inference_mode()
@@ -6888,11 +7020,17 @@ def main():
                     torch.manual_seed(local_seed)
                     torch.cuda.manual_seed_all(local_seed)
                 try:
-                    yield from generate_prompt_jobs(
-                        model, tokenizer, prompts_by_group, counts_by_group,
-                        cfg, max_new_tokens=max_new_tokens,
-                        temperature=temperature, top_p=top_p,
-                        cap_state=local_cap)
+                    adapter_context = (
+                        backend.disable_adapter()
+                        if adapter_path is None else nullcontext()
+                    )
+                    with adapter_context:
+                        yield from generate_prompt_jobs(
+                            model, tokenizer, prompts_by_group,
+                            counts_by_group, cfg,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature, top_p=top_p,
+                            cap_state=local_cap)
                 finally:
                     backend.set_training_mode()
 

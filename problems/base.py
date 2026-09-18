@@ -90,6 +90,8 @@ class Problem(ABC):
     # replay does not reproduce it. Circle packing and gpu_mode carry no
     # construction at all, and their programs are the artifact.
     saves_construction: bool = False
+    two_stage_rollouts: bool = False
+    strategy_max_new_tokens: int = 16000
 
     def __init__(self, cfg: dict):
         self.cfg = dict(cfg or {})
@@ -119,6 +121,49 @@ class Problem(ABC):
         wrapper with an explicit empty hypothesis, isolating lesson content.
         """
         ...
+
+    def build_strategy_messages(self, messages: List[dict]) -> List[dict]:
+        staged = [dict(message) for message in messages]
+        instruction = (
+            "## Strategy-stage output\n\n"
+            "Develop a detailed, concrete, step-by-step strategy for solving "
+            "the task above. Think through the mathematics, algorithm, "
+            "implementation structure, numerical choices, and likely failure "
+            "modes. Do not write Python code or a code fence in this stage. "
+            "Return only the strategy between <strategy> and </strategy> tags."
+        )
+        if staged and staged[-1].get("role") == "user":
+            staged[-1]["content"] = (
+                str(staged[-1].get("content", "")).rstrip()
+                + "\n\n" + instruction + "\n"
+            )
+        else:
+            staged.append({"role": "user", "content": instruction})
+        return staged
+
+    def build_code_messages(self, messages: List[dict],
+                            strategy: str) -> List[dict]:
+        staged = [dict(message) for message in messages]
+        instruction = f"""## Strategy from the base-model planning stage
+
+<strategy>
+{strategy.strip()}
+</strategy>
+
+## Code-stage output
+
+Use the task information and strategy above to produce the complete solution.
+Do not output analysis, reasoning, a strategy, notes, or example usage. Return
+only exactly one fenced Python code block, beginning with ```python and ending
+with ```."""
+        if staged and staged[-1].get("role") == "user":
+            staged[-1]["content"] = (
+                str(staged[-1].get("content", "")).rstrip()
+                + "\n\n" + instruction + "\n"
+            )
+        else:
+            staged.append({"role": "user", "content": instruction})
+        return staged
 
     @abstractmethod
     def preprocess(self, code: str, parent: ParentContext) -> str:

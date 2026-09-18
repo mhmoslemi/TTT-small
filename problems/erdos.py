@@ -104,6 +104,7 @@ _VERIFIER_SRC = (
 
 
 class ErdosMinOverlap(Problem):
+    two_stage_rollouts = True
     name = "erdos"
     entrypoint = "run"
     metric_name = "C\u2085 bound"
@@ -238,10 +239,6 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 {state_ctx}
 {construction_section}{memory_section}
 {code_section}
-
-## Output format
-
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 
 '''
 

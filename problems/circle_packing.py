@@ -116,6 +116,7 @@ verbatim and do not let it dictate the complete arrangement."""
 
 
 class CirclePacking(Problem):
+    two_stage_rollouts = True
     name = "circle_packing"
     entrypoint = "run_packing"
     metric_name = "sum of radii"
@@ -175,7 +176,6 @@ Rules:
   Let it fail loudly instead.
 - You need to get really creative and think from first principles.
 
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 """
 
         return [{"role": "user", "content": user}]

@@ -51,6 +51,7 @@ Protocol (per step):
 import importlib.metadata
 import os
 from array import array
+from contextlib import nullcontext
 import queue
 import re
 import sys
@@ -328,8 +329,7 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     def ensure_adapter(adapter_path):
         nonlocal peft_model, current_adapter
         if adapter_path is None:
-            # No adapter yet (step 0 before any training) -> use base as-is
-            return base
+            return peft_model if peft_model is not None else base
         if peft_model is None:
             peft_model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False)
             peft_model.eval()
@@ -383,13 +383,20 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
 
         gen_model = ensure_adapter(adapter_path)
 
+        adapter_context = (
+            gen_model.disable_adapter()
+            if adapter_path is None and peft_model is not None
+            else nullcontext()
+        )
         cap_state = {"value": gen_cap}
-        for group_idx, job_results in _iter_hf_job_batches(
-                gen_model, tokenizer, jobs, device, max_seq_length, gen_kwargs,
-                cap_state=cap_state, log_prefix=f"worker {rank}"):
-            # Report every completed micro-batch so evaluation can overlap the
-            # remaining GPU work.
-            result_queue.put((rank, group_idx, job_results))
+        with adapter_context:
+            for group_idx, job_results in _iter_hf_job_batches(
+                    gen_model, tokenizer, jobs, device, max_seq_length,
+                    gen_kwargs, cap_state=cap_state,
+                    log_prefix=f"worker {rank}"):
+                # Report every completed micro-batch so evaluation can overlap
+                # the remaining GPU work.
+                result_queue.put((rank, group_idx, job_results))
         gen_cap = int(cap_state["value"])
 
     print(f"[worker {rank}] shutting down", flush=True)
@@ -1149,7 +1156,7 @@ class GenerationPool:
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
-                        return_logprobs=False):
+                        return_logprobs=False, progress_desc="rollouts"):
         """
         Stream generation results as each (worker, group) job completes.
 
@@ -1186,7 +1193,8 @@ class GenerationPool:
             self.task_queues[r].put((step_idx, adapter_path, worker_jobs[r], gen_kwargs))
 
         collected = 0
-        bar = make_progress_bar(total_expected, desc="rollouts") if show_progress else None
+        bar = (make_progress_bar(total_expected, desc=progress_desc)
+               if show_progress else None)
         try:
             while collected < total_expected:
                 try:
@@ -1358,7 +1366,8 @@ class HybridHFGenerationPool:
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        show_progress=True, counts_by_group=None):
+                        show_progress=True, counts_by_group=None,
+                        progress_desc="rollouts"):
         counts = ([int(group_size)] * len(prompts_by_group)
                   if counts_by_group is None
                   else [int(value) for value in counts_by_group])
@@ -1394,7 +1403,7 @@ class HybridHFGenerationPool:
             target=run_remote, name="hf-rollout-workers", daemon=True)
         remote_thread.start()
         total_expected = sum(counts)
-        bar = (make_progress_bar(total_expected, desc="rollouts")
+        bar = (make_progress_bar(total_expected, desc=progress_desc)
                if show_progress else None)
         remote_done = False
 
@@ -1423,6 +1432,7 @@ class HybridHFGenerationPool:
             local_kwargs = {
                 "prompts_by_group": prompts_by_group,
                 "counts_by_group": local_counts,
+                "adapter_path": adapter_path,
                 "max_new_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_p": top_p,

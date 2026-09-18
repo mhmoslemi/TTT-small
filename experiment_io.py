@@ -2,11 +2,13 @@
 Per-experiment file I/O.
 
 Creates a directory under runs/ named from the main hyperparameters, then
-writes one .txt and one .meta.json per rollout. ALL rollouts are saved,
-including ones that failed extraction or validation.
+writes one .txt and one .meta.json per rollout. Two-stage problems also write
+the paired base-model planning response as .strategy.txt. ALL rollouts are
+saved, including ones that failed extraction or validation.
 
 Filenames:
     step03_group2_rollout17.txt        ← raw model response
+    step03_group2_rollout17.strategy.txt ← raw planning-stage response
     step03_group2_rollout17.meta.json  ← reward, valid, msg, beta, advantage, etc.
 
 Directory name (problem-agnostic):
@@ -89,10 +91,11 @@ def save_rollout(
     response_text: str,
     meta: dict,
     prompt_text: str = None,
+    strategy_text: str = None,
 ):
     """
-    Save one rollout as a .txt + .meta.json pair (plus a .prompt.txt when the
-    rendered prompt is supplied).
+    Save one rollout as a .txt + .meta.json pair, plus optional prompt and
+    planning-stage text files.
 
     meta should include at least: reward, valid, parsed, ran, msg.
     Anything JSON-serializable is fine.
@@ -101,6 +104,9 @@ def save_rollout(
     step_dir.mkdir(exist_ok=True)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
     (step_dir / f"{base}.txt").write_text(response_text, errors="replace")
+    if strategy_text is not None:
+        (step_dir / f"{base}.strategy.txt").write_text(
+            strategy_text, errors="replace")
     if prompt_text is not None:
         (step_dir / f"{base}.prompt.txt").write_text(prompt_text, errors="replace")
 
