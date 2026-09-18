@@ -265,7 +265,20 @@ def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
         model_name, cfg.get("vllm_quantization", "")) / parallel_size
     kv_gib = (_kv_bytes_per_token(model_name) * _effective_max_length(cfg)
               / parallel_size / (1024.0 ** 3))
-    return weight_gib + 4.0 + kv_gib
+    required = weight_gib + 4.0 + kv_gib
+
+    # GPT-OSS-120B's native MXFP4 checkpoint can reside on a 95-GiB card once
+    # loaded, but a TP=1 vLLM startup is not viable there: conversion to the
+    # Marlin MoE layout transiently reached more than 94 GiB before the final
+    # expert was repacked.  This peak is specific to the unsharded conversion;
+    # TP>=2 partitions both expert weights and repacking scratch.  Account for
+    # it in the automatic layout rather than discovering it after a full model
+    # download/load.  Cards with at least 100 GiB of usable vLLM budget may
+    # still select TP=1.
+    if ("gpt-oss-120b" in str(model_name).lower()
+            and parallel_size == 1):
+        required = max(required, 100.0)
+    return required
 
 
 def resolve_memory_settings(cfg: dict, roles: GPURoles,
