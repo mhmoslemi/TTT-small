@@ -470,11 +470,27 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             kwargs["enable_chunked_prefill"] = True
     if seed is not None:
         kwargs["seed"] = int(seed)
-    # Keep vLLM quantization in sync with the training model by default. An
-    # explicit vllm_quantization value still overrides this automatic choice.
+    # An explicit vllm_quantization value always wins.  Ordinarily the training
+    # QLoRA flag also selects dynamic BitsAndBytes for the rollout copy, but
+    # vLLM's BitsAndBytes loader cannot reshape the packed expert tensors used
+    # by Qwen3 MoE checkpoints (for example Qwen3-Coder-30B-A3B).  Loading the
+    # original checkpoint precision is both supported and well within the
+    # memory layout already computed for these models.
     quantization = str(quantization or "").strip()
     if not quantization and load_in_4bit:
-        quantization = "bitsandbytes"
+        normalized_name = str(model_name).lower()
+        packed_qwen3_moe = (
+            "qwen3" in normalized_name
+            and ("a3b" in normalized_name
+                 or "coder-next" in normalized_name)
+        )
+        if packed_qwen3_moe:
+            print("[vllm] Qwen3 packed-MoE checkpoint: not propagating "
+                  "training load_in_4bit to the incompatible dynamic "
+                  "BitsAndBytes rollout loader; using checkpoint precision",
+                  flush=True)
+        else:
+            quantization = "bitsandbytes"
     if quantization and quantization.lower() not in ("auto", "none"):
         kwargs["quantization"] = quantization
     return kwargs
