@@ -1561,6 +1561,14 @@ class PhasedVLLMGenerationPool:
             self._pool_kwargs.pop("vllm_sleep_level", 2))
         if self._sleep_level not in (1, 2):
             raise ValueError("vllm_sleep_level must be 1 or 2")
+        model_name = str(self._pool_kwargs.get("model_name", "")).lower()
+        # Native GPT-OSS MXFP4 parameters are transformed while vLLM first
+        # loads the model.  vLLM's level-2 wake path then tries to reload the
+        # original parameter names and fails (for example, w2_bias is no
+        # longer present).  A fresh process is exact and also releases the
+        # residual CUDA allocations that level-2 sleep keeps alive.
+        self._force_transient = bool(
+            self._sleep_level == 2 and "gpt-oss" in model_name)
         self._pool = None
         self._persistent = False
         self._awake = False
@@ -1581,15 +1589,26 @@ class PhasedVLLMGenerationPool:
                 # loaded every engine, immediately slept it, restored training,
                 # then reloaded the same weights for step 0. More importantly,
                 # a broken initial sleep could hang before the run even began.
-                self._pool = GenerationPool(
-                    **self._pool_kwargs,
-                    vllm_enable_sleep_mode=True,
-                    vllm_sleep_level=self._sleep_level,
-                )
+                if self._force_transient:
+                    self._pool = GenerationPool(**self._pool_kwargs)
+                else:
+                    self._pool = GenerationPool(
+                        **self._pool_kwargs,
+                        vllm_enable_sleep_mode=True,
+                        vllm_sleep_level=self._sleep_level,
+                    )
                 self.num_workers = self._pool.num_workers
-                self._persistent = self._pool.sleep_supported
+                self._persistent = bool(
+                    not self._force_transient
+                    and self._pool.sleep_supported)
                 if not self._sleep_mode_announced:
-                    if self._persistent:
+                    if self._force_transient:
+                        print(
+                            "[pool] GPT-OSS level-2 weight reload is unsafe; "
+                            "using a fresh transient vLLM pool for each phase",
+                            flush=True,
+                        )
+                    elif self._persistent:
                         detail = (
                             "weights discarded; no host-RAM backups"
                             if self._sleep_level == 2 else

@@ -5008,7 +5008,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from queue import Queue
 
     from sampler import State
-    from experiment_io import save_parent_selections, save_rollout
+    from experiment_io import (save_parent_selections, save_rollout,
+                               save_strategy_response)
     from problems.base import ParentContext
     from gen_workers import make_progress_bar
 
@@ -5333,6 +5334,26 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "directly from the task specification.")
         return text
 
+    def _record_strategy_response(chain, strategy_index, response_text):
+        """Save and register a strategy at stream-arrival time."""
+        if len(chain["strategies"]) != int(strategy_index):
+            raise RuntimeError(
+                f"strategy chain {chain['chain_id']} received strategy "
+                f"{strategy_index} after {len(chain['strategies'])} records")
+        raw_response = str(response_text or "")
+        save_strategy_response(
+            exp_dir,
+            step_idx,
+            int(chain["parent_group"]),
+            int(chain["fold_index"]),
+            int(strategy_index),
+            raw_response,
+        )
+        chain["strategies"].append({
+            "response": raw_response,
+            "strategy": _strategy_body(raw_response),
+        })
+
     def _code_prompt_jobs(source_jobs, chains):
         code_jobs = []
         for chain in chains:
@@ -5531,7 +5552,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 )
                                 strategy_prompts.append(
                                     _render_strategy(messages))
-                            round_results = {}
+                            completed_chains = set()
                             for chain_index, job_results in (
                                     planning_pool.iter_group_jobs(
                                         prompts_by_group=strategy_prompts,
@@ -5555,19 +5576,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     raise RuntimeError(
                                         "strategy generation must return "
                                         "exactly one response per chain")
-                                round_results[int(chain_index)] = (
-                                    job_results[0][0])
-                            if len(round_results) != len(strategy_chains):
+                                chain_index = int(chain_index)
+                                if chain_index in completed_chains:
+                                    raise RuntimeError(
+                                        "strategy generation returned chain "
+                                        f"{chain_index} more than once")
+                                _record_strategy_response(
+                                    strategy_chains[chain_index],
+                                    strategy_index,
+                                    job_results[0][0],
+                                )
+                                completed_chains.add(chain_index)
+                            if len(completed_chains) != len(strategy_chains):
                                 raise RuntimeError(
                                     "strategy generation did not return every "
                                     "parent/fold chain")
-                            for chain_index, chain in enumerate(
-                                    strategy_chains):
-                                response_text = round_results[chain_index]
-                                chain["strategies"].append({
-                                    "response": str(response_text or ""),
-                                    "strategy": _strategy_body(response_text),
-                                })
                     finally:
                         if planning_pool is not gen_pool:
                             planning_pool.release()
@@ -5646,7 +5669,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             _seed_local_generation(
                                 int(step_idx) + 2_000_000
                                 + strategy_index * 10_000)
-                            round_results = {}
+                            completed_chains = set()
                             strategy_bar = make_progress_bar(
                                 len(strategy_chains),
                                 desc=(f"strategy {strategy_index + 1}/"
@@ -5668,21 +5691,25 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         raise RuntimeError(
                                             "strategy generation must return "
                                             "exactly one response per chain")
-                                    round_results[int(chain_index)] = (
-                                        responses[0][0])
+                                    chain_index = int(chain_index)
+                                    if chain_index in completed_chains:
+                                        raise RuntimeError(
+                                            "strategy generation returned "
+                                            f"chain {chain_index} more than "
+                                            "once")
+                                    _record_strategy_response(
+                                        strategy_chains[chain_index],
+                                        strategy_index,
+                                        responses[0][0],
+                                    )
+                                    completed_chains.add(chain_index)
                                     strategy_bar.update(1)
                             finally:
                                 strategy_bar.close()
-                            if len(round_results) != len(strategy_chains):
+                            if len(completed_chains) != len(strategy_chains):
                                 raise RuntimeError(
                                     "strategy generation did not return every "
                                     "parent/fold chain")
-                            for chain_index, chain in enumerate(strategy_chains):
-                                response_text = round_results[chain_index]
-                                chain["strategies"].append({
-                                    "response": str(response_text or ""),
-                                    "strategy": _strategy_body(response_text),
-                                })
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
                     print(f"[step {step_idx}] two-stage coding: generating "

@@ -10,6 +10,7 @@ Filenames:
     step03_group2_rollout17.txt        ← raw model response
     step03_group2_rollout17.strategy.txt ← raw planning-stage response
     step03_group2_rollout17.meta.json  ← reward, valid, msg, beta, advantage, etc.
+    step03_group02_fold00_strategy01.txt ← strategy saved immediately
 
 Directory name (problem-agnostic):
     runs/erdos_gpt-oss-120b_0602-2201/
@@ -128,6 +129,21 @@ def save_rollout(
 
     safe_meta = {k: _coerce(v) for k, v in meta.items()}
     (step_dir / f"{base}.meta.json").write_text(json.dumps(safe_meta, indent=2))
+
+
+def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
+                           fold: int, strategy: int,
+                           response_text: str) -> Path:
+    """Persist one planning response immediately after generation returns."""
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    step_dir.mkdir(exist_ok=True)
+    base = (f"step{step:02d}_group{parent_group:02d}_fold{fold:02d}_"
+            f"strategy{strategy:02d}.txt")
+    path = step_dir / base
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(str(response_text or ""), errors="replace")
+    tmp.replace(path)
+    return path
 
 
 def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
