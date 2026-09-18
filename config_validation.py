@@ -84,8 +84,19 @@ CPU_PROBLEMS = frozenset({
 PROBLEM_REQUIRED_KEYS = {
     "circle_packing": frozenset({
         "num_circles", "degenerate_threshold", "eval_cpus",
+        "strategy_model_name", "strategies_per_parent",
+        "programs_per_strategy", "strategy_max_new_tokens",
+        "strategy_max_seq_length", "strategy_temperature",
+        "strategy_top_p", "strategy_thinking",
+        "strategy_vllm_quantization",
     }),
-    "erdos": frozenset({"budget_s", "eval_cpus"}),
+    "erdos": frozenset({
+        "budget_s", "eval_cpus", "strategy_model_name",
+        "strategies_per_parent", "programs_per_strategy",
+        "strategy_max_new_tokens", "strategy_max_seq_length",
+        "strategy_temperature", "strategy_top_p", "strategy_thinking",
+        "strategy_vllm_quantization",
+    }),
     "erdos-c4": frozenset({
         "budget_s", "eval_cpus", "max_coeff_count", "benchmark_c4",
     }),
@@ -118,6 +129,15 @@ EXCLUSIVE_KEY_OWNERS = {
     "eval_seed": frozenset({"denoising"}),
     "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
     "eval_cpus": CPU_PROBLEMS,
+    "strategy_model_name": frozenset({"circle_packing", "erdos"}),
+    "strategies_per_parent": frozenset({"circle_packing", "erdos"}),
+    "programs_per_strategy": frozenset({"circle_packing", "erdos"}),
+    "strategy_max_new_tokens": frozenset({"circle_packing", "erdos"}),
+    "strategy_max_seq_length": frozenset({"circle_packing", "erdos"}),
+    "strategy_temperature": frozenset({"circle_packing", "erdos"}),
+    "strategy_top_p": frozenset({"circle_packing", "erdos"}),
+    "strategy_thinking": frozenset({"circle_packing", "erdos"}),
+    "strategy_vllm_quantization": frozenset({"circle_packing", "erdos"}),
     "max_coeff_count": frozenset({"erdos-c4"}),
     "benchmark_c4": frozenset({"erdos-c4"}),
     "problem_type": frozenset({"ac1", "ac2", "gpu_mode"}),
@@ -208,7 +228,9 @@ def validate_problem_config(
 
     for key in ("num_steps", "groups_per_step", "group_size",
                 "num_seed_states", "max_new_tokens", "max_seq_length",
-                "train_examples_per_microbatch"):
+                "train_examples_per_microbatch", "strategies_per_parent",
+                "programs_per_strategy", "strategy_max_new_tokens",
+                "strategy_max_seq_length"):
         if key in data:
             _positive_int(data, key, source)
     if "eval_cpus" in data:
@@ -228,6 +250,18 @@ def validate_problem_config(
 
     if "top_p" in data and not 0 < float(data["top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: top_p must be in (0, 1]")
+    if ("strategy_top_p" in data
+            and not 0 < float(data["strategy_top_p"]) <= 1):
+        raise ValueError(
+            f"{_label(source)}: strategy_top_p must be in (0, 1]")
+    if ("strategy_temperature" in data
+            and float(data["strategy_temperature"]) <= 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_temperature must be positive")
+    if ("strategy_thinking" in data
+            and not isinstance(data["strategy_thinking"], bool)):
+        raise ValueError(
+            f"{_label(source)}: strategy_thinking must be true or false")
     if "memory_top_p" in data and not 0 < float(data["memory_top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: memory_top_p must be in (0, 1]")
     if "memory_version" in data and str(data["memory_version"]).upper() not in {

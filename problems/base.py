@@ -91,7 +91,6 @@ class Problem(ABC):
     # construction at all, and their programs are the artifact.
     saves_construction: bool = False
     two_stage_rollouts: bool = False
-    strategy_max_new_tokens: int = 16000
 
     def __init__(self, cfg: dict):
         self.cfg = dict(cfg or {})
@@ -122,11 +121,30 @@ class Problem(ABC):
         """
         ...
 
-    def build_strategy_messages(self, messages: List[dict]) -> List[dict]:
+    def build_strategy_messages(
+            self, messages: List[dict],
+            previous_strategies: Optional[List[str]] = None) -> List[dict]:
         staged = [dict(message) for message in messages]
+        previous_strategies = list(previous_strategies or [])
+        history = ""
+        if previous_strategies:
+            rendered = []
+            for index, strategy in enumerate(previous_strategies, start=1):
+                rendered.append(
+                    f"<previous_strategy_{index}>\n{strategy.strip()}\n"
+                    f"</previous_strategy_{index}>")
+            history = (
+                "The following strategies were already proposed for this same "
+                "task and parent context:\n\n"
+                + "\n\n".join(rendered)
+                + "\n\nPropose a materially different approach. Do not merely "
+                  "rename variables, reorder steps, or make superficial "
+                  "parameter changes.\n\n"
+            )
         instruction = (
             "## Strategy-stage output\n\n"
-            "Develop a detailed, concrete, step-by-step strategy for solving "
+            + history
+            + "Develop a detailed, concrete, step-by-step strategy for solving "
             "the task above. Think through the mathematics, algorithm, "
             "implementation structure, numerical choices, and likely failure "
             "modes. Do not write Python code or a code fence in this stage. "
@@ -144,7 +162,7 @@ class Problem(ABC):
     def build_code_messages(self, messages: List[dict],
                             strategy: str) -> List[dict]:
         staged = [dict(message) for message in messages]
-        instruction = f"""## Strategy from the base-model planning stage
+        instruction = f"""## Strategy from the reasoning-model planning stage
 
 <strategy>
 {strategy.strip()}

@@ -464,6 +464,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
     p.add_argument("--model-name", default=None)
+    p.add_argument("--strategy-model-name", default=None,
+                   help="Base reasoning checkpoint used only to generate "
+                        "strategies; it never receives or trains the LoRA.")
     p.add_argument(
         "--training-model-name", default=None,
         help="Optional trainable checkpoint override. Rollout generation still "
@@ -485,6 +488,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--group-size", type=int, default=None,
                    help="Rollouts per parent group; in X-GRPO, group size G "
                         "(paper default: 64)")
+    p.add_argument("--strategies-per-parent", type=int, default=None,
+                   help="Sequential diverse strategies generated per parent.")
+    p.add_argument("--programs-per-strategy", type=int, default=None,
+                   help="LoRA-policy code rollouts sampled from each strategy.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--uct", action="store_const", const=True, default=None,
                    help="Use UCT parent selection instead of PUCT. Both use "
@@ -503,6 +510,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--growth-factor", type=float, default=None,
                    help="Multiply G and K by this when both signals clear.")
     p.add_argument("--max-new-tokens", type=int, default=None)
+    p.add_argument("--strategy-max-new-tokens", type=int, default=None)
+    p.add_argument("--strategy-max-seq-length", type=int, default=None)
+    p.add_argument("--strategy-temperature", type=float, default=None)
+    p.add_argument("--strategy-top-p", type=float, default=None)
+    p.add_argument("--strategy-thinking", dest="strategy_thinking",
+                   action="store_const", const=True, default=None)
+    p.add_argument("--no-strategy-thinking", dest="strategy_thinking",
+                   action="store_const", const=False)
+    p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
     p.add_argument("--adam-beta2", type=float, default=None)
@@ -1018,6 +1034,50 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
+    if str(merged.get("problem", "")).lower() in {
+            "circle_packing", "erdos"}:
+        strategy_model_name = str(
+            merged.get("strategy_model_name") or merged["model_name"]
+        ).strip()
+        strategies_per_parent = int(merged["strategies_per_parent"])
+        programs_per_strategy = int(merged["programs_per_strategy"])
+        strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
+        strategy_max_seq_length = int(merged["strategy_max_seq_length"])
+        strategy_temperature = float(merged["strategy_temperature"])
+        strategy_top_p = float(merged["strategy_top_p"])
+        if (strategies_per_parent < 1 or programs_per_strategy < 1
+                or strategy_max_new_tokens < 1
+                or strategy_max_seq_length < 1):
+            raise ValueError(
+                "strategy counts and token limits must be positive")
+        if strategy_temperature <= 0.0:
+            raise ValueError("strategy_temperature must be positive")
+        if not 0.0 < strategy_top_p <= 1.0:
+            raise ValueError("strategy_top_p must be in (0, 1]")
+        effective_group_size = (
+            strategies_per_parent * programs_per_strategy)
+        if (int(merged.get("group_size", effective_group_size))
+                != effective_group_size):
+            print(f"[config] hierarchical rollout group size derived as "
+                  f"{strategies_per_parent} strategies x "
+                  f"{programs_per_strategy} programs = "
+                  f"{effective_group_size}; replacing configured group_size="
+                  f"{merged.get('group_size')}")
+        merged["strategy_model_name"] = strategy_model_name
+        merged["strategies_per_parent"] = strategies_per_parent
+        merged["programs_per_strategy"] = programs_per_strategy
+        merged["strategy_max_new_tokens"] = strategy_max_new_tokens
+        merged["strategy_max_seq_length"] = strategy_max_seq_length
+        merged["strategy_temperature"] = strategy_temperature
+        merged["strategy_top_p"] = strategy_top_p
+        merged["strategy_thinking"] = bool(merged["strategy_thinking"])
+        merged["strategy_vllm_quantization"] = str(
+            merged.get("strategy_vllm_quantization") or "").strip()
+        merged["group_size"] = effective_group_size
+        # Strategy multiplicity is the authoritative rollout budget. Adaptive
+        # growth may still change the parent count, but cannot silently break
+        # the S*C hierarchy by changing the derived per-parent group size.
+        merged["max_group_size"] = effective_group_size
     cvar_alpha = merged.get("cvar_alpha")
     cvar_alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
     if not (0.0 < cvar_alpha < 1.0):
@@ -1230,6 +1290,44 @@ def load_config():
                   f"TP={layout.tensor_parallel_size}; selected layout needs "
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
+
+        strategy_name = str(
+            merged.get("strategy_model_name") or merged.get("model_name"))
+        if strategy_name == str(merged.get("model_name")):
+            merged["strategy_vllm_tensor_parallel_size"] = (
+                layout.tensor_parallel_size)
+            merged["strategy_vllm_pipeline_parallel_size"] = (
+                layout.pipeline_parallel_size)
+        else:
+            strategy_layout_cfg = dict(merged)
+            strategy_layout_cfg.update({
+                "model_name": strategy_name,
+                "max_seq_length": int(merged["strategy_max_seq_length"]),
+                "load_in_4bit": False,
+                "vllm_quantization": merged.get(
+                    "strategy_vllm_quantization", ""),
+            })
+            strategy_heads = detect_attention_heads(strategy_name)
+            strategy_layout = derive_vllm_parallel_layout(
+                strategy_layout_cfg, roles, memory, strategy_heads)
+            merged["strategy_vllm_tensor_parallel_size"] = (
+                strategy_layout.tensor_parallel_size)
+            merged["strategy_vllm_pipeline_parallel_size"] = (
+                strategy_layout.pipeline_parallel_size)
+            validate_attention_heads(
+                strategy_heads,
+                strategy_layout.tensor_parallel_size,
+                strategy_name,
+            )
+            print(f"[config] strategy model {strategy_name}: "
+                  f"{strategy_layout.replicas} vLLM replica(s), "
+                  f"TP={strategy_layout.tensor_parallel_size}, "
+                  f"PP={strategy_layout.pipeline_parallel_size}")
+    elif (str(merged.get("strategy_model_name") or merged.get("model_name"))
+          != str(merged.get("model_name"))):
+        raise ValueError(
+            "a distinct strategy_model_name currently requires "
+            "generation_backend=vllm")
 
     for note in resolve_memory_settings(merged, roles, memory):
         print(f"[memory] auto: {note}")
@@ -4853,6 +4951,7 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
 
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
+               strategy_pool=None, strategy_tokenizer=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
                curator=None, fb_cfg=None, parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None):
@@ -5010,6 +5109,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 messages, tokenize=False, add_generation_prompt=True,
             )
 
+    strategy_tokenizer = strategy_tokenizer or tokenizer
+
+    def _render_strategy(messages):
+        try:
+            return strategy_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=bool(cfg.strategy_thinking),
+            )
+        except TypeError:
+            return strategy_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+
     prompt_jobs = []
     for g, _parent in enumerate(parents):
         pc = parent_ctxs[g]
@@ -5084,18 +5196,73 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             mem_arm_rollouts[arm.name] = (
                 mem_arm_rollouts.get(arm.name, 0) + int(arm.count))
 
+    two_stage_rollouts = bool(
+        getattr(problem, "two_stage_rollouts", False))
+    strategies_per_parent = (
+        int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
+    programs_per_strategy = (
+        int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
+    if (two_stage_rollouts
+            and int(cfg.group_size)
+            != strategies_per_parent * programs_per_strategy):
+        raise RuntimeError(
+            "hierarchical rollout group size must equal "
+            "strategies_per_parent * programs_per_strategy")
+
+    def _source_schedule(parent_group):
+        indices = [
+            index for index, job in enumerate(prompt_jobs)
+            if int(job["parent_group"]) == int(parent_group)
+        ]
+        if not indices:
+            raise RuntimeError(
+                f"parent {parent_group} has no rendered prompt job")
+        weights = [max(0, int(prompt_jobs[index]["count"]))
+                   for index in indices]
+        total = sum(weights)
+        if total < 1:
+            return [indices[slot % len(indices)]
+                    for slot in range(strategies_per_parent)]
+        cumulative = []
+        running = 0
+        for index, weight in zip(indices, weights):
+            running += weight
+            cumulative.append((running, index))
+        schedule = []
+        for slot in range(strategies_per_parent):
+            target = (slot + 0.5) * total / strategies_per_parent
+            selected = cumulative[-1][1]
+            for boundary, index in cumulative:
+                if target <= boundary:
+                    selected = index
+                    break
+            schedule.append(selected)
+        return schedule
+
+    strategy_chains = []
+    if two_stage_rollouts:
+        for parent_group in range(len(parents)):
+            schedule = _source_schedule(parent_group)
+            for fold_index in range(x_grpo_groups_per_context):
+                strategy_chains.append({
+                    "chain_id": len(strategy_chains),
+                    "parent_group": parent_group,
+                    "fold_index": fold_index,
+                    "source_indices": list(schedule),
+                    "strategies": [],
+                })
+        mem_arm_rollouts = {}
+        for chain in strategy_chains:
+            for source_idx in chain["source_indices"]:
+                arm = prompt_jobs[source_idx]["arm"]
+                mem_arm_rollouts[arm] = (
+                    mem_arm_rollouts.get(arm, 0) + programs_per_strategy)
+
     if memory is not None and prompt_jobs:
         vals = [job["memory_tokens"] for job in prompt_jobs]
         print(f"[step {step_idx}] memory arms {mem_arm_rollouts}; injected "
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
-
-    two_stage_rollouts = bool(
-        getattr(problem, "two_stage_rollouts", False))
-    strategy_max_new_tokens = min(
-        int(cfg.max_new_tokens),
-        int(getattr(problem, "strategy_max_new_tokens", 2048)),
-    )
 
     def _strategy_body(response_text):
         text = str(response_text or "").strip()
@@ -5111,27 +5278,30 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "directly from the task specification.")
         return text
 
-    def _code_prompt_jobs(source_jobs, strategy_results):
+    def _code_prompt_jobs(source_jobs, chains):
         code_jobs = []
-        for source_idx, source_job in enumerate(source_jobs):
-            results = strategy_results.get(source_idx, [])
-            expected = int(source_job["count"])
-            if len(results) != expected:
+        for chain in chains:
+            if len(chain["strategies"]) != strategies_per_parent:
                 raise RuntimeError(
-                    "two-stage generation requires one base strategy per "
-                    f"program; prompt job {source_idx} expected {expected}, "
-                    f"received {len(results)}")
-            for response_text in results:
-                strategy = _strategy_body(response_text)
+                    f"strategy chain {chain['chain_id']} expected "
+                    f"{strategies_per_parent} strategies, received "
+                    f"{len(chain['strategies'])}")
+            for strategy_index, strategy_record in enumerate(
+                    chain["strategies"]):
+                source_idx = chain["source_indices"][strategy_index]
+                source_job = source_jobs[source_idx]
+                strategy = strategy_record["strategy"]
                 messages = problem.build_code_messages(
                     source_job["messages"], strategy)
                 code_jobs.append({
                     **source_job,
                     "messages": messages,
                     "prompt_text": _render(messages),
-                    "count": 1,
+                    "count": programs_per_strategy,
                     "strategy": strategy,
-                    "strategy_response": str(response_text or ""),
+                    "strategy_response": strategy_record["response"],
+                    "strategy_index": strategy_index,
+                    "assigned_fold_index": int(chain["fold_index"]),
                 })
         return code_jobs
 
@@ -5197,6 +5367,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     deferred_rollouts = []
     vllm_logprob_records = []
     queued_by_parent = {g: 0 for g in range(len(parents))}
+    queued_by_group = {g: 0 for g in range(num_groups)}
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
 
@@ -5236,13 +5407,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 raise RuntimeError(
                     "X-GRPO generation returned more than K*G rollouts for "
                     f"context {parent_group}")
-            fold_index = parent_ordinal // int(cfg.group_size)
+            fold_index = int(job.get(
+                "assigned_fold_index",
+                parent_ordinal // int(cfg.group_size),
+            ))
             group_id = (
                 parent_group * x_grpo_groups_per_context + fold_index)
+            if queued_by_group[group_id] >= int(cfg.group_size):
+                raise RuntimeError(
+                    "X-GRPO generation returned more than G rollouts for "
+                    f"context {parent_group} fold {fold_index}")
         else:
             fold_index = 0
             group_id = parent_group
         queued_by_parent[parent_group] = parent_ordinal + 1
+        queued_by_group[group_id] += 1
         record = {
             "job_idx": int(job_idx),
             "parent_group": parent_group,
@@ -5274,38 +5453,75 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # until generation releases that same physical card.
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
-                    strategy_results = {
-                        job_idx: []
-                        for job_idx in range(len(source_prompt_jobs))
-                    }
-                    strategy_count = sum(
-                        int(job["count"]) for job in source_prompt_jobs)
-                    strategy_prompts = [
-                        _render(problem.build_strategy_messages(job["messages"]))
-                        for job in source_prompt_jobs
-                    ]
-                    print(f"[step {step_idx}] two-stage planning: generating "
-                          f"{strategy_count} base-policy strategies with LoRA "
-                          f"disabled (max {strategy_max_new_tokens} tokens each)",
+                    planning_pool = strategy_pool or gen_pool
+                    print(f"[step {step_idx}] hierarchical planning: "
+                          f"{len(strategy_chains)} chain(s) x "
+                          f"{strategies_per_parent} sequential strategies with "
+                          f"{cfg.strategy_model_name}; LoRA disabled "
+                          f"(max {cfg.strategy_max_new_tokens} tokens each)",
                           flush=True)
-                    for job_idx, job_results in gen_pool.iter_group_jobs(
-                            prompts_by_group=strategy_prompts,
-                            group_size=cfg.group_size,
-                            counts_by_group=[
-                                job["count"] for job in source_prompt_jobs],
-                            adapter_path=None,
-                            max_new_tokens=strategy_max_new_tokens,
-                            temperature=cfg.temperature,
-                            top_p=cfg.top_p,
-                            step_idx=int(step_idx) + 2_000_000,
-                            progress_desc="strategies"):
-                        strategy_results[int(job_idx)].extend(
-                            result[0] for result in job_results)
+                    try:
+                        for strategy_index in range(strategies_per_parent):
+                            strategy_prompts = []
+                            for chain in strategy_chains:
+                                source_idx = chain["source_indices"][
+                                    strategy_index]
+                                previous = [
+                                    record["strategy"]
+                                    for record in chain["strategies"]
+                                ]
+                                messages = problem.build_strategy_messages(
+                                    source_prompt_jobs[source_idx]["messages"],
+                                    previous_strategies=previous,
+                                )
+                                strategy_prompts.append(
+                                    _render_strategy(messages))
+                            round_results = {}
+                            for chain_index, job_results in (
+                                    planning_pool.iter_group_jobs(
+                                        prompts_by_group=strategy_prompts,
+                                        group_size=1,
+                                        counts_by_group=(
+                                            [1] * len(strategy_prompts)),
+                                        adapter_path=None,
+                                        max_new_tokens=int(
+                                            cfg.strategy_max_new_tokens),
+                                        temperature=float(
+                                            cfg.strategy_temperature),
+                                        top_p=float(cfg.strategy_top_p),
+                                        step_idx=(
+                                            int(step_idx) + 2_000_000
+                                            + strategy_index * 10_000),
+                                        progress_desc=(
+                                            f"strategy "
+                                            f"{strategy_index + 1}/"
+                                            f"{strategies_per_parent}"))):
+                                if len(job_results) != 1:
+                                    raise RuntimeError(
+                                        "strategy generation must return "
+                                        "exactly one response per chain")
+                                round_results[int(chain_index)] = (
+                                    job_results[0][0])
+                            if len(round_results) != len(strategy_chains):
+                                raise RuntimeError(
+                                    "strategy generation did not return every "
+                                    "parent/fold chain")
+                            for chain_index, chain in enumerate(
+                                    strategy_chains):
+                                response_text = round_results[chain_index]
+                                chain["strategies"].append({
+                                    "response": str(response_text or ""),
+                                    "strategy": _strategy_body(response_text),
+                                })
+                    finally:
+                        if planning_pool is not gen_pool:
+                            planning_pool.release()
                     prompt_jobs = _code_prompt_jobs(
-                        source_prompt_jobs, strategy_results)
+                        source_prompt_jobs, strategy_chains)
                     print(f"[step {step_idx}] two-stage coding: generating "
-                          f"{len(prompt_jobs)} LoRA-policy programs conditioned "
-                          "on the base strategies", flush=True)
+                          f"{sum(job['count'] for job in prompt_jobs)} "
+                          f"LoRA-policy programs from {len(prompt_jobs)} "
+                          "strategy-conditioned prompts", flush=True)
 
                 generation_options = {
                     "prompts_by_group": [
@@ -5345,41 +5561,79 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
-                    strategy_results = {
-                        job_idx: []
-                        for job_idx in range(len(source_prompt_jobs))
-                    }
-                    strategy_count = sum(
-                        int(job["count"]) for job in source_prompt_jobs)
-                    strategy_prompts = [
-                        _render(problem.build_strategy_messages(job["messages"]))
-                        for job in source_prompt_jobs
-                    ]
-                    print(f"[step {step_idx}] two-stage planning: generating "
-                          f"{strategy_count} base-policy strategies with LoRA "
-                          f"disabled (max {strategy_max_new_tokens} tokens each)",
+                    print(f"[step {step_idx}] hierarchical planning: "
+                          f"{len(strategy_chains)} chain(s) x "
+                          f"{strategies_per_parent} sequential strategies with "
+                          f"{cfg.strategy_model_name}; LoRA disabled "
+                          f"(max {cfg.strategy_max_new_tokens} tokens each)",
                           flush=True)
-                    _seed_local_generation(int(step_idx) + 2_000_000)
-                    strategy_bar = make_progress_bar(
-                        strategy_count, desc="strategies")
-                    try:
-                        with backend.disable_adapter():
-                            for job_idx, responses in generate_prompt_jobs(
-                                    model, tokenizer, strategy_prompts,
-                                    [job["count"]
-                                     for job in source_prompt_jobs], cfg,
-                                    max_new_tokens=strategy_max_new_tokens,
-                                    cap_state=cap_state):
-                                strategy_results[int(job_idx)].extend(
-                                    text for text, _token_ids in responses)
-                                strategy_bar.update(len(responses))
-                    finally:
-                        strategy_bar.close()
+                    strategy_cfg = SimpleNamespace(**vars(cfg))
+                    strategy_cfg.advantage_mode = "entropic"
+                    strategy_cfg.temperature = float(
+                        cfg.strategy_temperature)
+                    strategy_cfg.top_p = float(cfg.strategy_top_p)
+                    with backend.disable_adapter():
+                        for strategy_index in range(strategies_per_parent):
+                            strategy_prompts = []
+                            for chain in strategy_chains:
+                                source_idx = chain["source_indices"][
+                                    strategy_index]
+                                previous = [
+                                    record["strategy"]
+                                    for record in chain["strategies"]
+                                ]
+                                messages = problem.build_strategy_messages(
+                                    source_prompt_jobs[source_idx]["messages"],
+                                    previous_strategies=previous,
+                                )
+                                strategy_prompts.append(
+                                    _render_strategy(messages))
+                            _seed_local_generation(
+                                int(step_idx) + 2_000_000
+                                + strategy_index * 10_000)
+                            round_results = {}
+                            strategy_bar = make_progress_bar(
+                                len(strategy_chains),
+                                desc=(f"strategy {strategy_index + 1}/"
+                                      f"{strategies_per_parent}"))
+                            try:
+                                for chain_index, responses in (
+                                        generate_prompt_jobs(
+                                            model, tokenizer,
+                                            strategy_prompts,
+                                            [1] * len(strategy_prompts),
+                                            strategy_cfg,
+                                            max_new_tokens=int(
+                                                cfg.strategy_max_new_tokens),
+                                            temperature=float(
+                                                cfg.strategy_temperature),
+                                            top_p=float(cfg.strategy_top_p),
+                                            cap_state=cap_state)):
+                                    if len(responses) != 1:
+                                        raise RuntimeError(
+                                            "strategy generation must return "
+                                            "exactly one response per chain")
+                                    round_results[int(chain_index)] = (
+                                        responses[0][0])
+                                    strategy_bar.update(1)
+                            finally:
+                                strategy_bar.close()
+                            if len(round_results) != len(strategy_chains):
+                                raise RuntimeError(
+                                    "strategy generation did not return every "
+                                    "parent/fold chain")
+                            for chain_index, chain in enumerate(strategy_chains):
+                                response_text = round_results[chain_index]
+                                chain["strategies"].append({
+                                    "response": str(response_text or ""),
+                                    "strategy": _strategy_body(response_text),
+                                })
                     prompt_jobs = _code_prompt_jobs(
-                        source_prompt_jobs, strategy_results)
+                        source_prompt_jobs, strategy_chains)
                     print(f"[step {step_idx}] two-stage coding: generating "
-                          f"{len(prompt_jobs)} LoRA-policy programs conditioned "
-                          "on the base strategies", flush=True)
+                          f"{sum(job['count'] for job in prompt_jobs)} "
+                          f"LoRA-policy programs from {len(prompt_jobs)} "
+                          "strategy-conditioned prompts", flush=True)
 
                 _seed_local_generation(step_idx)
                 gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
@@ -5993,6 +6247,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "two_stage_rollout": bool(two_stage_rollouts),
                 "strategy": (job.get("strategy")
                              if two_stage_rollouts else None),
+                "strategy_index": (job.get("strategy_index")
+                                   if two_stage_rollouts else None),
+                "strategy_model_name": (cfg.strategy_model_name
+                                        if two_stage_rollouts else None),
+                "programs_per_strategy": (
+                    programs_per_strategy if two_stage_rollouts else None),
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -6570,6 +6830,7 @@ def main():
         cfg, resume_dir=resume_dir, config_dict=merged
     )
     vllm_log_path = None
+    strategy_vllm_log_path = None
     dependency_log_path = None
     if cfg.generation_backend == "vllm":
         vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
@@ -6578,6 +6839,17 @@ def main():
                 f"\n=== TTT vLLM log parent_pid={os.getpid()} "
                 f"run_dir={Path(exp_dir).resolve()} ===\n")
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
+        if (getattr(cfg, "strategy_model_name", cfg.model_name)
+                != cfg.model_name):
+            strategy_vllm_log_path = str(
+                Path(exp_dir).resolve() / "strategy_vllm.log")
+            with open(strategy_vllm_log_path, "a",
+                      encoding="utf-8") as log_handle:
+                log_handle.write(
+                    f"\n=== TTT strategy vLLM log parent_pid={os.getpid()} "
+                    f"run_dir={Path(exp_dir).resolve()} ===\n")
+            print(f"[logs] strategy vLLM output: "
+                  f"{strategy_vllm_log_path}", flush=True)
         dependency_log_path = vllm_log_path
     else:
         dependency_log_path = str(
@@ -6643,6 +6915,8 @@ def main():
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
+    if getattr(problem, "two_stage_rollouts", False):
+        print(f"Strategy model:     {cfg.strategy_model_name} (no LoRA)")
     if cfg.training_model_name != cfg.model_name:
         print(f"Training model:     {cfg.training_model_name}")
     print(f"Training backend:   {cfg.backend}")
@@ -6718,8 +6992,14 @@ def main():
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
-        print(f"Rollout pipeline:   base strategy -> LoRA code "
-              f"(strategy max {min(int(cfg.max_new_tokens), int(getattr(problem, 'strategy_max_new_tokens', 2048)))} tokens)")
+        print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
+              f"strategies/parent x {cfg.programs_per_strategy} "
+              f"programs/strategy = {cfg.group_size}/parent")
+        print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
+              f"max_seq={cfg.strategy_max_seq_length}, "
+              f"temperature={cfg.strategy_temperature}, "
+              f"top_p={cfg.strategy_top_p}, "
+              f"thinking={'on' if cfg.strategy_thinking else 'off'}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     print(f"Fused long attention: "
           f"{'on' if cfg.fused_long_attention else 'off'}")
@@ -6750,6 +7030,15 @@ def main():
         from model_backend import load_backend
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()
+    strategy_tokenizer = tokenizer
+    if (getattr(problem, "two_stage_rollouts", False)
+            and cfg.strategy_model_name != cfg.model_name):
+        from transformers import AutoTokenizer
+        with _route_dependency_notices(dependency_log_path):
+            strategy_tokenizer = AutoTokenizer.from_pretrained(
+                cfg.strategy_model_name, trust_remote_code=True)
+        if strategy_tokenizer.pad_token_id is None:
+            strategy_tokenizer.pad_token = strategy_tokenizer.eos_token
     effective_4bit = bool(getattr(cfg, "effective_load_in_4bit",
                                   cfg.load_in_4bit))
     print(f"[precision] training copy: "
@@ -6893,6 +7182,7 @@ def main():
 
     # ---- generation pool ----
     gen_pool = None
+    strategy_pool = None
     # vLLM forms exact TP/PP engines over every rollout card. Because those
     # cards also hold either training replicas or model shards, the two runtimes
     # alternate residency.
@@ -7000,6 +7290,28 @@ def main():
             )
             print(f"[init] phase-shared vLLM pool configured across all "
                   f"rollout GPUs {gpu_ids}")
+            if (getattr(problem, "two_stage_rollouts", False)
+                    and cfg.strategy_model_name != cfg.model_name):
+                strategy_pool_options = dict(pool_options)
+                strategy_pool_options.update({
+                    "model_name": cfg.strategy_model_name,
+                    "max_seq_length": cfg.strategy_max_seq_length,
+                    "load_in_4bit": False,
+                    "vllm_quantization": (
+                        cfg.strategy_vllm_quantization),
+                    "vllm_tensor_parallel_size": (
+                        cfg.strategy_vllm_tensor_parallel_size),
+                    "vllm_pipeline_parallel_size": (
+                        cfg.strategy_vllm_pipeline_parallel_size),
+                    "vllm_log_path": strategy_vllm_log_path,
+                })
+                strategy_pool = PhasedVLLMGenerationPool(
+                    before_start=_offload_trainer_for_generation,
+                    after_stop=_restore_trainer_after_generation,
+                    **strategy_pool_options,
+                )
+                print(f"[init] separate no-LoRA strategy vLLM pool "
+                      f"configured for {cfg.strategy_model_name}")
         else:
             # Do not load a duplicate base model beside the trainer. Rank zero
             # is the live HF/Unsloth training model; only the remaining cards
@@ -7039,6 +7351,9 @@ def main():
             print(f"[init] hybrid HF rollout pool: live trainer on "
                   f"physical GPU {gpu_ids[0]} plus persistent workers "
                   f"{gpu_ids[1:]}")
+        if (getattr(problem, "two_stage_rollouts", False)
+                and strategy_pool is None):
+            strategy_pool = gen_pool
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
                           else "micro-batch")
@@ -7103,6 +7418,9 @@ def main():
     else:
         cur_g = int(cfg.groups_per_step)
         cur_k = int(cfg.group_size)
+    if getattr(problem, "two_stage_rollouts", False):
+        cur_k = int(cfg.strategies_per_parent) * int(
+            cfg.programs_per_strategy)
     if configured_advantage_mode == "x-grpo":
         growth_shape = (
             f"P={cfg.x_grpo_contexts_per_step}, K={cur_g}, G={cur_k} -> "
@@ -7146,15 +7464,26 @@ def main():
             if configured_advantage_mode == "x-grpo":
                 rollout_count = (
                     int(cfg.x_grpo_contexts_per_step) * cur_g * cur_k)
+                hierarchy = (
+                    f"{cfg.strategies_per_parent} strategies x "
+                    f"{cfg.programs_per_strategy} programs/group; "
+                    if getattr(problem, "two_stage_rollouts", False) else "")
                 print(f"[step {step}] batch: "
                       f"P={cfg.x_grpo_contexts_per_step} K={cur_g} G={cur_k} "
-                      f"({rollout_count} rollouts)")
+                      f"({hierarchy}{rollout_count} rollouts)")
+            elif getattr(problem, "two_stage_rollouts", False):
+                print(f"[step {step}] batch: parents={cur_g} "
+                      f"strategies/parent={cfg.strategies_per_parent} "
+                      f"programs/strategy={cfg.programs_per_strategy} "
+                      f"({cur_g * cur_k} code rollouts)")
             else:
                 print(f"[step {step}] batch: G={cur_g} K={cur_k} "
                       f"({cur_g * cur_k} rollouts)")
 
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
                                cfg, exp_dir, problem, gen_pool,
+                               strategy_pool=strategy_pool,
+                               strategy_tokenizer=strategy_tokenizer,
                                memory=memory, extractor=extractor, mem_cfg=mem_cfg,
                                lookup=lookup, curator=curator, fb_cfg=fb_cfg,
                                parallel_trainer=parallel_trainer,
@@ -7220,6 +7549,9 @@ def main():
         if reranker is not None:
             print("[shutdown] stopping Elo re-ranker ...")
             reranker.stop()
+        if strategy_pool is not None and strategy_pool is not gen_pool:
+            print("[shutdown] stopping strategy generation pool ...")
+            strategy_pool.shutdown()
         if gen_pool is not None:
             print("[shutdown] stopping generation pool ...")
             gen_pool.shutdown()
