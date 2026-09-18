@@ -436,6 +436,42 @@ def _expert_count(model_config) -> int:
     return 0
 
 
+def _prepare_sparse_moe_for_kbit_training(model):
+    """Freeze a partly quantized MoE without FP32-expanding its experts.
+
+    Some MoE implementations store all expert projections in packed 3-D
+    Parameters instead of ``nn.Linear`` modules.  BitsAndBytes therefore leaves
+    those frozen tensors in checkpoint precision.  PEFT's generic k-bit
+    preparation casts every non-4-bit FP16/BF16 Parameter to FP32, which can
+    nearly double a sparse model's resident size even though those expert
+    weights will never be trained.  Only the small norm/bias vectors need the
+    usual FP32 treatment here; all matrix and packed-expert base weights remain
+    frozen in their existing dtype.
+    """
+    cast_parameters = 0
+    cast_values = 0
+    retained_values = 0
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+        if (parameter.dtype not in (torch.float16, torch.bfloat16)
+                or parameter.__class__.__name__ == "Params4bit"):
+            continue
+        if parameter.ndim <= 1:
+            parameter.data = parameter.data.to(torch.float32)
+            cast_parameters += 1
+            cast_values += int(parameter.numel())
+        else:
+            retained_values += int(parameter.numel())
+    print(
+        "[memory] sparse-MoE k-bit preparation: froze base weights; "
+        f"cast {cast_parameters} norm/bias tensors ({cast_values:,} values) "
+        f"to FP32; kept {retained_values:,} frozen matrix/expert values in "
+        "checkpoint precision",
+        flush=True,
+    )
+    return model
+
+
 def _resolve_lora_target_modules(cfg, model_config):
     """Avoid allocating a separate large LoRA across every MoE expert."""
     targets = list(cfg.target_modules)
@@ -543,8 +579,18 @@ class HFBackend(_ModelPlacementBackend):
 
         training_name = _training_model_name(self.cfg)
         device_map = _training_device_map(self.cfg)
-        print(f"[backend=hf] loading {training_name} across "
-              f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
+        replica_device = getattr(self.cfg, "training_replica_device", None)
+        if replica_device is None:
+            placement = (
+                f"across {int(getattr(self.cfg, 'num_training_gpus', 1))} "
+                "GPU(s)"
+            )
+        else:
+            placement = (
+                "as one replicated trainer on logical GPU "
+                f"{int(replica_device)}"
+            )
+        print(f"[backend=hf] loading {training_name} {placement} ...")
         tokenizer = AutoTokenizer.from_pretrained(
             training_name, trust_remote_code=True)
         hf_config = AutoConfig.from_pretrained(
@@ -610,7 +656,10 @@ class HFBackend(_ModelPlacementBackend):
         self._remember_training_placement(model)
 
         if use_4bit:
-            model = prepare_model_for_kbit_training(model)
+            if _expert_count(hf_config) > 0:
+                model = _prepare_sparse_moe_for_kbit_training(model)
+            else:
+                model = prepare_model_for_kbit_training(model)
 
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(

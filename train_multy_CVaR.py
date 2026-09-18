@@ -4231,6 +4231,8 @@ class ProcessDistributedTrainer:
 
         print(f"[train-fast] starting {self._world_size - 1} persistent "
               "worker processes; main process is rank 0", flush=True)
+        print("[train-fast] loading trainer replicas one at a time to cap "
+              "host/GPU initialization peaks", flush=True)
         try:
             for rank in range(1, self._world_size):
                 command_queue = self._context.Queue(maxsize=2)
@@ -4246,14 +4248,14 @@ class ProcessDistributedTrainer:
                 process.start()
                 self._command_queues[rank] = command_queue
                 self._processes[rank] = process
-
-            loaded = self._collect_event(
-                "loaded", range(1, self._world_size))
-            for rank, message in loaded.items():
+                message = self._collect_event("loaded", [rank])[rank]
                 if message.get("parameter_signature") != expected_signature:
                     raise RuntimeError(
                         f"fast trainer rank {rank} has a different trainable "
                         "parameter layout")
+                print(f"[train-fast] trainer replica {rank + 1}/"
+                      f"{self._world_size} loaded on logical GPU {rank}",
+                      flush=True)
             for command_queue in self._command_queues.values():
                 command_queue.put({"kind": "init_distributed"})
             dist.init_process_group(
