@@ -1681,6 +1681,37 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(derive_vllm_tensor_parallel_size(8, 32), 8)
         self.assertEqual(derive_vllm_tensor_parallel_size(7, None), 7)
 
+    def test_debug_models_resolve_head_compatible_parallel_layouts(self):
+        roles = allocate_gpu_roles(list(range(8)), "circle_packing")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 95.6, 52.7)
+            for gpu_id in roles.generation
+        }
+
+        coder = {
+            "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "max_seq_length": 32000,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+        }
+        coder_heads = detect_attention_heads(coder["model_name"])
+        coder_layout = derive_vllm_parallel_layout(
+            coder, roles, memory, coder_heads)
+        self.assertEqual(coder_heads, 28)
+        self.assertEqual(coder_layout.tensor_parallel_size, 1)
+        self.assertEqual(coder_layout.pipeline_parallel_size, 1)
+        self.assertEqual(coder_layout.replicas, 8)
+
+        strategist = dict(coder, model_name="openai/gpt-oss-20b")
+        strategy_heads = detect_attention_heads(strategist["model_name"])
+        strategy_layout = derive_vllm_parallel_layout(
+            strategist, roles, memory, strategy_heads)
+        self.assertEqual(strategy_heads, 64)
+        self.assertEqual(strategy_layout.tensor_parallel_size, 1)
+        self.assertEqual(strategy_layout.pipeline_parallel_size, 1)
+        self.assertEqual(strategy_layout.replicas, 8)
+
     def test_gpu_mode_roles_type_and_replica_count_come_from_inventory(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")

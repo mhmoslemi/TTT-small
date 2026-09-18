@@ -425,6 +425,8 @@ def derive_vllm_tensor_parallel_size(num_gpus: int,
 def known_attention_heads(model_name: str) -> Optional[int]:
     """Fast preflight for the model families explicitly supported here."""
     name = str(model_name or "").lower()
+    if "qwen2.5-coder-7b" in name:
+        return 28
     if "qwen3-coder-next" in name:
         return 16
     if "qwen3-coder-30b" in name:
@@ -433,6 +435,8 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         return 64
     if "qwen3-8b" in name:
         return 32
+    if "gpt-oss-20b" in name:
+        return 64
     if "gpt-oss-120b" in name:
         return 64
     if "deepseek-v4" in name:
