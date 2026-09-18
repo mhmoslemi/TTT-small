@@ -444,6 +444,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
     p.add_argument(
+        "--strategies", action="store_const", const=True, default=None,
+        help="Use the opt-in two-stage rollout path: a frozen reasoning model "
+             "first produces sequential strategies, then the trainable coder "
+             "policy produces programs conditioned on those strategies. "
+             "Without this flag ordinary one-stage rollouts are unchanged.")
+    p.add_argument(
         "--fused-long-attention", action="store_const", const=True,
         default=None,
         help="Use exact fused causal SDPA for eligible unpadded long training "
@@ -464,6 +470,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Engine used by generation workers. Independent of the "
                         "differentiable training backend.")
     p.add_argument("--model-name", default=None)
+    p.add_argument(
+        "--coder-model-name", default=None,
+        help="Policy checkpoint selected as --model-name when --strategies is "
+             "active and --model-name was not explicitly supplied.")
+    p.add_argument(
+        "--coder-training-model-name", default=None,
+        help="Optional trainable checkpoint paired with --coder-model-name. "
+             "Used only by --strategies unless --training-model-name is explicit.")
     p.add_argument("--strategy-model-name", default=None,
                    help="Base reasoning checkpoint used only to generate "
                         "strategies; it never receives or trains the LoRA.")
@@ -518,6 +532,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    action="store_const", const=True, default=None)
     p.add_argument("--no-strategy-thinking", dest="strategy_thinking",
                    action="store_const", const=False)
+    p.add_argument("--strategy-reasoning-effort",
+                   choices=["low", "medium", "high"], default=None,
+                   help="Reasoning effort passed to strategy-model chat "
+                        "templates that support it, including GPT-OSS.")
     p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
@@ -1012,9 +1030,18 @@ def load_config():
     # These modes are deliberately launch-scoped. Saved/YAML values must not
     # silently change a later invocation's trainer or evaluator.
     merged["fast"] = bool(args.fast)
+    merged["strategies"] = bool(args.strategies)
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
+    if merged["strategies"]:
+        # Keep the ordinary policy checkpoint untouched unless the opt-in
+        # hierarchy is requested. Explicit CLI model choices remain strongest.
+        if args.model_name is None:
+            merged["model_name"] = str(merged["coder_model_name"]).strip()
+            if args.training_model_name is None:
+                merged["training_model_name"] = str(
+                    merged.get("coder_training_model_name") or "").strip()
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -1034,8 +1061,7 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
-    if str(merged.get("problem", "")).lower() in {
-            "circle_packing", "erdos"}:
+    if merged["strategies"]:
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
@@ -1071,6 +1097,13 @@ def load_config():
         merged["strategy_temperature"] = strategy_temperature
         merged["strategy_top_p"] = strategy_top_p
         merged["strategy_thinking"] = bool(merged["strategy_thinking"])
+        strategy_reasoning_effort = str(
+            merged.get("strategy_reasoning_effort") or "high"
+        ).strip().lower()
+        if strategy_reasoning_effort not in {"low", "medium", "high"}:
+            raise ValueError(
+                "strategy_reasoning_effort must be low, medium, or high")
+        merged["strategy_reasoning_effort"] = strategy_reasoning_effort
         merged["strategy_vllm_quantization"] = str(
             merged.get("strategy_vllm_quantization") or "").strip()
         merged["group_size"] = effective_group_size
@@ -1101,6 +1134,15 @@ def load_config():
     pp = int(merged["vllm_pipeline_parallel_size"] or 1)
     if tp < 0 or pp < 1:
         raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
+    for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
+        value = int(merged.get(key, 2))
+        if value not in (1, 2):
+            raise ValueError(f"{key} must be 1 or 2")
+        merged[key] = value
+    merged["vllm_staged_loading"] = bool(
+        merged.get("vllm_staged_loading", True))
+    merged["strategy_vllm_staged_loading"] = bool(
+        merged.get("strategy_vllm_staged_loading", True))
 
     # Omitted growth caps mean fixed batch size. Resolve after YAML and CLI so
     # `--groups-per-step 5 --group-size 16` becomes max G=5, max K=16 even if
@@ -1291,39 +1333,42 @@ def load_config():
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
 
-        strategy_name = str(
-            merged.get("strategy_model_name") or merged.get("model_name"))
-        if strategy_name == str(merged.get("model_name")):
-            merged["strategy_vllm_tensor_parallel_size"] = (
-                layout.tensor_parallel_size)
-            merged["strategy_vllm_pipeline_parallel_size"] = (
-                layout.pipeline_parallel_size)
-        else:
-            strategy_layout_cfg = dict(merged)
-            strategy_layout_cfg.update({
-                "model_name": strategy_name,
-                "max_seq_length": int(merged["strategy_max_seq_length"]),
-                "load_in_4bit": False,
-                "vllm_quantization": merged.get(
-                    "strategy_vllm_quantization", ""),
-            })
-            strategy_heads = detect_attention_heads(strategy_name)
-            strategy_layout = derive_vllm_parallel_layout(
-                strategy_layout_cfg, roles, memory, strategy_heads)
-            merged["strategy_vllm_tensor_parallel_size"] = (
-                strategy_layout.tensor_parallel_size)
-            merged["strategy_vllm_pipeline_parallel_size"] = (
-                strategy_layout.pipeline_parallel_size)
-            validate_attention_heads(
-                strategy_heads,
-                strategy_layout.tensor_parallel_size,
-                strategy_name,
-            )
-            print(f"[config] strategy model {strategy_name}: "
-                  f"{strategy_layout.replicas} vLLM replica(s), "
-                  f"TP={strategy_layout.tensor_parallel_size}, "
-                  f"PP={strategy_layout.pipeline_parallel_size}")
-    elif (str(merged.get("strategy_model_name") or merged.get("model_name"))
+        if merged["strategies"]:
+            strategy_name = str(
+                merged.get("strategy_model_name") or merged.get("model_name"))
+            if strategy_name == str(merged.get("model_name")):
+                merged["strategy_vllm_tensor_parallel_size"] = (
+                    layout.tensor_parallel_size)
+                merged["strategy_vllm_pipeline_parallel_size"] = (
+                    layout.pipeline_parallel_size)
+            else:
+                strategy_layout_cfg = dict(merged)
+                strategy_layout_cfg.update({
+                    "model_name": strategy_name,
+                    "max_seq_length": int(merged["strategy_max_seq_length"]),
+                    "load_in_4bit": False,
+                    "vllm_quantization": merged.get(
+                        "strategy_vllm_quantization", ""),
+                })
+                strategy_heads = detect_attention_heads(strategy_name)
+                strategy_layout = derive_vllm_parallel_layout(
+                    strategy_layout_cfg, roles, memory, strategy_heads)
+                merged["strategy_vllm_tensor_parallel_size"] = (
+                    strategy_layout.tensor_parallel_size)
+                merged["strategy_vllm_pipeline_parallel_size"] = (
+                    strategy_layout.pipeline_parallel_size)
+                validate_attention_heads(
+                    strategy_heads,
+                    strategy_layout.tensor_parallel_size,
+                    strategy_name,
+                )
+                print(f"[config] strategy model {strategy_name}: "
+                      f"{strategy_layout.replicas} vLLM replica(s), "
+                      f"TP={strategy_layout.tensor_parallel_size}, "
+                      f"PP={strategy_layout.pipeline_parallel_size}")
+    elif (merged["strategies"]
+          and str(merged.get("strategy_model_name")
+                  or merged.get("model_name"))
           != str(merged.get("model_name"))):
         raise ValueError(
             "a distinct strategy_model_name currently requires "
@@ -5112,10 +5157,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     strategy_tokenizer = strategy_tokenizer or tokenizer
 
     def _render_strategy(messages):
+        strategy_name = str(getattr(cfg, "strategy_model_name", "")).lower()
+        template_options = {}
+        if "gpt-oss" in strategy_name:
+            template_options["reasoning_effort"] = str(
+                cfg.strategy_reasoning_effort)
+        else:
+            template_options["enable_thinking"] = bool(
+                cfg.strategy_thinking)
         try:
             return strategy_tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=bool(cfg.strategy_thinking),
+                **template_options,
             )
         except TypeError:
             return strategy_tokenizer.apply_chat_template(
@@ -6839,7 +6892,8 @@ def main():
                 f"\n=== TTT vLLM log parent_pid={os.getpid()} "
                 f"run_dir={Path(exp_dir).resolve()} ===\n")
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
-        if (getattr(cfg, "strategy_model_name", cfg.model_name)
+        if (cfg.strategies
+                and getattr(cfg, "strategy_model_name", cfg.model_name)
                 != cfg.model_name):
             strategy_vllm_log_path = str(
                 Path(exp_dir).resolve() / "strategy_vllm.log")
@@ -6904,6 +6958,10 @@ def main():
         problem_config = dict(merged)
         problem_config["eval_cpus"] = 1
     problem = get_problem(cfg.problem, problem_config)
+    # Strategy generation is a launch mode, not a permanent property of a
+    # problem class. Without --strategies every problem follows its original
+    # one-stage policy rollout path.
+    problem.two_stage_rollouts = bool(cfg.strategies)
 
     print("=" * 70)
     print("TTT-Discover — local multi-problem implementation")
@@ -6999,7 +7057,8 @@ def main():
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "
               f"top_p={cfg.strategy_top_p}, "
-              f"thinking={'on' if cfg.strategy_thinking else 'off'}")
+              f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
+              f"reasoning_effort={cfg.strategy_reasoning_effort}")
     print(f"Max seq length:     {cfg.max_seq_length}")
     print(f"Fused long attention: "
           f"{'on' if cfg.fused_long_attention else 'off'}")
@@ -7212,6 +7271,8 @@ def main():
             vllm_pipeline_parallel_size=cfg.vllm_pipeline_parallel_size,
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
+            vllm_sleep_level=cfg.vllm_sleep_level,
+            vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
         )
         if cfg.generation_backend == "vllm":
@@ -7303,6 +7364,9 @@ def main():
                         cfg.strategy_vllm_tensor_parallel_size),
                     "vllm_pipeline_parallel_size": (
                         cfg.strategy_vllm_pipeline_parallel_size),
+                    "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
+                    "vllm_staged_loading": (
+                        cfg.strategy_vllm_staged_loading),
                     "vllm_log_path": strategy_vllm_log_path,
                 })
                 strategy_pool = PhasedVLLMGenerationPool(

@@ -46,6 +46,10 @@ memory_version="${MEMORY_VERSION:-V2}"
 # Skip adapter training completely while keeping rollout, evaluation, search,
 # memory, and result/checkpoint persistence:
 #   sh run.sh --no-train
+# Opt into hierarchical rollouts. The frozen strategist runs first, is fully
+# offloaded, then the LoRA coder generates programs and trains. Without this
+# flag the ordinary one-stage rollout path is unchanged:
+#   sh run.sh --strategies
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 case "${1:-}" in

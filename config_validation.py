@@ -26,7 +26,8 @@ reranker_poll_interval_s reranker_min_states_to_rank reranker_goal
 
 COMMON_REQUIRED_KEYS = frozenset("""
 problem target
-fail_score model_name training_model_name backend max_seq_length load_in_4bit
+fail_score model_name training_model_name coder_model_name
+coder_training_model_name strategy_model_name backend max_seq_length load_in_4bit
 lora_rank lora_alpha
 lora_dropout target_modules
 training_gpu_id available_gpu_ids reserve_last_gpu_for_evaluation
@@ -35,14 +36,19 @@ evaluation_shares_generation
 generation_backend gen_micro_batch vllm_gpu_memory_utilization
 vllm_enforce_eager vllm_enable_prefix_caching vllm_tensor_parallel_size
 vllm_pipeline_parallel_size vllm_quantization
-vllm_max_num_batched_tokens vllm_enable_expert_parallel
-num_steps groups_per_step group_size num_seed_states max_groups_per_step
+vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
+vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
+num_steps groups_per_step group_size strategies_per_parent
+programs_per_strategy num_seed_states max_groups_per_step
 max_group_size growth_force_step growth_valid_yield growth_distinct_min
 growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
-max_new_tokens temperature top_p thinking deterministic seed
+max_new_tokens temperature top_p thinking strategy_max_new_tokens
+strategy_max_seq_length strategy_temperature strategy_top_p
+strategy_thinking strategy_reasoning_effort strategy_vllm_quantization
+deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
 memory memory_version memory_extract_mode memory_lessons_per_call memory_hygiene_profile
 memory_max_examples_per_call memory_max_chars_per_example
@@ -84,18 +90,9 @@ CPU_PROBLEMS = frozenset({
 PROBLEM_REQUIRED_KEYS = {
     "circle_packing": frozenset({
         "num_circles", "degenerate_threshold", "eval_cpus",
-        "strategy_model_name", "strategies_per_parent",
-        "programs_per_strategy", "strategy_max_new_tokens",
-        "strategy_max_seq_length", "strategy_temperature",
-        "strategy_top_p", "strategy_thinking",
-        "strategy_vllm_quantization",
     }),
     "erdos": frozenset({
-        "budget_s", "eval_cpus", "strategy_model_name",
-        "strategies_per_parent", "programs_per_strategy",
-        "strategy_max_new_tokens", "strategy_max_seq_length",
-        "strategy_temperature", "strategy_top_p", "strategy_thinking",
-        "strategy_vllm_quantization",
+        "budget_s", "eval_cpus",
     }),
     "erdos-c4": frozenset({
         "budget_s", "eval_cpus", "max_coeff_count", "benchmark_c4",
@@ -129,15 +126,6 @@ EXCLUSIVE_KEY_OWNERS = {
     "eval_seed": frozenset({"denoising"}),
     "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
     "eval_cpus": CPU_PROBLEMS,
-    "strategy_model_name": frozenset({"circle_packing", "erdos"}),
-    "strategies_per_parent": frozenset({"circle_packing", "erdos"}),
-    "programs_per_strategy": frozenset({"circle_packing", "erdos"}),
-    "strategy_max_new_tokens": frozenset({"circle_packing", "erdos"}),
-    "strategy_max_seq_length": frozenset({"circle_packing", "erdos"}),
-    "strategy_temperature": frozenset({"circle_packing", "erdos"}),
-    "strategy_top_p": frozenset({"circle_packing", "erdos"}),
-    "strategy_thinking": frozenset({"circle_packing", "erdos"}),
-    "strategy_vllm_quantization": frozenset({"circle_packing", "erdos"}),
     "max_coeff_count": frozenset({"erdos-c4"}),
     "benchmark_c4": frozenset({"erdos-c4"}),
     "problem_type": frozenset({"ac1", "ac2", "gpu_mode"}),
@@ -262,6 +250,19 @@ def validate_problem_config(
             and not isinstance(data["strategy_thinking"], bool)):
         raise ValueError(
             f"{_label(source)}: strategy_thinking must be true or false")
+    if ("strategy_reasoning_effort" in data
+            and str(data["strategy_reasoning_effort"]).lower()
+            not in {"low", "medium", "high"}):
+        raise ValueError(
+            f"{_label(source)}: strategy_reasoning_effort must be low, "
+            "medium, or high")
+    for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
+        if key in data and int(data[key]) not in (1, 2):
+            raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
+    for key in ("vllm_staged_loading", "strategy_vllm_staged_loading"):
+        if key in data and not isinstance(data[key], bool):
+            raise ValueError(
+                f"{_label(source)}: {key} must be true or false")
     if "memory_top_p" in data and not 0 < float(data["memory_top_p"]) <= 1:
         raise ValueError(f"{_label(source)}: memory_top_p must be in (0, 1]")
     if "memory_version" in data and str(data["memory_version"]).upper() not in {
