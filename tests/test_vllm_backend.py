@@ -1931,6 +1931,35 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(strategy_layout.pipeline_parallel_size, 1)
         self.assertEqual(strategy_layout.replicas, 8)
 
+    def test_auto_vllm_budget_never_exceeds_current_free_memory(self):
+        roles = allocate_gpu_roles(list(range(8)), "circle_packing")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 95.6, 45.0)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "generation_backend": "vllm",
+            "max_seq_length": 32000,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_tensor_parallel_size": 1,
+            "vllm_pipeline_parallel_size": 1,
+            "vllm_max_num_batched_tokens": "auto",
+            "gen_micro_batch": "auto",
+            "logprob_chunk": "auto",
+        }
+
+        resolve_memory_settings(cfg, roles, memory)
+
+        requested_gib = (
+            memory[0].total_gib * cfg["vllm_gpu_memory_utilization"])
+        self.assertAlmostEqual(
+            cfg["vllm_gpu_memory_utilization"], 0.408, places=3)
+        self.assertLessEqual(requested_gib, memory[0].free_gib - 5.9)
+        self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
+
     def test_gpu_mode_roles_type_and_replica_count_come_from_inventory(self):
         fake_numpy = types.ModuleType("numpy")
         fake_yaml = types.ModuleType("yaml")

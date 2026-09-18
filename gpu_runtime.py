@@ -250,8 +250,12 @@ def _effective_max_length(cfg: dict) -> int:
 def _resolved_vllm_utilization(raw_value, total_gib: float,
                                free_gib: float) -> float:
     if _auto(raw_value):
+        # Size the allocator from memory that is actually free, retaining a
+        # 6-GiB CUDA/runtime reserve.  A former 50% floor could request more
+        # memory than existed (for example 47.8 GiB on a card with 45 GiB
+        # free), after which the startup preflight rejected its own auto value.
         util = min(0.90, (free_gib - 6.0) / max(total_gib, 1.0))
-        return max(0.50, util)
+        return max(0.10, util)
     util = float(raw_value)
     if not 0.0 < util <= 1.0:
         raise ValueError("vllm_gpu_memory_utilization must be auto or in (0, 1]")
