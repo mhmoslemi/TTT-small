@@ -232,7 +232,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
 - Your function must complete within budget_s seconds and return the best solution found
 
-**Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.379.
+**Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.38080.
 
 {state_ctx}
 {construction_section}{memory_section}
@@ -240,18 +240,18 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 ## Output format
 
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+Plan the solution internally before answering. Do not print chain-of-thought or
+intermediate reasoning. Output only a single strategy sentence of at most 25
+words between <strategy> and </strategy>, followed by the final program.
 
+- Exactly ONE ```python block, containing the complete program. It is extracted
+  verbatim and executed as written.
 - No prose, notes, explanation, or example usage after the closing fence.
 - No second code block. No partial snippets earlier in the response.
 - The block must define `run` at top level and be runnable on its own.
 '''
 
 # Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
-
-
-# - Exactly ONE ```python block, containing the complete program. It is extracted
-#   verbatim and executed as written.
 
         return [{"role": "user", "content": user}]
 

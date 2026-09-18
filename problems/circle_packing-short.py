@@ -175,7 +175,10 @@ Rules:
   Let it fail loudly instead.
 - You need to get really creative and think from first principles.
 
-Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+Plan the solution internally before answering. Do not print chain-of-thought or
+intermediate reasoning. Output only a single strategy sentence of at most 25
+words between <strategy> and </strategy>, followed by exactly one ```python
+block containing the complete program. Do not output anything after the block.
 """
 
         return [{"role": "user", "content": user}]
