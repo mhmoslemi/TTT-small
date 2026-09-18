@@ -231,6 +231,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - No filesystem or network IO
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
 - Your function must complete within budget_s seconds and return the best solution found
+- The block must define `run` at top level and be runnable on its own.
 
 **Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.379.
 
@@ -242,12 +243,12 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 
-- No prose, notes, explanation, or example usage after the closing fence.
-- No second code block. No partial snippets earlier in the response.
-- The block must define `run` at top level and be runnable on its own.
 '''
 
 # Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
+# - No prose, notes, explanation, or example usage after the closing fence.
+# - No second code block. No partial snippets earlier in the response.
+
 
 
 # - Exactly ONE ```python block, containing the complete program. It is extracted
