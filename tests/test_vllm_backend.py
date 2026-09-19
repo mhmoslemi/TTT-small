@@ -1078,6 +1078,7 @@ class VLLMBackendTests(unittest.TestCase):
             pipeline_parallel_size=2,
             max_num_batched_tokens=4096,
             enable_sleep_mode=True,
+            disable_custom_all_reduce=True,
         )
 
         self.assertEqual(kwargs["model"], "org/model")
@@ -1096,6 +1097,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(kwargs["max_num_batched_tokens"], 4096)
         self.assertIs(kwargs["enable_chunked_prefill"], True)
         self.assertIs(kwargs["enable_sleep_mode"], True)
+        self.assertIs(kwargs["disable_custom_all_reduce"], True)
 
     def test_vllm_engine_kwargs_omit_optional_limits(self):
         kwargs = _vllm_engine_kwargs(
@@ -1300,6 +1302,9 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertEqual(
                 [item.kwargs["enable_sleep_mode"] for item in initial],
                 [True, False, False, False])
+            self.assertTrue(all(
+                item.kwargs["disable_custom_all_reduce"]
+                for item in initial))
 
             pool.sleep()
             self.assertTrue(pool.procs[0].is_alive())
@@ -1327,6 +1332,9 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertEqual(coder_pool.persistent_workers, 8)
             self.assertTrue(all(
                 item.kwargs["enable_sleep_mode"]
+                for item in created[coder_start:]))
+            self.assertTrue(all(
+                not item.kwargs["disable_custom_all_reduce"]
                 for item in created[coder_start:]))
             loaded_coder_processes = len(created)
             coder_pool.sleep()

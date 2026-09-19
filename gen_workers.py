@@ -424,7 +424,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         tensor_parallel_size=1, pipeline_parallel_size=1,
                         max_num_batched_tokens=0,
                         enable_expert_parallel=False,
-                        enable_sleep_mode=False):
+                        enable_sleep_mode=False,
+                        disable_custom_all_reduce=False):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -477,6 +478,12 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         kwargs["enable_expert_parallel"] = True
     if bool(enable_sleep_mode):
         kwargs["enable_sleep_mode"] = True
+    if bool(disable_custom_all_reduce):
+        # vLLM's CUDA custom all-reduce uses process-global IPC resources.
+        # Multiple independent TP engines on disjoint, remapped GPU subsets
+        # can collide during CUDA-graph warm-up (custom_all_reduce.cuh:164).
+        # NCCL/PyNCCL computes the same collective without that shared state.
+        kwargs["disable_custom_all_reduce"] = True
     if int(max_num_seqs or 0) > 0:
         kwargs["max_num_seqs"] = int(max_num_seqs)
     if int(max_num_batched_tokens or 0) > 0:
@@ -640,7 +647,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       tensor_parallel_size=1, pipeline_parallel_size=1,
                       max_num_batched_tokens=0,
                       enable_expert_parallel=False, enable_sleep_mode=False,
-                      sleep_level=1, control_queue=None, vllm_log_path=None):
+                      sleep_level=1, control_queue=None, vllm_log_path=None,
+                      disable_custom_all_reduce=False):
     """Persistent vLLM engine spanning one physical GPU group."""
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
@@ -689,10 +697,13 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             # start normally and report no sleep capability so the parent can
             # select its transient compatibility path.
             enable_sleep_mode=(enable_sleep_mode and sleep_api_available),
+            disable_custom_all_reduce=disable_custom_all_reduce,
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
-              f"PP={pipeline_parallel_size}) ...", flush=True)
+              f"PP={pipeline_parallel_size}, collectives="
+              f"{'NCCL' if disable_custom_all_reduce else 'auto'}) ...",
+              flush=True)
         llm = LLM(**engine_kwargs)
     except Exception:
         detail = traceback.format_exc()
@@ -1121,6 +1132,15 @@ class GenerationPool:
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
+            # Separate TP engines remap different physical GPU pairs to the
+            # same local CUDA ordinals. vLLM 0.28's custom all-reduce IPC can
+            # then fail while the second engine profiles CUDA graphs. Use the
+            # exact NCCL collective for this layout. Single TP engines and
+            # ordinary one-GPU replicas retain vLLM's faster automatic path.
+            "disable_custom_all_reduce": bool(
+                self.backend == "vllm"
+                and self.num_workers > 1
+                and tp > 1),
             "sleep_level": self.sleep_level,
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
