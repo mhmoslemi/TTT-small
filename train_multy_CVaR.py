@@ -1143,6 +1143,15 @@ def load_config():
         merged.get("vllm_staged_loading", True))
     merged["strategy_vllm_staged_loading"] = bool(
         merged.get("strategy_vllm_staged_loading", True))
+    strategy_persistent_workers = merged.get(
+        "strategy_vllm_persistent_workers")
+    if strategy_persistent_workers is not None:
+        strategy_persistent_workers = int(strategy_persistent_workers)
+        if strategy_persistent_workers < 0:
+            raise ValueError(
+                "strategy_vllm_persistent_workers must be nonnegative")
+    merged["strategy_vllm_persistent_workers"] = (
+        strategy_persistent_workers)
 
     # Omitted growth caps mean fixed batch size. Resolve after YAML and CLI so
     # `--groups-per-step 5 --group-size 16` becomes max G=5, max K=16 even if
@@ -1973,14 +1982,16 @@ def _split_training_batches(batches):
     return split, changed
 
 
-def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
-    """Retry an update with smaller batches and CPU-saved activations.
+def _run_oom_resilient_backward(
+        model, batches, attempt, *, device_label, expand_memory=None):
+    """Retry with smaller batches, CPU activations, and reserved GPU headroom.
 
     Each attempt starts the local replica's gradients from zero, so an OOM
     during backward cannot double-count a partially accumulated microbatch.
-    Once batches reach one example, saved-tensor CPU offload is tried. A truly
-    untrainable outlier is quarantined from this update rather than terminating
-    the entire multi-hour run; all generated artifacts remain saved.
+    Once batches reach one example, saved-tensor CPU offload is tried. Fast
+    training may then provide ``expand_memory`` to use the card headroom that
+    normal adaptive batches deliberately reserve. A truly untrainable outlier
+    is quarantined only after every exact fallback has failed.
     """
     import gc
     import torch
@@ -1988,6 +1999,7 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
     active = [list(batch) for batch in batches if batch]
     quarantined = []
     activation_offload = False
+    memory_expanded = False
     cuda_devices = sorted({
         parameter.device.index
         for parameter in model.parameters()
@@ -2030,6 +2042,19 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
                 print(f"[train-oom] {device_label}: singleton OOM; retrying "
                       "with saved activations offloaded to CPU", flush=True)
                 continue
+            if (cuda_oom and activation_offload and not memory_expanded
+                    and expand_memory is not None):
+                expanded_fraction = expand_memory()
+                if expanded_fraction is not None:
+                    memory_expanded = True
+                    print(
+                        f"[train-oom] {device_label}: singleton still exceeds "
+                        "the normal ceiling; retrying the exact update with "
+                        f"reserved GPU headroom (allocator cap "
+                        f"{100.0 * float(expanded_fraction):.1f}%)",
+                        flush=True,
+                    )
+                    continue
 
             victim_index = max(
                 range(len(active)),
@@ -2043,7 +2068,11 @@ def _run_oom_resilient_backward(model, batches, attempt, *, device_label):
                 victim["prompt_ids"].shape[1]
                 + victim["response_ids"].shape[1])
             quarantined.append(victim)
-            activation_offload = False
+            # Once the reserved-headroom path was required, keep activations
+            # offloaded while checking the remaining long singletons. This
+            # avoids repeating one guaranteed-to-fail ordinary attempt for
+            # every neighboring rollout.
+            activation_offload = memory_expanded
             if kernel_unavailable:
                 reason = "has no compatible linear-memory attention kernel"
             else:
@@ -4270,7 +4299,8 @@ class ProcessDistributedTrainer:
             raise
 
         print(f"[train-fast] process-distributed trainer active on physical "
-              f"GPUs {self._physical_ids}; adaptive memory ceiling=80%",
+              f"GPUs {self._physical_ids}; adaptive memory ceiling=80%, "
+              "exact long-rollout rescue up to 96%",
               flush=True)
 
     @property
@@ -4515,6 +4545,7 @@ class ProcessDistributedTrainer:
               f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}",
               flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling=80%; "
+              "exact singleton rescue=96%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -7432,6 +7463,8 @@ def main():
                     "vllm_pipeline_parallel_size": (
                         cfg.strategy_vllm_pipeline_parallel_size),
                     "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
+                    "vllm_persistent_workers": getattr(
+                        cfg, "strategy_vllm_persistent_workers", None),
                     "vllm_staged_loading": (
                         cfg.strategy_vllm_staged_loading),
                     "vllm_log_path": strategy_vllm_log_path,

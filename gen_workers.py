@@ -1003,6 +1003,7 @@ class GenerationPool:
                  vllm_enable_expert_parallel=False,
                  vllm_enable_sleep_mode=False,
                  vllm_sleep_level=1,
+                 vllm_persistent_workers=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None):
         self.model_name = model_name
@@ -1071,21 +1072,45 @@ class GenerationPool:
 
         # Jobs are distributed over independent engines, not over TP ranks.
         self.num_workers = len(gpu_groups)
+        configured_persistent_workers = (
+            None if vllm_persistent_workers is None
+            else int(vllm_persistent_workers))
+        if (configured_persistent_workers is not None
+                and not 0 <= configured_persistent_workers <= self.num_workers):
+            raise ValueError(
+                "vllm_persistent_workers must be between zero and the "
+                f"number of vLLM engines ({self.num_workers})")
+        if not self.sleep_requested:
+            persistent_workers = 0
+        elif configured_persistent_workers is None:
+            persistent_workers = self.num_workers
+        else:
+            persistent_workers = configured_persistent_workers
+        if (self.backend != "vllm"
+                and configured_persistent_workers not in (None, 0)):
+            raise ValueError(
+                "vllm_persistent_workers is valid only for backend='vllm'")
+        self.persistent_workers = persistent_workers
+        self._persistent_worker_ids = tuple(range(persistent_workers))
+        self._transient_worker_ids = tuple(
+            range(persistent_workers, self.num_workers))
 
         ctx = mp.get_context("spawn")
-        self.task_queues = [ctx.Queue() for _ in range(self.num_workers)]
+        self._ctx = ctx
+        self._gpu_groups = gpu_groups
+        self.task_queues = [None for _ in range(self.num_workers)]
         self.result_queue = ctx.Queue()
-        ready_queue = ctx.Queue()
+        self._ready_queue = ctx.Queue()
         self.control_queue = ctx.Queue()
 
         if self.backend == "vllm":
             _assert_vllm_memory_available(
                 self.gpu_ids, vllm_gpu_memory_utilization, model_name)
 
-        self.procs = []
-        worker_target = (_vllm_worker_loop
-                         if self.backend == "vllm" else _hf_worker_loop)
-        worker_options = {
+        self.procs = [None for _ in range(self.num_workers)]
+        self._worker_target = (_vllm_worker_loop
+                               if self.backend == "vllm" else _hf_worker_loop)
+        self._worker_options = {
             "lora_rank": int(lora_rank),
             "gpu_memory_utilization": float(vllm_gpu_memory_utilization),
             "enforce_eager": effective_enforce_eager,
@@ -1096,25 +1121,15 @@ class GenerationPool:
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
-            "enable_sleep_mode": self.sleep_requested,
             "sleep_level": self.sleep_level,
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
-        def start_worker(r):
-            p = ctx.Process(
-                target=worker_target,
-                args=(r, (gpu_groups[r] if self.backend == "vllm"
-                          else gpu_groups[r][0]), model_name, max_seq_length,
-                      load_in_4bit, self.task_queues[r], self.result_queue,
-                      ready_queue, self.seed),
-                kwargs=worker_options,
-                # vLLM may manage child processes depending on its version and
-                # engine settings; Python daemonic processes cannot do that.
-                daemon=(self.backend != "vllm"),
-            )
-            p.start()
-            self.procs.append(p)
+        self._load_in_4bit = bool(load_in_4bit)
+        self._startup_timeout = _positive_env_timeout(
+            "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
+        self._sleep_capable_workers = set()
+        self._ready_worker_ids = set()
 
         # Large first loads are optionally serialized by independent engine.
         # This prevents concurrent checkpoint materialization/page-cache spikes
@@ -1125,86 +1140,182 @@ class GenerationPool:
         mode = " one at a time" if staged else ""
         print(f"[pool] loading {self.num_workers} {self.backend} engine(s){mode} "
               f"on {requested_num_gpus} GPU(s) ...", flush=True)
-        loaded = 0
-        sleep_capable = 0
-        startup_timeout = _positive_env_timeout(
-            "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
-
-        def wait_until(target, deadline):
-            nonlocal loaded, sleep_capable
-            while loaded < target:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.shutdown()
-                    raise TimeoutError(
-                        f"vLLM startup exceeded {startup_timeout:.0f}s while "
-                        f"waiting for {loaded}/{self.num_workers} engines; "
-                        f"details: {self.vllm_log_path or 'console'}")
-                try:
-                    status, rank, detail = ready_queue.get(
-                        timeout=min(1.0, remaining))
-                except queue.Empty:
-                    dead = [
-                        (idx, proc.exitcode)
-                        for idx, proc in enumerate(self.procs)
-                        if proc.exitcode is not None
-                    ]
-                    if dead:
-                        self.shutdown()
-                        raise RuntimeError(
-                            "generation worker(s) exited during startup: "
-                            f"{dead}")
-                    continue
-                if status == "error":
-                    self.shutdown()
-                    raise RuntimeError(
-                        f"{self.backend} generation worker {rank} failed to "
-                        f"start:\n{detail}")
-                if str(detail).startswith("sleep:"):
-                    sleep_capable += 1
-                loaded += 1
-                print(f"[pool] {loaded}/{self.num_workers} workers ready",
-                      flush=True)
-
-        if staged:
-            for rank in range(self.num_workers):
-                start_worker(rank)
-                wait_until(loaded + 1, time.monotonic() + startup_timeout)
-        else:
-            for rank in range(self.num_workers):
-                start_worker(rank)
-            wait_until(
-                self.num_workers, time.monotonic() + startup_timeout)
+        self._staged_loading = staged
+        self._start_workers(range(self.num_workers), initial=True)
         self.sleep_supported = bool(
             self.backend == "vllm" and self.sleep_requested
-            and sleep_capable == self.num_workers)
+            and self.persistent_workers > 0
+            and set(self._persistent_worker_ids).issubset(
+                self._sleep_capable_workers))
 
-    def _vllm_control(self, command):
+    def _start_worker(self, rank):
+        rank = int(rank)
+        current = self.procs[rank]
+        if current is not None and current.is_alive():
+            raise RuntimeError(f"generation worker {rank} is already alive")
+        task_queue = self._ctx.Queue()
+        self.task_queues[rank] = task_queue
+        worker_options = dict(self._worker_options)
+        worker_options["enable_sleep_mode"] = bool(
+            self.sleep_requested
+            and rank in self._persistent_worker_ids)
+        process = self._ctx.Process(
+            target=self._worker_target,
+            args=(
+                rank,
+                (self._gpu_groups[rank] if self.backend == "vllm"
+                 else self._gpu_groups[rank][0]),
+                self.model_name,
+                self.max_seq_length,
+                self._load_in_4bit,
+                task_queue,
+                self.result_queue,
+                self._ready_queue,
+                self.seed,
+            ),
+            kwargs=worker_options,
+            # vLLM may manage child processes depending on its version and
+            # engine settings; Python daemonic processes cannot do that.
+            daemon=(self.backend != "vllm"),
+        )
+        self.procs[rank] = process
+        process.start()
+
+    def _wait_workers(self, worker_ids):
+        pending = {int(rank) for rank in worker_ids}
+        deadline = time.monotonic() + self._startup_timeout
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.shutdown()
+                raise TimeoutError(
+                    f"vLLM startup exceeded {self._startup_timeout:.0f}s "
+                    f"while waiting for workers {sorted(pending)}; details: "
+                    f"{self.vllm_log_path or 'console'}")
+            try:
+                status, rank, detail = self._ready_queue.get(
+                    timeout=min(1.0, remaining))
+            except queue.Empty:
+                dead = [
+                    (rank, None if self.procs[rank] is None
+                     else self.procs[rank].exitcode)
+                    for rank in pending
+                    if (self.procs[rank] is None
+                        or self.procs[rank].exitcode is not None)
+                ]
+                if dead:
+                    self.shutdown()
+                    raise RuntimeError(
+                        "generation worker(s) exited during startup: "
+                        f"{dead}")
+                continue
+            rank = int(rank)
+            if rank not in pending:
+                self.shutdown()
+                raise RuntimeError(
+                    f"unexpected startup acknowledgement from worker {rank}")
+            if status == "error":
+                self.shutdown()
+                raise RuntimeError(
+                    f"{self.backend} generation worker {rank} failed to "
+                    f"start:\n{detail}")
+            if str(detail).startswith("sleep:"):
+                self._sleep_capable_workers.add(rank)
+            self._ready_worker_ids.add(rank)
+            pending.remove(rank)
+            print(f"[pool] {len(self._ready_worker_ids)}/"
+                  f"{self.num_workers} workers ready", flush=True)
+
+    def _start_workers(self, worker_ids, *, initial=False):
+        worker_ids = tuple(int(rank) for rank in worker_ids)
+        if not worker_ids:
+            return
+        if not initial:
+            print(f"[pool] reloading {len(worker_ids)} transient "
+                  f"{self.backend} engine(s)"
+                  + (" one at a time" if self._staged_loading else "")
+                  + " ...", flush=True)
+        if self._staged_loading:
+            for rank in worker_ids:
+                self._start_worker(rank)
+                self._wait_workers((rank,))
+        else:
+            for rank in worker_ids:
+                self._start_worker(rank)
+            self._wait_workers(worker_ids)
+
+    def _stop_workers(self, worker_ids):
+        worker_ids = tuple(int(rank) for rank in worker_ids)
+        for rank in worker_ids:
+            process = self.procs[rank]
+            task_queue = self.task_queues[rank]
+            if process is not None and process.is_alive() and task_queue is not None:
+                try:
+                    task_queue.put(None)
+                except Exception:
+                    pass
+        for rank in worker_ids:
+            process = self.procs[rank]
+            task_queue = self.task_queues[rank]
+            if process is not None:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+            self.procs[rank] = None
+            self._ready_worker_ids.discard(rank)
+            self._sleep_capable_workers.discard(rank)
+            if task_queue is not None:
+                try:
+                    task_queue.close()
+                    task_queue.join_thread()
+                except (AttributeError, OSError, ValueError):
+                    pass
+            self.task_queues[rank] = None
+
+    def _vllm_control(self, command, worker_ids=None):
         if self.backend != "vllm":
             raise RuntimeError("sleep/wake controls are only valid for vLLM")
         if not self.sleep_supported:
             raise RuntimeError("the installed vLLM engine lacks sleep mode")
-        for task_queue in self.task_queues:
+        worker_ids = tuple(
+            self._persistent_worker_ids
+            if worker_ids is None else (int(rank) for rank in worker_ids))
+        for rank in worker_ids:
+            process = self.procs[rank]
+            task_queue = self.task_queues[rank]
+            if (process is None or not process.is_alive()
+                    or task_queue is None):
+                raise RuntimeError(
+                    f"vLLM worker {rank} is unavailable during {command}")
             task_queue.put(("__control__", command))
-        completed = 0
+        completed_workers = set()
         control_timeout = _positive_env_timeout(
             "TTT_VLLM_CONTROL_TIMEOUT_S", 600.0)
         control_deadline = time.monotonic() + control_timeout
-        while completed < self.num_workers:
+        while len(completed_workers) < len(worker_ids):
             remaining = control_deadline - time.monotonic()
             if remaining <= 0:
                 self.shutdown()
                 raise TimeoutError(
                     f"vLLM {command} exceeded {control_timeout:.0f}s while "
-                    f"waiting for {completed}/{self.num_workers} engines; "
+                    f"waiting for {len(completed_workers)}/"
+                    f"{len(worker_ids)} engines; "
                     f"details: {self.vllm_log_path or 'console'}")
             try:
                 status, rank, got_command, detail = self.control_queue.get(
                     timeout=min(1.0, remaining))
             except queue.Empty:
-                dead = [(idx, proc.exitcode)
-                        for idx, proc in enumerate(self.procs)
-                        if proc.exitcode is not None]
+                dead = [
+                    (rank, None if self.procs[rank] is None
+                     else self.procs[rank].exitcode)
+                    for rank in worker_ids
+                    if (self.procs[rank] is None
+                        or self.procs[rank].exitcode is not None)
+                ]
                 if dead:
                     raise RuntimeError(
                         f"vLLM worker(s) exited during {command}: {dead}")
@@ -1215,16 +1326,30 @@ class GenerationPool:
             if got_command != command:
                 raise RuntimeError(
                     f"unexpected vLLM control acknowledgement {got_command!r}")
-            completed += 1
+            if int(rank) not in worker_ids:
+                raise RuntimeError(
+                    f"unexpected vLLM control worker {rank} during {command}")
+            if int(rank) in completed_workers:
+                raise RuntimeError(
+                    f"duplicate vLLM control acknowledgement from worker "
+                    f"{rank} during {command}")
+            completed_workers.add(int(rank))
 
     def sleep(self):
-        self._vllm_control("sleep")
+        # Stop transient engines first. Creating the sole persistent worker's
+        # host-RAM backup afterwards avoids a temporary peak containing both
+        # that backup and all transient engine processes.
+        self._stop_workers(self._transient_worker_ids)
+        self._vllm_control("sleep", self._persistent_worker_ids)
 
     def wake_up(self):
         _assert_vllm_memory_available(
             self.gpu_ids, self.vllm_gpu_memory_utilization,
             self.model_name)
-        self._vllm_control("wake_up")
+        # Wake the RAM-resident engine before loading transient checkpoints so
+        # its offloaded weights leave host memory as early as vLLM permits.
+        self._vllm_control("wake_up", self._persistent_worker_ids)
+        self._start_workers(self._transient_worker_ids)
 
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
@@ -1273,9 +1398,10 @@ class GenerationPool:
                 try:
                     rank, group_idx, job_results = self.result_queue.get(timeout=1.0)
                 except queue.Empty:
-                    dead = [(idx, proc.exitcode)
-                            for idx, proc in enumerate(self.procs)
-                            if proc.exitcode is not None]
+                    dead = [
+                        (idx, None if proc is None else proc.exitcode)
+                        for idx, proc in enumerate(self.procs)
+                        if proc is None or proc.exitcode is not None]
                     if dead:
                         raise RuntimeError(
                             f"generation worker(s) exited during inference: {dead}")
@@ -1348,9 +1474,10 @@ class GenerationPool:
                     rank, group_idx, job_results = self.result_queue.get(
                         timeout=1.0)
                 except queue.Empty:
-                    dead = [(idx, proc.exitcode)
-                            for idx, proc in enumerate(self.procs)
-                            if proc.exitcode is not None]
+                    dead = [
+                        (idx, None if proc is None else proc.exitcode)
+                        for idx, proc in enumerate(self.procs)
+                        if proc is None or proc.exitcode is not None]
                     if dead:
                         raise RuntimeError(
                             "vLLM worker(s) exited during reference scoring: "
@@ -1404,19 +1531,7 @@ class GenerationPool:
         return by_group
 
     def shutdown(self):
-        for r in range(self.num_workers):
-            try:
-                self.task_queues[r].put(None)
-            except Exception:
-                pass
-        for p in self.procs:
-            p.join(timeout=10)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=10)
-            if p.is_alive():
-                p.kill()
-                p.join(timeout=5)
+        self._stop_workers(range(self.num_workers))
 
 
 class HybridHFGenerationPool:
@@ -1631,10 +1746,19 @@ class PhasedVLLMGenerationPool:
                             flush=True,
                         )
                     elif self._persistent:
-                        detail = (
-                            "weights discarded; no host-RAM backups"
-                            if self._sleep_level == 2 else
-                            "weights backed up in host RAM")
+                        persistent_workers = int(getattr(
+                            self._pool, "persistent_workers",
+                            self.num_workers))
+                        if persistent_workers < self.num_workers:
+                            detail = (
+                                f"{persistent_workers}/{self.num_workers} "
+                                "engine(s) backed up in host RAM; remaining "
+                                "engines reload each phase")
+                        else:
+                            detail = (
+                                "weights discarded; no host-RAM backups"
+                                if self._sleep_level == 2 else
+                                "weights backed up in host RAM")
                         prefix = (
                             f"{self._level_one_override_model} persistent "
                             "vLLM sleep level 1"

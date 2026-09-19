@@ -75,6 +75,7 @@ feedback_max_per_signature feedback_auto_signature_fraction
 COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
     "fused_long_attention",
+    "strategy_vllm_persistent_workers",
     "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
@@ -259,6 +260,12 @@ def validate_problem_config(
     for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
         if key in data and int(data[key]) not in (1, 2):
             raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
+    if "strategy_vllm_persistent_workers" in data:
+        value = data["strategy_vllm_persistent_workers"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{_label(source)}: strategy_vllm_persistent_workers must "
+                "be a nonnegative integer")
     for key in ("vllm_staged_loading", "strategy_vllm_staged_loading"):
         if key in data and not isinstance(data[key], bool):
             raise ValueError(

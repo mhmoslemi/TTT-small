@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import call, mock_open, patch
 
@@ -291,6 +292,56 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(attempted_maxima, [4, 2])
         self.assertEqual(max(len(batch) for batch in effective), 2)
         self.assertEqual(quarantined, [])
+
+    def test_training_singleton_uses_reserved_memory_before_quarantine(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        example = {
+            "prompt_ids": torch.zeros((1, 1), dtype=torch.long),
+            "response_ids": torch.zeros((1, 1), dtype=torch.long),
+        }
+        attempts = []
+        expansions = []
+
+        def attempt(_batches):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            model(torch.ones((1, 2))).sum().backward()
+            return "trained"
+
+        def expand_memory():
+            expansions.append(True)
+            return 0.96
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    return_value=nullcontext())):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0",
+                expand_memory=expand_memory)
+
+        self.assertEqual(result, "trained")
+        self.assertEqual(attempts, [1, 2, 3])
+        self.assertEqual(expansions, [True])
+        self.assertEqual(effective, [[example]])
+        self.assertEqual(quarantined, [])
+
+    def test_long_rollout_ceiling_counts_other_gpu_processes(self):
+        from fast_distributed import set_long_rollout_memory_ceiling
+
+        with (patch("torch.cuda.device", return_value=nullcontext()),
+              patch("torch.cuda.empty_cache"),
+              patch("torch.cuda.memory_allocated", return_value=200),
+              patch("torch.cuda.memory_reserved", return_value=100),
+              patch("torch.cuda.mem_get_info", return_value=(800, 1000)),
+              patch("torch.cuda.set_per_process_memory_fraction") as setter):
+            actual = set_long_rollout_memory_ceiling(2)
+
+        self.assertAlmostEqual(actual, 0.86)
+        setter.assert_called_once_with(0.86, device=2)
 
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
         from train_multy import (_resolve_training_backend,
@@ -1158,6 +1209,133 @@ class VLLMBackendTests(unittest.TestCase):
     def test_generation_pool_rejects_unknown_backend_before_spawning(self):
         with self.assertRaisesRegex(ValueError, r"expected hf\|vllm"):
             GenerationPool("org/model", 1, backend="vision")
+
+    def test_mixed_vllm_pool_keeps_one_engine_and_reloads_the_rest(self):
+        created = []
+
+        class HookQueue(_Queue):
+            def __init__(self):
+                super().__init__()
+                self.owner = None
+
+            def put(self, item):
+                super().put(item)
+                if self.owner is None:
+                    return
+                if item is None:
+                    self.owner.alive = False
+                    self.owner.exitcode = 0
+                elif (isinstance(item, tuple) and len(item) >= 2
+                      and item[0] == "__control__"):
+                    command = item[1]
+                    self.owner.control_queue.put((
+                        "ok", self.owner.rank, command, ""))
+
+            def close(self):
+                pass
+
+            def join_thread(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self, *, target, args, kwargs, daemon):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs
+                self.daemon = daemon
+                self.rank = int(args[0])
+                self.task_queue = args[5]
+                self.ready_queue = args[7]
+                self.control_queue = kwargs["control_queue"]
+                self.alive = False
+                self.exitcode = None
+                created.append(self)
+
+            def start(self):
+                self.alive = True
+                self.task_queue.owner = self
+                detail = (
+                    f"sleep:{self.kwargs['sleep_level']}"
+                    if self.kwargs["enable_sleep_mode"] else "")
+                self.ready_queue.put(("ready", self.rank, detail))
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                pass
+
+            def terminate(self):
+                self.alive = False
+                self.exitcode = -15
+
+            def kill(self):
+                self.alive = False
+                self.exitcode = -9
+
+        class FakeContext:
+            def Queue(self):
+                return HookQueue()
+
+            def Process(self, **kwargs):
+                return FakeProcess(**kwargs)
+
+        with (patch("gen_workers.mp.get_context",
+                    return_value=FakeContext()),
+              patch("gen_workers._assert_vllm_memory_available"),
+              patch("gen_workers._resolve_vllm_enforce_eager",
+                    return_value=(False, False))):
+            pool = GenerationPool(
+                "openai/gpt-oss-120b", 8,
+                gpu_ids=list(range(8)), backend="vllm",
+                vllm_tensor_parallel_size=2,
+                vllm_enable_sleep_mode=True,
+                vllm_sleep_level=1,
+                vllm_persistent_workers=1,
+                vllm_staged_loading=True,
+            )
+            initial = list(created)
+            self.assertEqual(pool.num_workers, 4)
+            self.assertEqual(pool.persistent_workers, 1)
+            self.assertEqual(
+                [item.kwargs["enable_sleep_mode"] for item in initial],
+                [True, False, False, False])
+
+            pool.sleep()
+            self.assertTrue(pool.procs[0].is_alive())
+            self.assertEqual(pool.procs[1:], [None, None, None])
+
+            pool.wake_up()
+            self.assertTrue(all(process.is_alive()
+                                for process in pool.procs))
+            self.assertEqual(len(created), 7)
+            self.assertTrue(all(
+                not item.kwargs["enable_sleep_mode"]
+                for item in created[4:]))
+            pool.shutdown()
+
+            coder_start = len(created)
+            coder_pool = GenerationPool(
+                "Qwen/Qwen3-Coder-30B-A3B-Instruct", 8,
+                gpu_ids=list(range(8)), backend="vllm",
+                vllm_tensor_parallel_size=1,
+                vllm_enable_sleep_mode=True,
+                vllm_sleep_level=1,
+                vllm_staged_loading=True,
+            )
+            self.assertEqual(coder_pool.num_workers, 8)
+            self.assertEqual(coder_pool.persistent_workers, 8)
+            self.assertTrue(all(
+                item.kwargs["enable_sleep_mode"]
+                for item in created[coder_start:]))
+            loaded_coder_processes = len(created)
+            coder_pool.sleep()
+            coder_pool.wake_up()
+            self.assertEqual(len(created), loaded_coder_processes)
+            coder_pool.shutdown()
+
+        self.assertEqual(pool.procs, [None, None, None, None])
+        self.assertEqual(coder_pool.procs, [None] * 8)
 
     def test_small_prompt_jobs_rotate_across_all_workers(self):
         jobs = distribute_jobs(["a", "b", "c", "d"], 1, 3)

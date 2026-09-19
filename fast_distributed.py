@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import traceback
 
 
+STANDARD_TRAINING_MEMORY_FRACTION = 0.80
+LONG_ROLLOUT_MEMORY_FRACTION = 0.96
+
+
 def trainable_parameters(model):
     return [parameter for parameter in model.parameters()
             if parameter.requires_grad]
@@ -39,25 +43,35 @@ def validate_model_device(model, logical_id):
             f"{expected}, but also found {sorted(wrong)}")
 
 
-def set_allocator_memory_ceiling(logical_id, fraction=0.80):
-    """Make 80% an allocator limit, not merely a post-hoc target."""
+def _set_allocator_memory_ceiling(logical_id, fraction, *, maximum, label):
     import torch
 
     fraction = float(fraction)
-    if not 0.0 < fraction <= 0.80:
-        raise ValueError("fast trainer allocator ceiling must be in (0, 0.80]")
+    if not 0.0 < fraction <= float(maximum):
+        raise ValueError(
+            f"{label} allocator ceiling must be in (0, {maximum:.2f}]")
     with torch.cuda.device(int(logical_id)):
         torch.cuda.set_per_process_memory_fraction(
             fraction, device=int(logical_id))
 
 
-def set_total_memory_ceiling(logical_id, fraction=0.80):
-    """Cap this allocator so it plus already-used device memory stays bounded."""
+def set_allocator_memory_ceiling(
+        logical_id, fraction=STANDARD_TRAINING_MEMORY_FRACTION):
+    """Make 80% an allocator limit, not merely a post-hoc target."""
+    return _set_allocator_memory_ceiling(
+        logical_id, fraction,
+        maximum=STANDARD_TRAINING_MEMORY_FRACTION,
+        label="fast trainer")
+
+
+def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label):
+    """Cap this allocator plus allocations owned by other GPU processes."""
     import torch
 
     fraction = float(fraction)
-    if not 0.0 < fraction <= 0.80:
-        raise ValueError("fast trainer total memory ceiling must be in (0, 0.80]")
+    if not 0.0 < fraction <= float(maximum):
+        raise ValueError(
+            f"{label} total memory ceiling must be in (0, {maximum:.2f}]")
     with torch.cuda.device(int(logical_id)):
         # Release only unused cache before measuring the model's persistent base.
         # This runs at worker load/update boundaries, never per microbatch.
@@ -71,13 +85,39 @@ def set_total_memory_ceiling(logical_id, fraction=0.80):
         if process_limit <= allocated:
             occupied = (outside_allocator + allocated) / max(1, int(total_bytes))
             raise RuntimeError(
-                f"fast trainer rank {logical_id} already needs "
+                f"{label} rank {logical_id} already needs "
                 f"{100.0 * occupied:.1f}% GPU memory before a batch, so the "
                 f"{100.0 * fraction:.0f}% total ceiling cannot be honored")
         allocator_fraction = min(
             fraction, process_limit / max(1, int(total_bytes)))
-        set_allocator_memory_ceiling(logical_id, allocator_fraction)
+        _set_allocator_memory_ceiling(
+            logical_id, allocator_fraction,
+            maximum=maximum, label=label)
         return allocator_fraction
+
+
+def set_total_memory_ceiling(
+        logical_id, fraction=STANDARD_TRAINING_MEMORY_FRACTION):
+    """Apply the normal conservative limit used by adaptive microbatches."""
+    return _set_total_memory_ceiling(
+        logical_id, fraction,
+        maximum=STANDARD_TRAINING_MEMORY_FRACTION,
+        label="fast trainer")
+
+
+def set_long_rollout_memory_ceiling(
+        logical_id, fraction=LONG_ROLLOUT_MEMORY_FRACTION):
+    """Use reserved card headroom for an otherwise untrainable singleton.
+
+    This is reached only after the batch has been reduced to one rollout and
+    saved activations have already been moved to CPU. External allocations
+    (including sleeping vLLM processes and NCCL) remain part of the total, so
+    the final four percent of the card is still left untouched.
+    """
+    return _set_total_memory_ceiling(
+        logical_id, fraction,
+        maximum=LONG_ROLLOUT_MEMORY_FRACTION,
+        label="long-rollout rescue")
 
 
 def broadcast_trainable_parameters(model, source_rank=0):
@@ -409,6 +449,22 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     peak_memory_fraction = 0.0
     feedback_parts = []
     budget = max(1, int(token_budget or cfg.max_seq_length))
+    emergency_allocator_fraction = None
+
+    def expand_for_long_rollout():
+        nonlocal allocator_fraction, emergency_allocator_fraction
+        if emergency_allocator_fraction is not None:
+            return emergency_allocator_fraction
+        try:
+            emergency_allocator_fraction = (
+                set_long_rollout_memory_ceiling(logical_id))
+        except RuntimeError as error:
+            print(f"[train-oom] cuda:{logical_id}: reserved GPU headroom is "
+                  f"unavailable ({error})", flush=True)
+            return None
+        allocator_fraction = max(
+            allocator_fraction, emergency_allocator_fraction)
+        return emergency_allocator_fraction
 
     examples = list(examples or ())
     if work_queue is not None and examples:
@@ -659,7 +715,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
             result, effective_batches, quarantined = (
                 training._run_oom_resilient_backward(
                     model, [local_batch], attempt,
-                    device_label=f"cuda:{logical_id}"))
+                    device_label=f"cuda:{logical_id}",
+                    expand_memory=expand_for_long_rollout))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
@@ -750,6 +807,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         "trained_examples": trained_examples,
         "peak_memory_fraction": peak_memory_fraction,
         "allocator_memory_fraction": allocator_fraction,
+        "long_rollout_memory_rescue": (
+            emergency_allocator_fraction is not None),
         "token_budget": budget,
         "feedback_stats": _feedback_stats_dict(merged_feedback),
     }
