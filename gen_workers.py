@@ -60,6 +60,13 @@ import time
 import traceback
 import multiprocessing as mp
 
+# Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
+# process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
+# metadata. Two alternating, RAM-resident pools therefore cannot each claim
+# 90% of the same card. Keep enough unclaimed memory for the inactive pool.
+VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 12.0
+VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
+
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
 # Fall back to a coarse print bar if it isn't, so nothing depends on it.
 try:
@@ -992,6 +999,44 @@ def _assert_vllm_memory_available(gpu_ids, utilization, model_name):
             + "; ".join(deficits) + ")")
 
 
+def _vllm_utilization_with_reserve(utilization, total_gib, reserve_gib):
+    """Cap an allocator fraction while leaving an absolute per-GPU reserve."""
+    utilization = float(utilization)
+    total_gib = float(total_gib)
+    reserve_gib = float(reserve_gib)
+    if total_gib <= 0.0:
+        return utilization
+    cap = (total_gib - reserve_gib) / total_gib
+    if cap <= 0.0:
+        raise RuntimeError(
+            f"cannot reserve {reserve_gib:.1f} GiB on a {total_gib:.1f}-GiB "
+            "GPU for co-resident vLLM sleep state")
+    return min(utilization, cap)
+
+
+def _cap_vllm_utilization_for_gpus(utilization, gpu_ids, *, reserve_gib,
+                                   reserve_from_free=False):
+    """Apply one conservative allocator fraction across a TP/PP GPU group."""
+    try:
+        from gpu_runtime import query_gpu_memory
+        memory = query_gpu_memory()
+    except Exception:
+        return float(utilization)
+    caps = []
+    for gpu_id in gpu_ids:
+        item = memory.get(int(gpu_id))
+        if item is None:
+            continue
+        available = (float(item.free_gib) if reserve_from_free
+                     else float(item.total_gib))
+        caps.append(_vllm_utilization_with_reserve(
+            utilization,
+            float(item.total_gib),
+            float(item.total_gib) - available + float(reserve_gib),
+        ))
+    return min(caps, default=float(utilization))
+
+
 class GenerationPool:
     """
     Manages persistent generation processes. HF uses one engine per GPU. vLLM
@@ -1015,6 +1060,7 @@ class GenerationPool:
                  vllm_enable_sleep_mode=False,
                  vllm_sleep_level=1,
                  vllm_persistent_workers=None,
+                 vllm_co_resident_sleep=False,
                  vllm_staged_loading=False,
                  vllm_log_path=None):
         self.model_name = model_name
@@ -1024,8 +1070,9 @@ class GenerationPool:
         self.max_seq_length = int(max_seq_length)
         self.gen_micro_batch = int(gen_micro_batch or 0)
         self.backend = str(backend).lower()
-        self.vllm_gpu_memory_utilization = float(
-            vllm_gpu_memory_utilization)
+        requested_vllm_utilization = float(vllm_gpu_memory_utilization)
+        self.vllm_co_resident_sleep = bool(vllm_co_resident_sleep)
+        self.vllm_gpu_memory_utilization = requested_vllm_utilization
         self.sleep_requested = bool(vllm_enable_sleep_mode)
         self.sleep_level = int(vllm_sleep_level)
         if self.sleep_level not in (1, 2):
@@ -1057,6 +1104,24 @@ class GenerationPool:
             raise ValueError("gpu_ids must contain exactly num_workers entries")
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must not contain duplicates")
+
+        if self.backend == "vllm" and self.vllm_co_resident_sleep:
+            self.vllm_gpu_memory_utilization = (
+                _cap_vllm_utilization_for_gpus(
+                    requested_vllm_utilization,
+                    self.gpu_ids,
+                    reserve_gib=VLLM_CORESIDENT_SLEEP_RESERVE_GIB,
+                ))
+            if (self.vllm_gpu_memory_utilization
+                    < requested_vllm_utilization - 1e-9):
+                print(
+                    "[pool] shared sleep residency: reserving at least "
+                    f"{VLLM_CORESIDENT_SLEEP_RESERVE_GIB:.1f} GiB/GPU; "
+                    "vLLM utilization "
+                    f"{requested_vllm_utilization:.3f} -> "
+                    f"{self.vllm_gpu_memory_utilization:.3f}",
+                    flush=True,
+                )
 
         if self.backend == "vllm":
             pp = int(vllm_pipeline_parallel_size or 1)
@@ -1116,14 +1181,15 @@ class GenerationPool:
 
         if self.backend == "vllm":
             _assert_vllm_memory_available(
-                self.gpu_ids, vllm_gpu_memory_utilization, model_name)
+                self.gpu_ids, self.vllm_gpu_memory_utilization, model_name)
 
         self.procs = [None for _ in range(self.num_workers)]
         self._worker_target = (_vllm_worker_loop
                                if self.backend == "vllm" else _hf_worker_loop)
         self._worker_options = {
             "lora_rank": int(lora_rank),
-            "gpu_memory_utilization": float(vllm_gpu_memory_utilization),
+            "gpu_memory_utilization": float(
+                self.vllm_gpu_memory_utilization),
             "enforce_eager": effective_enforce_eager,
             "enable_prefix_caching": bool(vllm_enable_prefix_caching),
             "gen_micro_batch": self.gen_micro_batch,
@@ -1176,6 +1242,21 @@ class GenerationPool:
         task_queue = self._ctx.Queue()
         self.task_queues[rank] = task_queue
         worker_options = dict(self._worker_options)
+        startup_utilization = _cap_vllm_utilization_for_gpus(
+            worker_options["gpu_memory_utilization"],
+            self._gpu_groups[rank],
+            reserve_gib=VLLM_STARTUP_FREE_MARGIN_GIB,
+            reserve_from_free=True,
+        )
+        if (startup_utilization
+                < worker_options["gpu_memory_utilization"] - 1e-9):
+            print(
+                f"[pool] worker {rank}: current free memory lowers vLLM "
+                f"utilization {worker_options['gpu_memory_utilization']:.3f} "
+                f"-> {startup_utilization:.3f}",
+                flush=True,
+            )
+            worker_options["gpu_memory_utilization"] = startup_utilization
         worker_options["enable_sleep_mode"] = bool(
             self.sleep_requested
             and rank in self._persistent_worker_ids)
@@ -1363,9 +1444,15 @@ class GenerationPool:
         self._vllm_control("sleep", self._persistent_worker_ids)
 
     def wake_up(self):
-        _assert_vllm_memory_available(
-            self.gpu_ids, self.vllm_gpu_memory_utilization,
-            self.model_name)
+        if not self.vllm_co_resident_sleep:
+            _assert_vllm_memory_available(
+                self.gpu_ids, self.vllm_gpu_memory_utilization,
+                self.model_name)
+        # For co-resident pools, a full-budget preflight is mathematically
+        # wrong: this pool's untagged CUDA/NCCL allocations are already part
+        # of the used-memory reading, and wake_up only restores its released
+        # tagged allocations. The fixed outside-vLLM reserve above protects
+        # that delta while the other pool remains asleep.
         # Wake the RAM-resident engine before loading transient checkpoints so
         # its offloaded weights leave host memory as early as vLLM permits.
         self._vllm_control("wake_up", self._persistent_worker_ids)

@@ -7350,6 +7350,10 @@ def main():
         from gen_workers import (GenerationPool, HybridHFGenerationPool,
                                  PhasedVLLMGenerationPool, worker_seed)
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
+        separate_strategy_pool = bool(
+            cfg.generation_backend == "vllm"
+            and getattr(problem, "two_stage_rollouts", False)
+            and cfg.strategy_model_name != cfg.model_name)
         pool_options = dict(
             model_name=cfg.model_name,
             num_workers=cfg.num_gpus,
@@ -7370,6 +7374,10 @@ def main():
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
             vllm_sleep_level=cfg.vllm_sleep_level,
+            # The distinct strategist and coder pools alternate on the same
+            # cards while retaining level-1 host backups. Account for the
+            # inactive pool's residual CUDA/NCCL state in both directions.
+            vllm_co_resident_sleep=separate_strategy_pool,
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
         )
@@ -7449,8 +7457,7 @@ def main():
             )
             print(f"[init] phase-shared vLLM pool configured across all "
                   f"rollout GPUs {gpu_ids}")
-            if (getattr(problem, "two_stage_rollouts", False)
-                    and cfg.strategy_model_name != cfg.model_name):
+            if separate_strategy_pool:
                 strategy_pool_options = dict(pool_options)
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,

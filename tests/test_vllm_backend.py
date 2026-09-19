@@ -22,6 +22,7 @@ from gen_workers import (
     _resolve_vllm_enforce_eager,
     _vllm_engine_kwargs,
     _vllm_job_seed,
+    _vllm_utilization_with_reserve,
     _vllm_worker_loop,
 )
 from feedback import FeedbackConfig, is_code_failure, render_chat
@@ -1099,6 +1100,12 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIs(kwargs["enable_sleep_mode"], True)
         self.assertIs(kwargs["disable_custom_all_reduce"], True)
 
+    def test_shared_sleep_reserve_caps_vllm_utilization(self):
+        capped = _vllm_utilization_with_reserve(0.9, 94.97, 12.0)
+        self.assertAlmostEqual(capped, (94.97 - 12.0) / 94.97)
+        self.assertEqual(
+            _vllm_utilization_with_reserve(0.8, 94.97, 12.0), 0.8)
+
     def test_vllm_engine_kwargs_omit_optional_limits(self):
         kwargs = _vllm_engine_kwargs(
             model_name="org/model",
@@ -1282,9 +1289,20 @@ class VLLMBackendTests(unittest.TestCase):
             def Process(self, **kwargs):
                 return FakeProcess(**kwargs)
 
+        fake_memory = {
+            gpu_id: GPUMemory(
+                physical_id=gpu_id,
+                name="RTX PRO 6000 Blackwell",
+                total_gib=94.97,
+                free_gib=85.40,
+            )
+            for gpu_id in range(8)
+        }
         with (patch("gen_workers.mp.get_context",
                     return_value=FakeContext()),
-              patch("gen_workers._assert_vllm_memory_available"),
+              patch("gen_workers._assert_vllm_memory_available") as memory_check,
+              patch("gpu_runtime.query_gpu_memory",
+                    return_value=fake_memory),
               patch("gen_workers._resolve_vllm_enforce_eager",
                     return_value=(False, False))):
             pool = GenerationPool(
@@ -1294,6 +1312,7 @@ class VLLMBackendTests(unittest.TestCase):
                 vllm_enable_sleep_mode=True,
                 vllm_sleep_level=1,
                 vllm_persistent_workers=1,
+                vllm_co_resident_sleep=True,
                 vllm_staged_loading=True,
             )
             initial = list(created)
@@ -1305,12 +1324,21 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertTrue(all(
                 item.kwargs["disable_custom_all_reduce"]
                 for item in initial))
+            shared_utilization = (94.97 - 12.0) / 94.97
+            self.assertTrue(all(
+                abs(item.kwargs["gpu_memory_utilization"]
+                    - shared_utilization) < 1e-9
+                for item in initial))
 
             pool.sleep()
             self.assertTrue(pool.procs[0].is_alive())
             self.assertEqual(pool.procs[1:], [None, None, None])
 
             pool.wake_up()
+            # Construction checks the complete allocation. A co-resident
+            # wake restores only allocations released by this same process,
+            # so it must not falsely require the complete budget to be free.
+            self.assertEqual(memory_check.call_count, 1)
             self.assertTrue(all(process.is_alive()
                                 for process in pool.procs))
             self.assertEqual(len(created), 7)
@@ -1326,6 +1354,7 @@ class VLLMBackendTests(unittest.TestCase):
                 vllm_tensor_parallel_size=1,
                 vllm_enable_sleep_mode=True,
                 vllm_sleep_level=1,
+                vllm_co_resident_sleep=True,
                 vllm_staged_loading=True,
             )
             self.assertEqual(coder_pool.num_workers, 8)
@@ -1336,9 +1365,14 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertTrue(all(
                 not item.kwargs["disable_custom_all_reduce"]
                 for item in created[coder_start:]))
+            self.assertTrue(all(
+                abs(item.kwargs["gpu_memory_utilization"]
+                    - shared_utilization) < 1e-9
+                for item in created[coder_start:]))
             loaded_coder_processes = len(created)
             coder_pool.sleep()
             coder_pool.wake_up()
+            self.assertEqual(memory_check.call_count, 2)
             self.assertEqual(len(created), loaded_coder_processes)
             coder_pool.shutdown()
 
