@@ -437,36 +437,31 @@ def _expert_count(model_config) -> int:
 
 
 def _prepare_sparse_moe_for_kbit_training(model):
-    """Freeze a partly quantized MoE without FP32-expanding its experts.
+    """Freeze a partly quantized MoE without changing its forward dtypes.
 
     Some MoE implementations store all expert projections in packed 3-D
     Parameters instead of ``nn.Linear`` modules.  BitsAndBytes therefore leaves
     those frozen tensors in checkpoint precision.  PEFT's generic k-bit
     preparation casts every non-4-bit FP16/BF16 Parameter to FP32, which can
     nearly double a sparse model's resident size even though those expert
-    weights will never be trained.  Only the small norm/bias vectors need the
-    usual FP32 treatment here; all matrix and packed-expert base weights remain
-    frozen in their existing dtype.
+    weights will never be trained.  Mixing FP32 norm vectors with checkpoint-
+    precision router/expert matrices is also invalid for implementations such
+    as Qwen3-MoE: the norm promotes hidden states to FP32, then the BF16 router
+    receives mismatched inputs.  Keep every frozen base tensor in its original
+    dtype; LoRA parameters are attached separately below.
     """
-    cast_parameters = 0
-    cast_values = 0
+    retained_parameters = 0
     retained_values = 0
     for parameter in model.parameters():
         parameter.requires_grad = False
-        if (parameter.dtype not in (torch.float16, torch.bfloat16)
-                or parameter.__class__.__name__ == "Params4bit"):
-            continue
-        if parameter.ndim <= 1:
-            parameter.data = parameter.data.to(torch.float32)
-            cast_parameters += 1
-            cast_values += int(parameter.numel())
-        else:
+        if parameter.dtype in (torch.float16, torch.bfloat16):
+            retained_parameters += 1
             retained_values += int(parameter.numel())
     print(
         "[memory] sparse-MoE k-bit preparation: froze base weights; "
-        f"cast {cast_parameters} norm/bias tensors ({cast_values:,} values) "
-        f"to FP32; kept {retained_values:,} frozen matrix/expert values in "
-        "checkpoint precision",
+        f"kept {retained_parameters} FP16/BF16 tensors "
+        f"({retained_values:,} values) in checkpoint precision so norms, "
+        "routers, and experts use compatible dtypes",
         flush=True,
     )
     return model
