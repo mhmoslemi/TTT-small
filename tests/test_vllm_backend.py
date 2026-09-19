@@ -1288,7 +1288,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(scores, [[-0.25]])
         self.assertEqual(got_again, [(0, [("ok", [1])])])
         self.assertEqual(events, [
-            ("offload", None), ("start", (True, 2)),
+            ("offload", None), ("start", (True, 1)),
             ("generate", None), ("score", [([1], [2])]),
             ("sleep", None), ("restore", None),
             ("offload", None), ("wake", None), ("generate", None),

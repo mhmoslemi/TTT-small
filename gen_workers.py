@@ -1555,7 +1555,7 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self._pool_kwargs = dict(pool_kwargs)
         requested_sleep_level = int(
-            self._pool_kwargs.pop("vllm_sleep_level", 2))
+            self._pool_kwargs.pop("vllm_sleep_level", 1))
         if requested_sleep_level not in (1, 2):
             raise ValueError("vllm_sleep_level must be 1 or 2")
         model_name = str(self._pool_kwargs.get("model_name", "")).lower()
