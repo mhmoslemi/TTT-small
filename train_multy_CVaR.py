@@ -1725,6 +1725,118 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
     return (scored, entropies) if return_entropy else scored
 
 
+def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
+                                  return_entropy):
+    """Score response branches while evaluating their common prompt once.
+
+    The packed sequence contains one prompt followed by isolated response
+    branches.  Each branch resets its logical positions after the prompt and
+    the registered attention backend lets it see only the prompt and its own
+    causal history.  The prompt remains in the autograd graph, so gradients
+    from every response accumulate through it exactly; no detached-KV
+    approximation is used.
+    """
+    import torch
+
+    examples = list(examples)
+    if len(examples) < 2:
+        return None
+    components = _causal_lm_decoder_and_head(model)
+    if components is None:
+        return None
+    decoder, output_head = components
+    decoder_config = getattr(decoder, "config", None)
+    if str(getattr(decoder_config, "_attn_implementation", "")) != (
+            "ttt_blockwise_attention"):
+        return None
+
+    prompt = examples[0]["prompt_ids"]
+    if prompt.ndim != 2 or int(prompt.shape[0]) != 1:
+        return None
+    for example in examples[1:]:
+        candidate = example["prompt_ids"]
+        if (candidate.shape != prompt.shape
+                or candidate.device != prompt.device
+                or candidate.dtype != prompt.dtype
+                or not torch.equal(candidate, prompt)):
+            return None
+
+    prompt_length = int(prompt.shape[1])
+    if prompt_length < 1:
+        return None
+    device = prompt.device
+    input_parts = [prompt[0]]
+    segment_parts = [torch.zeros(
+        prompt_length, dtype=torch.long, device=device)]
+    position_parts = [torch.arange(
+        prompt_length, dtype=torch.long, device=device)]
+    response_ranges = []
+    attention_branches = []
+    cursor = prompt_length
+    for branch_index, example in enumerate(examples, start=1):
+        response = example["response_ids"]
+        if (response.ndim != 2 or int(response.shape[0]) != 1
+                or int(response.shape[1]) < 1):
+            return None
+        branch_input = response[0, :-1]
+        branch_length = int(branch_input.shape[0])
+        start = cursor
+        end = start + branch_length
+        response_ranges.append((start, end))
+        if branch_length:
+            input_parts.append(branch_input)
+            segment_parts.append(torch.full(
+                (branch_length,), branch_index,
+                dtype=torch.long, device=device))
+            position_parts.append(torch.arange(
+                prompt_length, prompt_length + branch_length,
+                dtype=torch.long, device=device))
+            attention_branches.append((start, end))
+            cursor = end
+
+    packed_ids = torch.cat(input_parts, dim=0).unsqueeze(0)
+    segments = torch.cat(segment_parts, dim=0)
+    positions = torch.cat(position_parts, dim=0)
+    compact_mask = torch.stack((segments, positions), dim=0).unsqueeze(0)
+    from model_backend import register_shared_prefix_attention_mask
+    register_shared_prefix_attention_mask(
+        compact_mask, prompt_length, attention_branches)
+
+    context = torch.enable_grad() if with_grad else torch.no_grad()
+    with context:
+        outputs = decoder(
+            input_ids=packed_ids,
+            attention_mask=compact_mask,
+            position_ids=positions.unsqueeze(0),
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            try:
+                hidden = outputs[0]
+            except (IndexError, KeyError, TypeError):
+                return None
+        prompt_last = hidden[0, prompt_length - 1:prompt_length, :]
+        scored = []
+        entropies = []
+        for example, (start, end) in zip(examples, response_ranges):
+            prediction_hidden = torch.cat(
+                (prompt_last, hidden[0, start:end, :]), dim=0)
+            targets = example["response_ids"][0]
+            result = _score_hidden_token_chunks(
+                prediction_hidden, targets, output_head,
+                chunk=chunk, with_grad=with_grad,
+                return_entropy=return_entropy)
+            if return_entropy:
+                chosen, entropy = result
+                scored.append(chosen)
+                entropies.append(entropy)
+            else:
+                scored.append(result)
+    return (scored, entropies) if return_entropy else scored
+
+
 def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
                            chunk: int = 0, *, return_entropy: bool = False):
     """
@@ -1816,6 +1928,12 @@ def compute_batched_token_logprobs(
             logprobs, entropies = result
             return [logprobs], [entropies]
         return [result]
+
+    shared = _shared_prefix_token_logprobs(
+        model, examples, chunk=chunk, with_grad=with_grad,
+        return_entropy=return_entropy)
+    if shared is not None:
+        return shared
 
     prompts = [example["prompt_ids"] for example in examples]
     responses = [example["response_ids"] for example in examples]
@@ -4369,6 +4487,8 @@ class ProcessDistributedTrainer:
 
     def _queue_examples(self, examples):
         """Queue expensive examples first; idle ranks steal the next work."""
+        import torch
+
         maximum_length = max(1, int(self.cfg.max_seq_length))
 
         def estimated_cost(example):
@@ -4377,15 +4497,65 @@ class ProcessDistributedTrainer:
             total = prompt + response
             return total * total + response * maximum_length
 
-        ordered = sorted(
-            self._cpu_examples(examples),
-            key=estimated_cost, reverse=True)
-        for example in ordered:
-            self._work_queue.put(example)
+        copied = self._cpu_examples(examples)
+        if bool(getattr(self.cfg, "strategies", False)):
+            from fast_distributed import SHARED_PREFIX_WORK_KEY
+
+            grouped = {}
+            for example in copied:
+                prompt_job_id = example.get("prompt_job_id")
+                if prompt_job_id is None:
+                    raise RuntimeError(
+                        "strategy training example has no prompt_job_id")
+                grouped.setdefault(int(prompt_job_id), []).append(example)
+
+            def group_cost(group):
+                prompt = int(group[0]["prompt_ids"].shape[1])
+                responses = [
+                    int(example["response_ids"].shape[1])
+                    for example in group
+                ]
+                # The prompt is evaluated once. Each isolated response branch
+                # attends to that prompt and its own causal prefix.
+                return prompt * prompt + sum(
+                    response * (prompt + response)
+                    for response in responses)
+
+            groups = []
+            for prompt_job_id, group in grouped.items():
+                prompt = group[0]["prompt_ids"]
+                if any(
+                        example["prompt_ids"].shape != prompt.shape
+                        or not torch.equal(example["prompt_ids"], prompt)
+                        for example in group[1:]):
+                    raise RuntimeError(
+                        "one strategy prompt_job_id contains different prompts: "
+                        f"{prompt_job_id}")
+                # Longest branches first makes any budget-driven split stable
+                # and avoids leaving one pathological response until last.
+                group.sort(
+                    key=lambda example: int(
+                        example["response_ids"].shape[1]),
+                    reverse=True)
+                groups.append(group)
+            groups.sort(key=group_cost, reverse=True)
+            for group in groups:
+                self._work_queue.put({SHARED_PREFIX_WORK_KEY: group})
+            ordered = copied
+            print(
+                f"[train-fast] queued {len(groups)} shared strategy prompts / "
+                f"{len(ordered)} examples by packed cost; each free GPU "
+                "claims one complete prompt group",
+                flush=True,
+            )
+        else:
+            ordered = sorted(copied, key=estimated_cost, reverse=True)
+            for example in ordered:
+                self._work_queue.put(example)
+            print(f"[train-fast] queued {len(ordered)} examples longest-first; "
+                  "each free GPU claims the next adaptive batch", flush=True)
         for _ in range(self._world_size):
             self._work_queue.put(None)
-        print(f"[train-fast] queued {len(ordered)} examples longest-first; "
-              "each free GPU claims the next adaptive batch", flush=True)
         return ordered
 
     @staticmethod
@@ -5818,10 +5988,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                   "missing; this step uses rho_min", flush=True)
                         else:
                             try:
-                                current_policy_scores = (
-                                    gen_pool.score_token_logprobs(
-                                        score_pairs, show_progress=True,
-                                        adapter_path=adapter_path))
+                                # These responses were sampled by adapter_path
+                                # moments ago, and vLLM already returned the
+                                # exact chosen-token logprobs.  Re-scoring the
+                                # same 480 long prompts wastes a complete
+                                # policy pass and can exhaust the temporary
+                                # vocabulary-projection headroom.
+                                current_policy_scores = [
+                                    (list(record["behavior_logprobs"])
+                                     if record["behavior_logprobs"] is not None
+                                     and len(record["behavior_logprobs"])
+                                     == len(record["token_ids"])
+                                     else None)
+                                    for record in vllm_logprob_records
+                                ]
                                 previous_policy_scores = (
                                     gen_pool.score_token_logprobs(
                                         score_pairs, show_progress=True,

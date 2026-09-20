@@ -64,7 +64,12 @@ import multiprocessing as mp
 # process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
 # metadata. Two alternating, RAM-resident pools therefore cannot each claim
 # 90% of the same card. Keep enough unclaimed memory for the inactive pool.
-VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 12.0
+# Long prompt-logprob scoring briefly materializes a vocabulary projection for
+# an entire chunk.  Qwen3-Coder's 150k-token vocabulary needs several GiB on
+# top of the steady model/KV allocation, while the sleeping strategy engine
+# and offloaded trainer still retain CUDA context state.  Twelve GiB left less
+# than one projection's headroom in real 96-GiB runs; keep sixteen unclaimed.
+VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 16.0
 VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
 
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
@@ -1927,13 +1932,30 @@ class PhasedVLLMGenerationPool:
             if self._persistent:
                 try:
                     self._pool.sleep()
-                except Exception:
-                    # Do not restore the trainer next to an engine whose GPU
-                    # allocations may still be live.
-                    self._pool.shutdown()
-                    self._pool = None
+                except Exception as exc:
+                    # A vLLM EngineCore can die after an inference OOM.  It
+                    # cannot acknowledge sleep, but shutting down the complete
+                    # pool still releases its remaining processes and makes a
+                    # clean pool reload on the next phase safe.  Cleanup must
+                    # not turn an already handled optional-score failure into
+                    # a fatal training-step failure.
+                    failed_pool, self._pool = self._pool, None
                     self._persistent = False
-                    raise
+                    try:
+                        failed_pool.shutdown()
+                    except Exception as shutdown_error:
+                        print(
+                            "[pool] failed vLLM engine also raised during "
+                            f"forced shutdown ({type(shutdown_error).__name__}); "
+                            "continuing after process cleanup request",
+                            flush=True,
+                        )
+                    print(
+                        "[pool] vLLM sleep failed after an engine failure "
+                        f"({type(exc).__name__}); discarded the pool and will "
+                        "reload it next phase",
+                        flush=True,
+                    )
             else:
                 pool, self._pool = self._pool, None
                 pool.shutdown()

@@ -3,12 +3,59 @@
 import importlib.util
 import os
 import torch
+import weakref
 
 
 _FUSED_LONG_ATTENTION = False
 _FUSED_LONG_ATTENTION_DISABLED = False
 _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
 _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
+_SHARED_PREFIX_ATTENTION_LAYOUTS = {}
+
+
+def register_shared_prefix_attention_mask(mask, prefix_end, branches):
+    """Associate a compact packed-branch mask with its contiguous layout.
+
+    The registry keeps only a weak reference.  Gradient checkpointing retains
+    ``mask`` until the backward recomputation has finished; once that graph is
+    released, the callback deletes the temporary layout automatically.
+    """
+    if (not torch.is_tensor(mask) or mask.ndim != 3
+            or tuple(mask.shape[:2]) != (1, 2)):
+        raise ValueError("shared-prefix attention mask must have shape (1, 2, T)")
+    prefix_end = int(prefix_end)
+    normalized = tuple((int(start), int(end)) for start, end in branches)
+    total = int(mask.shape[-1])
+    if prefix_end < 1 or prefix_end > total:
+        raise ValueError("shared-prefix boundary is outside the packed sequence")
+    cursor = prefix_end
+    for start, end in normalized:
+        if start != cursor or end < start or end > total:
+            raise ValueError("shared-prefix branches must be contiguous")
+        cursor = end
+    if cursor != total:
+        raise ValueError("shared-prefix layout does not cover the packed sequence")
+    key = (str(mask.device), int(mask.data_ptr()))
+
+    def discard(reference, *, registry_key=key):
+        current = _SHARED_PREFIX_ATTENTION_LAYOUTS.get(registry_key)
+        if current is not None and current[0] is reference:
+            _SHARED_PREFIX_ATTENTION_LAYOUTS.pop(registry_key, None)
+
+    reference = weakref.ref(mask, discard)
+    _SHARED_PREFIX_ATTENTION_LAYOUTS[key] = (
+        reference, prefix_end, normalized)
+
+
+def _shared_prefix_attention_layout(mask):
+    if (not torch.is_tensor(mask) or mask.ndim != 3
+            or tuple(mask.shape[:2]) != (1, 2)):
+        return None
+    key = (str(mask.device), int(mask.data_ptr()))
+    entry = _SHARED_PREFIX_ATTENTION_LAYOUTS.get(key)
+    if entry is None or entry[0]() is not mask:
+        raise RuntimeError("unregistered shared-prefix attention mask")
+    return entry[1], entry[2]
 
 
 # ======================================================================
@@ -185,7 +232,7 @@ def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
 
 
 def _raw_padding_attention_mask(*args, attention_mask=None, **kwargs):
-    """Keep only the compact 2D padding mask for blockwise attention."""
+    """Keep the compact padding or registered shared-prefix mask intact."""
     return attention_mask
 
 
@@ -228,6 +275,43 @@ def _attention_allowed_mask(attention_mask, *, batch, query_start,
         "ttt blockwise attention accepts a 2D padding or 4D attention mask")
 
 
+def _ttt_shared_prefix_attention_forward(
+        module, query, key, value, layout, *, dropout, scaling,
+        sliding_window, **kwargs):
+    """Attend one shared prompt plus mutually isolated response branches."""
+    prefix_end, branches = layout
+    prefix_query = query[:, :, :prefix_end, :]
+    prefix_key = key[:, :, :prefix_end, :]
+    prefix_value = value[:, :, :prefix_end, :]
+    prefix_output, _ = _ttt_blockwise_attention_forward(
+        module, prefix_query, prefix_key, prefix_value, None,
+        dropout=dropout, scaling=scaling,
+        sliding_window=sliding_window, **kwargs)
+    outputs = [prefix_output]
+    cursor = int(prefix_end)
+    for start, end in branches:
+        if start != cursor:
+            raise RuntimeError("noncontiguous shared-prefix attention branch")
+        cursor = end
+        if end == start:
+            continue
+        branch_query = query[:, :, start:end, :]
+        branch_key = torch.cat(
+            (prefix_key, key[:, :, start:end, :]), dim=2)
+        branch_value = torch.cat(
+            (prefix_value, value[:, :, start:end, :]), dim=2)
+        branch_output, _ = _ttt_blockwise_attention_forward(
+            module, branch_query, branch_key, branch_value, None,
+            dropout=dropout, scaling=scaling,
+            sliding_window=sliding_window, **kwargs)
+        outputs.append(branch_output)
+    if cursor != int(query.shape[2]):
+        raise RuntimeError("shared-prefix attention layout length mismatch")
+    # AttentionInterface outputs are (batch, sequence, heads, width), even
+    # though its query/key/value inputs are (batch, heads, sequence, width).
+    return torch.cat(outputs, dim=1), None
+
+
 def _ttt_blockwise_attention_forward(
         module, query, key, value, attention_mask, dropout=0.0,
         scaling=None, sliding_window=None, **kwargs):
@@ -239,6 +323,15 @@ def _ttt_blockwise_attention_forward(
     truncation—while peak score memory is O(query_block * sequence_length).
     """
     import torch.nn.functional as F
+
+    shared_layout = _shared_prefix_attention_layout(attention_mask)
+    if shared_layout is not None:
+        if int(query.shape[0]) != 1:
+            raise ValueError("shared-prefix attention requires batch size one")
+        return _ttt_shared_prefix_attention_forward(
+            module, query, key, value, shared_layout,
+            dropout=dropout, scaling=scaling,
+            sliding_window=sliding_window, **kwargs)
 
     batch, query_heads, query_length, head_dim = query.shape
     key_heads = int(key.shape[1])

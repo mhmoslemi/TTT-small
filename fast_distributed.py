@@ -12,6 +12,52 @@ import traceback
 
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 LONG_ROLLOUT_MEMORY_FRACTION = 0.96
+SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
+
+
+def _shared_prefix_examples(batch):
+    batch = list(batch or ())
+    if len(batch) < 2:
+        return False
+    prompt_job_id = batch[0].get("prompt_job_id")
+    if prompt_job_id is None:
+        return False
+    prompt_shape = tuple(batch[0]["prompt_ids"].shape)
+    return all(
+        example.get("prompt_job_id") == prompt_job_id
+        and tuple(example["prompt_ids"].shape) == prompt_shape
+        for example in batch[1:]
+    )
+
+
+def _shared_prefix_token_count(batch):
+    """Physical packed tokens for one prompt and several response branches."""
+    batch = list(batch)
+    if not batch:
+        return 0
+    prompt = int(batch[0]["prompt_ids"].shape[1])
+    return prompt + sum(max(
+        0, int(example["response_ids"].shape[1]) - 1)
+        for example in batch)
+
+
+def _take_shared_prefix_chunk(examples, token_budget, example_cap=64):
+    """Take the largest leading exact-prefix pack within the token budget."""
+    examples = list(examples)
+    if not examples:
+        return [], []
+    prompt = int(examples[0]["prompt_ids"].shape[1])
+    used = prompt
+    count = 0
+    for example in examples:
+        contribution = max(0, int(example["response_ids"].shape[1]) - 1)
+        if count and (count >= int(example_cap)
+                      or used + contribution > int(token_budget)):
+            break
+        used += contribution
+        count += 1
+    count = max(1, count)
+    return examples[:count], examples[count:]
 
 
 def trainable_parameters(model):
@@ -204,6 +250,8 @@ def _merge_feedback_stats(parts):
 def _padded_token_count(batch):
     if not batch:
         return 0
+    if _shared_prefix_examples(batch):
+        return _shared_prefix_token_count(batch)
     return max(
         int(example["prompt_ids"].shape[1]
             + example["response_ids"].shape[1])
@@ -510,12 +558,20 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     else:
         # None is one end marker per rank. A single deferred example lets a rank
         # stop growing the current padded batch without putting work back or
-        # disturbing the global queue's exactly-once behavior.
+        # disturbing the global queue's exactly-once behavior. Strategy-mode
+        # work items contain every program sharing one prompt; keep the item on
+        # this rank and consume it in exact shared-prefix packs so no other rank
+        # independently evaluates that prompt.
         queue_finished = False
         deferred = None
+        prefix_remainder = []
 
         def take_batch():
-            nonlocal queue_finished, deferred
+            nonlocal queue_finished, deferred, prefix_remainder
+            if prefix_remainder:
+                batch, prefix_remainder = _take_shared_prefix_chunk(
+                    prefix_remainder, budget, max_examples_per_batch)
+                return batch
             if queue_finished and deferred is None:
                 return []
             if deferred is not None:
@@ -525,6 +581,12 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 if first is None:
                     queue_finished = True
                     return []
+            if (isinstance(first, dict)
+                    and SHARED_PREFIX_WORK_KEY in first):
+                batch, prefix_remainder = _take_shared_prefix_chunk(
+                    first[SHARED_PREFIX_WORK_KEY], budget,
+                    max_examples_per_batch)
+                return batch
             batch = [first]
             maximum = example_length(first)
             gate = example_gate(first)
@@ -533,6 +595,10 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 candidate = work_queue.get()
                 if candidate is None:
                     queue_finished = True
+                    break
+                if (isinstance(candidate, dict)
+                        and SHARED_PREFIX_WORK_KEY in candidate):
+                    deferred = candidate
                     break
                 candidate_length = example_length(candidate)
                 next_maximum = max(maximum, candidate_length)

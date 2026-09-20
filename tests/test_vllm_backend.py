@@ -1324,7 +1324,7 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertTrue(all(
                 item.kwargs["disable_custom_all_reduce"]
                 for item in initial))
-            shared_utilization = (94.97 - 12.0) / 94.97
+            shared_utilization = (94.97 - 16.0) / 94.97
             self.assertTrue(all(
                 abs(item.kwargs["gpu_memory_utilization"]
                     - shared_utilization) < 1e-9
@@ -1514,6 +1514,53 @@ class VLLMBackendTests(unittest.TestCase):
             ("offload", None), ("wake", None), ("generate", None),
             ("sleep", None), ("restore", None),
             ("shutdown", None),
+        ])
+
+    def test_phased_vllm_pool_discards_engine_when_sleep_fails(self):
+        events = []
+        starts = {"count": 0}
+
+        class FakePool:
+            num_workers = 1
+            sleep_supported = True
+
+            def __init__(self, **_kwargs):
+                self.instance = starts["count"]
+                starts["count"] += 1
+                events.append(("start", self.instance))
+
+            def sleep(self):
+                events.append(("sleep", self.instance))
+                if self.instance == 0:
+                    raise RuntimeError("dead EngineCore")
+
+            def wake_up(self):
+                events.append(("wake", self.instance))
+
+            def iter_group_jobs(self, *args, **kwargs):
+                yield 0, [("ok", [1])]
+
+            def shutdown(self):
+                events.append(("shutdown", self.instance))
+
+        with patch("gen_workers.GenerationPool", FakePool):
+            pool = PhasedVLLMGenerationPool(
+                before_start=lambda: events.append(("offload", None)),
+                after_stop=lambda: events.append(("restore", None)),
+                model_name="org/model", num_workers=1, gpu_ids=[0],
+            )
+            list(pool.iter_group_jobs())
+            pool.release()
+            list(pool.iter_group_jobs())
+            pool.release()
+            pool.shutdown()
+
+        self.assertEqual(events, [
+            ("offload", None), ("start", 0),
+            ("sleep", 0), ("shutdown", 0), ("restore", None),
+            ("offload", None), ("start", 1),
+            ("sleep", 1), ("restore", None),
+            ("shutdown", 1),
         ])
 
     def test_gpt_oss_20b_uses_persistent_level_one_sleep(self):
