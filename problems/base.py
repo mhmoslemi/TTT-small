@@ -150,7 +150,7 @@ class Problem(ABC):
             "implementation structure, numerical choices, and likely failure "
             "modes. Do not write Python code or a code fence in this stage. "
             "Do not restate the task or these output instructions. Keep the "
-            "final strategy concise (at most 1,200 words), and finish it well "
+            "final strategy concise, and finish it well "
             "before the response-token limit. Your final answer must contain "
             "exactly one complete <strategy>...</strategy> block and nothing "
             "else; an unclosed block is unusable."

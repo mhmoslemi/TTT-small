@@ -246,7 +246,7 @@ Unless you make a meaningful improvement, you will not be rewarded.'''
 
         direct_output_section = ""
         if not self.two_stage_rollouts:
-            direct_output_section = '''
+            direct_output_section = ''' 
 ## Required output
 
 Return exactly one complete fenced Python code block, beginning with
@@ -295,13 +295,12 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - When `initial_h_values` is available, use it directly. Never redefine it or
   copy its entries into the response. Construct all large arrays
   algorithmically; do not print long numeric literals or unrolled tables
-- Keep generated source below 300 lines and about 12,000 characters
 - Your function must complete within budget_s seconds and return the best solution found
 - The extracted block must define `run` at top level. The harness prepends the
   pre-imported helpers and optional parent construction before execution; do
   not copy those inputs into the block to make it standalone
 
-**Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.379.
+**Lower is better**. Current record: C₅ ≤ 0.38085. Our goal is to find a construction that shows C₅ ≤ 0.38085.
 
 {state_ctx}
 {construction_section}{memory_section}
