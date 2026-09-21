@@ -105,6 +105,7 @@ _VERIFIER_SRC = (
 
 class ErdosMinOverlap(Problem):
     two_stage_rollouts = True
+    retry_truncated_code = True
     name = "erdos"
     entrypoint = "run"
     metric_name = "C\u2085 bound"
@@ -123,6 +124,55 @@ class ErdosMinOverlap(Problem):
         # killed by its own clock rather than by the harness, which produces a
         # returned best-so-far instead of a lost rollout.
         self.budget_s = float(cfg.get("budget_s", 60.0))
+
+    @staticmethod
+    def _append_user_instruction(messages: List[dict], instruction: str
+                                 ) -> List[dict]:
+        staged = [dict(message) for message in messages]
+        if staged and staged[-1].get("role") == "user":
+            staged[-1]["content"] = (
+                str(staged[-1].get("content", "")).rstrip()
+                + "\n\n" + instruction.strip() + "\n"
+            )
+        else:
+            staged.append({"role": "user", "content": instruction.strip()})
+        return staged
+
+    def build_strategy_messages(
+            self, messages: List[dict],
+            previous_strategies: List[str] | None = None) -> List[dict]:
+        staged = self._append_user_instruction(messages, '''
+Erdos-specific implementation constraint: `initial_h_values`, when a current
+construction is available, is already supplied to the executed program as a
+NumPy array. Never plan to copy, serialize, reconstruct, or hard-code that
+array. Never propose a long explicit numeric table or an unrolled pattern.
+Describe compact algorithmic construction using NumPy operations, formulas,
+loops, interpolation, or seeded random generation. The eventual complete
+program must fit comfortably in a few hundred lines.''')
+        return super().build_strategy_messages(
+            staged, previous_strategies=previous_strategies)
+
+    def build_code_messages(self, messages: List[dict],
+                            strategy: str) -> List[dict]:
+        staged = super().build_code_messages(messages, strategy)
+        return self._append_user_instruction(staged, '''
+## Mandatory compact-source contract
+
+- `initial_h_values` is runtime input when a parent construction exists.
+  Reference it directly; NEVER assign to it, paste its values, serialize it,
+  or reconstruct it as a literal. If no parent construction was announced,
+  create a starting vector under a different name.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- Keep the complete source concise: at most 300 lines and about 12,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
+
+These are hard output constraints even if the proposed strategy suggests
+otherwise.''')
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext, memory: str = "",
@@ -194,6 +244,17 @@ Unless you make a meaningful improvement, you will not be rewarded.'''
         else:
             code_section = '''Write code to optimize this construction.'''
 
+        direct_output_section = ""
+        if not self.two_stage_rollouts:
+            direct_output_section = '''
+## Required output
+
+Return exactly one complete fenced Python code block, beginning with
+```python and ending with ```, and nothing else. Do not output a strategy,
+analysis, prose, notes, example usage, a second code block, or a partial
+snippet. Finish the program and close the fence well before the response-token
+limit.'''
+
         user = f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
 Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.
 
@@ -231,25 +292,23 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
+- When `initial_h_values` is available, use it directly. Never redefine it or
+  copy its entries into the response. Construct all large arrays
+  algorithmically; do not print long numeric literals or unrolled tables
+- Keep generated source below 300 lines and about 12,000 characters
 - Your function must complete within budget_s seconds and return the best solution found
-- The block must define `run` at top level and be runnable on its own.
+- The extracted block must define `run` at top level. The harness prepends the
+  pre-imported helpers and optional parent construction before execution; do
+  not copy those inputs into the block to make it standalone
 
 **Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.379.
 
 {state_ctx}
 {construction_section}{memory_section}
 {code_section}
+{direct_output_section}
 
 '''
-
-# Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags (under 100 words / 3-4 sentences maximum), then finally return the final program between ```python and ```.
-# - No prose, notes, explanation, or example usage after the closing fence.
-# - No second code block. No partial snippets earlier in the response.
-
-
-
-# - Exactly ONE ```python block, containing the complete program. It is extracted
-#   verbatim and executed as written.
 
         return [{"role": "user", "content": user}]
 

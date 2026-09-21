@@ -91,6 +91,7 @@ class Problem(ABC):
     # construction at all, and their programs are the artifact.
     saves_construction: bool = False
     two_stage_rollouts: bool = False
+    retry_truncated_code: bool = False
 
     def __init__(self, cfg: dict):
         self.cfg = dict(cfg or {})

@@ -67,6 +67,39 @@ def _ensure_pad_token(tokenizer):
     return tokenizer
 
 
+def set_gradient_checkpointing(model, enabled):
+    """Toggle transformer checkpointing without changing training mode.
+
+    PEFT and Unsloth wrappers normally forward these methods to the underlying
+    Transformers model.  Keeping this compatibility shim here lets the shared
+    OOM controller select checkpointing per workload instead of forcing its
+    recomputation cost on every update.
+    """
+    method_name = (
+        "gradient_checkpointing_enable"
+        if bool(enabled) else
+        "gradient_checkpointing_disable"
+    )
+    method = getattr(model, method_name, None)
+    if not callable(method):
+        getter = getattr(model, "get_base_model", None)
+        if callable(getter):
+            try:
+                method = getattr(getter(), method_name, None)
+            except (AttributeError, TypeError):
+                method = None
+    if not callable(method):
+        return False
+    if enabled:
+        try:
+            method(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            method()
+    else:
+        method()
+    return True
+
+
 def _training_model_name(cfg):
     return str(getattr(cfg, "training_model_name",
                        getattr(cfg, "model_name", "")))
@@ -630,6 +663,7 @@ class UnslothBackend(_ModelPlacementBackend):
             use_gradient_checkpointing="unsloth",
             random_state=self.cfg.seed,
         )
+        set_gradient_checkpointing(model, False)
         tokenizer = _ensure_pad_token(tokenizer)
 
         if hasattr(model, "generation_config") and model.generation_config is not None:
@@ -749,10 +783,6 @@ class HFBackend(_ModelPlacementBackend):
             else:
                 model = prepare_model_for_kbit_training(model)
 
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
@@ -767,6 +797,7 @@ class HFBackend(_ModelPlacementBackend):
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, peft_cfg)
+        set_gradient_checkpointing(model, False)
         model.print_trainable_parameters()
 
         tokenizer = _ensure_pad_token(tokenizer)
