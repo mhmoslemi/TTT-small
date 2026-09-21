@@ -50,6 +50,10 @@ memory_version="${MEMORY_VERSION:-V2}"
 # offloaded, then the LoRA coder generates programs and trains. Without this
 # flag the ordinary one-stage rollout path is unchanged:
 #   sh run.sh --strategies
+# An OpenAI-compatible remote strategist can be selected without loading its
+# tokenizer or weights locally:
+#   export DEEPSEEK_API_KEY='...'
+#   sh run.sh --strategy-api --strategy-model-name deepseek-v4-pro
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 case "${1:-}" in

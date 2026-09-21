@@ -58,16 +58,15 @@ _STRATEGY_FINAL_MARKERS = (
 
 
 def _extract_final_strategy(response_text):
-    """Return only a strategist's final answer, never its private analysis.
+    """Extract only the final, complete strategy block.
 
-    GPT-OSS offline decoding can expose Harmony channel text such as
-    ``analysis...assistantfinal``.  Its analysis frequently quotes the output
-    instruction itself, including a dummy ``<strategy> and </strategy>`` pair.
-    Selecting the first XML-looking block therefore turns a long valid final
-    answer into the literal word ``and``.  Prefer the final channel, select the
-    last complete block, and require enough content to plausibly be the
-    requested detailed plan.  A malformed or truncated answer becomes an
-    explicit safe fallback instead of being injected into the coder prompt.
+    GPT-OSS may expose a long analysis channel before its final answer. None of
+    that text is allowed into a later strategist or coder prompt. We retain
+    only the body of the last complete ``<strategy>...</strategy>`` block at
+    the end of the response. An explicit final channel is preferred when the
+    template exposes one, but is not required: preceding reasoning is harmless
+    because it is never returned. A missing, empty, or unclosed final block is
+    retried by the caller and ultimately becomes the safe fallback.
     """
     raw = str(response_text or "").strip()
     if not raw:
@@ -81,38 +80,27 @@ def _extract_final_strategy(response_text):
         if position > final_position:
             final_position = position
             final_marker = marker
-    final_text = (
-        raw[final_position + len(final_marker):].strip()
-        if final_position >= 0 else ""
-    )
+    if final_position >= 0:
+        final_text = raw[final_position + len(final_marker):].strip()
+    else:
+        # Non-Harmony templates can include reasoning without labeling their
+        # channels. Only the final block below is retained, so the prefix is
+        # never exposed to a later strategist or to the coder.
+        final_text = raw
 
-    # Search the explicit final channel first. If a runtime strips Harmony
-    # markers, the last complete block in the entire decoded response is the
-    # next-best unambiguous final answer.
-    regions = [final_text] if final_text else []
-    if not lowered.startswith("analysis"):
-        regions.append(raw)
-    for region in regions:
-        matches = list(_STRATEGY_BLOCK_RE.finditer(region))
-        for match in reversed(matches):
-            body = match.group(1).strip()
-            if len(body) >= 80:
-                return body, None
+    matches = list(_STRATEGY_BLOCK_RE.finditer(final_text))
+    if not matches:
+        return _STRATEGY_FALLBACK, "missing complete final strategy"
 
-    # Some non-Harmony chat templates omit the requested wrapper while still
-    # returning clean final prose. Accept only an identifiable final channel,
-    # or a plain response with no evidence of exposed analysis.
-    candidate = final_text
-    if not candidate and not lowered.startswith("analysis"):
-        candidate = raw
-    candidate = candidate.strip()
-    if (len(candidate) >= 80
-            and "<strategy" not in candidate.lower()
-            and "</strategy" not in candidate.lower()
-            and "assistantfinal" not in candidate.lower()):
-        return candidate, None
+    match = matches[-1]
+    trailing = final_text[match.end():]
+    if re.search(r"<strategy\b", trailing, flags=re.IGNORECASE):
+        return _STRATEGY_FALLBACK, "unclosed final strategy block"
 
-    return _STRATEGY_FALLBACK, "missing complete final strategy"
+    body = match.group(1).strip()
+    if not body:
+        return _STRATEGY_FALLBACK, "empty final strategy"
+    return body, None
 
 
 class _TimestampedLineStream:
@@ -554,6 +542,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy-model-name", default=None,
                    help="Base reasoning checkpoint used only to generate "
                         "strategies; it never receives or trains the LoRA.")
+    p.add_argument(
+        "--strategy-backend", choices=["local", "api"], default=None,
+        help="Run the frozen strategist through a local generation pool or "
+             "an OpenAI-compatible remote API.")
+    p.add_argument(
+        "--strategy-api", dest="strategy_backend", action="store_const",
+        const="api",
+        help="Shorthand for --strategy-backend api. No strategist weights or "
+             "tokenizer are loaded locally.")
+    p.add_argument("--strategy-api-base-url", default=None)
+    p.add_argument("--strategy-api-key-env", default=None,
+                   help="Environment-variable name containing the API key; "
+                        "the key itself is never stored in run configuration.")
+    p.add_argument("--strategy-api-concurrency", type=int, default=None)
+    p.add_argument("--strategy-api-timeout-s", type=float, default=None)
+    p.add_argument("--strategy-api-max-retries", type=int, default=None)
     p.add_argument(
         "--training-model-name", default=None,
         help="Optional trainable checkpoint override. Rollout generation still "
@@ -1115,6 +1119,20 @@ def load_config():
             if args.training_model_name is None:
                 merged["training_model_name"] = str(
                     merged.get("coder_training_model_name") or "").strip()
+
+    training_layout = str(
+        merged.get("training_layout") or "auto").strip().lower()
+    if training_layout not in {"auto", "replicated", "sharded"}:
+        raise ValueError(
+            "training_layout must be 'auto', 'replicated', or 'sharded'")
+    merged["training_layout"] = training_layout
+    if training_layout == "sharded" and merged["fast"]:
+        # --fast is process-per-GPU data parallelism: every process needs one
+        # complete base model. Large MoE checkpoints instead need one trainer
+        # whose frozen base weights are distributed across all selected GPUs.
+        print("[config] training_layout=sharded overrides --fast; using one "
+              "model-parallel LoRA trainer across all training GPUs")
+        merged["fast"] = False
     if args.problem_type is not None:
         merged["problem_type"] = args.problem_type
 
@@ -1138,6 +1156,11 @@ def load_config():
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
+        strategy_backend = str(
+            merged.get("strategy_backend") or "local"
+        ).strip().lower()
+        if strategy_backend not in {"local", "api"}:
+            raise ValueError("strategy_backend must be 'local' or 'api'")
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
         strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
@@ -1163,6 +1186,7 @@ def load_config():
                   f"{effective_group_size}; replacing configured group_size="
                   f"{merged.get('group_size')}")
         merged["strategy_model_name"] = strategy_model_name
+        merged["strategy_backend"] = strategy_backend
         merged["strategies_per_parent"] = strategies_per_parent
         merged["programs_per_strategy"] = programs_per_strategy
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
@@ -1179,6 +1203,34 @@ def load_config():
         merged["strategy_reasoning_effort"] = strategy_reasoning_effort
         merged["strategy_vllm_quantization"] = str(
             merged.get("strategy_vllm_quantization") or "").strip()
+        merged["strategy_api_base_url"] = str(
+            merged.get("strategy_api_base_url")
+            or "https://api.deepseek.com").strip().rstrip("/")
+        merged["strategy_api_key_env"] = str(
+            merged.get("strategy_api_key_env")
+            or "DEEPSEEK_API_KEY").strip()
+        merged["strategy_api_concurrency"] = int(
+            merged.get("strategy_api_concurrency") or 8)
+        merged["strategy_api_timeout_s"] = float(
+            merged.get("strategy_api_timeout_s") or 1800.0)
+        merged["strategy_api_max_retries"] = int(
+            merged.get("strategy_api_max_retries")
+            if merged.get("strategy_api_max_retries") is not None else 5)
+        if not merged["strategy_api_base_url"]:
+            raise ValueError("strategy_api_base_url cannot be empty")
+        if not merged["strategy_api_key_env"]:
+            raise ValueError("strategy_api_key_env cannot be empty")
+        if merged["strategy_api_concurrency"] < 1:
+            raise ValueError("strategy_api_concurrency must be >= 1")
+        if merged["strategy_api_timeout_s"] <= 0.0:
+            raise ValueError("strategy_api_timeout_s must be positive")
+        if merged["strategy_api_max_retries"] < 0:
+            raise ValueError("strategy_api_max_retries must be >= 0")
+        if (strategy_backend == "api"
+                and not os.environ.get(merged["strategy_api_key_env"], "")):
+            raise ValueError(
+                "strategy API mode requires environment variable "
+                f"{merged['strategy_api_key_env']} to be set")
         merged["group_size"] = effective_group_size
         # Strategy multiplicity is the authoritative rollout budget. Adaptive
         # growth may still change the parent count, but cannot silently break
@@ -1360,6 +1412,17 @@ def load_config():
         print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
+    if merged["training_layout"] == "sharded":
+        if merged["backend"] != "hf":
+            raise ValueError(
+                "training_layout=sharded currently requires backend=hf")
+        if int(merged["num_training_gpus"]) < 2:
+            raise ValueError(
+                "training_layout=sharded requires at least two training GPUs")
+        if bool(merged.get("load_in_4bit", False)):
+            raise ValueError(
+                "training_layout=sharded expects an unquantized trainable "
+                "checkpoint; set load_in_4bit: false")
     training_budgets = _resolve_training_memory_budgets(
         training_gpu_ids, memory,
         max_fraction=(0.80 if merged["fast"] else 0.90))
@@ -1415,7 +1478,8 @@ def load_config():
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
 
-        if merged["strategies"]:
+        if (merged["strategies"]
+                and merged.get("strategy_backend", "local") == "local"):
             strategy_name = str(
                 merged.get("strategy_model_name") or merged.get("model_name"))
             if strategy_name == str(merged.get("model_name")):
@@ -1449,6 +1513,7 @@ def load_config():
                       f"TP={strategy_layout.tensor_parallel_size}, "
                       f"PP={strategy_layout.pipeline_parallel_size}")
     elif (merged["strategies"]
+          and merged.get("strategy_backend", "local") == "local"
           and str(merged.get("strategy_model_name")
                   or merged.get("model_name"))
           != str(merged.get("model_name"))):
@@ -5357,7 +5422,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                strategy_pool=None, strategy_tokenizer=None,
                memory=None, extractor=None, mem_cfg=None, lookup=None,
                curator=None, fb_cfg=None, parallel_trainer=None,
-               spo_rs_tracker=None, sampling_adapter_path=None):
+               spo_rs_tracker=None, sampling_adapter_path=None,
+               ensure_trainer_ready=None):
     import os
     import torch
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -5516,6 +5582,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     strategy_tokenizer = strategy_tokenizer or tokenizer
 
     def _render_strategy(messages, *, reasoning_effort=None):
+        if getattr(cfg, "strategy_backend", "local") == "api":
+            # The remote client applies the provider's chat template. Passing
+            # structured messages here avoids loading any strategist tokenizer
+            # or weights in this process.
+            return [dict(message) for message in messages]
         strategy_name = str(getattr(cfg, "strategy_model_name", "")).lower()
         template_options = {}
         if "gpt-oss" in strategy_name:
@@ -5712,9 +5783,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if retry:
             retry_instruction = (
                 "Your previous attempt did not contain a complete usable "
-                "final strategy. Respond concisely now. Complete the final "
-                "<strategy>...</strategy> block before the token limit; do "
-                "not restate the problem, instructions, or private reasoning."
+                "final strategy. You may reason as needed, but end with exactly "
+                "one complete <strategy>...</strategy> block containing the "
+                "concise final plan. Only that block is retained. Put nothing "
+                "after </strategy>, and close it before the token limit."
             )
             if messages and messages[-1].get("role") == "user":
                 messages[-1]["content"] = (
@@ -5725,10 +5797,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 messages.append({"role": "user", "content": retry_instruction})
         return _render_strategy(
             messages,
-            # Preserve the requested effort for the first attempt. A malformed
-            # high-effort GPT-OSS response is retried at low effort so private
-            # reasoning cannot consume the final-answer budget a second time.
-            reasoning_effort=("low" if retry else None),
+            # Effort stays at the configured level (cfg.strategy_reasoning_effort)
+            # on retry too -- the retry's job is the concise, focused
+            # instruction above plus the strategy stage's larger token
+            # budget, not a lower-effort model.
+            reasoning_effort=None,
         )
 
     def _code_prompt_jobs(source_jobs, chains):
@@ -7303,6 +7376,12 @@ code block.'''
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
 
+    # A model-parallel trainer can remain on CPU throughout every vLLM phase
+    # and all reward processing. Restore its shards only when this step has a
+    # real calibration/backward update to perform.
+    if ensure_trainer_ready is not None:
+        ensure_trainer_ready()
+
     if x_grpo_mode:
         calibration_t0 = time.time()
         group_ids_by_context = {}
@@ -7567,6 +7646,7 @@ def main():
                 f"run_dir={Path(exp_dir).resolve()} ===\n")
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
         if (cfg.strategies
+                and getattr(cfg, "strategy_backend", "local") == "local"
                 and getattr(cfg, "strategy_model_name", cfg.model_name)
                 != cfg.model_name):
             strategy_vllm_log_path = str(
@@ -7617,6 +7697,7 @@ def main():
         and int(cfg.num_training_gpus) > 1
         and cfg.backend == "hf"
         and cfg.generation_backend == "vllm"
+        and cfg.training_layout != "sharded"
     )
     if use_replicated_training:
         cfg.training_replica_device = 0
@@ -7648,7 +7729,11 @@ def main():
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
     if getattr(problem, "two_stage_rollouts", False):
-        print(f"Strategy model:     {cfg.strategy_model_name} (no LoRA)")
+        strategy_location = (
+            "remote API; no local weights"
+            if cfg.strategy_backend == "api" else "local; no LoRA")
+        print(f"Strategy model:     {cfg.strategy_model_name} "
+              f"({strategy_location})")
     if cfg.training_model_name != cfg.model_name:
         print(f"Training model:     {cfg.training_model_name}")
     print(f"Training backend:   {cfg.backend}")
@@ -7765,6 +7850,7 @@ def main():
         model, tokenizer = backend.load()
     strategy_tokenizer = tokenizer
     if (getattr(problem, "two_stage_rollouts", False)
+            and cfg.strategy_backend == "local"
             and cfg.strategy_model_name != cfg.model_name):
         from transformers import AutoTokenizer
         with _route_dependency_notices(dependency_log_path):
@@ -7916,6 +8002,23 @@ def main():
     # ---- generation pool ----
     gen_pool = None
     strategy_pool = None
+    ensure_trainer_ready = None
+    if (getattr(problem, "two_stage_rollouts", False)
+            and cfg.strategy_backend == "api"):
+        from strategy_api import StrategyAPIGenerationPool
+        strategy_pool = StrategyAPIGenerationPool(
+            model_name=cfg.strategy_model_name,
+            base_url=cfg.strategy_api_base_url,
+            api_key_env=cfg.strategy_api_key_env,
+            concurrency=cfg.strategy_api_concurrency,
+            timeout_s=cfg.strategy_api_timeout_s,
+            max_retries=cfg.strategy_api_max_retries,
+            thinking=cfg.strategy_thinking,
+            reasoning_effort=cfg.strategy_reasoning_effort,
+        )
+        print(f"[init] remote strategy API configured for "
+              f"{cfg.strategy_model_name}; no strategist tokenizer, weights, "
+              "or local generation pool loaded", flush=True)
     # vLLM forms exact TP/PP engines over every rollout card. Because those
     # cards also hold either training replicas or model shards, the two runtimes
     # alternate residency.
@@ -7929,6 +8032,7 @@ def main():
         separate_strategy_pool = bool(
             cfg.generation_backend == "vllm"
             and getattr(problem, "two_stage_rollouts", False)
+            and cfg.strategy_backend == "local"
             and cfg.strategy_model_name != cfg.model_name)
         pool_options = dict(
             model_name=cfg.model_name,
@@ -8010,12 +8114,16 @@ def main():
                     print("[gpu] keeping inactive training model offloaded "
                           "(--no-train)", flush=True)
                     return
-                if parallel_trainer is not None:
+                if (parallel_trainer is not None
+                        or cfg.training_layout == "sharded"):
                     # Memory lookup, rollouts, extraction, and curation may each
-                    # open a separate vLLM phase in one step. Keep replicas on
-                    # CPU between those phases and restore them once, lazily,
+                    # open a separate vLLM phase in one step. Keep the trainer
+                    # on CPU between those phases and restore it once, lazily,
                     # when the actual gradient update begins.
-                    print("[gpu] keeping trainer replicas offloaded until the "
+                    trainer_label = ("trainer replicas"
+                                     if parallel_trainer is not None
+                                     else "sharded trainer")
+                    print(f"[gpu] keeping {trainer_label} offloaded until the "
                           "adapter update", flush=True)
                     return
                 if not trainer_offloaded:
@@ -8029,6 +8137,23 @@ def main():
                 _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
                 trainer_offloaded = False
+
+            def _ensure_sharded_trainer_ready():
+                nonlocal trainer_offloaded
+                if not trainer_offloaded:
+                    return
+                print("[gpu] restoring sharded trainer for adapter update",
+                      flush=True)
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                backend.restore_after_generation()
+                _restore_optimizer_state_to_parameters(optimizer)
+                backend.set_training_mode()
+                trainer_offloaded = False
+
+            if cfg.training_layout == "sharded":
+                ensure_trainer_ready = _ensure_sharded_trainer_ready
 
             gen_pool = PhasedVLLMGenerationPool(
                 before_start=_offload_trainer_for_generation,
@@ -8243,7 +8368,8 @@ def main():
                                sampling_adapter_path=(
                                    current_policy_adapter_path
                                    if configured_advantage_mode == "spo-rs"
-                                   else None))
+                                   else None),
+                               ensure_trainer_ready=ensure_trainer_ready)
 
             stats = stats or {}
             step_training_seconds = float(

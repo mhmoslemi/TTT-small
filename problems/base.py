@@ -146,14 +146,17 @@ class Problem(ABC):
             "## Strategy-stage output\n\n"
             + history
             + "Develop a detailed, concrete, step-by-step strategy for solving "
-            "the task above. Think through the mathematics, algorithm, "
+            "the task above. You may reason through the mathematics, algorithm, "
             "implementation structure, numerical choices, and likely failure "
-            "modes. Do not write Python code or a code fence in this stage. "
-            "Do not restate the task or these output instructions. Keep the "
-            "final strategy concise, and finish it well "
-            "before the response-token limit. Your final answer must contain "
-            "exactly one complete <strategy>...</strategy> block and nothing "
-            "else; an unclosed block is unusable."
+            "modes before giving the final plan. At the end of the response, "
+            "emit exactly one complete <strategy>...</strategy> block. Only "
+            "the text inside that final block is retained and shared with "
+            "later strategists and the coder; all preceding reasoning is "
+            "discarded. Put nothing after </strategy>. Inside the block, give "
+            "only a concise final plan, do not restate the task or these output "
+            "instructions, and do not write Python code or a code fence. Close "
+            "the block well before the response-token limit; an unclosed block "
+            "is unusable."
         )
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (

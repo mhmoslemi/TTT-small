@@ -75,7 +75,11 @@ feedback_max_per_signature feedback_auto_signature_fraction
 COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
     "fused_long_attention",
+    "training_layout",
     "strategy_vllm_persistent_workers",
+    "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
+    "strategy_api_concurrency", "strategy_api_timeout_s",
+    "strategy_api_max_retries",
     "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
@@ -257,6 +261,22 @@ def validate_problem_config(
         raise ValueError(
             f"{_label(source)}: strategy_reasoning_effort must be low, "
             "medium, or high")
+    if ("strategy_backend" in data
+            and str(data["strategy_backend"]).lower() not in {"local", "api"}):
+        raise ValueError(
+            f"{_label(source)}: strategy_backend must be local or api")
+    if ("strategy_api_concurrency" in data
+            and int(data["strategy_api_concurrency"]) < 1):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_concurrency must be >= 1")
+    if ("strategy_api_timeout_s" in data
+            and float(data["strategy_api_timeout_s"]) <= 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_timeout_s must be positive")
+    if ("strategy_api_max_retries" in data
+            and int(data["strategy_api_max_retries"]) < 0):
+        raise ValueError(
+            f"{_label(source)}: strategy_api_max_retries must be >= 0")
     for key in ("vllm_sleep_level", "strategy_vllm_sleep_level"):
         if key in data and int(data[key]) not in (1, 2):
             raise ValueError(f"{_label(source)}: {key} must be 1 or 2")
