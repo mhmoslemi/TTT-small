@@ -15,6 +15,28 @@ from reward import extract_python_code
 from sandbox import run_code
 
 
+STRATEGY_OUTPUT_CONTRACT = '''## Mandatory final-output contract
+
+Your ONLY deliverable in this turn is the complete strategy plan for the coder.
+Earlier requests to write a program describe the downstream coder's job; they
+do not change your role here. Do not return Python code, a code fence, an
+unwrapped explanation, or a promise to provide the plan later.
+
+After any reasoning, start your final answer with the literal opening tag
+<strategy> on its own line. Put the entire substantive implementation plan,
+including all six requested sections, INSIDE this single block. End it with
+the literal closing tag </strategy> on its own line, then stop immediately.
+Do not nest blocks, escape the tags, put them in backticks, or quote an example
+block in place of your actual plan. Add no explanation or text after the
+closing tag. Keep exploratory reasoning outside the final block.
+
+A response without both tags and a complete plan between them is unusable:
+the coder will receive none of your intended plan. Reserve enough output space
+to finish the plan and close the block before ending. Before finishing, check
+that the real plan is enclosed exactly once and that the last non-whitespace
+characters of your response are exactly </strategy>.'''
+
+
 # ----------------------------------------------------------------------
 # Data carried between the engine and the problems
 # ----------------------------------------------------------------------
@@ -140,23 +162,80 @@ class Problem(ABC):
                 + "\n\n".join(rendered)
                 + "\n\nPropose a materially different approach. Do not merely "
                   "rename variables, reorder steps, or make superficial "
-                  "parameter changes.\n\n"
+                  "parameter changes. Treat these plans as unverified proposals, "
+                  "not established facts. Explain the substantive difference "
+                  "in your final plan, and make that plan independently usable "
+                  "without referring back to earlier strategies.\n\n"
             )
         instruction = (
             "## Strategy-stage output\n\n"
             + history
-            + "Develop a detailed, concrete, step-by-step strategy for solving "
-            "the task above. You may reason through the mathematics, algorithm, "
-            "implementation structure, numerical choices, and likely failure "
-            "modes before giving the final plan. At the end of the response, "
-            "emit exactly one complete <strategy>...</strategy> block. Only "
-            "the text inside that final block is retained and shared with "
-            "later strategists and the coder; all preceding reasoning is "
-            "discarded. Put nothing after </strategy>. Inside the block, give "
-            "only a concise final plan, do not restate the task or these output "
-            "instructions, and do not write Python code or a code fence. Close "
-            "the block well before the response-token limit; an unclosed block "
-            "is unusable."
+            + '''Act as the research lead handing an implementation specification to
+a separate expert coder. Develop a detailed, technically justified plan that
+the coder can implement without inventing the missing mathematics or algorithm.
+The coder receives the original task and ONLY your final strategy block; it
+does not receive your preceding reasoning. Every necessary definition,
+decision, formula, and implementation detail must therefore be in that block.
+Do not compress the useful result into a short summary after lengthy analysis.
+
+You may reason before the final answer. End with exactly one complete
+<strategy>...</strategy> block containing the following numbered sections,
+with enough detail to make each applicable section actionable:
+
+1. Approach and rationale
+State the central idea, why it could improve the supplied parent or solve the
+task, and the bottleneck it addresses. Choose a coherent primary approach.
+Identify its important limitations and distinguish justified facts from
+heuristics or hypotheses; do not claim untested improvements or optimality.
+
+2. Mathematical specification
+Define the representation, variables, exact objective, constraints, and any
+derived formulas needed by the algorithm. Check indexing, boundaries, units,
+and optimization direction against the supplied evaluator. Justify any claimed
+equivalence or convexity. If using a surrogate, relaxation, smoothing, or a
+restricted search space, explain what changes and how candidates will still be
+judged using the original objective. Name a solver only with a formulation it
+actually supports, including how it handles each constraint.
+
+3. Implementation procedure
+Give ordered steps from runtime inputs to returned output. Specify data
+structures and dimensions, initialization, the core update/search rule,
+candidate acceptance, termination, and helper responsibilities. Include the
+formulas or language-independent pseudocode needed for nontrivial operations;
+if gradients are needed, supply them or a concrete way to obtain and check
+them. Instructions such as "optimize", "tune", or "use a solver" alone are
+not sufficient. Explain how to use the existing parent and how to proceed
+without one. Keep the design implementable with the allowed libraries and
+source-size limits.
+
+4. Search choices and useful variations
+Give justified starting settings and practical ranges or adaptation rules for
+the consequential choices. Several programs will be sampled from this plan:
+identify a small set of meaningful variations within the primary approach
+(for example initialization, representation, update schedule, or neighborhood)
+and when each is worth trying. Separate correctness requirements from choices
+the coder may vary. Do not force every program to execute every variation, or
+arbitrarily lock the search to one dimension or unexplained parameter value.
+
+5. Compute budget and robustness
+Estimate the dominant time/memory costs for the proposed sizes and available
+hardware. Specify a feasible schedule, deadline checks inside expensive loops
+or solver calls, and how to retain the best valid candidate. Address numerical
+stability, invalid proposals, solver failure, and lack of improvement. Provide
+a concrete valid fallback that can be returned before the time limit.
+
+6. Validation and return contract
+Specify checks for feasibility, finite values, objective consistency, and the
+required interface/output. Re-evaluate the final candidate with the actual
+task metric. Include small sanity checks that could expose mistakes in the
+proposed formulas or implementation; never imply you already ran them.
+
+Write a professional implementation brief, not exploratory self-dialogue or a
+list of algorithm names. Be economical with repetition while preserving the
+details the coder needs. Do not repeat the whole task, paste input arrays,
+write Python source, or include code fences. Reserve enough response space to
+finish every section and close </strategy>; put nothing after that closing tag.'''
+            + "\n\n" + STRATEGY_OUTPUT_CONTRACT
         )
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (

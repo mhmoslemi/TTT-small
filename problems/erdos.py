@@ -148,7 +148,27 @@ NumPy array. Never plan to copy, serialize, reconstruct, or hard-code that
 array. Never propose a long explicit numeric table or an unrolled pattern.
 Describe compact algorithmic construction using NumPy operations, formulas,
 loops, interpolation, or seeded random generation. The eventual complete
-program must fit comfortably in a few hundred lines.''')
+program must fit comfortably in a few hundred lines.
+
+Erdos mathematical checks for the final plan:
+- The authoritative objective is max(np.correlate(h, 1-h, mode="full")) *
+  (2.0 / n_points), over all 2*n_points-1 lags. This is linear correlation
+  with finite support, not circular correlation. Include both lag directions.
+- At a nonzero lag, the overlap covers only part of the interval. The sum of
+  h over that overlap is not generally its full integral of 1. Do not replace
+  the objective with 1 minus a minimum autocorrelation without a derivation
+  that preserves these boundary terms and exactly matches the evaluator.
+- Products of entries of h make this a generally nonconvex optimization
+  problem. A direct CVXPY call is not a solution unless the subproblem you
+  formulate satisfies its supported rules. For a convex subproblem or
+  relaxation, specify its derivation, candidate recovery, and exact-objective
+  acceptance check. Do not claim a global optimum from a local method.
+- State how every returned vector satisfies both 0 <= h[i] <= 1 and
+  sum(h) = n_points / 2. Clipping and rescaling in succession do not generally
+  enforce both constraints; give a valid joint feasibility mechanism.
+- Derive dimensions from runtime inputs. If changing resolution, describe how
+  to transfer the parent, restore feasibility, and compare exact scores.
+  Retain a validated parent as a fallback when one is supplied.''')
         return super().build_strategy_messages(
             staged, previous_strategies=previous_strategies)
 

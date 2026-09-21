@@ -1794,6 +1794,11 @@ def _score_hidden_token_chunks(hidden_states, targets, output_head, *,
     def project(hidden_chunk, target_chunk):
         logits = output_head(hidden_chunk).float()
         log_probs = F.log_softmax(logits, dim=-1)
+        # Examples may be built while the trainer is offloaded to CPU. With
+        # model sharding, the output head can also run on a different GPU from
+        # the input embeddings. Align indices with the actual projected scores
+        # here, including when checkpoint recomputes this chunk in backward.
+        target_chunk = target_chunk.to(device=log_probs.device)
         chosen = log_probs.gather(
             1, target_chunk.unsqueeze(-1)).squeeze(-1)
         if not return_entropy:
@@ -2014,6 +2019,7 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
         logits = out.logits  # (1, T, V)
         # Predict response token at position P+k from logits at position P+k-1.
         pred_logits = logits[:, P - 1 : P - 1 + R, :]  # (1, R, V)
+        targets = response_ids.to(device=pred_logits.device)
 
         if chunk and 0 < chunk < R:
             parts = []
@@ -2021,7 +2027,7 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
             for s in range(0, R, chunk):
                 e = min(s + chunk, R)
                 lp = F.log_softmax(pred_logits[:, s:e, :].float(), dim=-1)
-                g = lp.gather(2, response_ids[:, s:e].unsqueeze(-1)).squeeze(-1)
+                g = lp.gather(2, targets[:, s:e].unsqueeze(-1)).squeeze(-1)
                 parts.append(g)          # keep only (1, e-s); lp freed next iter
                 if return_entropy:
                     safe_lp = lp.masked_fill(~torch.isfinite(lp), 0.0)
@@ -2031,7 +2037,7 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
                 entropy = torch.cat(entropies, dim=1)
         else:
             log_probs = F.log_softmax(pred_logits.float(), dim=-1)
-            gathered = log_probs.gather(2, response_ids.unsqueeze(-1)).squeeze(-1)  # (1, R)
+            gathered = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (1, R)
             if return_entropy:
                 safe_lp = log_probs.masked_fill(~torch.isfinite(log_probs), 0.0)
                 entropy = -(log_probs.exp() * safe_lp).sum(dim=-1)
@@ -2128,7 +2134,7 @@ def compute_batched_token_logprobs(
             response_len = int(response_ids.shape[1])
             pred_logits = logits[
                 row, prompt_len - 1:prompt_len - 1 + response_len, :]
-            targets = response_ids[0]
+            targets = response_ids[0].to(device=pred_logits.device)
             step = (int(chunk) if chunk and 0 < int(chunk) < response_len
                     else response_len)
             parts = []
@@ -5432,7 +5438,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from sampler import State
     from experiment_io import (save_parent_selections, save_rollout,
                                save_strategy_response)
-    from problems.base import ParentContext
+    from problems.base import ParentContext, STRATEGY_OUTPUT_CONTRACT
     from gen_workers import make_progress_bar
 
     from memory import (MemoryArm, RolloutRecord, allocate_memory_arms,
@@ -5785,9 +5791,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "Your previous attempt did not contain a complete usable "
                 "final strategy. You may reason as needed, but end with exactly "
                 "one complete <strategy>...</strategy> block containing the "
-                "concise final plan. Only that block is retained. Put nothing "
+                "full structured implementation plan requested above, including "
+                "the mathematical specification, concrete algorithm, budget, "
+                "and validation. Preserve the details needed by the coder; "
+                "remove repetition rather than reducing the plan to a summary. "
+                "Only that block is retained. Put nothing "
                 "after </strategy>, and close it before the token limit."
             )
+            retry_instruction += "\n\n" + STRATEGY_OUTPUT_CONTRACT
             if messages and messages[-1].get("role") == "user":
                 messages[-1]["content"] = (
                     str(messages[-1].get("content", "")).rstrip()
@@ -5798,9 +5809,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return _render_strategy(
             messages,
             # Effort stays at the configured level (cfg.strategy_reasoning_effort)
-            # on retry too -- the retry's job is the concise, focused
-            # instruction above plus the strategy stage's larger token
-            # budget, not a lower-effort model.
+            # on retry too. Repair the output contract while preserving the
+            # complete implementation plan for the coder.
             reasoning_effort=None,
         )
 
