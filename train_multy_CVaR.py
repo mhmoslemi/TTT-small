@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import random
+import re
 import threading
 import time
 from contextlib import (contextmanager, nullcontext, redirect_stderr,
@@ -40,6 +41,78 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import yaml
+
+
+_STRATEGY_FALLBACK = (
+    "No usable strategy was returned. Derive the implementation directly "
+    "from the task specification and current parent construction."
+)
+_STRATEGY_BLOCK_RE = re.compile(
+    r"<strategy\b[^>]*>\s*(.*?)\s*</strategy\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_STRATEGY_FINAL_MARKERS = (
+    "<|channel|>final<|message|>",
+    "assistantfinal",
+)
+
+
+def _extract_final_strategy(response_text):
+    """Return only a strategist's final answer, never its private analysis.
+
+    GPT-OSS offline decoding can expose Harmony channel text such as
+    ``analysis...assistantfinal``.  Its analysis frequently quotes the output
+    instruction itself, including a dummy ``<strategy> and </strategy>`` pair.
+    Selecting the first XML-looking block therefore turns a long valid final
+    answer into the literal word ``and``.  Prefer the final channel, select the
+    last complete block, and require enough content to plausibly be the
+    requested detailed plan.  A malformed or truncated answer becomes an
+    explicit safe fallback instead of being injected into the coder prompt.
+    """
+    raw = str(response_text or "").strip()
+    if not raw:
+        return _STRATEGY_FALLBACK, "empty response"
+
+    lowered = raw.lower()
+    final_position = -1
+    final_marker = ""
+    for marker in _STRATEGY_FINAL_MARKERS:
+        position = lowered.rfind(marker.lower())
+        if position > final_position:
+            final_position = position
+            final_marker = marker
+    final_text = (
+        raw[final_position + len(final_marker):].strip()
+        if final_position >= 0 else ""
+    )
+
+    # Search the explicit final channel first. If a runtime strips Harmony
+    # markers, the last complete block in the entire decoded response is the
+    # next-best unambiguous final answer.
+    regions = [final_text] if final_text else []
+    if not lowered.startswith("analysis"):
+        regions.append(raw)
+    for region in regions:
+        matches = list(_STRATEGY_BLOCK_RE.finditer(region))
+        for match in reversed(matches):
+            body = match.group(1).strip()
+            if len(body) >= 80:
+                return body, None
+
+    # Some non-Harmony chat templates omit the requested wrapper while still
+    # returning clean final prose. Accept only an identifiable final channel,
+    # or a plain response with no evidence of exposed analysis.
+    candidate = final_text
+    if not candidate and not lowered.startswith("analysis"):
+        candidate = raw
+    candidate = candidate.strip()
+    if (len(candidate) >= 80
+            and "<strategy" not in candidate.lower()
+            and "</strategy" not in candidate.lower()
+            and "assistantfinal" not in candidate.lower()):
+        return candidate, None
+
+    return _STRATEGY_FALLBACK, "missing complete final strategy"
 
 
 class _TimestampedLineStream:
@@ -5360,12 +5433,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     strategy_tokenizer = strategy_tokenizer or tokenizer
 
-    def _render_strategy(messages):
+    def _render_strategy(messages, *, reasoning_effort=None):
         strategy_name = str(getattr(cfg, "strategy_model_name", "")).lower()
         template_options = {}
         if "gpt-oss" in strategy_name:
             template_options["reasoning_effort"] = str(
-                cfg.strategy_reasoning_effort)
+                cfg.strategy_reasoning_effort
+                if reasoning_effort is None else reasoning_effort)
         else:
             template_options["enable_thinking"] = bool(
                 cfg.strategy_thinking)
@@ -5521,20 +5595,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
               f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
 
-    def _strategy_body(response_text):
-        text = str(response_text or "").strip()
-        lowered = text.lower()
-        opening = lowered.find("<strategy>")
-        if opening >= 0:
-            opening += len("<strategy>")
-            closing = lowered.find("</strategy>", opening)
-            if closing >= 0:
-                text = text[opening:closing].strip()
-        if not text:
-            text = ("No usable strategy was returned. Derive the implementation "
-                    "directly from the task specification.")
-        return text
-
     def _record_strategy_response(chain, strategy_index, response_text):
         """Save and register a strategy at stream-arrival time."""
         if len(chain["strategies"]) != int(strategy_index):
@@ -5550,12 +5610,57 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             int(strategy_index),
             raw_response,
         )
+        strategy, extraction_issue = _extract_final_strategy(raw_response)
         chain["strategies"].append({
             "response": raw_response,
-            "strategy": _strategy_body(raw_response),
+            "strategy": strategy,
+            "extraction_issue": extraction_issue,
         })
 
+    def _strategy_prompt(source_jobs, chain, strategy_index, *, retry=False):
+        source_idx = chain["source_indices"][strategy_index]
+        previous = [
+            record["strategy"] for record in chain["strategies"]
+            if record["extraction_issue"] is None
+        ]
+        messages = problem.build_strategy_messages(
+            source_jobs[source_idx]["messages"],
+            previous_strategies=previous,
+        )
+        if retry:
+            retry_instruction = (
+                "Your previous attempt did not contain a complete usable "
+                "final strategy. Respond concisely now. Complete the final "
+                "<strategy>...</strategy> block before the token limit; do "
+                "not restate the problem, instructions, or private reasoning."
+            )
+            if messages and messages[-1].get("role") == "user":
+                messages[-1]["content"] = (
+                    str(messages[-1].get("content", "")).rstrip()
+                    + "\n\n" + retry_instruction + "\n"
+                )
+            else:
+                messages.append({"role": "user", "content": retry_instruction})
+        return _render_strategy(
+            messages,
+            # Preserve the requested effort for the first attempt. A malformed
+            # high-effort GPT-OSS response is retried at low effort so private
+            # reasoning cannot consume the final-answer budget a second time.
+            reasoning_effort=("low" if retry else None),
+        )
+
     def _code_prompt_jobs(source_jobs, chains):
+        extraction_failures = sum(
+            record["extraction_issue"] is not None
+            for chain in chains for record in chain["strategies"])
+        if extraction_failures:
+            print(
+                f"[warn] strategist returned {extraction_failures}/"
+                f"{len(chains) * strategies_per_parent} malformed or "
+                "truncated final answers; coder prompts use the explicit "
+                "safe fallback for those entries",
+                flush=True,
+            )
         code_jobs = []
         for chain in chains:
             if len(chain["strategies"]) != strategies_per_parent:
@@ -5738,28 +5843,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                           f"(max {cfg.strategy_max_new_tokens} tokens each)",
                           flush=True)
                     try:
-                        for strategy_index in range(strategies_per_parent):
-                            strategy_prompts = []
-                            for chain in strategy_chains:
-                                source_idx = chain["source_indices"][
-                                    strategy_index]
-                                previous = [
-                                    record["strategy"]
-                                    for record in chain["strategies"]
-                                ]
-                                messages = problem.build_strategy_messages(
-                                    source_prompt_jobs[source_idx]["messages"],
-                                    previous_strategies=previous,
-                                )
-                                strategy_prompts.append(
-                                    _render_strategy(messages))
-                            completed_chains = set()
-                            for chain_index, job_results in (
+                        def _generate_strategy_batch(
+                                prompts, chain_indices, strategy_index,
+                                *, retry=False):
+                            responses = {}
+                            completed = set()
+                            suffix = " retry" if retry else ""
+                            for prompt_index, job_results in (
                                     planning_pool.iter_group_jobs(
-                                        prompts_by_group=strategy_prompts,
+                                        prompts_by_group=prompts,
                                         group_size=1,
-                                        counts_by_group=(
-                                            [1] * len(strategy_prompts)),
+                                        counts_by_group=[1] * len(prompts),
                                         adapter_path=None,
                                         max_new_tokens=int(
                                             cfg.strategy_max_new_tokens),
@@ -5768,30 +5862,80 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         top_p=float(cfg.strategy_top_p),
                                         step_idx=(
                                             int(step_idx) + 2_000_000
-                                            + strategy_index * 10_000),
+                                            + strategy_index * 10_000
+                                            + (5_000 if retry else 0)),
                                         progress_desc=(
                                             f"strategy "
                                             f"{strategy_index + 1}/"
-                                            f"{strategies_per_parent}"))):
+                                            f"{strategies_per_parent}"
+                                            f"{suffix}"))):
                                 if len(job_results) != 1:
                                     raise RuntimeError(
                                         "strategy generation must return "
                                         "exactly one response per chain")
-                                chain_index = int(chain_index)
-                                if chain_index in completed_chains:
+                                prompt_index = int(prompt_index)
+                                if (prompt_index < 0
+                                        or prompt_index
+                                        >= len(chain_indices)):
+                                    raise RuntimeError(
+                                        "strategy generation returned an "
+                                        "out-of-range prompt index")
+                                chain_index = int(
+                                    chain_indices[prompt_index])
+                                if chain_index in completed:
                                     raise RuntimeError(
                                         "strategy generation returned chain "
                                         f"{chain_index} more than once")
-                                _record_strategy_response(
-                                    strategy_chains[chain_index],
-                                    strategy_index,
-                                    job_results[0][0],
-                                )
-                                completed_chains.add(chain_index)
-                            if len(completed_chains) != len(strategy_chains):
+                                responses[chain_index] = job_results[0][0]
+                                completed.add(chain_index)
+                            if completed != set(chain_indices):
                                 raise RuntimeError(
                                     "strategy generation did not return every "
                                     "parent/fold chain")
+                            return responses
+
+                        for strategy_index in range(strategies_per_parent):
+                            chain_indices = list(range(len(strategy_chains)))
+                            strategy_prompts = [
+                                _strategy_prompt(
+                                    source_prompt_jobs, chain, strategy_index)
+                                for chain in strategy_chains
+                            ]
+                            responses = _generate_strategy_batch(
+                                strategy_prompts, chain_indices,
+                                strategy_index)
+                            malformed = [
+                                chain_index
+                                for chain_index, response in responses.items()
+                                if _extract_final_strategy(response)[1]
+                                is not None
+                            ]
+                            if malformed:
+                                print(
+                                    f"[warn] strategy "
+                                    f"{strategy_index + 1}/"
+                                    f"{strategies_per_parent}: retrying "
+                                    f"{len(malformed)} malformed or truncated "
+                                    "answer(s) with a constrained final pass",
+                                    flush=True,
+                                )
+                                retry_prompts = [
+                                    _strategy_prompt(
+                                        source_prompt_jobs,
+                                        strategy_chains[chain_index],
+                                        strategy_index,
+                                        retry=True)
+                                    for chain_index in malformed
+                                ]
+                                responses.update(_generate_strategy_batch(
+                                    retry_prompts, malformed, strategy_index,
+                                    retry=True))
+                            for chain_index in chain_indices:
+                                _record_strategy_response(
+                                    strategy_chains[chain_index],
+                                    strategy_index,
+                                    responses[chain_index],
+                                )
                     finally:
                         if planning_pool is not gen_pool:
                             planning_pool.release()
@@ -5853,20 +5997,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     strategy_cfg.top_p = float(cfg.strategy_top_p)
                     with backend.disable_adapter():
                         for strategy_index in range(strategies_per_parent):
-                            strategy_prompts = []
-                            for chain in strategy_chains:
-                                source_idx = chain["source_indices"][
-                                    strategy_index]
-                                previous = [
-                                    record["strategy"]
-                                    for record in chain["strategies"]
-                                ]
-                                messages = problem.build_strategy_messages(
-                                    source_prompt_jobs[source_idx]["messages"],
-                                    previous_strategies=previous,
-                                )
-                                strategy_prompts.append(
-                                    _render_strategy(messages))
+                            strategy_prompts = [
+                                _strategy_prompt(
+                                    source_prompt_jobs, chain, strategy_index)
+                                for chain in strategy_chains
+                            ]
                             _seed_local_generation(
                                 int(step_idx) + 2_000_000
                                 + strategy_index * 10_000)
@@ -5982,48 +6117,59 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     elif spo_rs_tracker.initialized:
                         if (spo_rs_previous_adapter_path is None
                                 or not spo_rs_previous_adapter_path.is_dir()):
-                            spo_rs_divergence = math.inf
-                            spo_rs_missing_policy_scores = len(score_pairs)
-                            print("[warn] SPO-RS previous policy adapter is "
-                                  "missing; this step uses rho_min", flush=True)
+                            raise FileNotFoundError(
+                                "SPO-RS cannot compute the consecutive-policy "
+                                "KL because its previous sampling adapter is "
+                                f"missing: {spo_rs_previous_adapter_path}")
                         else:
-                            try:
-                                # These responses were sampled by adapter_path
-                                # moments ago, and vLLM already returned the
-                                # exact chosen-token logprobs.  Re-scoring the
-                                # same 480 long prompts wastes a complete
-                                # policy pass and can exhaust the temporary
-                                # vocabulary-projection headroom.
-                                current_policy_scores = [
-                                    (list(record["behavior_logprobs"])
-                                     if record["behavior_logprobs"] is not None
-                                     and len(record["behavior_logprobs"])
-                                     == len(record["token_ids"])
-                                     else None)
-                                    for record in vllm_logprob_records
-                                ]
-                                previous_policy_scores = (
+                            # These responses were sampled by adapter_path
+                            # moments ago, and vLLM already returned the exact
+                            # chosen-token logprobs. Re-score only if an engine
+                            # produced an incomplete rollout payload.
+                            current_policy_scores = [
+                                (list(record["behavior_logprobs"])
+                                 if record["behavior_logprobs"] is not None
+                                 and len(record["behavior_logprobs"])
+                                 == len(record["token_ids"])
+                                 else None)
+                                for record in vllm_logprob_records
+                            ]
+                            if any(value is None
+                                   for value in current_policy_scores):
+                                rescored_current = (
                                     gen_pool.score_token_logprobs(
                                         score_pairs, show_progress=True,
-                                        adapter_path=str(
-                                            spo_rs_previous_adapter_path)))
-                                (spo_rs_divergence,
-                                 spo_rs_missing_policy_scores,
-                                 spo_rs_context_divergences) = (
-                                    spo_rs_tracker.consecutive_policy_divergence(
+                                        adapter_path=str(adapter_path),
+                                        require_complete=True))
+                                current_policy_scores = [
+                                    existing if existing is not None else retry
+                                    for existing, retry in zip(
                                         current_policy_scores,
-                                        previous_policy_scores,
-                                        [record["context_id"] for record
-                                         in vllm_logprob_records],
-                                        required_context_ids=[
-                                            spec["context_id"]
-                                            for spec in group_specs]))
-                            except Exception as error:
-                                spo_rs_divergence = math.inf
-                                spo_rs_missing_policy_scores = len(score_pairs)
-                                print(f"[warn] SPO-RS consecutive-policy "
-                                      f"scoring failed ({error!r}); this step "
-                                      "uses rho_min", flush=True)
+                                        rescored_current)
+                                ]
+                            previous_policy_scores = (
+                                gen_pool.score_token_logprobs(
+                                    score_pairs, show_progress=True,
+                                    adapter_path=str(
+                                        spo_rs_previous_adapter_path),
+                                    require_complete=True))
+                            (spo_rs_divergence,
+                             spo_rs_missing_policy_scores,
+                             spo_rs_context_divergences) = (
+                                spo_rs_tracker.consecutive_policy_divergence(
+                                    current_policy_scores,
+                                    previous_policy_scores,
+                                    [record["context_id"] for record
+                                     in vllm_logprob_records],
+                                    required_context_ids=[
+                                        spec["context_id"]
+                                        for spec in group_specs]))
+                            if (spo_rs_missing_policy_scores
+                                    or not math.isfinite(spo_rs_divergence)):
+                                raise RuntimeError(
+                                    "SPO-RS exact consecutive-policy scoring "
+                                    "completed without a usable score for "
+                                    f"{spo_rs_missing_policy_scores} rollout(s)")
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -7558,6 +7704,10 @@ def main():
             # cards while retaining level-1 host backups. Account for the
             # inactive pool's residual CUDA/NCCL state in both directions.
             vllm_co_resident_sleep=separate_strategy_pool,
+            # Training modes consume exact chosen-token prompt logprobs after
+            # generation. Give that vocabulary projection explicit memory
+            # headroom; this changes scheduling only, never the scores.
+            vllm_token_scoring=not bool(cfg.no_train),
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
         )
@@ -7650,6 +7800,7 @@ def main():
                     "vllm_pipeline_parallel_size": (
                         cfg.strategy_vllm_pipeline_parallel_size),
                     "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
+                    "vllm_token_scoring": False,
                     "vllm_persistent_workers": getattr(
                         cfg, "strategy_vllm_persistent_workers", None),
                     "vllm_staged_loading": (

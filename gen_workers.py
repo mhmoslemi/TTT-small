@@ -70,6 +70,14 @@ import multiprocessing as mp
 # and offloaded trainer still retain CUDA context state.  Twelve GiB left less
 # than one projection's headroom in real 96-GiB runs; keep sixteen unclaimed.
 VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 16.0
+# Prompt-logprob scoring materializes a vocabulary projection for every prefill
+# chunk.  On 150k-vocabulary coder models that transient is substantially
+# larger than ordinary generation activations, and CUDA-graph memory can make
+# vLLM exceed its nominal utilization target by several GiB.  Preserve enough
+# real headroom for the projection instead of letting an otherwise healthy
+# engine die after rollouts have already completed.
+VLLM_TOKEN_SCORING_RESERVE_GIB = 24.0
+VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS = 4096
 VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
 
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
@@ -1066,6 +1074,7 @@ class GenerationPool:
                  vllm_sleep_level=1,
                  vllm_persistent_workers=None,
                  vllm_co_resident_sleep=False,
+                 vllm_token_scoring=False,
                  vllm_staged_loading=False,
                  vllm_log_path=None):
         self.model_name = model_name
@@ -1077,6 +1086,7 @@ class GenerationPool:
         self.backend = str(backend).lower()
         requested_vllm_utilization = float(vllm_gpu_memory_utilization)
         self.vllm_co_resident_sleep = bool(vllm_co_resident_sleep)
+        self.vllm_token_scoring = bool(vllm_token_scoring)
         self.vllm_gpu_memory_utilization = requested_vllm_utilization
         self.sleep_requested = bool(vllm_enable_sleep_mode)
         self.sleep_level = int(vllm_sleep_level)
@@ -1110,23 +1120,50 @@ class GenerationPool:
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must not contain duplicates")
 
-        if self.backend == "vllm" and self.vllm_co_resident_sleep:
+        reserve_gib = 0.0
+        reserve_reasons = []
+        if self.vllm_co_resident_sleep:
+            reserve_gib = max(
+                reserve_gib, VLLM_CORESIDENT_SLEEP_RESERVE_GIB)
+            reserve_reasons.append("shared sleep residency")
+        if self.vllm_token_scoring:
+            reserve_gib = max(
+                reserve_gib, VLLM_TOKEN_SCORING_RESERVE_GIB)
+            reserve_reasons.append("exact token scoring")
+        if self.backend == "vllm" and reserve_gib > 0.0:
             self.vllm_gpu_memory_utilization = (
                 _cap_vllm_utilization_for_gpus(
                     requested_vllm_utilization,
                     self.gpu_ids,
-                    reserve_gib=VLLM_CORESIDENT_SLEEP_RESERVE_GIB,
+                    reserve_gib=reserve_gib,
                 ))
             if (self.vllm_gpu_memory_utilization
                     < requested_vllm_utilization - 1e-9):
                 print(
-                    "[pool] shared sleep residency: reserving at least "
-                    f"{VLLM_CORESIDENT_SLEEP_RESERVE_GIB:.1f} GiB/GPU; "
+                    f"[pool] {' + '.join(reserve_reasons)}: reserving at "
+                    f"least {reserve_gib:.1f} GiB/GPU; "
                     "vLLM utilization "
                     f"{requested_vllm_utilization:.3f} -> "
                     f"{self.vllm_gpu_memory_utilization:.3f}",
                     flush=True,
                 )
+
+        effective_max_batched_tokens = int(
+            vllm_max_num_batched_tokens or 0)
+        if (self.backend == "vllm" and self.vllm_token_scoring
+                and (effective_max_batched_tokens <= 0
+                     or effective_max_batched_tokens
+                     > VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS)):
+            configured = ("automatic" if effective_max_batched_tokens <= 0
+                          else str(effective_max_batched_tokens))
+            effective_max_batched_tokens = (
+                VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS)
+            print(
+                "[pool] exact token scoring: max batched tokens "
+                f"{configured} -> {effective_max_batched_tokens} to bound "
+                "the temporary vocabulary projection",
+                flush=True,
+            )
 
         if self.backend == "vllm":
             pp = int(vllm_pipeline_parallel_size or 1)
@@ -1201,7 +1238,7 @@ class GenerationPool:
             "quantization": vllm_quantization,
             "tensor_parallel_size": tp,
             "pipeline_parallel_size": pp,
-            "max_num_batched_tokens": int(vllm_max_num_batched_tokens or 0),
+            "max_num_batched_tokens": effective_max_batched_tokens,
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             # Separate TP engines remap different physical GPU pairs to the
             # same local CUDA ordinals. vLLM 0.28's custom all-reduce IPC can
@@ -1532,87 +1569,161 @@ class GenerationPool:
                 bar.close()
 
     def score_token_logprobs(self, prompt_response_pairs, show_progress=True,
-                             adapter_path=None):
+                             adapter_path=None, require_complete=False,
+                             max_retries=None):
         """Score observed response tokens with the base model or one LoRA.
 
         Calls are length-balanced over the already-awake engines. Omitting
-        ``adapter_path`` scores the fixed base model. Results align with
-        prompt_response_pairs; None marks an input that must fall back to HF.
+        ``adapter_path`` scores the fixed base model. A failed engine is
+        discarded, reloaded, and assigned only the still-missing trajectories.
+        Results align with prompt_response_pairs; None marks an optional input
+        that must fall back to HF. ``require_complete`` instead makes any
+        irrecoverable omission fatal, as required for SPO-RS policy KL.
         """
         if self.backend != "vllm":
             raise RuntimeError("token scoring is only available on vLLM pools")
         pairs = list(prompt_response_pairs)
         scores = [None] * len(pairs)
-        worker_jobs = [[] for _ in range(self.num_workers)]
-        worker_loads = [0 for _ in range(self.num_workers)]
-        skipped = 0
-        ordered = sorted(
-            enumerate(pairs),
-            key=lambda item: len(item[1][0]) + len(item[1][1]),
-            reverse=True,
-        )
-        for request_idx, (prompt_ids, response_ids) in ordered:
+        scorable = []
+        skipped = []
+        for request_idx, (prompt_ids, response_ids) in enumerate(pairs):
             total = len(prompt_ids) + len(response_ids)
             # Exact-limit inputs are handled by the worker by moving their last
             # observed token into the one generated scoring position.
             if not response_ids or total > self.max_seq_length:
-                skipped += 1
+                skipped.append(request_idx)
                 continue
-            worker = min(
-                range(self.num_workers), key=lambda idx: worker_loads[idx])
-            worker_jobs[worker].append(
-                (request_idx, list(prompt_ids), list(response_ids)))
-            worker_loads[worker] += total
+            scorable.append(request_idx)
 
-        expected_jobs = sum(len(jobs) for jobs in worker_jobs)
-        active_workers = sum(bool(jobs) for jobs in worker_jobs)
-        if not expected_jobs:
+        if require_complete and skipped:
+            raise ValueError(
+                "exact vLLM token scoring cannot score "
+                f"{len(skipped)}/{len(pairs)} empty or overlength responses")
+        if not scorable:
             return scores
-        for worker, jobs in enumerate(worker_jobs):
-            if jobs:
-                self.task_queues[worker].put(
-                    ("__score__", jobs, adapter_path))
 
-        completed_workers = set()
         score_label = ("vllm policy logprobs" if adapter_path is not None
                        else "vllm reference logprobs")
         bar = (make_progress_bar(len(pairs), desc=score_label)
                if show_progress else None)
         if bar is not None and skipped:
-            bar.update(skipped)
-        try:
-            while len(completed_workers) < active_workers:
+            bar.update(len(skipped))
+
+        def _balanced_jobs(request_indices):
+            worker_jobs = [[] for _ in range(self.num_workers)]
+            worker_loads = [0 for _ in range(self.num_workers)]
+            ordered = sorted(
+                request_indices,
+                key=lambda idx: len(pairs[idx][0]) + len(pairs[idx][1]),
+                reverse=True,
+            )
+            for request_idx in ordered:
+                prompt_ids, response_ids = pairs[request_idx]
+                worker = min(
+                    range(self.num_workers),
+                    key=lambda idx: worker_loads[idx],
+                )
+                worker_jobs[worker].append((
+                    request_idx, list(prompt_ids), list(response_ids)))
+                worker_loads[worker] += len(prompt_ids) + len(response_ids)
+            return worker_jobs
+
+        def _dispatch(worker_jobs):
+            waiting = {
+                worker for worker, jobs in enumerate(worker_jobs) if jobs
+            }
+            failed_workers = set()
+            for worker in waiting:
+                self.task_queues[worker].put(
+                    ("__score__", worker_jobs[worker], adapter_path))
+
+            while waiting:
                 try:
                     rank, group_idx, job_results = self.result_queue.get(
                         timeout=1.0)
                 except queue.Empty:
-                    dead = [
-                        (idx, None if proc is None else proc.exitcode)
-                        for idx, proc in enumerate(self.procs)
-                        if proc is None or proc.exitcode is not None]
+                    dead = {
+                        idx for idx in waiting
+                        if (self.procs[idx] is None
+                            or self.procs[idx].exitcode is not None)
+                    }
                     if dead:
-                        raise RuntimeError(
-                            "vLLM worker(s) exited during reference scoring: "
-                            f"{dead}")
+                        failed_workers.update(dead)
+                        waiting.difference_update(dead)
                     continue
+
+                rank = int(rank)
+                if rank not in waiting:
+                    raise RuntimeError(
+                        "unexpected or duplicate vLLM token-scoring result "
+                        f"from worker {rank}")
+                waiting.remove(rank)
                 if group_idx is None and isinstance(job_results, dict):
-                    detail = job_results.get("error", "unknown worker failure")
-                    print(f"[warn] vLLM worker {rank} failed during reference "
-                          f"scoring ({detail}); its values will fall back to "
-                          "HF", flush=True)
-                    completed_workers.add(int(rank))
+                    detail = job_results.get(
+                        "error", "unknown worker failure")
+                    print(
+                        f"[warn] vLLM worker {rank} failed during exact "
+                        f"token scoring ({detail})",
+                        flush=True,
+                    )
+                    failed_workers.add(rank)
                     continue
                 if group_idx != "__score__":
                     raise RuntimeError(
-                        "unexpected generation result during reference scoring")
-                if int(rank) in completed_workers:
-                    raise RuntimeError(
-                        f"duplicate vLLM reference result from worker {rank}")
+                        "unexpected generation result during token scoring")
+
+                newly_scored = 0
                 for request_idx, values in job_results:
-                    scores[int(request_idx)] = values
-                completed_workers.add(int(rank))
-                if bar is not None:
-                    bar.update(len(job_results))
+                    request_idx = int(request_idx)
+                    expected = len(pairs[request_idx][1])
+                    if values is None or len(values) != expected:
+                        continue
+                    if scores[request_idx] is None:
+                        newly_scored += 1
+                    scores[request_idx] = values
+                if bar is not None and newly_scored:
+                    bar.update(newly_scored)
+            return failed_workers
+
+        try:
+            pending = list(scorable)
+            retries = max(0, int(
+                2 if max_retries is None and require_complete
+                else (max_retries or 0)))
+            attempt = 0
+            while pending:
+                failed_workers = _dispatch(_balanced_jobs(pending))
+                pending = [
+                    request_idx for request_idx in scorable
+                    if scores[request_idx] is None
+                ]
+                if not pending or attempt >= retries:
+                    break
+                attempt += 1
+                if failed_workers:
+                    failed = sorted(failed_workers)
+                    print(
+                        f"[pool] exact token scoring retry {attempt}/"
+                        f"{retries}: restarting failed vLLM worker(s) "
+                        f"{failed} and rescoring {len(pending)} missing "
+                        "trajectories",
+                        flush=True,
+                    )
+                    self._stop_workers(failed)
+                    self._start_workers(failed)
+                else:
+                    print(
+                        f"[pool] exact token scoring retry {attempt}/"
+                        f"{retries}: rescoring {len(pending)} incomplete "
+                        "trajectories",
+                        flush=True,
+                    )
+
+            if require_complete and pending:
+                raise RuntimeError(
+                    "exact vLLM token scoring remained incomplete for "
+                    f"{len(pending)}/{len(pairs)} trajectories after "
+                    f"{attempt} retry attempt(s)")
         finally:
             if bar is not None:
                 bar.close()

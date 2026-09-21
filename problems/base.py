@@ -148,7 +148,11 @@ class Problem(ABC):
             "the task above. Think through the mathematics, algorithm, "
             "implementation structure, numerical choices, and likely failure "
             "modes. Do not write Python code or a code fence in this stage. "
-            "Return only the strategy between <strategy> and </strategy> tags."
+            "Do not restate the task or these output instructions. Keep the "
+            "final strategy concise (at most 1,200 words), and finish it well "
+            "before the response-token limit. Your final answer must contain "
+            "exactly one complete <strategy>...</strategy> block and nothing "
+            "else; an unclosed block is unusable."
         )
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (
@@ -171,9 +175,11 @@ class Problem(ABC):
 ## Code-stage output
 
 Use the task information and strategy above to produce the complete solution.
-Do not output analysis, reasoning, a strategy, notes, or example usage. Return
-only exactly one fenced Python code block, beginning with ```python and ending
-with ```."""
+Treat the strategy as planning guidance: preserve useful ideas, but correct any
+mistake or conflict with the task, required interface, or current parent
+construction. Do not output analysis, reasoning, a strategy, notes, or example
+usage. Return only exactly one fenced Python code block, beginning with
+```python and ending with ```."""
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (
                 str(staged[-1].get("content", "")).rstrip()
