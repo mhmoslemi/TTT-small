@@ -2190,6 +2190,7 @@ def _gradient_checkpointing_work_units(batches):
                 == tuple(batch[0]["prompt_ids"].shape)
                 for example in batch[1:]
             )
+        )
         if shared_prefix:
             work = int(batch[0]["prompt_ids"].shape[1]) + sum(
                 max(0, int(example["response_ids"].shape[1]) - 1)
