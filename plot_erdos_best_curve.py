@@ -237,9 +237,11 @@ def config_caption(run_dir, valid_count, metric_name, maximize):
     model = Path(str(config.get("model_name", "?"))).name
     groups = config.get("groups_per_step", "?")
     size = config.get("group_size", "?")
-    memory = "memory on" if config.get("memory") else "memory off"
+    # memory = "memory on" if config.get("memory") else "memory off"
+    memory = ""
     problem = config.get("problem", "unknown")
-    direction = "higher is better" if maximize else "lower is better"
+    # direction = "higher is better" if maximize else "lower is better"
+    direction = ""
     return (f"{problem} · {metric_name} · {model} · {groups} groups × {size} "
             f"rollouts · {memory} · {valid_count:,} valid rollouts · {direction}")
 
@@ -301,6 +303,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
             target = _finite_float(json.loads(config_path.read_text()).get("target"))
         except (OSError, json.JSONDecodeError):
             pass
+    target = 0.380876            
     if target is not None:
         ax.axhline(target, color=INK_MUTED, linewidth=1.2,
                    linestyle=(0, (5, 4)), zorder=2)
@@ -333,9 +336,11 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     values_for_limits = list(ys)
     if target is not None:
         values_for_limits.append(target)
+    
     low, high = min(values_for_limits), max(values_for_limits)
     span = max(high - low, 1e-5)
     ax.set_ylim(low - 0.09 * span, high + 0.18 * span)
+    # ax.set_ylim(0.38085, high + 0.18 * span)
     ax.set_xlim(min(steps) - 0.6, max(steps) + 0.6)
     ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.6f"))
@@ -344,11 +349,11 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     direction_word = "highest" if maximize else "lowest"
     ax.set_ylabel(f"{direction_word} {metric_name} seen so far",
                   fontsize=10.5, color=INK, labelpad=8)
-    fig.suptitle(title or f"{problem}: best-so-far score vs. training step",
-                 x=0.075, ha="left", y=0.95, fontsize=14,
-                 color=INK, fontweight="bold")
-    fig.text(0.075, 0.90, config_caption(run_dir, valid_count, metric_name, maximize),
-             ha="left", fontsize=9.5, color=INK_SOFT)
+    # fig.suptitle(title or f"{problem}: best-so-far score vs. training step",
+                #  x=0.075, ha="left", y=0.95, fontsize=14,
+                #  color=INK, fontweight="bold")
+    fig.text(0.075, 0.86, config_caption(run_dir, valid_count, metric_name, maximize),
+             ha="left", fontsize=14, color=INK)
 
     handles = [
         Line2D([], [], color=BLUE, lw=2.2, marker="o", ms=6,

@@ -103,4 +103,4 @@ esac
 # exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank entropic spo-rs
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode spo-rs \
     --fast --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
-    --isolate-eval  --strategies "$@"  # --no-train --fused-long-attention
+    --isolate-eval  --strategies "$@"  --no-train #  --fused-long-attention
