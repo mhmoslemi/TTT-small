@@ -55,6 +55,7 @@ _STRATEGY_FINAL_MARKERS = (
     "<|channel|>final<|message|>",
     "assistantfinal",
 )
+_LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
 
 
 def _extract_final_strategy(response_text):
@@ -117,7 +118,12 @@ class _TimestampedLineStream:
         with self._lock:
             for index, part in enumerate(parts):
                 if part and self._line_start:
-                    self.stream.write(time.strftime("[%H:%M:%S] "))
+                    timestamp = time.strftime(
+                        "[%H:%M:%S] ",
+                        time.localtime(
+                            time.time() + _LOG_TIME_OFFSET_SECONDS),
+                    )
+                    self.stream.write(timestamp)
                 if part:
                     self.stream.write(part)
                     self._line_start = False
