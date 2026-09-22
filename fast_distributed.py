@@ -715,8 +715,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                         weighted_losses = []
                         for example, current_lp, token_entropy in zip(
                                 batch, current_logprobs, token_entropies):
-                            loss, metrics = training.rank_grpo_loss(
-                                current_lp,
+                            loss, metrics = training.clipped_policy_loss(
+                                cfg, current_lp,
                                 example["rank_old_logprobs"],
                                 example["rank_reference_logprob"],
                                 example["advantage"],
@@ -951,8 +951,10 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 if offloaded:
                     raise RuntimeError(
                         "fast worker received training while offloaded")
+                step_cfg = SimpleNamespace(**dict(
+                    command.get("step_cfg") or vars(cfg)))
                 stats = local_rank_update(
-                    backend, model, tokenizer, (), cfg,
+                    backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
                     memory_fraction=command.get("memory_fraction", 0.80),
                     fb_cfg=command.get("fb_cfg"),

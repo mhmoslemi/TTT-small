@@ -121,6 +121,12 @@ def _training_model_name(cfg):
                        getattr(cfg, "model_name", "")))
 
 
+def _lora_rank(cfg):
+    if bool(getattr(cfg, "binary_coder_training", False)):
+        return int(getattr(cfg, "binary_coder_lora_rank"))
+    return int(cfg.lora_rank)
+
+
 def _requires_unsloth_gpt_oss_loader(model_name):
     name = str(model_name).strip().lower()
     return "gpt-oss" in name and "unsloth-bnb-4bit" in name
@@ -618,7 +624,7 @@ def _resolve_lora_target_modules(cfg, model_config):
     kept = [name for name in targets if name not in expert_mlp_targets]
     if experts >= 64 and removed and kept:
         print(f"[memory] large MoE ({experts} experts): excluding expert-wide "
-              f"LoRA targets {removed}; keeping {kept} at rank {cfg.lora_rank}")
+              f"LoRA targets {removed}; keeping {kept} at rank {_lora_rank(cfg)}")
         targets = kept
     cfg.effective_target_modules = tuple(targets)
     return targets
@@ -671,7 +677,7 @@ class UnslothBackend(_ModelPlacementBackend):
         print("[backend=unsloth] attaching LoRA ...")
         model = FastLanguageModel.get_peft_model(
             model,
-            r=self.cfg.lora_rank,
+            r=_lora_rank(self.cfg),
             lora_alpha=self.cfg.lora_alpha,
             lora_dropout=self.cfg.lora_dropout,
             target_modules=target_modules,
@@ -805,7 +811,7 @@ class HFBackend(_ModelPlacementBackend):
         target_modules = _resolve_lora_target_modules(self.cfg, hf_config)
         print("[backend=hf] attaching LoRA ...")
         peft_cfg = LoraConfig(
-            r=self.cfg.lora_rank,
+            r=_lora_rank(self.cfg),
             lora_alpha=self.cfg.lora_alpha,
             lora_dropout=self.cfg.lora_dropout,
             target_modules=target_modules,

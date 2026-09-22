@@ -30,6 +30,8 @@ fail_score model_name training_model_name coder_model_name
 coder_training_model_name strategy_model_name backend max_seq_length load_in_4bit
 lora_rank lora_alpha
 lora_dropout target_modules
+binary_coder_training binary_coder_init_steps binary_coder_lora_rank
+binary_coder_clip_epsilon_low binary_coder_clip_epsilon_high
 training_gpu_id available_gpu_ids reserve_last_gpu_for_evaluation
 evaluation_gpu_id num_gpus gpu_ids sequential_generation
 evaluation_shares_generation
@@ -223,9 +225,27 @@ def validate_problem_config(
                 "num_seed_states", "max_new_tokens", "max_seq_length",
                 "train_examples_per_microbatch", "strategies_per_parent",
                 "programs_per_strategy", "strategy_max_new_tokens",
-                "strategy_max_seq_length"):
+                "strategy_max_seq_length", "binary_coder_lora_rank"):
         if key in data:
             _positive_int(data, key, source)
+    if "binary_coder_training" in data:
+        if not isinstance(data["binary_coder_training"], bool):
+            raise ValueError(
+                f"{_label(source)}: binary_coder_training must be true or false")
+        init_steps = data.get("binary_coder_init_steps")
+        if (isinstance(init_steps, bool) or not isinstance(init_steps, int)
+                or init_steps < 0):
+            raise ValueError(
+                f"{_label(source)}: binary_coder_init_steps must be a "
+                "nonnegative integer")
+        if data["binary_coder_training"] and init_steps < 1:
+            raise ValueError(
+                f"{_label(source)}: binary_coder_init_steps must be positive "
+                "when binary_coder_training is enabled")
+    for key in ("binary_coder_clip_epsilon_low",
+                "binary_coder_clip_epsilon_high"):
+        if key in data and not 0.0 < float(data[key]) < 1.0:
+            raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
     if "eval_cpus" in data:
         _positive_int(data, "eval_cpus", source)
     if "num_circles" in data:

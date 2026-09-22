@@ -250,7 +250,8 @@ def _route_dependency_notices(log_path):
 # CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
 ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank", "x-grpo", "spo-rs")
-CLIPPED_POLICY_MODES = frozenset(("rank", "x-grpo", "spo-rs"))
+CLIPPED_POLICY_MODES = frozenset(
+    ("rank", "x-grpo", "spo-rs", "binary-coder"))
 CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
 CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
 # RANK_GAMMA_DEFAULT = math.log(4) # cirlce pack
@@ -275,6 +276,20 @@ SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
 
 def _uses_clipped_policy_loss(mode):
     return str(mode or "entropic").lower() in CLIPPED_POLICY_MODES
+
+
+def _resolve_binary_coder_options(merged):
+    from problems.binary_coder import BinaryCoderConfig
+
+    resolved = BinaryCoderConfig.from_mapping(merged)
+    merged.update(resolved.as_dict())
+    if resolved.enabled:
+        if (float(merged["temperature"]) != 1.0
+                or float(merged["top_p"]) != 1.0):
+            print("[config] binary coder PPO sets temperature=1 and top_p=1 "
+                  "to match the policy likelihood used by the loss")
+        merged["temperature"] = 1.0
+        merged["top_p"] = 1.0
 
 
 def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
@@ -1084,6 +1099,11 @@ def load_config():
                 - int(saved.get("memory_token_budget", 0)),
             )
         merged.update(saved)
+        # Runs created before the binary coder phase existed must retain their
+        # original adapter rank/objective when resumed, even if the current
+        # problem preset now enables the new phase for fresh runs.
+        if "binary_coder_training" not in saved:
+            merged["binary_coder_training"] = False
         print(f"[config] resuming original configuration from "
               f"{resume_dir / 'config.json'}")
 
@@ -1246,6 +1266,7 @@ def load_config():
     if not (0.0 <= cvar_lambda <= 1.0):
         raise ValueError("cvar_lambda must be in [0, 1]")
     merged["cvar_lambda"] = cvar_lambda
+    _resolve_binary_coder_options(merged)
     _resolve_rank_options(merged)
     _resolve_x_grpo_options(merged)
     _resolve_spo_rs_options(merged)
@@ -1434,9 +1455,11 @@ def load_config():
               f"{training_budgets} GiB")
 
     if merged["fast"] and not merged["no_train"]:
-        if not _uses_clipped_policy_loss(merged["advantage_mode"]):
+        if (not merged["binary_coder_training"]
+                and not _uses_clipped_policy_loss(merged["advantage_mode"])):
             raise ValueError(
-                "--fast requires --advantage-mode rank, x-grpo, or spo-rs")
+                "--fast requires binary coder training or --advantage-mode "
+                "rank, x-grpo, or spo-rs")
         if int(merged["rank_update_epochs"]) != 1:
             raise ValueError("--fast requires one clipped-policy update epoch")
         if not (int(merged["num_training_gpus"]) > 1
@@ -2605,6 +2628,8 @@ def _rank_dropout_disabled(model):
 
 
 def _rank_entropy_coefficient(cfg):
+    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
+        return 0.0
     if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
         return 0.0
     if getattr(cfg, "advantage_mode", "entropic") == "x-grpo":
@@ -2616,6 +2641,10 @@ def _rank_entropy_coefficient(cfg):
 
 def _clipped_policy_options(cfg):
     """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
+    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
+        low = float(cfg.binary_coder_clip_epsilon_low)
+        high = float(cfg.binary_coder_clip_epsilon_high)
+        return low, low, high, 0.0
     if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
         epsilon = float(getattr(
             cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
@@ -2634,15 +2663,42 @@ def _clipped_policy_options(cfg):
 
 
 def _clipped_reference_count(cfg, supplied, total):
-    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+    if getattr(cfg, "advantage_mode", "entropic") in (
+            "spo-rs", "binary-coder"):
         return "off"
     return f"{int(supplied)}/{int(total)}"
 
 
 def _clipped_reference_metric(cfg, value):
-    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+    if getattr(cfg, "advantage_mode", "entropic") in (
+            "spo-rs", "binary-coder"):
         return "reference=off"
     return f"avg logpi_theta-logpi_base={float(value):.6f}"
+
+
+def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
+                        reference_logprob, advantage, *,
+                        clip_epsilon, clip_epsilon_low,
+                        clip_epsilon_high, kl_coef=0.0,
+                        entropy_coef=0.0, token_entropies=None,
+                        return_tensor_metrics=False):
+    """Dispatch the shared fast trainer to the active clipped objective."""
+    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
+        from problems.binary_coder import binary_coder_clipped_loss
+        return binary_coder_clipped_loss(
+            current_logprobs, old_logprobs, advantage,
+            clip_epsilon_low=clip_epsilon_low,
+            clip_epsilon_high=clip_epsilon_high,
+            return_tensor_metrics=return_tensor_metrics)
+    return rank_grpo_loss(
+        current_logprobs, old_logprobs, reference_logprob, advantage,
+        clip_epsilon=clip_epsilon,
+        clip_epsilon_low=clip_epsilon_low,
+        clip_epsilon_high=clip_epsilon_high,
+        kl_coef=kl_coef,
+        entropy_coef=entropy_coef,
+        token_entropies=token_entropies,
+        return_tensor_metrics=return_tensor_metrics)
 
 
 def _x_grpo_batched_autograd_unavailable(error):
@@ -3210,7 +3266,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
     reference_label = _clipped_reference_count(
         cfg, supplied_reference, len(examples))
     fallback_reference_label = (
-        "off" if cfg.advantage_mode == "spo-rs"
+        "off" if cfg.advantage_mode in ("spo-rs", "binary-coder")
         else str(len(reference_fallback)))
     print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: vLLM supplied old="
           f"{len(examples) - len(missing_old)}/{len(examples)}, reference="
@@ -3290,8 +3346,8 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                     weighted_losses = []
                     for ex, cur_lp, token_entropy in zip(
                             batch, current_logprobs, token_entropies):
-                        loss, metrics = rank_grpo_loss(
-                            cur_lp, ex["rank_old_logprobs"],
+                        loss, metrics = clipped_policy_loss(
+                            cfg, cur_lp, ex["rank_old_logprobs"],
                             ex["rank_reference_logprob"], ex["advantage"],
                             clip_epsilon=epsilon,
                             clip_epsilon_low=epsilon_low,
@@ -3864,8 +3920,8 @@ class ReplicatedDataParallelTrainer:
                                 for example, current_lp, token_entropy in zip(
                                         batch, current_logprobs,
                                         token_entropies):
-                                    loss, metrics = rank_grpo_loss(
-                                        current_lp,
+                                    loss, metrics = clipped_policy_loss(
+                                        cfg, current_lp,
                                         example["rank_old_logprobs"],
                                         example["rank_reference_logprob"],
                                         example["advantage"],
@@ -4241,8 +4297,8 @@ class ReplicatedDataParallelTrainer:
                             for example, current_lp, token_entropy in zip(
                                     batch, current_logprobs,
                                     token_entropies):
-                                loss, metrics = rank_grpo_loss(
-                                    current_lp,
+                                loss, metrics = clipped_policy_loss(
+                                    cfg, current_lp,
                                     example["rank_old_logprobs"],
                                     example["rank_reference_logprob"],
                                     example["advantage"],
@@ -4949,6 +5005,7 @@ class ProcessDistributedTrainer:
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
                 "kind": "train_rank",
+                "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": 0.80,
                 "fb_cfg": fb_cfg,
@@ -5454,6 +5511,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rank_mode = active_advantage_mode == "rank"
     x_grpo_mode = active_advantage_mode == "x-grpo"
     spo_rs_mode = active_advantage_mode == "spo-rs"
+    binary_coder_mode = active_advantage_mode == "binary-coder"
     if spo_rs_mode and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
@@ -5512,6 +5570,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rank_group_stats = []
     x_grpo_groups = {}
     spo_rs_updates = []
+    binary_coder_diagnostics = []
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
@@ -6501,6 +6560,9 @@ code block.'''
                                     "SPO-RS exact consecutive-policy scoring "
                                     "completed without a usable score for "
                                     f"{spo_rs_missing_policy_scores} rollout(s)")
+                elif binary_coder_mode:
+                    reference_scores = [None] * len(score_pairs)
+                    current_policy_scores = [None] * len(score_pairs)
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -6515,7 +6577,8 @@ code block.'''
                 for record, values in zip(
                         vllm_logprob_records, reference_scores):
                     behavior_values = record["behavior_logprobs"]
-                    if (not spo_rs_mode and values is None
+                    if (not (spo_rs_mode or binary_coder_mode)
+                            and values is None
                             and behavior_values is not None
                             and len(behavior_values)
                             == len(record["token_ids"])):
@@ -6536,8 +6599,9 @@ code block.'''
                     future.done() for futures in reward_futures.values()
                     for future in futures)
                 reference_label = (
-                    "off for SPO-RS" if spo_rs_mode
-                    else f"{reference_count}/{len(vllm_logprob_records)}")
+                    "off for SPO-RS" if spo_rs_mode else
+                    "off for binary coder" if binary_coder_mode else
+                    f"{reference_count}/{len(vllm_logprob_records)}")
                 if spo_rs_mode and not spo_rs_tracker.initialized:
                     policy_label = ", SPO-RS policy KL=initialization"
                 elif spo_rs_mode and same_policy:
@@ -6872,6 +6936,19 @@ code block.'''
             adv_scale = float(cfg.spo_rs_beta)
             adv_scale_label = "beta"
             adv_info = {}
+        elif binary_coder_mode:
+            from problems.binary_coder import binary_coder_advantages
+            advantages, group_binary_diagnostics = binary_coder_advantages(
+                outs, parent, fail_score=cfg.fail_score)
+            binary_coder_diagnostics.extend({
+                "group": g,
+                "rollout": r_idx,
+                **diagnostic,
+            } for r_idx, diagnostic in enumerate(
+                group_binary_diagnostics))
+            adv_scale = 1.0
+            adv_scale_label = "binary"
+            adv_info = {}
         else:
             advantages, adv_scale, adv_scale_label, adv_info = (
                 compute_group_advantages(
@@ -7054,6 +7131,8 @@ code block.'''
                     float(values[r_idx]) for values in x_trial_advantages]
             elif spo_rs_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
+            elif binary_coder_mode:
+                meta["binary_coder"] = group_binary_diagnostics[r_idx]
             if memory_v2:
                 meta["memory_version"] = "V2"
                 meta["memory_comparison_n"] = int(
@@ -7255,7 +7334,7 @@ code block.'''
                   f"{unusable} rollout(s); saved them but excluded only those "
                   "records from the clipped-policy update", flush=True)
 
-    if spo_rs_mode and all_examples:
+    if (spo_rs_mode or binary_coder_mode) and all_examples:
         trajectory_weight = 1.0 / len(all_examples)
         for example in all_examples:
             example["sample_weight"] = trajectory_weight
@@ -7361,6 +7440,26 @@ code block.'''
 
     if rank_mode:
         step_stats["rank_groups"] = rank_group_stats
+    elif binary_coder_mode:
+        usable_count = sum(
+            bool(item["usable"]) for item in binary_coder_diagnostics)
+        reason_counts = {}
+        for item in binary_coder_diagnostics:
+            reason = str(item["reason"])
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+        step_stats["binary_coder"] = {
+            "usable": int(usable_count),
+            "failed": int(len(binary_coder_diagnostics) - usable_count),
+            "total": int(len(binary_coder_diagnostics)),
+            "reasons": reason_counts,
+            "usable_fraction": (
+                float(usable_count / len(binary_coder_diagnostics))
+                if binary_coder_diagnostics else 0.0),
+        }
+        print(f"[step {step_idx}] binary coder verified usability: "
+              f"{usable_count}/{len(binary_coder_diagnostics)} "
+              f"({step_stats['binary_coder']['usable_fraction']:.1%}); "
+              "usable=+1, every rejection=-1", flush=True)
     elif spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
         step_stats["spo_rs_tracker_size"] = len(spo_rs_tracker)
@@ -7377,7 +7476,9 @@ code block.'''
     if not training_enabled:
         step_stats["training_disabled"] = True
         step_stats["training_seconds"] = 0.0
-        print(f"[step {step_idx}] training disabled (--no-train); "
+        disabled_reason = str(getattr(
+            cfg, "_training_disabled_reason", "--no-train"))
+        print(f"[step {step_idx}] training disabled ({disabled_reason}); "
               "skipping training-only logprobs, backward, and optimizer update",
               flush=True)
         return step_stats
@@ -7630,6 +7731,9 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 def main():
     _install_console_timestamps()
     cfg, merged = load_config()
+    from problems.binary_coder import (
+        BINARY_CODER_MODE, BinaryCoderConfig)
+    binary_coder_cfg = BinaryCoderConfig.from_mapping(merged)
     # This must precede every import path that can initialize CUDA. Worker and
     # evaluation children replace CUDA_VISIBLE_DEVICES with their own physical
     # groups before importing their CUDA stacks.
@@ -7787,33 +7891,49 @@ def main():
         print(f"Group size:         {cfg.group_size}")
         print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
     print(f"LR:                 {cfg.learning_rate}")
-    if configured_advantage_mode == "spo-rs":
+    if binary_coder_cfg.enabled:
+        print("Reference KL:        off (binary coder PPO objective)")
+    elif configured_advantage_mode == "spo-rs":
         print("Reference KL:        off (SPO-RS PPO objective)")
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
-    print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
-    if getattr(cfg, "advantage_mode", "entropic") == "cvar":
+    print(f"Advantage mode:     "
+          f"{'binary-coder' if binary_coder_cfg.enabled else getattr(cfg, 'advantage_mode', 'entropic')}")
+    if binary_coder_cfg.enabled:
+        print(f"Binary coder phase: steps 0-{binary_coder_cfg.init_steps - 1}; "
+              f"verified +/-1 advantages, LoRA rank "
+              f"{binary_coder_cfg.lora_rank}")
+        print(f"Binary coder clip:  low/high "
+              f"{binary_coder_cfg.clip_epsilon_low} / "
+              f"{binary_coder_cfg.clip_epsilon_high} "
+              f"(bounds {1.0 - binary_coder_cfg.clip_epsilon_low:.4f} / "
+              f"{1.0 + binary_coder_cfg.clip_epsilon_high:.4f}); "
+              "adapter remains active and freezes afterward")
+    if (not binary_coder_cfg.enabled
+            and getattr(cfg, "advantage_mode", "entropic") == "cvar"):
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
-    if configured_advantage_mode == "spo-rs":
-        print(f"SPO-RS beta:        {cfg.spo_rs_beta}")
-        print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
-        print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
-        print(f"SPO-RS clip eps low/high: "
-              f"{cfg.spo_rs_clip_epsilon_low} / "
-              f"{cfg.spo_rs_clip_epsilon_high} "
-              f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
-              f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
-        print(f"SPO-RS update epochs: {cfg.rank_update_epochs}")
-    elif _uses_clipped_policy_loss(configured_advantage_mode):
-        print(f"Rank clip eps low/high: "
-              f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
-              f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
-              f"{1.0 + cfg.rank_clip_epsilon_high:.4f})")
-        print(f"Rank update epochs: {cfg.rank_update_epochs}")
-    if configured_advantage_mode == "rank":
+    if not binary_coder_cfg.enabled:
+        if configured_advantage_mode == "spo-rs":
+            print(f"SPO-RS beta:        {cfg.spo_rs_beta}")
+            print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
+            print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
+            print(f"SPO-RS clip eps low/high: "
+                  f"{cfg.spo_rs_clip_epsilon_low} / "
+                  f"{cfg.spo_rs_clip_epsilon_high} "
+                  f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
+                  f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
+            print(f"SPO-RS update epochs: {cfg.rank_update_epochs}")
+        elif _uses_clipped_policy_loss(configured_advantage_mode):
+            print(f"Rank clip eps low/high: "
+                  f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
+                  f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
+                  f"{1.0 + cfg.rank_clip_epsilon_high:.4f})")
+            print(f"Rank update epochs: {cfg.rank_update_epochs}")
+    if not binary_coder_cfg.enabled and configured_advantage_mode == "rank":
         print(f"Rank gamma:         {cfg.rank_gamma}")
         print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
-    elif configured_advantage_mode == "x-grpo":
+    elif (not binary_coder_cfg.enabled
+          and configured_advantage_mode == "x-grpo"):
         print(f"X-GRPO budgets:     {list(cfg.x_grpo_budgets)}")
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
@@ -7838,9 +7958,9 @@ def main():
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
     print(f"Memory:             {'on' if mem_cfg.enabled else 'off'}")
     feedback_label = (
-        "disabled (--no-train)" if cfg.no_train
-        else ("on" if bool(merged["feedback"]) else "off")
-    )
+        "disabled (--no-train)" if cfg.no_train else
+        "off during binary coder phase" if binary_coder_cfg.enabled else
+        "on" if bool(merged["feedback"]) else "off")
     print(f"Feedback signal:    {feedback_label}")
     print("=" * 70)
 
@@ -7967,7 +8087,7 @@ def main():
     print(f"[init] sampler archive size = {sampler.archive_size()}")
 
     spo_rs_tracker = None
-    if configured_advantage_mode == "spo-rs":
+    if configured_advantage_mode == "spo-rs" and not binary_coder_cfg.enabled:
         from spo_rs import SPORSTracker
         spo_rs_tracker = SPORSTracker(
             entropic_beta=cfg.spo_rs_beta,
@@ -8054,7 +8174,8 @@ def main():
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
-            lora_rank=cfg.lora_rank,
+            lora_rank=(binary_coder_cfg.lora_rank
+                       if binary_coder_cfg.enabled else cfg.lora_rank),
             vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
             vllm_enforce_eager=cfg.vllm_enforce_eager,
             vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
@@ -8348,6 +8469,23 @@ def main():
                 cur_g, cur_k = int(cfg.max_groups_per_step), int(cfg.max_group_size)
             cfg.groups_per_step = cur_g
             cfg.group_size = cur_k
+            step_cfg = cfg
+            step_fb_cfg = fb_cfg
+            if binary_coder_cfg.enabled:
+                step_cfg = SimpleNamespace(**vars(cfg))
+                step_cfg.advantage_mode = BINARY_CODER_MODE
+                step_fb_cfg = None
+                if binary_coder_cfg.active(step):
+                    step_cfg.no_train = bool(cfg.no_train)
+                    print(f"[step {step}] binary coder initialization "
+                          f"{step + 1}/{binary_coder_cfg.init_steps}: "
+                          "training the verified-usability adapter", flush=True)
+                else:
+                    step_cfg.no_train = True
+                    step_cfg._training_disabled_reason = (
+                        "binary coder initialization complete; adapter frozen")
+                    print(f"[step {step}] binary coder adapter is active and "
+                          "frozen; policy training remains off", flush=True)
             if configured_advantage_mode == "x-grpo":
                 rollout_count = (
                     int(cfg.x_grpo_contexts_per_step) * cur_g * cur_k)
@@ -8368,16 +8506,18 @@ def main():
                       f"({cur_g * cur_k} rollouts)")
 
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
-                               cfg, exp_dir, problem, gen_pool,
+                               step_cfg, exp_dir, problem, gen_pool,
                                strategy_pool=strategy_pool,
                                strategy_tokenizer=strategy_tokenizer,
                                memory=memory, extractor=extractor, mem_cfg=mem_cfg,
-                               lookup=lookup, curator=curator, fb_cfg=fb_cfg,
+                               lookup=lookup, curator=curator,
+                               fb_cfg=step_fb_cfg,
                                parallel_trainer=parallel_trainer,
                                spo_rs_tracker=spo_rs_tracker,
                                sampling_adapter_path=(
                                    current_policy_adapter_path
-                                   if configured_advantage_mode == "spo-rs"
+                                   if (configured_advantage_mode == "spo-rs"
+                                       and not binary_coder_cfg.enabled)
                                    else None),
                                ensure_trainer_ready=ensure_trainer_ready)
 
@@ -8405,7 +8545,10 @@ def main():
             if memory is not None:
                 memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
                 memory.save(memory_path)
-            if configured_advantage_mode == "spo-rs":
+            if binary_coder_cfg.enabled:
+                adapter_path = _save_adapter(
+                    model, exp_dir, step, cfg.model_name)
+            elif configured_advantage_mode == "spo-rs":
                 if stats.get("spo_rs_policy_updated", False):
                     adapter_path = _save_adapter(
                         model, exp_dir, step, cfg.model_name)
