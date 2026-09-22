@@ -11,6 +11,7 @@ _FUSED_LONG_ATTENTION_DISABLED = False
 _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
 _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
 _SHARED_PREFIX_ATTENTION_LAYOUTS = {}
+_CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = None
 
 
 def register_shared_prefix_attention_mask(mask, prefix_end, branches):
@@ -45,6 +46,13 @@ def register_shared_prefix_attention_mask(mask, prefix_end, branches):
     reference = weakref.ref(mask, discard)
     _SHARED_PREFIX_ATTENTION_LAYOUTS[key] = (
         reference, prefix_end, normalized)
+    # Training performs one synchronous forward/backward at a time in each
+    # process.  Accelerate may create one mask copy per sharded decoder layer;
+    # this device-independent entry lets those copies recover the current
+    # layout without a GPU-to-CPU synchronization on every layer.
+    global _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT
+    _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = (
+        total, prefix_end, normalized)
 
 
 def _shared_prefix_attention_layout(mask):
@@ -53,9 +61,17 @@ def _shared_prefix_attention_layout(mask):
         return None
     key = (str(mask.device), int(mask.data_ptr()))
     entry = _SHARED_PREFIX_ATTENTION_LAYOUTS.get(key)
-    if entry is None or entry[0]() is not mask:
-        raise RuntimeError("unregistered shared-prefix attention mask")
-    return entry[1], entry[2]
+    if entry is not None and entry[0]() is mask:
+        return entry[1], entry[2]
+
+    current = _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT
+    if (current is not None
+            and int(mask.shape[-1]) == current[0]
+            and mask.dtype in (
+                torch.int8, torch.int16, torch.int32,
+                torch.int64, torch.uint8)):
+        return current[1], current[2]
+    raise RuntimeError("unregistered shared-prefix attention mask")
 
 
 # ======================================================================
