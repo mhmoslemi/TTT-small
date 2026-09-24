@@ -1494,12 +1494,12 @@ def load_config():
               f"{training_budgets} GiB")
 
     if merged["fast"] and not merged["no_train"]:
-        if (not merged["binary_coder_training"]
-                and not _uses_clipped_policy_loss(merged["advantage_mode"])):
-            raise ValueError(
-                "--fast requires binary coder training or --advantage-mode "
-                "rank, x-grpo, or spo-rs")
-        if int(merged["rank_update_epochs"]) != 1:
+        fast_clipped_policy = bool(
+            merged["binary_coder_training"]
+            or _uses_clipped_policy_loss(merged["advantage_mode"])
+        )
+        if (fast_clipped_policy
+                and int(merged["rank_update_epochs"]) != 1):
             raise ValueError("--fast requires one clipped-policy update epoch")
         if not (int(merged["num_training_gpus"]) > 1
                 and merged["backend"] == "hf"
@@ -8366,6 +8366,17 @@ def main():
         and cfg.generation_backend == "vllm"
         and cfg.training_layout != "sharded"
     )
+    # The process-per-GPU adaptive scheduler implements the clipped-policy
+    # objectives.  Entropic/GRPO/CVaR already have an exact concurrent
+    # all-GPU implementation in ReplicatedDataParallelTrainer; keep --fast
+    # accepted and route those objectives there rather than rejecting them or
+    # changing their loss.
+    use_process_distributed_training = bool(
+        use_replicated_training
+        and cfg.fast
+        and (binary_coder_cfg.enabled
+             or _uses_clipped_policy_loss(cfg.advantage_mode))
+    )
     if use_replicated_training:
         cfg.training_replica_device = 0
 
@@ -8408,13 +8419,17 @@ def main():
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
     training_layout = (
         "disabled (--no-train)" if cfg.no_train
-        else ("process-distributed LoRA" if cfg.fast
+        else ("process-distributed LoRA"
+              if use_process_distributed_training
               else ("replicated data parallel" if use_replicated_training
                     else "model parallel/single GPU"))
     )
     training_scheduler = (
         "disabled (--no-train)" if cfg.no_train
-        else ("adaptive process-per-GPU (--fast)" if cfg.fast else "default")
+        else ("adaptive process-per-GPU (--fast)"
+              if use_process_distributed_training
+              else ("concurrent length-balanced replicas (--fast)"
+                    if cfg.fast and use_replicated_training else "default"))
     )
     print(f"Training layout:    {training_layout}")
     print(f"Training scheduler: {training_scheduler}")
@@ -8607,7 +8622,7 @@ def main():
 
     parallel_trainer = None
     if use_replicated_training:
-        if cfg.fast:
+        if use_process_distributed_training:
             parallel_trainer = ProcessDistributedTrainer(
                 backend, model, tokenizer, optimizer, cfg, exp_dir,
                 dependency_log_path=dependency_log_path,
