@@ -18,7 +18,13 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
+import threading
+
+
+# Creating a Popen briefly allocates several parent-side descriptors. Serialize
+# only that millisecond-scale setup; the child processes themselves still run
+# fully concurrently on their assigned CPUs.
+_SANDBOX_LAUNCH_LOCK = threading.Lock()
 
 
 # Placeholders __PROGRAM_PATH__ / __FUNCTION_NAME__ / __RESULTS_PATH__
@@ -77,9 +83,16 @@ def _kill_tree(proc, pgid, hard=False):
     if pgid is not None:
         try:
             os.killpg(pgid, sig)
+            return
+        except ProcessLookupError:
+            # The session no longer exists, so it has no surviving children.
+            return
         except Exception:
             pass
-    if shutil.which("pkill"):
+    # start_new_session normally makes killpg sufficient. Use pkill only on
+    # platforms/races where no usable process group was available; spawning a
+    # pkill process for every successful evaluation wastes hundreds of PIDs.
+    if proc.poll() is None and shutil.which("pkill"):
         try:
             subprocess.run(
                 ["pkill", "-KILL" if hard else "-TERM", "-P", str(proc.pid)],
@@ -111,118 +124,159 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
             raise ValueError(
                 f"CPU {pinned_cpu} is outside this process's allowed CPU set")
 
-    # Write code to a temp file
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
-        program_path = f.name
-        f.write(code)
-
-    # Write the runner script
-    runner_src = (
-        RUNNER_TEMPLATE
-        .replace("__PROGRAM_PATH__", program_path)
-        .replace("__FUNCTION_NAME__", entrypoint)
-        .replace("__RESULTS_PATH__", program_path + ".pkl")
-    )
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as f:
-        runner_path = f.name
-        f.write(runner_src)
-
-    results_path = program_path + ".pkl"
-
-    # Limit BLAS threads in the child so generated code can't fork 200 threads
-    env = os.environ.copy()
-    # Ordinary problem evaluation is CPU-only. The GPU-mode evaluator has its
-    # own leased subprocess path and never calls this sandbox.
-    env["CUDA_VISIBLE_DEVICES"] = ""
-    env["HIP_VISIBLE_DEVICES"] = ""
-    env["ROCR_VISIBLE_DEVICES"] = ""
-    env.pop("TTT_EVAL_CPU_ID", None)
-    # A pinned candidate receives one BLAS thread as well as one-CPU affinity.
-    # The ordinary path retains its configured per-candidate thread count.
-    t = "1" if pinned_cpu is not None else str(max(1, int(max_cpus)))
-    for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS"]:
-        env[key] = t
-    if pinned_cpu is not None:
-        env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
-
-    proc = subprocess.Popen(
-        [sys.executable, runner_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        start_new_session=True, 
-    )
-
+    paths = []
+    proc = None
+    pgid = None
     try:
-        pgid = os.getpgid(proc.pid)
-    except Exception:
-        pgid = None
+        # Write code to a temp file.
+        with tempfile.NamedTemporaryFile(
+                suffix=".py", delete=False, mode="w") as f:
+            program_path = f.name
+            paths.append(program_path)
+            f.write(code)
 
-    stdout_bytes = b""
-    stderr_bytes = b""
-    timed_out = False
+        results_path = program_path + ".pkl"
+        stdout_path = program_path + ".stdout"
+        stderr_path = program_path + ".stderr"
+        paths.extend((results_path, stdout_path, stderr_path))
 
-    try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_tree(proc, pgid, hard=False)
+        # Write the runner script.
+        runner_src = (
+            RUNNER_TEMPLATE
+            .replace("__PROGRAM_PATH__", program_path)
+            .replace("__FUNCTION_NAME__", entrypoint)
+            .replace("__RESULTS_PATH__", results_path)
+        )
+        with tempfile.NamedTemporaryFile(
+                suffix=".py", delete=False, mode="w") as f:
+            runner_path = f.name
+            paths.append(runner_path)
+            f.write(runner_src)
+
+        # Limit BLAS threads in the child so generated code cannot fork one
+        # thread per host CPU.
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["HIP_VISIBLE_DEVICES"] = ""
+        env["ROCR_VISIBLE_DEVICES"] = ""
+        env.pop("TTT_EVAL_CPU_ID", None)
+        t = "1" if pinned_cpu is not None else str(max(1, int(max_cpus)))
+        for key in [
+                "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                "BLIS_NUM_THREADS"]:
+            env[key] = t
+        if pinned_cpu is not None:
+            env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
+
+        # Do not retain PIPE descriptors for the lifetime of every sandbox.
+        # The child writes to files, and the parent closes its handles as soon
+        # as Popen returns. Serializing only this setup also bounds transient
+        # errpipe descriptors without serializing any actual evaluation work.
+        with _SANDBOX_LAUNCH_LOCK:
+            with open(stdout_path, "wb") as stdout_file, open(
+                    stderr_path, "wb") as stderr_file:
+                proc = subprocess.Popen(
+                    [sys.executable, runner_path],
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=env,
+                    start_new_session=True,
+                )
+
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=1.0)
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = None
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            _kill_tree(proc, pgid, hard=True)
+            timed_out = True
+            _kill_tree(proc, pgid, hard=False)
             try:
-                stdout_bytes, stderr_bytes = proc.communicate(timeout=1.0)
+                proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                pass
+                _kill_tree(proc, pgid, hard=True)
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
 
-    # Belt-and-suspenders: make sure nothing's left
-    _kill_tree(proc, pgid, hard=True)
+        # Belt-and-suspenders: make sure no descendant outlives evaluation.
+        _kill_tree(proc, pgid, hard=True)
 
-    stdout_text = stdout_bytes.decode(errors="ignore") if stdout_bytes else ""
-    stderr_text = stderr_bytes.decode(errors="ignore") if stderr_bytes else ""
-
-    # Build result
-    if timed_out:
-        result = {"ok": False, "error": f"Timeout after {timeout_s}s", "stdout": stdout_text}
-    elif proc.returncode != 0:
-        # Child crashed without writing results
-        if os.path.exists(results_path):
+        def _read_capture(path):
             try:
-                with open(results_path, "rb") as f:
-                    payload = pickle.load(f)
-                payload["stdout"] = stdout_text
-                result = payload
-            except Exception as e:
-                result = {"ok": False, "error": f"Failed to read results: {e}", "stdout": stdout_text}
-        else:
-            result = {
+                with open(path, "rb") as capture:
+                    return capture.read()
+            except OSError:
+                return b""
+
+        stdout_bytes = _read_capture(stdout_path)
+        stderr_bytes = _read_capture(stderr_path)
+        stdout_text = (
+            stdout_bytes.decode(errors="ignore") if stdout_bytes else "")
+        stderr_text = (
+            stderr_bytes.decode(errors="ignore") if stderr_bytes else "")
+
+        if timed_out:
+            return {
+                "ok": False,
+                "error": f"Timeout after {timeout_s}s",
+                "stdout": stdout_text,
+            }
+        if proc.returncode != 0:
+            # The runner normally pickles its exception even though it exits
+            # successfully; this branch handles import/interpreter crashes.
+            if os.path.exists(results_path):
+                try:
+                    with open(results_path, "rb") as f:
+                        payload = pickle.load(f)
+                    payload["stdout"] = stdout_text
+                    return payload
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "error": f"Failed to read results: {error}",
+                        "stdout": stdout_text,
+                    }
+            return {
                 "ok": False,
                 "error": f"Process exited with code {proc.returncode}",
                 "stdout": stdout_text,
                 "stderr": stderr_text,
             }
-    else:
         if not os.path.exists(results_path):
-            result = {"ok": False, "error": "No results file written", "stdout": stdout_text}
-        else:
-            try:
-                with open(results_path, "rb") as f:
-                    payload = pickle.load(f)
-                payload["stdout"] = stdout_text
-                result = payload
-            except Exception as e:
-                result = {"ok": False, "error": f"Failed to read results: {e}", "stdout": stdout_text}
-
-    # Cleanup
-    for p in [program_path, runner_path, results_path]:
+            return {
+                "ok": False,
+                "error": "No results file written",
+                "stdout": stdout_text,
+            }
         try:
-            os.unlink(p)
-        except (FileNotFoundError, OSError):
-            pass
-
-    return result
+            with open(results_path, "rb") as f:
+                payload = pickle.load(f)
+            payload["stdout"] = stdout_text
+            return payload
+        except Exception as error:
+            return {
+                "ok": False,
+                "error": f"Failed to read results: {error}",
+                "stdout": stdout_text,
+            }
+    finally:
+        if proc is not None and proc.poll() is None:
+            _kill_tree(proc, pgid, hard=True)
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        for path in paths:
+            try:
+                os.unlink(path)
+            except (FileNotFoundError, OSError):
+                pass
 
 
 if __name__ == "__main__":

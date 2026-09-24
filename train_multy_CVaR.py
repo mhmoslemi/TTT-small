@@ -5783,79 +5783,6 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
     return max(1, cpu_budget // per_evaluation)
 
 
-def _file_descriptor_safe_worker_limit(requested_workers: int):
-    """Cap concurrent sandboxes below this process's open-file limit.
-
-    Every live ``Popen(..., stdout=PIPE, stderr=PIPE)`` keeps two descriptors
-    in the parent. Concurrent process creation can temporarily hold all four
-    endpoints of those pipes plus both endpoints of Python's error pipe. vLLM,
-    multiprocessing queues, checkpoints, and the progress machinery also
-    retain descriptors. Reserving six descriptors per
-    admitted sandbox plus explicit process headroom prevents a large CPU
-    machine (for example, 192 CPUs at two sandboxes each) from overrunning the
-    common Linux soft limit of 1024 descriptors.
-    """
-    requested_workers = max(1, int(requested_workers))
-    try:
-        import resource
-
-        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft_limit == resource.RLIM_INFINITY or int(soft_limit) <= 0:
-            return requested_workers, None
-        soft_limit = int(soft_limit)
-    except (ImportError, OSError, ValueError):
-        return requested_workers, None
-
-    open_descriptors = None
-    for descriptor_dir in ("/proc/self/fd", "/dev/fd"):
-        try:
-            open_descriptors = len(os.listdir(descriptor_dir))
-            break
-        except OSError:
-            continue
-    if open_descriptors is None:
-        # The fixed reserve below still makes this safe on platforms without
-        # a descriptor directory; zero avoids guessing an inflated live count.
-        open_descriptors = 0
-
-    descriptors_per_worker = 6
-    original_soft_limit = soft_limit
-    # First use any already-authorized hard-limit headroom. This preserves the
-    # requested CPU parallelism instead of needlessly slowing evaluation. The
-    # division solves target - 12.5% target >= live + 6 * workers.
-    desired_soft_limit = max(
-        int(open_descriptors) + descriptors_per_worker * requested_workers + 128,
-        int(math.ceil(
-            (int(open_descriptors)
-             + descriptors_per_worker * requested_workers) / 0.875)),
-    )
-    if desired_soft_limit > soft_limit:
-        target_soft_limit = desired_soft_limit
-        if hard_limit != resource.RLIM_INFINITY:
-            target_soft_limit = min(target_soft_limit, int(hard_limit))
-        if target_soft_limit > soft_limit:
-            try:
-                resource.setrlimit(
-                    resource.RLIMIT_NOFILE,
-                    (target_soft_limit, hard_limit))
-                soft_limit = target_soft_limit
-            except (OSError, ValueError):
-                pass
-
-    reserve = max(128, int(math.ceil(0.125 * soft_limit)))
-    usable = max(0, soft_limit - int(open_descriptors) - reserve)
-    safe_workers = max(1, usable // descriptors_per_worker)
-    admitted = min(requested_workers, safe_workers)
-    return admitted, {
-        "soft_limit": soft_limit,
-        "original_soft_limit": original_soft_limit,
-        "open_descriptors": int(open_descriptors),
-        "reserve": reserve,
-        "descriptors_per_worker": descriptors_per_worker,
-        "requested_workers": requested_workers,
-    }
-
-
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
@@ -6396,32 +6323,14 @@ code block.'''
             for cpu_id in isolated_cpu_ids:
                 isolated_cpu_slots.put(cpu_id)
         isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
-        requested_reward_workers = max(
-            1, min(total_rollouts, isolated_capacity))
-        n_reward_workers, descriptor_limit = (
-            _file_descriptor_safe_worker_limit(requested_reward_workers))
-        descriptor_label = ""
-        if descriptor_limit is not None:
-            original_limit = descriptor_limit["original_soft_limit"]
-            effective_limit = descriptor_limit["soft_limit"]
-            if effective_limit > original_limit:
-                descriptor_label += (
-                    f"; raised RLIMIT_NOFILE "
-                    f"{original_limit}->{effective_limit}")
-            if n_reward_workers < requested_reward_workers:
-                descriptor_label += (
-                    f"; capped from {requested_reward_workers} by "
-                    f"RLIMIT_NOFILE={effective_limit} "
-                    f"(open={descriptor_limit['open_descriptors']}, "
-                    f"reserve={descriptor_limit['reserve']}, "
-                    f"{descriptor_limit['descriptors_per_worker']} "
-                    "FDs/sandbox)")
+        n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
         print(f"[step {step_idx}] isolated evaluation pool: "
               f"{n_reward_workers} sandbox process(es) across "
               f"{isolated_cpu_count} CPU(s), up to "
               f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
               "process tree is pinned to one CPU and excess candidates remain "
-              f"queued{descriptor_label}")
+              "queued; sandbox launches are FD-safe and do not reduce this "
+              "parallelism")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
         print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
