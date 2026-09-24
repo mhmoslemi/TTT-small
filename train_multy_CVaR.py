@@ -56,6 +56,24 @@ _STRATEGY_FINAL_MARKERS = (
     "assistantfinal",
 )
 _LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
+_QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
+
+
+def _is_exact_qwen3_8b(model_name):
+    return (str(model_name or "").strip().rstrip("/").lower()
+            == _QWEN3_8B_MODEL_ID)
+
+
+def _dual_resident_qwen3_8b_strategy_coder_pools(config):
+    """Select independent co-resident strategist and coder Qwen3-8B pools."""
+    return bool(
+        config.get("strategies", False)
+        and str(config.get("strategy_backend") or "local").lower() == "local"
+        and str(config.get("generation_backend") or "hf").lower() == "vllm"
+        and _is_exact_qwen3_8b(config.get("coder_model_name"))
+        and _is_exact_qwen3_8b(config.get("strategy_model_name"))
+        and _is_exact_qwen3_8b(config.get("model_name"))
+    )
 
 
 def _extract_final_strategy(response_text):
@@ -1262,6 +1280,13 @@ def load_config():
         # growth may still change the parent count, but cannot silently break
         # the S*C hierarchy by changing the derived per-parent group size.
         merged["max_group_size"] = effective_group_size
+    # This ablation intentionally keeps two independent Qwen3-8B engines per
+    # card resident together: a permanently base/no-LoRA strategist and a
+    # coder that receives the current LoRA adapter. Keep the switch derived
+    # rather than user-configurable so every other model pairing retains the
+    # existing alternating-pool behavior.
+    merged["dual_resident_qwen3_8b_strategy_coder_pools"] = (
+        _dual_resident_qwen3_8b_strategy_coder_pools(merged))
     cvar_alpha = merged.get("cvar_alpha")
     cvar_alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
     if not (0.0 < cvar_alpha < 1.0):
@@ -1483,6 +1508,17 @@ def load_config():
         known_heads = detect_attention_heads(merged.get("model_name", ""))
         layout = derive_vllm_parallel_layout(
             merged, roles, memory, known_heads)
+        if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
+            # Qwen3-8B plus one native-context KV cache fits independently on
+            # each selected card.  Refuse an unsafe host rather than silently
+            # weakening this ablation into fewer tensor-parallel engines.
+            if (layout.tensor_parallel_size != 1
+                    or layout.pipeline_parallel_size != 1):
+                raise ValueError(
+                    "the dual-resident Qwen3-8B strategy/coder ablation "
+                    "requires one engine from each pool per GPU (TP=1, "
+                    "PP=1), but the available memory cannot fit that layout "
+                    "at the configured context")
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
         validate_attention_heads(
@@ -1490,7 +1526,11 @@ def load_config():
             merged["vllm_tensor_parallel_size"],
             merged.get("model_name", ""),
         )
-        if layout.pipeline_parallel_size > 1:
+        if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
+            print(f"[config] Qwen3-8B strategist/coder ablation: two "
+                  f"independent co-resident pools, each with {len(gpu_ids)} "
+                  "engines (one per GPU, TP=1, PP=1)")
+        elif layout.pipeline_parallel_size > 1:
             print(f"[config] compatible TP={layout.tensor_parallel_size} "
                   f"replicas need about "
                   f"{layout.unsharded_stage_required_gib:.1f} GiB/GPU, above "
@@ -6532,7 +6572,11 @@ code block.'''
                                     responses[chain_index],
                                 )
                     finally:
-                        if planning_pool is not gen_pool:
+                        if (planning_pool is not gen_pool
+                                and not getattr(
+                                    cfg,
+                                    "dual_resident_qwen3_8b_strategy_coder_pools",
+                                    False)):
                             planning_pool.release()
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
@@ -6939,6 +6983,14 @@ code block.'''
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
                 gen_pool.release()
+            if (getattr(
+                    cfg,
+                    "dual_resident_qwen3_8b_strategy_coder_pools",
+                    False)
+                    and strategy_pool is not None
+                    and strategy_pool is not gen_pool
+                    and getattr(strategy_pool, "sequential", False)):
+                strategy_pool.release()
 
         if deferred_rollouts:
             print(f"[step {step_idx}] releasing trainer memory on the shared "
@@ -8217,8 +8269,12 @@ def main():
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
         if (cfg.strategies
                 and getattr(cfg, "strategy_backend", "local") == "local"
-                and getattr(cfg, "strategy_model_name", cfg.model_name)
-                != cfg.model_name):
+                and (getattr(cfg, "strategy_model_name", cfg.model_name)
+                     != cfg.model_name
+                     or getattr(
+                         cfg,
+                         "dual_resident_qwen3_8b_strategy_coder_pools",
+                         False))):
             strategy_vllm_log_path = str(
                 Path(exp_dir).resolve() / "strategy_vllm.log")
             with open(strategy_vllm_log_path, "a",
@@ -8619,11 +8675,22 @@ def main():
         from gen_workers import (GenerationPool, HybridHFGenerationPool,
                                  PhasedVLLMGenerationPool, worker_seed)
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
+        dual_resident_qwen3_8b_pools = bool(getattr(
+            cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False))
         separate_strategy_pool = bool(
             cfg.generation_backend == "vllm"
             and getattr(problem, "two_stage_rollouts", False)
             and cfg.strategy_backend == "local"
-            and cfg.strategy_model_name != cfg.model_name)
+            and (cfg.strategy_model_name != cfg.model_name
+                 or dual_resident_qwen3_8b_pools))
+        generation_utilization = float(cfg.vllm_gpu_memory_utilization)
+        if dual_resident_qwen3_8b_pools:
+            # Each physical card hosts two independent Qwen3-8B vLLM
+            # processes. Bound each allocator so strategist + coder + CUDA
+            # runtime fit together while the differentiable trainer is off.
+            generation_utilization = min(generation_utilization, 0.40)
+            print("[memory] dual Qwen3-8B pools: limiting each vLLM engine "
+                  "to 40% GPU memory for concurrent residency", flush=True)
         pool_options = dict(
             model_name=cfg.model_name,
             num_workers=cfg.num_gpus,
@@ -8636,7 +8703,7 @@ def main():
             backend=cfg.generation_backend,
             lora_rank=(binary_coder_cfg.lora_rank
                        if binary_coder_cfg.enabled else cfg.lora_rank),
-            vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+            vllm_gpu_memory_utilization=generation_utilization,
             vllm_enforce_eager=cfg.vllm_enforce_eager,
             vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
             vllm_quantization=cfg.vllm_quantization,
@@ -8645,9 +8712,9 @@ def main():
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
             vllm_sleep_level=cfg.vllm_sleep_level,
-            # The distinct strategist and coder pools alternate on the same
-            # cards while retaining level-1 host backups. Account for the
-            # inactive pool's residual CUDA/NCCL state in both directions.
+            # Distinct strategist/coder pools share the same cards. Account
+            # for either a sleeping pool's residual CUDA/NCCL state or the
+            # Qwen3-8B ablation's concurrently awake peer pool.
             vllm_co_resident_sleep=separate_strategy_pool,
             # Training modes consume exact chosen-token prompt logprobs after
             # generation. Give that vocabulary projection explicit memory
@@ -8705,6 +8772,13 @@ def main():
                 if not runtime_training_active["value"]:
                     print("[gpu] keeping inactive training model offloaded "
                           "(no-training phase)", flush=True)
+                    return
+                if dual_resident_qwen3_8b_pools and any(
+                        pool is not None and getattr(pool, "active", False)
+                        for pool in (gen_pool, strategy_pool)):
+                    print("[gpu] keeping trainer offloaded while the other "
+                          "Qwen3-8B generation pool remains active",
+                          flush=True)
                     return
                 if (parallel_trainer is not None
                         or cfg.training_layout == "sharded"):
@@ -8826,6 +8900,11 @@ def main():
         if (getattr(problem, "two_stage_rollouts", False)
                 and strategy_pool is None):
             strategy_pool = gen_pool
+        elif dual_resident_qwen3_8b_pools:
+            print(f"[init] dual-resident Qwen3-8B pools: strategist and coder "
+                  f"each have {cfg.num_gpus} independent engine(s), one/GPU; "
+                  "strategist is always base/no-LoRA, coder receives the "
+                  "current LoRA", flush=True)
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
             limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
                           else "micro-batch")
