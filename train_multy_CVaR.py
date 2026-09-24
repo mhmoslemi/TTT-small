@@ -3240,6 +3240,303 @@ def _apply_x_grpo_calibration(examples, group_data, calibration, cfg):
     return summaries
 
 
+def _prepare_binary_overlap_examples(
+        model, tokenizer, group_responses, reward_futures, prompt_jobs,
+        parents):
+    """Build the binary-coder tensors before the CPU rewards are available.
+
+    Generation already supplied the frozen behavior log-probabilities.  The
+    prompt/response tensors and the denominator of the step-wide mean therefore
+    do not depend on reward.  Each prepared example retains only its aligned
+    reward future; the future is resolved *after* that microbatch's policy
+    forward, keeping at most one autograd graph alive while CPU verification
+    continues.
+    """
+    import torch
+
+    prompt_ids_by_job = {}
+    prepared = []
+    submission_index = 0
+    for group_id in sorted(group_responses):
+        responses = group_responses[group_id]
+        futures = reward_futures[group_id]
+        if len(responses) != len(futures):
+            raise RuntimeError(
+                f"binary overlap group {group_id} has {len(responses)} "
+                f"responses but {len(futures)} reward futures")
+        for rollout_index, (record, reward_future) in enumerate(
+                zip(responses, futures)):
+            token_ids = list(record.get("token_ids") or ())
+            behavior_values = record.get("behavior_logprobs")
+            if (not token_ids or behavior_values is None
+                    or len(behavior_values) != len(token_ids)):
+                submission_index += 1
+                continue
+            job_idx = int(record["job_idx"])
+            if job_idx not in prompt_ids_by_job:
+                prompt_ids_by_job[job_idx] = tokenizer(
+                    prompt_jobs[job_idx]["prompt_text"],
+                    return_tensors="pt").input_ids.to(model.device)
+            response_ids = torch.tensor(
+                [token_ids], dtype=torch.long, device=model.device)
+            behavior_logprobs = torch.as_tensor(
+                behavior_values, dtype=torch.float32,
+                device=model.device)
+            if not torch.isfinite(behavior_logprobs).all():
+                submission_index += 1
+                continue
+            parent_group = int(record["parent_group"])
+            example = {
+                "prompt_ids": prompt_ids_by_job[job_idx],
+                "response_ids": response_ids,
+                # Filled from the verified RewardResult after the forward.
+                "advantage": None,
+                "behavior_logprobs": behavior_logprobs,
+                "reference_logprobs": None,
+                "reprompt_text": None,
+                "failure_signature": "",
+                "reward_constant": False,
+                "rank_entropy_gate": False,
+                "group_id": int(group_id),
+                "x_grpo_context_id": int(record["context_id"]),
+                "x_grpo_fold_index": int(record["fold_index"]),
+                "rollout_index": int(rollout_index),
+                "prompt_job_id": job_idx,
+                "x_grpo_group_size": len(responses),
+                "x_grpo_all_tied": False,
+                "x_grpo_trial_advantages": (),
+                "sample_weight": 0.0,
+                "_overlap_key": (int(group_id), int(rollout_index)),
+                "_overlap_submission_index": int(submission_index),
+                "_overlap_reward_future": reward_future,
+                "_overlap_parent": parents[parent_group],
+            }
+            # Reuse these exact tensors in the later save/accounting pass.  This
+            # avoids tokenizing and allocating every long prompt a second time.
+            record["_binary_overlap_example"] = example
+            prepared.append(example)
+            submission_index += 1
+
+    if prepared:
+        weight = 1.0 / len(prepared)
+        for example in prepared:
+            example["sample_weight"] = weight
+    return prepared
+
+
+def _precompute_binary_coder_backward(
+        backend, model, tokenizer, optimizer, examples, cfg, step_idx):
+    """Run the exact one-epoch binary backward while rewards finish on CPU.
+
+    No parameter is updated here.  Every forward sees the same frozen policy as
+    the ordinary post-evaluation implementation.  A microbatch's reward futures
+    are read only after its differentiable forward has been launched; its fixed
+    +/-1 labels are then applied and the loss is backpropagated immediately.
+    The caller performs the single optimizer step only after all evaluations and
+    rollout artifacts have completed.
+    """
+    import torch
+    from problems.binary_coder import verified_usability
+
+    if str(getattr(cfg, "advantage_mode", "")) != "binary-coder":
+        raise ValueError("evaluation-overlapped backward is binary-coder only")
+    epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
+    if epochs != 1:
+        raise ValueError(
+            "evaluation-overlapped binary training requires exactly one "
+            "clipped-policy update epoch")
+    if not examples:
+        return None
+
+    backend.set_training_mode()
+    started = time.time()
+    update_batches = _training_microbatches(examples, cfg)
+    largest_batch = max((len(batch) for batch in update_batches), default=0)
+    print(f"[train-overlap] binary coder LoRA microbatches="
+          f"{len(update_batches)}; configured max="
+          f"{int(cfg.train_examples_per_microbatch)}, effective max="
+          f"{largest_batch}, padded-token cap={int(cfg.max_seq_length)}",
+          flush=True)
+
+    missing_old, _missing_reference = _initialize_rank_logprob_caches(examples)
+    if missing_old:
+        raise RuntimeError(
+            "binary overlap received examples without complete frozen "
+            "behavior log-probabilities")
+    print(f"[step {step_idx}] binary-coder logprobs: vLLM supplied old="
+          f"{len(examples)}/{len(examples)}, reference=off; starting policy "
+          "forward/backward while CPU evaluation is active", flush=True)
+
+    epsilon, epsilon_low, epsilon_high, kl_coef = (
+        _clipped_policy_options(cfg))
+    if kl_coef != 0.0:
+        raise RuntimeError("binary coder overlap unexpectedly enabled KL")
+    metric_keys = (
+        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+        "ratio", "clipped_fraction",
+    )
+    reward_wait_seconds = 0.0
+    optimizer.zero_grad(set_to_none=True)
+    model.zero_grad(set_to_none=True)
+
+    def attempt(active_batches):
+        nonlocal reward_wait_seconds
+        totals = {key: 0.0 for key in metric_keys}
+        max_ratio = 0.0
+        max_prefix_ratio = 0.0
+        entropy_examples = 0
+        pending_batches = list(active_batches)
+        while pending_batches:
+            # Re-evaluate readiness after every backward.  Evaluation continues
+            # concurrently, so a batch that was pending when this attempt began
+            # may be ready now.  If none is ready, choose the batch whose latest
+            # submitted rollout is earliest in the executor's FIFO queue.
+            ready_indices = [
+                index for index, candidate in enumerate(pending_batches)
+                if all(ex["_overlap_reward_future"].done()
+                       for ex in candidate)
+            ]
+            if ready_indices:
+                batch_index = ready_indices[0]
+            else:
+                batch_index = min(
+                    range(len(pending_batches)),
+                    key=lambda index: max(
+                        ex["_overlap_submission_index"]
+                        for ex in pending_batches[index]),
+                )
+            batch = pending_batches.pop(batch_index)
+            # This is the expensive reward-independent part.  CUDA kernels can
+            # continue executing while the host waits below for this batch's
+            # CPU verifier results.
+            current_logprobs = compute_batched_token_logprobs(
+                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
+                pad_token_id=tokenizer.pad_token_id)
+            weighted_losses = []
+            for example, current_lp in zip(batch, current_logprobs):
+                wait_started = time.time()
+                result = example["_overlap_reward_future"].result()
+                reward_wait_seconds += time.time() - wait_started
+                usable, _reason = verified_usability(
+                    result, example["_overlap_parent"],
+                    fail_score=cfg.fail_score)
+                advantage = 1.0 if usable else -1.0
+                example["advantage"] = advantage
+                loss, metrics = clipped_policy_loss(
+                    cfg, current_lp, example["rank_old_logprobs"], None,
+                    advantage, clip_epsilon=epsilon,
+                    clip_epsilon_low=epsilon_low,
+                    clip_epsilon_high=epsilon_high, kl_coef=0.0,
+                    entropy_coef=0.0, token_entropies=None)
+                weight = float(example["sample_weight"])
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError(
+                        "nonfinite evaluation-overlapped binary coder loss")
+                weighted_losses.append(weight * loss)
+                totals["loss"] += weight * float(loss.detach().item())
+                for key in ("policy_loss", "kl_estimate",
+                            "entropy_estimate", "ratio"):
+                    totals[key] += weight * metrics[key]
+                totals["clipped_fraction"] += (
+                    weight * float(metrics["clipped"]))
+                max_ratio = max(max_ratio, metrics["ratio"])
+                max_prefix_ratio = max(
+                    max_prefix_ratio, metrics["prefix_ratio_max"])
+            if weighted_losses:
+                sum(weighted_losses[1:], weighted_losses[0]).backward()
+        return totals, max_ratio, max_prefix_ratio, entropy_examples
+
+    with _rank_dropout_disabled(model):
+        result, effective_batches, quarantined = (
+            _run_oom_resilient_backward(
+                model, update_batches, attempt,
+                device_label=str(model.device)))
+    if result is None:
+        result = (
+            {key: 0.0 for key in metric_keys}, 0.0, 0.0, 0)
+    totals, max_ratio, max_prefix_ratio, entropy_examples = result
+    trained_keys = {
+        example["_overlap_key"]
+        for batch in effective_batches for example in batch
+    }
+    scheduled_keys = {example["_overlap_key"] for example in examples}
+    wall_seconds = time.time() - started
+    return {
+        "examples": examples,
+        "scheduled_keys": scheduled_keys,
+        "trained_keys": trained_keys,
+        "totals": totals,
+        "max_ratio": max_ratio,
+        "max_prefix_ratio": max_prefix_ratio,
+        "entropy_examples": entropy_examples,
+        "quarantined_examples": len(quarantined),
+        "wall_seconds": wall_seconds,
+        "reward_wait_seconds": reward_wait_seconds,
+        "active_seconds": max(0.0, wall_seconds - reward_wait_seconds),
+    }
+
+
+def _finish_binary_coder_overlap_update(
+        model, optimizer, cfg, step_idx, state):
+    """Apply the one optimizer step after overlapped gradients are complete."""
+    import torch
+
+    finish_started = time.time()
+    update_error = None
+    grad_norm = None
+    try:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in model.parameters()
+             if parameter.requires_grad],
+            max_norm=cfg.grad_clip, error_if_nonfinite=True)
+        optimizer.step()
+        grad_norm = float(grad_norm_tensor.item())
+    except BaseException as error:
+        update_error = error
+    finally:
+        model.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+    if update_error is not None:
+        raise update_error
+
+    totals = state["totals"]
+    history = [{
+        "epoch": 1,
+        **totals,
+        "ratio_max": state["max_ratio"],
+        "prefix_ratio_max": state["max_prefix_ratio"],
+        "entropy_examples": state["entropy_examples"],
+        "oom_quarantined_examples": state["quarantined_examples"],
+        "grad_norm": grad_norm,
+    }]
+    print(f"[step {step_idx}] binary-coder epoch 1/1: "
+          f"loss={totals['loss']:.6f} reference=off "
+          f"ratio={totals['ratio']:.6f} max={state['max_ratio']:.6f} "
+          f"clipped={totals['clipped_fraction']:.1%} entropy examples=0 "
+          f"OOM-quarantined={state['quarantined_examples']} "
+          f"(forward/backward overlapped CPU evaluation)", flush=True)
+    training_seconds = (
+        float(state.get("restore_seconds", 0.0))
+        + float(state["active_seconds"])
+        + (time.time() - finish_started)
+    )
+    for example in state["examples"]:
+        for key in (
+                "rank_old_logprobs", "rank_reference_logprob",
+                "rank_feedback_advantage", "_overlap_reward_future",
+                "_overlap_parent"):
+            example.pop(key, None)
+    return {
+        "rank_updates": history,
+        "rank_train_seconds": training_seconds,
+        "binary_train_overlap_wall_seconds": float(state["wall_seconds"]),
+        "binary_train_overlap_reward_wait_seconds": float(
+            state["reward_wait_seconds"]),
+        "binary_train_overlap_active_seconds": float(state["active_seconds"]),
+        "oom_quarantined_examples": int(state["quarantined_examples"]),
+    }
+
+
 def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                          cfg, step_idx, *, fb_cfg=None, fb_on=False,
                          fb_lambda=0.0):
@@ -5486,6 +5783,79 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
     return max(1, cpu_budget // per_evaluation)
 
 
+def _file_descriptor_safe_worker_limit(requested_workers: int):
+    """Cap concurrent sandboxes below this process's open-file limit.
+
+    Every live ``Popen(..., stdout=PIPE, stderr=PIPE)`` keeps two descriptors
+    in the parent. Concurrent process creation can temporarily hold all four
+    endpoints of those pipes plus both endpoints of Python's error pipe. vLLM,
+    multiprocessing queues, checkpoints, and the progress machinery also
+    retain descriptors. Reserving six descriptors per
+    admitted sandbox plus explicit process headroom prevents a large CPU
+    machine (for example, 192 CPUs at two sandboxes each) from overrunning the
+    common Linux soft limit of 1024 descriptors.
+    """
+    requested_workers = max(1, int(requested_workers))
+    try:
+        import resource
+
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit == resource.RLIM_INFINITY or int(soft_limit) <= 0:
+            return requested_workers, None
+        soft_limit = int(soft_limit)
+    except (ImportError, OSError, ValueError):
+        return requested_workers, None
+
+    open_descriptors = None
+    for descriptor_dir in ("/proc/self/fd", "/dev/fd"):
+        try:
+            open_descriptors = len(os.listdir(descriptor_dir))
+            break
+        except OSError:
+            continue
+    if open_descriptors is None:
+        # The fixed reserve below still makes this safe on platforms without
+        # a descriptor directory; zero avoids guessing an inflated live count.
+        open_descriptors = 0
+
+    descriptors_per_worker = 6
+    original_soft_limit = soft_limit
+    # First use any already-authorized hard-limit headroom. This preserves the
+    # requested CPU parallelism instead of needlessly slowing evaluation. The
+    # division solves target - 12.5% target >= live + 6 * workers.
+    desired_soft_limit = max(
+        int(open_descriptors) + descriptors_per_worker * requested_workers + 128,
+        int(math.ceil(
+            (int(open_descriptors)
+             + descriptors_per_worker * requested_workers) / 0.875)),
+    )
+    if desired_soft_limit > soft_limit:
+        target_soft_limit = desired_soft_limit
+        if hard_limit != resource.RLIM_INFINITY:
+            target_soft_limit = min(target_soft_limit, int(hard_limit))
+        if target_soft_limit > soft_limit:
+            try:
+                resource.setrlimit(
+                    resource.RLIMIT_NOFILE,
+                    (target_soft_limit, hard_limit))
+                soft_limit = target_soft_limit
+            except (OSError, ValueError):
+                pass
+
+    reserve = max(128, int(math.ceil(0.125 * soft_limit)))
+    usable = max(0, soft_limit - int(open_descriptors) - reserve)
+    safe_workers = max(1, usable // descriptors_per_worker)
+    admitted = min(requested_workers, safe_workers)
+    return admitted, {
+        "soft_limit": soft_limit,
+        "original_soft_limit": original_soft_limit,
+        "open_descriptors": int(open_descriptors),
+        "reserve": reserve,
+        "descriptors_per_worker": descriptors_per_worker,
+        "requested_workers": requested_workers,
+    }
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
@@ -5577,6 +5947,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     x_grpo_groups = {}
     spo_rs_updates = []
     binary_coder_diagnostics = []
+    binary_overlap_state = None
     all_children = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
@@ -5603,9 +5974,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
 
-    # SPO-RS needs immutable consecutive policy versions. Reuse the adapter
-    # saved after the preceding update; only a fresh run needs an initial
-    # snapshot. Other objectives retain their existing per-step save.
+    # SPO-RS needs immutable consecutive policy versions. Binary-coder mode
+    # likewise reuses the adapter saved after the preceding update; once its
+    # initialization window closes, this is the frozen rollout policy for the
+    # rest of the discovery run. Only a fresh run needs an initial snapshot.
     adapter_path = None
     if spo_rs_mode:
         if sampling_adapter_path is None:
@@ -5617,6 +5989,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if not Path(adapter_path).is_dir():
                 raise FileNotFoundError(
                     f"SPO-RS sampling adapter not found: {adapter_path}")
+    elif binary_coder_mode and sampling_adapter_path is not None:
+        adapter_path = str(Path(sampling_adapter_path))
+        if not Path(adapter_path).is_dir():
+            raise FileNotFoundError(
+                f"binary coder sampling adapter not found: {adapter_path}")
     elif gen_pool is not None:
         adapter_path = _save_adapter(
             model, exp_dir, step_idx, cfg.model_name)
@@ -6019,13 +6396,32 @@ code block.'''
             for cpu_id in isolated_cpu_ids:
                 isolated_cpu_slots.put(cpu_id)
         isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
-        n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
+        requested_reward_workers = max(
+            1, min(total_rollouts, isolated_capacity))
+        n_reward_workers, descriptor_limit = (
+            _file_descriptor_safe_worker_limit(requested_reward_workers))
+        descriptor_label = ""
+        if descriptor_limit is not None:
+            original_limit = descriptor_limit["original_soft_limit"]
+            effective_limit = descriptor_limit["soft_limit"]
+            if effective_limit > original_limit:
+                descriptor_label += (
+                    f"; raised RLIMIT_NOFILE "
+                    f"{original_limit}->{effective_limit}")
+            if n_reward_workers < requested_reward_workers:
+                descriptor_label += (
+                    f"; capped from {requested_reward_workers} by "
+                    f"RLIMIT_NOFILE={effective_limit} "
+                    f"(open={descriptor_limit['open_descriptors']}, "
+                    f"reserve={descriptor_limit['reserve']}, "
+                    f"{descriptor_limit['descriptors_per_worker']} "
+                    "FDs/sandbox)")
         print(f"[step {step_idx}] isolated evaluation pool: "
               f"{n_reward_workers} sandbox process(es) across "
               f"{isolated_cpu_count} CPU(s), up to "
               f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
               "process tree is pinned to one CPU and excess candidates remain "
-              "queued")
+              f"queued{descriptor_label}")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
         print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
@@ -6661,9 +7057,85 @@ code block.'''
             for record in deferred_rollouts:
                 _submit_rollout(record)
 
-        # Wait for whatever rewards are still running (a small tail if overlap
-        # worked); shows how many were already done when generation finished.
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
+        # Binary usability is a per-rollout label and the fast objective has one
+        # update epoch, no KL, no entropy, and no feedback.  On the sharded
+        # trainer we can therefore launch each policy forward while CPU rewards
+        # are outstanding, attach the +/-1 label when that microbatch's future
+        # resolves, and backpropagate without changing the policy.  The single
+        # optimizer step remains below the artifact-persistence barrier.
+        overlap_eligible = bool(
+            binary_coder_mode
+            and training_enabled
+            and parallel_trainer is None
+            and ensure_trainer_ready is not None
+            and cfg.generation_backend == "vllm"
+            and int(getattr(cfg, "rank_update_epochs", 1)) == 1
+            and not fb_candidate_on
+            and memory is None
+            and extractor is None
+            and not deferred_rollouts
+            and not evaluation_trainer_offloaded
+        )
+        if overlap_eligible:
+            pending_before = sum(not future.done() for future in all_futs)
+            restore_started = time.time()
+            overlap_examples = None
+            try:
+                ensure_trainer_ready()
+                restore_seconds = time.time() - restore_started
+                overlap_examples = _prepare_binary_overlap_examples(
+                    model, tokenizer, group_responses, reward_futures,
+                    prompt_jobs, parents)
+                if overlap_examples:
+                    print(
+                        f"[step {step_idx}] binary coder evaluation/training "
+                        f"overlap: {len(overlap_examples)} examples; "
+                        f"{pending_before}/{len(all_futs)} CPU evaluations "
+                        "were still pending when trainer restore began",
+                        flush=True,
+                    )
+                    binary_overlap_state = (
+                        _precompute_binary_coder_backward(
+                            backend, model, tokenizer, optimizer,
+                            overlap_examples, cfg, step_idx))
+                    if binary_overlap_state is not None:
+                        binary_overlap_state["restore_seconds"] = (
+                            restore_seconds)
+                        pending_after = sum(
+                            not future.done() for future in all_futs)
+                        print(
+                            f"[step {step_idx}] binary coder backward ready; "
+                            f"optimizer step deferred until rollout artifacts "
+                            f"are saved; CPU evaluations still pending: "
+                            f"{pending_after}/{len(all_futs)}",
+                            flush=True,
+                        )
+            except Exception as error:
+                # The ordinary post-evaluation path is the correctness fallback.
+                # Clear every partial gradient and discard only the temporary
+                # tensor records; completed CPU rewards remain valid and are not
+                # re-run.
+                model.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
+                for responses in group_responses.values():
+                    for record in responses:
+                        record.pop("_binary_overlap_example", None)
+                overlap_examples = None
+                binary_overlap_state = None
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(
+                    f"[warn] binary evaluation/training overlap was disabled "
+                    f"for this step ({type(error).__name__}: {error}); "
+                    "falling back to the unchanged post-evaluation update",
+                    flush=True,
+                )
+
+        # Wait for whatever rewards are still running.  With binary overlap the
+        # expensive policy forwards/backward have already consumed this same
+        # interval; as_completed only drains any non-training tail.
         eval_bar = make_progress_bar(len(all_futs), desc="evaluating")
         try:
             for _ in as_completed(all_futs):
@@ -7211,6 +7683,25 @@ code block.'''
                 continue
             if len(token_ids) == 0:
                 continue
+            prepared = record.get("_binary_overlap_example")
+            res = outs[r_idx]
+            if prepared is not None:
+                prepared_advantage = prepared.get("advantage")
+                if (prepared_advantage is not None
+                        and float(prepared_advantage) != float(adv)):
+                    prepared["_overlap_label_mismatch"] = True
+                prepared.update({
+                    "advantage": float(adv),
+                    "reprompt_text": reprompt_by_key.get((g, r_idx)),
+                    "failure_signature": RolloutRecord(
+                        msg=res.msg or "").failure_signature(),
+                    "reward_constant": constant,
+                    "rank_entropy_gate": rank_entropy_gate,
+                    "x_grpo_group_size": len(responses),
+                    "sample_weight": 1.0 / (num_groups * len(responses)),
+                })
+                all_examples.append(prepared)
+                continue
             if job_idx not in prompt_ids_by_job:
                 prompt_ids_by_job[job_idx] = tokenizer(
                     prompt_jobs[job_idx]["prompt_text"],
@@ -7228,7 +7719,6 @@ code block.'''
                              device=model.device)
                 if reference_values is not None
                 and len(reference_values) == len(token_ids) else None)
-            res = outs[r_idx]
             all_examples.append({
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
@@ -7254,13 +7744,13 @@ code block.'''
                 "sample_weight": 1.0 / (num_groups * len(responses)),
             })
 
-    # Persistence barrier: every response/prompt/meta file is on disk before
-    # memory work or any adapter forward/backward/update begins below. This is
-    # intentionally separate from stepXX.summary.json, which is the completion
-    # marker and therefore can only be written after the trained adapter and
-    # resumable checkpoint have both been saved by the caller.
+    # Persistence barrier: every response/prompt/meta file is on disk before the
+    # optimizer can mutate the adapter.  Binary coder mode may already have
+    # accumulated exact gradients during CPU evaluation, but its single update
+    # is deliberately deferred until this barrier.  stepXX.summary.json remains
+    # the completion marker and is written only after the adapter/checkpoint.
     save_suffix = ("with training disabled"
-                   if not training_enabled else "before adapter training")
+                   if not training_enabled else "before adapter update")
     print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
           f"pairs {save_suffix}", flush=True)
 
@@ -7345,10 +7835,42 @@ code block.'''
         for example in all_examples:
             example["sample_weight"] = trajectory_weight
 
+    if binary_overlap_state is not None:
+        actual_keys = {
+            example.get("_overlap_key") for example in all_examples
+            if example.get("_overlap_key") is not None
+        }
+        labels_complete = all(
+            example.get("advantage") in (-1.0, 1.0)
+            for example in all_examples
+        )
+        labels_match = not any(
+            example.get("_overlap_label_mismatch", False)
+            for example in all_examples
+        )
+        if (actual_keys != binary_overlap_state["scheduled_keys"]
+                or not labels_complete or not labels_match):
+            # Never apply a partial or differently normalized gradient.  The
+            # complete, ordinary training path below remains exact.
+            model.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
+            print(
+                f"[warn] discarding precomputed binary gradients because the "
+                f"final training set changed "
+                f"({len(actual_keys)}/"
+                f"{len(binary_overlap_state['scheduled_keys'])} records); "
+                "using the unchanged post-evaluation update",
+                flush=True,
+            )
+            binary_overlap_state = None
+
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples))
                       if training_enabled else "disabled")
-    print(f"[step {step_idx}] rollout+eval time: {rollout_time:.1f}s  "
+    rollout_phase_label = (
+        "rollout+eval+overlapped-backward wall time"
+        if binary_overlap_state is not None else "rollout+eval time")
+    print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
           f"training examples: {training_label}  "
           f"new children: {len(all_children)}")
 
@@ -7546,7 +8068,10 @@ code block.'''
             x_grpo_groups_per_context)
 
     if clipped_policy_mode:
-        if parallel_trainer is not None:
+        if binary_overlap_state is not None:
+            step_stats.update(_finish_binary_coder_overlap_update(
+                model, optimizer, cfg, step_idx, binary_overlap_state))
+        elif parallel_trainer is not None:
             step_stats.update(parallel_trainer.train_rank(
                 all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
                 fb_lambda=fb_lambda))
@@ -8139,6 +8664,10 @@ def main():
     gen_pool = None
     strategy_pool = None
     ensure_trainer_ready = None
+    # Unlike cfg.no_train, this can change after the binary-coder bootstrap.
+    # Generation callbacks consult it so all later steps follow the genuine
+    # no-training residency path instead of waiting for a nonexistent update.
+    runtime_training_active = {"value": not bool(cfg.no_train)}
     if (getattr(problem, "two_stage_rollouts", False)
             and cfg.strategy_backend == "api"):
         from strategy_api import StrategyAPIGenerationPool
@@ -8213,7 +8742,8 @@ def main():
                 if parallel_trainer is None and trainer_offloaded:
                     return
                 replica_label = (
-                    "inactive training model" if cfg.no_train
+                    "inactive training model"
+                    if not runtime_training_active["value"]
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
@@ -8247,9 +8777,9 @@ def main():
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
-                if cfg.no_train:
+                if not runtime_training_active["value"]:
                     print("[gpu] keeping inactive training model offloaded "
-                          "(--no-train)", flush=True)
+                          "(no-training phase)", flush=True)
                     return
                 if (parallel_trainer is not None
                         or cfg.training_layout == "sharded"):
@@ -8277,6 +8807,9 @@ def main():
 
             def _ensure_sharded_trainer_ready():
                 nonlocal trainer_offloaded
+                if not runtime_training_active["value"]:
+                    raise RuntimeError(
+                        "trainer restore requested during a no-training phase")
                 if not trainer_offloaded:
                     return
                 print("[gpu] restoring sharded trainer for adapter update",
@@ -8489,9 +9022,12 @@ def main():
                 else:
                     step_cfg.no_train = True
                     step_cfg._training_disabled_reason = (
-                        "binary coder initialization complete; adapter frozen")
-                    print(f"[step {step}] binary coder adapter is active and "
-                          "frozen; policy training remains off", flush=True)
+                        "binary coder initialization complete; full "
+                        "--no-train execution with frozen adapter")
+                    print(f"[step {step}] binary coder initialization is "
+                          "complete; using --no-train execution with the "
+                          "frozen coder adapter", flush=True)
+            runtime_training_active["value"] = not bool(step_cfg.no_train)
             if configured_advantage_mode == "x-grpo":
                 rollout_count = (
                     int(cfg.x_grpo_contexts_per_step) * cur_g * cur_k)
@@ -8522,8 +9058,8 @@ def main():
                                spo_rs_tracker=spo_rs_tracker,
                                sampling_adapter_path=(
                                    current_policy_adapter_path
-                                   if (configured_advantage_mode == "spo-rs"
-                                       and not binary_coder_cfg.enabled)
+                                   if (binary_coder_cfg.enabled
+                                       or configured_advantage_mode == "spo-rs")
                                    else None),
                                ensure_trainer_ready=ensure_trainer_ready)
 
@@ -8552,8 +9088,14 @@ def main():
                 memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
                 memory.save(memory_path)
             if binary_coder_cfg.enabled:
-                adapter_path = _save_adapter(
-                    model, exp_dir, step, cfg.model_name)
+                if (runtime_training_active["value"]
+                        or current_policy_adapter_path is None):
+                    adapter_path = _save_adapter(
+                        model, exp_dir, step, cfg.model_name)
+                else:
+                    # No weights change after the bootstrap. Reuse its final
+                    # adapter rather than writing an identical copy per step.
+                    adapter_path = Path(current_policy_adapter_path)
             elif configured_advantage_mode == "spo-rs":
                 if stats.get("spo_rs_policy_updated", False):
                     adapter_path = _save_adapter(
