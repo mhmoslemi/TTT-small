@@ -622,6 +622,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Sequential diverse strategies generated per parent.")
     p.add_argument("--programs-per-strategy", type=int, default=None,
                    help="LoRA-policy code rollouts sampled from each strategy.")
+    p.add_argument(
+        "--strategy-archive-top-r", type=int, default=None,
+        help="With --strategies, admit only the top-r valid unique programs "
+             "from each generated strategy before applying the existing "
+             "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--uct", action="store_const", const=True, default=None,
                    help="Use UCT parent selection instead of PUCT. Both use "
@@ -1207,11 +1212,13 @@ def load_config():
             raise ValueError("strategy_backend must be 'local' or 'api'")
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
+        strategy_archive_top_r = int(merged["strategy_archive_top_r"])
         strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
         strategy_max_seq_length = int(merged["strategy_max_seq_length"])
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
         if (strategies_per_parent < 1 or programs_per_strategy < 1
+                or strategy_archive_top_r < 1
                 or strategy_max_new_tokens < 1
                 or strategy_max_seq_length < 1):
             raise ValueError(
@@ -1233,6 +1240,7 @@ def load_config():
         merged["strategy_backend"] = strategy_backend
         merged["strategies_per_parent"] = strategies_per_parent
         merged["programs_per_strategy"] = programs_per_strategy
+        merged["strategy_archive_top_r"] = strategy_archive_top_r
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
         merged["strategy_temperature"] = strategy_temperature
@@ -5916,6 +5924,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     binary_coder_diagnostics = []
     binary_overlap_state = None
     all_children = []
+    all_child_strategy_keys = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
     mem_arm_updates = []        # matched treatment-vs-null outcome diagnostics
@@ -7515,6 +7524,9 @@ code block.'''
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
+                all_child_strategy_keys.append(
+                    int(job["strategy_index"])
+                    if two_stage_rollouts else None)
             pick_info = (sampler.last_picks_info[parent_group]
                          if parent_group < len(sampler.last_picks_info) else {})
             meta = {
@@ -7872,7 +7884,24 @@ code block.'''
         if previous_best_raw is not None else None)
 
     # Update archive
-    sampler.update(all_children)
+    archive_stats = sampler.update(
+        all_children,
+        strategy_keys=(all_child_strategy_keys
+                       if two_stage_rollouts else None),
+        strategy_top_r=(int(cfg.strategy_archive_top_r)
+                        if two_stage_rollouts else 0),
+    )
+    if two_stage_rollouts:
+        print(
+            f"[step {step_idx}] strategy archive: "
+            f"valid={archive_stats['submitted']}, "
+            f"unique-new={archive_stats['unique_new']}, "
+            f"top-{archive_stats['strategy_top_r']}/strategy="
+            f"{archive_stats['strategy_admitted']}, "
+            f"survived parent-top-{cfg.topk_children_per_parent}/global-cap="
+            f"{archive_stats['retained_new']}",
+            flush=True,
+        )
 
     # Report the problem-native metric before any memory or gradient work. This
     # is deliberately separate from reward: some problems maximize the raw
@@ -8466,6 +8495,8 @@ def main():
         print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
               f"strategies/parent x {cfg.programs_per_strategy} "
               f"programs/strategy = {cfg.group_size}/parent")
+        print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
+              f"then existing top {cfg.topk_children_per_parent}/parent")
         print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "

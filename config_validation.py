@@ -41,7 +41,7 @@ vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
 vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
 num_steps groups_per_step group_size strategies_per_parent
-programs_per_strategy num_seed_states max_groups_per_step
+programs_per_strategy strategy_archive_top_r num_seed_states max_groups_per_step
 max_group_size growth_force_step growth_valid_yield growth_distinct_min
 growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
@@ -224,7 +224,8 @@ def validate_problem_config(
     for key in ("num_steps", "groups_per_step", "group_size",
                 "num_seed_states", "max_new_tokens", "max_seq_length",
                 "train_examples_per_microbatch", "strategies_per_parent",
-                "programs_per_strategy", "strategy_max_new_tokens",
+                "programs_per_strategy", "strategy_archive_top_r",
+                "strategy_max_new_tokens",
                 "strategy_max_seq_length", "binary_coder_lora_rank"):
         if key in data:
             _positive_int(data, key, source)

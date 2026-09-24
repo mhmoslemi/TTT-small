@@ -356,15 +356,39 @@ class PUCTSampler:
         self.last_picks_info = info
         return picks
 
-    def update(self, children_with_parents):
+    def update(self, children_with_parents, *, strategy_keys=None,
+               strategy_top_r: int = 0):
         """
         Push new children into the archive and update PUCT stats.
         children_with_parents: list of (child_state, parent_state).
         Only children with valid (non-None) values should be passed.
 
+        When strategy_keys is supplied, it must align one-for-one with
+        children_with_parents. After the existing exact-code deduplication,
+        at most strategy_top_r new children are admitted from each
+        (parent, strategy) pair. The ordinary top-K-per-parent and global
+        archive cap are then applied unchanged.
+
         The whole body is guarded by _prior_lock so the background
         snapshot_top_states() cannot iterate self._states while it is rebuilt.
         """
+        children_with_parents = list(children_with_parents)
+        strategy_top_r = int(strategy_top_r or 0)
+        if strategy_top_r < 0:
+            raise ValueError("strategy_top_r must be nonnegative")
+        if strategy_keys is None:
+            strategy_keys = [None] * len(children_with_parents)
+        else:
+            strategy_keys = list(strategy_keys)
+            if len(strategy_keys) != len(children_with_parents):
+                raise ValueError(
+                    "strategy_keys must align with children_with_parents")
+            if strategy_top_r > 0 and any(
+                    key is None for key in strategy_keys):
+                raise ValueError(
+                    "strategy_keys cannot contain None when strategy_top_r "
+                    "is enabled")
+
         with self._prior_lock:
             # Do this before deduplication/pruning: every successfully evaluated
             # child counts toward the run's problem-native best-ever value.
@@ -385,8 +409,9 @@ class PUCTSampler:
 
             # Incorporate children + dedup by exact code
             existing_codes = {s.code for s in self._states if s.code}
-            new_states = []
-            for child, parent in children_with_parents:
+            new_entries = []
+            for (child, parent), strategy_key in zip(
+                    children_with_parents, strategy_keys):
                 if child.value is None:
                     continue
                 if child.code and child.code in existing_codes:
@@ -395,10 +420,30 @@ class PUCTSampler:
                     [{"id": parent.id, "timestep": parent.timestep}]
                     + (parent.parents or [])
                 )
-                new_states.append(child)
+                new_entries.append((child, parent, strategy_key))
                 if child.code:
                     existing_codes.add(child.code)
 
+            unique_new = len(new_entries)
+            if strategy_top_r > 0:
+                by_parent_strategy = {}
+                for child, parent, strategy_key in new_entries:
+                    key = (parent.id, strategy_key)
+                    by_parent_strategy.setdefault(key, []).append(
+                        (child, parent, strategy_key))
+                admitted_entries = []
+                for candidates in by_parent_strategy.values():
+                    candidates.sort(
+                        key=lambda entry: (
+                            entry[0].value
+                            if entry[0].value is not None else -np.inf),
+                        reverse=True,
+                    )
+                    admitted_entries.extend(candidates[:strategy_top_r])
+            else:
+                admitted_entries = new_entries
+
+            new_states = [entry[0] for entry in admitted_entries]
             self._states.extend(new_states)
 
             # Enforce top-K children per parent (excluding seeds)
@@ -430,6 +475,17 @@ class PUCTSampler:
                 )
                 keep_non_seeds = non_seeds[: self.max_buffer_size - len(seeds)]
                 self._states = seeds + keep_non_seeds
+
+            retained_ids = {state.id for state in self._states}
+            return {
+                "submitted": len(children_with_parents),
+                "unique_new": unique_new,
+                "strategy_top_r": strategy_top_r,
+                "strategy_admitted": len(new_states),
+                "retained_new": sum(
+                    state.id in retained_ids for state in new_states),
+                "archive_size": len(self._states),
+            }
 
     def record_expansion(self, parent: State, count: int = 1):
         """Called once per parent per step. Pass count=group_size so n and T
