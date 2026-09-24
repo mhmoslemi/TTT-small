@@ -5832,7 +5832,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                ensure_trainer_ready=None):
     import os
     import torch
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, wait
     from queue import Queue
 
     from sampler import State
@@ -6377,6 +6377,25 @@ code block.'''
               f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
 
+    # This bar must exist before generation begins.  Reward futures are added
+    # incrementally as rollout batches arrive, so constructing it from
+    # ``all_futs`` after generation made correctly overlapped evaluation look
+    # as though it started late at 0%.  Future callbacks keep it live from the
+    # first completed sandbox while GPU generation is still running.
+    eval_bar = make_progress_bar(total_rollouts, desc="evaluating")
+    eval_progress_condition = threading.Condition()
+    eval_progress_completed = 0
+    eval_bar_closed = False
+
+    def _record_evaluation_completion(_future):
+        nonlocal eval_progress_completed
+        with eval_progress_condition:
+            eval_progress_completed += 1
+            try:
+                eval_bar.update(1)
+            finally:
+                eval_progress_condition.notify_all()
+
     # Mutable records preserve streamed arrival order while vLLM reference
     # scoring fills its result concurrently with the CPU reward futures.
     group_responses = {g: [] for g in range(num_groups)}
@@ -6413,6 +6432,7 @@ code block.'''
                 cfg.sandbox_timeout_s
             )
         reward_futures[g].append(fut)
+        fut.add_done_callback(_record_evaluation_completion)
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
         job = prompt_jobs[int(job_idx)]
@@ -7019,20 +7039,6 @@ code block.'''
                 _submit_rollout(record)
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
-        # Track completion in its own lightweight thread so the evaluation bar
-        # remains live while the main thread restores the trainer and performs
-        # overlapped forward/backward work.
-        eval_bar = make_progress_bar(len(all_futs), desc="evaluating")
-        def _track_evaluation_progress():
-            for _future in as_completed(all_futs):
-                eval_bar.update(1)
-
-        eval_progress_thread = threading.Thread(
-            target=_track_evaluation_progress,
-            name=f"evaluation-progress-step-{step_idx}",
-            daemon=True,
-        )
-        eval_progress_thread.start()
         try:
             # Binary usability is a per-rollout label and the fast objective
             # has one update epoch, no KL, no entropy, and no feedback. On the
@@ -7113,14 +7119,20 @@ code block.'''
                     )
 
             # If training finished first, wait only for the remaining reward
-            # tail. If rewards finished first, this join returns immediately.
-            eval_progress_thread.join()
+            # tail. If rewards finished first, this returns immediately.  Do
+            # not consume exceptions here: the aligned per-group result() call
+            # below remains the single place that reports reward failures.
+            wait(all_futs)
+            with eval_progress_condition:
+                eval_progress_condition.wait_for(
+                    lambda: eval_progress_completed >= len(all_futs))
         finally:
-            if eval_progress_thread.is_alive():
-                eval_progress_thread.join()
             eval_bar.close()
+            eval_bar_closed = True
     finally:
         reward_pool.shutdown(wait=True)
+        if not eval_bar_closed:
+            eval_bar.close()
         if evaluation_trainer_offloaded:
             print(f"[step {step_idx}] restoring trainer after shared-GPU "
                   "benchmark evaluation")
