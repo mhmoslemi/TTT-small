@@ -6967,89 +6967,105 @@ code block.'''
                 _submit_rollout(record)
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
-        # Binary usability is a per-rollout label and the fast objective has one
-        # update epoch, no KL, no entropy, and no feedback.  On the sharded
-        # trainer we can therefore launch each policy forward while CPU rewards
-        # are outstanding, attach the +/-1 label when that microbatch's future
-        # resolves, and backpropagate without changing the policy.  The single
-        # optimizer step remains below the artifact-persistence barrier.
-        overlap_eligible = bool(
-            binary_coder_mode
-            and training_enabled
-            and parallel_trainer is None
-            and ensure_trainer_ready is not None
-            and cfg.generation_backend == "vllm"
-            and int(getattr(cfg, "rank_update_epochs", 1)) == 1
-            and not fb_candidate_on
-            and memory is None
-            and extractor is None
-            and not deferred_rollouts
-            and not evaluation_trainer_offloaded
+        # Track completion in its own lightweight thread so the evaluation bar
+        # remains live while the main thread restores the trainer and performs
+        # overlapped forward/backward work.
+        eval_bar = make_progress_bar(len(all_futs), desc="evaluating")
+        def _track_evaluation_progress():
+            for _future in as_completed(all_futs):
+                eval_bar.update(1)
+
+        eval_progress_thread = threading.Thread(
+            target=_track_evaluation_progress,
+            name=f"evaluation-progress-step-{step_idx}",
+            daemon=True,
         )
-        if overlap_eligible:
-            pending_before = sum(not future.done() for future in all_futs)
-            restore_started = time.time()
-            overlap_examples = None
-            try:
-                ensure_trainer_ready()
-                restore_seconds = time.time() - restore_started
-                overlap_examples = _prepare_binary_overlap_examples(
-                    model, tokenizer, group_responses, reward_futures,
-                    prompt_jobs, parents)
-                if overlap_examples:
-                    print(
-                        f"[step {step_idx}] binary coder evaluation/training "
-                        f"overlap: {len(overlap_examples)} examples; "
-                        f"{pending_before}/{len(all_futs)} CPU evaluations "
-                        "were still pending when trainer restore began",
-                        flush=True,
-                    )
-                    binary_overlap_state = (
-                        _precompute_binary_coder_backward(
-                            backend, model, tokenizer, optimizer,
-                            overlap_examples, cfg, step_idx))
-                    if binary_overlap_state is not None:
-                        binary_overlap_state["restore_seconds"] = (
-                            restore_seconds)
-                        pending_after = sum(
-                            not future.done() for future in all_futs)
+        eval_progress_thread.start()
+        try:
+            # Binary usability is a per-rollout label and the fast objective
+            # has one update epoch, no KL, no entropy, and no feedback. On the
+            # sharded trainer we can therefore launch each policy forward while
+            # CPU rewards are outstanding, attach the +/-1 label when that
+            # microbatch's future resolves, and backpropagate without changing
+            # the policy. The single optimizer step remains below the artifact-
+            # persistence barrier.
+            overlap_eligible = bool(
+                binary_coder_mode
+                and training_enabled
+                and parallel_trainer is None
+                and ensure_trainer_ready is not None
+                and cfg.generation_backend == "vllm"
+                and int(getattr(cfg, "rank_update_epochs", 1)) == 1
+                and not fb_candidate_on
+                and memory is None
+                and extractor is None
+                and not deferred_rollouts
+                and not evaluation_trainer_offloaded
+            )
+            if overlap_eligible:
+                pending_before = sum(not future.done() for future in all_futs)
+                restore_started = time.time()
+                overlap_examples = None
+                try:
+                    ensure_trainer_ready()
+                    restore_seconds = time.time() - restore_started
+                    overlap_examples = _prepare_binary_overlap_examples(
+                        model, tokenizer, group_responses, reward_futures,
+                        prompt_jobs, parents)
+                    if overlap_examples:
                         print(
-                            f"[step {step_idx}] binary coder backward ready; "
-                            f"optimizer step deferred until rollout artifacts "
-                            f"are saved; CPU evaluations still pending: "
-                            f"{pending_after}/{len(all_futs)}",
+                            f"[step {step_idx}] binary coder "
+                            "evaluation/training overlap: "
+                            f"{len(overlap_examples)} examples; "
+                            f"{pending_before}/{len(all_futs)} CPU "
+                            "evaluations were still pending when trainer "
+                            "restore began",
                             flush=True,
                         )
-            except Exception as error:
-                # The ordinary post-evaluation path is the correctness fallback.
-                # Clear every partial gradient and discard only the temporary
-                # tensor records; completed CPU rewards remain valid and are not
-                # re-run.
-                model.zero_grad(set_to_none=True)
-                optimizer.zero_grad(set_to_none=True)
-                for responses in group_responses.values():
-                    for record in responses:
-                        record.pop("_binary_overlap_example", None)
-                overlap_examples = None
-                binary_overlap_state = None
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                print(
-                    f"[warn] binary evaluation/training overlap was disabled "
-                    f"for this step ({type(error).__name__}: {error}); "
-                    "falling back to the unchanged post-evaluation update",
-                    flush=True,
-                )
+                        binary_overlap_state = (
+                            _precompute_binary_coder_backward(
+                                backend, model, tokenizer, optimizer,
+                                overlap_examples, cfg, step_idx))
+                        if binary_overlap_state is not None:
+                            binary_overlap_state["restore_seconds"] = (
+                                restore_seconds)
+                            pending_after = sum(
+                                not future.done() for future in all_futs)
+                            print(
+                                f"[step {step_idx}] binary coder backward "
+                                "ready; optimizer step deferred until rollout "
+                                "artifacts are saved; CPU evaluations still "
+                                f"pending: {pending_after}/{len(all_futs)}",
+                                flush=True,
+                            )
+                except Exception as error:
+                    # The ordinary post-evaluation path is the correctness
+                    # fallback. Clear every partial gradient and discard only
+                    # temporary tensor records; completed rewards are reused.
+                    model.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    for responses in group_responses.values():
+                        for record in responses:
+                            record.pop("_binary_overlap_example", None)
+                    overlap_examples = None
+                    binary_overlap_state = None
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    print(
+                        f"[warn] binary evaluation/training overlap was "
+                        f"disabled for this step ({type(error).__name__}: "
+                        f"{error}); falling back to the unchanged "
+                        "post-evaluation update",
+                        flush=True,
+                    )
 
-        # Wait for whatever rewards are still running.  With binary overlap the
-        # expensive policy forwards/backward have already consumed this same
-        # interval; as_completed only drains any non-training tail.
-        eval_bar = make_progress_bar(len(all_futs), desc="evaluating")
-        try:
-            for _ in as_completed(all_futs):
-                eval_bar.update(1)
+            # If training finished first, wait only for the remaining reward
+            # tail. If rewards finished first, this join returns immediately.
+            eval_progress_thread.join()
         finally:
+            if eval_progress_thread.is_alive():
+                eval_progress_thread.join()
             eval_bar.close()
     finally:
         reward_pool.shutdown(wait=True)
