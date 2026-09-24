@@ -520,15 +520,11 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
     return kwargs
 
 
-def _vllm_job_seed(seed, step, rank, group_idx, sample_offset=0):
+def _vllm_job_seed(seed, step, rank, group_idx):
     """Stable per-request seed; None preserves vLLM's stochastic default."""
     if seed is None:
         return None
-    return (
-        worker_seed(seed, step, rank)
-        + int(group_idx) * 104_729
-        + int(sample_offset) * 130_363
-    ) % (2 ** 31 - 1)
+    return (worker_seed(seed, step, rank) + int(group_idx) * 104_729) % (2 ** 31 - 1)
 
 
 def _python_development_header_path():
@@ -902,14 +898,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         try:
             lora_request = _lora_request(adapter_path)
 
-            # Dispatch in scheduler-sized waves.  A single blocking generate()
-            # over the worker's entire assignment withheld every completed
-            # rollout until the slowest sequence in that assignment finished,
-            # so CPU verification could not overlap generation in practice.
-            # Each wave still mixes prompts and fills max_num_seqs, but its
-            # results are returned immediately before the next wave begins.
+            # One call gives vLLM the whole worker workload so its scheduler can
+            # batch different prompts and all n samples under the memory limit.
             tokenizer = llm.get_tokenizer()
             runnable_jobs = []
+            max_tokens_by_job = []
             for group_idx, prompt, count in jobs:
                 prompt_len = len(tokenizer.encode(prompt))
                 max_tokens = min(
@@ -924,97 +917,63 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     result_queue.put(
                         (rank, group_idx, [("", []) for _ in range(int(count))]))
                     continue
-                runnable_jobs.append((
-                    int(group_idx), prompt, int(count), int(max_tokens)))
+                runnable_jobs.append((group_idx, prompt, count))
+                max_tokens_by_job.append(max_tokens)
 
             if not runnable_jobs:
                 continue
 
+            prompts = [prompt for (_group_idx, prompt, _count) in runnable_jobs]
             return_logprobs = bool(gen_kwargs.get("return_logprobs", False))
-            remaining = [job[2] for job in runnable_jobs]
-            emitted = [0 for _job in runnable_jobs]
-            total_remaining = sum(remaining)
-            wave_limit = int(gen_kwargs.get("micro_batch", 0) or 0)
-            if wave_limit <= 0:
-                wave_limit = total_remaining
-            cursor = 0
-
-            while total_remaining > 0:
-                wave_size = min(wave_limit, total_remaining)
-                allocation = [0 for _job in runnable_jobs]
-                probe = cursor
-                for _slot in range(wave_size):
-                    while remaining[probe] <= allocation[probe]:
-                        probe = (probe + 1) % len(runnable_jobs)
-                    allocation[probe] += 1
-                    probe = (probe + 1) % len(runnable_jobs)
-                cursor = probe
-
-                wave_indices = [
-                    index for index, count in enumerate(allocation) if count]
-                prompts = [runnable_jobs[index][1]
-                           for index in wave_indices]
-                sampling = []
-                for index in wave_indices:
-                    group_idx, _prompt, _count, max_tokens = (
-                        runnable_jobs[index])
-                    sampling_kwargs = dict(
-                        n=int(allocation[index]),
-                        max_tokens=int(max_tokens),
-                        temperature=float(gen_kwargs["temperature"]),
-                        top_p=float(gen_kwargs["top_p"]),
-                        seed=_vllm_job_seed(
-                            seed, step, rank, group_idx,
-                            sample_offset=emitted[index]),
-                        skip_special_tokens=True,
-                    )
-                    if return_logprobs:
-                        # vLLM always includes the sampled token in logprobs;
-                        # zero asks for no additional top-k entries.
-                        sampling_kwargs["logprobs"] = 0
-                    sampling.append(SamplingParams(**sampling_kwargs))
-
-                outputs = llm.generate(
-                    prompts,
-                    sampling_params=sampling,
-                    lora_request=lora_request,
-                    use_tqdm=False,
+            sampling = []
+            for (group_idx, _prompt, count), max_tokens in zip(
+                    runnable_jobs, max_tokens_by_job):
+                sampling_kwargs = dict(
+                    n=int(count),
+                    max_tokens=int(max_tokens),
+                    temperature=float(gen_kwargs["temperature"]),
+                    top_p=float(gen_kwargs["top_p"]),
+                    seed=_vllm_job_seed(seed, step, rank, group_idx),
+                    skip_special_tokens=True,
                 )
+                if return_logprobs:
+                    # vLLM always includes the sampled token in logprobs; zero
+                    # asks for no additional top-k entries.
+                    sampling_kwargs["logprobs"] = 0
+                sampling.append(SamplingParams(**sampling_kwargs))
+            outputs = llm.generate(
+                prompts,
+                sampling_params=sampling,
+                lora_request=lora_request,
+                use_tqdm=False,
+            )
 
-                for wave_pos, index in enumerate(wave_indices):
-                    group_idx, _prompt, _count, _max_tokens = (
-                        runnable_jobs[index])
-                    requested = int(allocation[index])
-                    request_output = (
-                        outputs[wave_pos] if wave_pos < len(outputs) else None)
-                    job_results = []
-                    if request_output is not None:
-                        for candidate in request_output.outputs[:requested]:
-                            token_ids = list(candidate.token_ids)
-                            if return_logprobs:
-                                values = _chosen_token_logprobs(
-                                    token_ids,
-                                    getattr(candidate, "logprobs", None))
-                                job_results.append(
-                                    (candidate.text, token_ids,
-                                     array("f", values)
-                                     if values is not None else None))
-                            else:
-                                job_results.append(
-                                    (candidate.text, token_ids))
-                    # Preserve the queue contract even if an engine/version
-                    # returns fewer samples than requested; downstream treats
-                    # placeholders as invalid instead of blocking forever.
-                    if len(job_results) < requested:
-                        missing = requested - len(job_results)
-                        placeholder = (("", [], None) if return_logprobs
-                                       else ("", []))
-                        job_results.extend(
-                            [placeholder for _ in range(missing)])
-                    result_queue.put((rank, group_idx, job_results))
-                    remaining[index] -= requested
-                    emitted[index] += requested
-                    total_remaining -= requested
+            for job_pos, (group_idx, _prompt, count) in enumerate(runnable_jobs):
+                request_output = (outputs[job_pos]
+                                  if job_pos < len(outputs) else None)
+                job_results = []
+                if request_output is not None:
+                    for candidate in request_output.outputs[:int(count)]:
+                        token_ids = list(candidate.token_ids)
+                        if return_logprobs:
+                            values = _chosen_token_logprobs(
+                                token_ids,
+                                getattr(candidate, "logprobs", None))
+                            job_results.append(
+                                (candidate.text, token_ids,
+                                 array("f", values)
+                                 if values is not None else None))
+                        else:
+                            job_results.append((candidate.text, token_ids))
+                # Preserve the queue contract even if an engine/version returns
+                # fewer samples than requested; downstream treats these as
+                # invalid rollouts instead of blocking forever.
+                if len(job_results) < int(count):
+                    missing = int(count) - len(job_results)
+                    placeholder = (("", [], None) if return_logprobs
+                                   else ("", []))
+                    job_results.extend([placeholder for _ in range(missing)])
+                result_queue.put((rank, group_idx, job_results))
         except Exception:
             detail = traceback.format_exc()
             print(f"[vllm worker {rank}] generation failed:\n{detail}",
