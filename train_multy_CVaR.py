@@ -539,7 +539,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "vLLM rollout generation (vLLM itself does not backpropagate).")
     p.add_argument(
         "--fast", action="store_const", const=True, default=None,
-        help="Use the opt-in process-per-GPU clipped-policy trainer: work is balanced "
+        help="Use the opt-in process-per-GPU LoRA trainer: work is balanced "
              "by sequence cost and every GPU independently learns a padded-"
              "token budget capped at 80%% GPU memory use. "
              "Without this flag the existing trainer is unchanged.")
@@ -5489,9 +5489,7 @@ class ProcessDistributedTrainer:
             self.restore_after_generation()
 
         started = time.time()
-        queued_examples = self._queue_examples(examples)
-        total_examples = len(queued_examples)
-        if total_examples < 1:
+        if not examples:
             return {
                 "training_seconds": 0.0,
                 "training_parallel_gpus": self._world_size,
@@ -5499,6 +5497,8 @@ class ProcessDistributedTrainer:
                 "training_fast_processes": True,
                 "oom_quarantined_examples": 0,
             }
+        queued_examples = self._queue_examples(examples)
+        total_examples = len(queued_examples)
         supplied_old = sum(
             _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in queued_examples)
