@@ -4945,7 +4945,7 @@ class ReplicatedDataParallelTrainer:
 
 
 class ProcessDistributedTrainer:
-    """Fast rank trainer with one persistent Python process per GPU."""
+    """Fast LoRA trainer with one persistent Python process per GPU."""
 
     def __init__(self, primary_backend, primary_model, primary_tokenizer,
                  optimizer, cfg, exp_dir, dependency_log_path=None):
@@ -5475,9 +5475,171 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def train_policy(self, *args, **kwargs):
-        raise RuntimeError(
-            "process-distributed --fast supports clipped-policy modes only")
+    def train_policy(self, examples, cfg, step_idx, *, fb_cfg=None,
+                     fb_on=False, fb_lambda=0.0):
+        """Run the exact standard policy loss on the process-per-GPU path."""
+        import torch
+        from fast_distributed import (broadcast_trainable_parameters,
+                                      local_policy_update,
+                                      reduce_trainable_gradients)
+
+        if self._offloaded:
+            print(f"[train-fast] restoring {self._world_size} process "
+                  "trainers for the update", flush=True)
+            self.restore_after_generation()
+
+        started = time.time()
+        queued_examples = self._queue_examples(examples)
+        total_examples = len(queued_examples)
+        if total_examples < 1:
+            return {
+                "training_seconds": 0.0,
+                "training_parallel_gpus": self._world_size,
+                "training_fast": True,
+                "training_fast_processes": True,
+                "oom_quarantined_examples": 0,
+            }
+        supplied_old = sum(
+            _valid_example_token_logprobs(example, "behavior_logprobs")
+            for example in queued_examples)
+        supplied_reference = sum(
+            _valid_example_token_logprobs(example, "reference_logprobs")
+            for example in queued_examples)
+        print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
+              f"vLLM supplied old={supplied_old}/{total_examples}, "
+              f"reference={supplied_reference}/{total_examples}",
+              flush=True)
+        print(f"[train-fast] one process/GPU; memory ceiling=80%; "
+              "exact singleton rescue=96%; "
+              f"initial padded-token budgets/GPU={self._token_budgets}",
+              flush=True)
+
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "train_policy",
+                "step_cfg": dict(vars(cfg)),
+                "token_budget": self._token_budgets[rank],
+                "total_examples": total_examples,
+                "memory_fraction": 0.80,
+                "fb_cfg": fb_cfg,
+                "fb_on": bool(fb_on),
+                "fb_lambda": float(fb_lambda),
+            })
+
+        local_stats = local_policy_update(
+            self.backend, self.model, self.tokenizer, (), cfg, 0,
+            self._token_budgets[0], total_examples,
+            memory_fraction=0.80, fb_cfg=fb_cfg, fb_on=fb_on,
+            fb_lambda=fb_lambda, work_queue=self._work_queue)
+        child_messages = self._collect_event(
+            "computed", range(1, self._world_size))
+        rank_stats = [local_stats] + [
+            child_messages[rank]["stats"]
+            for rank in range(1, self._world_size)
+        ]
+        accounted_examples = sum(
+            int(stats["trained_examples"])
+            + int(stats["quarantined_examples"])
+            for stats in rank_stats)
+        if accounted_examples != total_examples:
+            raise RuntimeError(
+                "fast trainer shared queue lost or duplicated work: "
+                f"accounted for {accounted_examples}/{total_examples} "
+                "examples")
+
+        for command_queue in self._command_queues.values():
+            command_queue.put({"kind": "finish_update"})
+        reduce_trainable_gradients(self.model, destination_rank=0)
+
+        update_error = None
+        grad_norm = None
+        try:
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in self.model.parameters()
+                 if parameter.requires_grad],
+                max_norm=cfg.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            grad_norm = float(grad_norm_tensor.item())
+        except BaseException as error:
+            update_error = error
+        finally:
+            self.model.zero_grad(set_to_none=True)
+            broadcast_trainable_parameters(self.model, source_rank=0)
+            self._collect_event("updated", range(1, self._world_size))
+            self._workers_idle = True
+        if update_error is not None:
+            raise update_error
+
+        for rank, stats in enumerate(rank_stats):
+            self._token_budgets[rank] = max(
+                1, int(stats["token_budget"]))
+        total_loss = sum(
+            float(stats["total_loss"]) for stats in rank_stats)
+        total_logp_delta = sum(
+            float(stats["total_logp_delta"]) for stats in rank_stats)
+        ratio_sum = sum(
+            float(stats["ratio_sum"]) for stats in rank_stats)
+        ratio_max = max(
+            float(stats["ratio_max"]) for stats in rank_stats)
+        ratio_count = sum(
+            int(stats["ratio_count"]) for stats in rank_stats)
+        quarantined_examples = sum(
+            int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [
+            int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [
+            int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [
+            float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [
+            float(stats["allocator_memory_fraction"])
+            for stats in rank_stats]
+        feedback_stats = self._merge_feedback_dicts([
+            stats["feedback_stats"] for stats in rank_stats])
+        kl_errors = [
+            error for stats in rank_stats for error in stats["kl_errors"]
+        ]
+        if kl_errors:
+            print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
+                  "training without KL penalty on affected examples",
+                  flush=True)
+        peak_percentages = [
+            round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [
+            round(100.0 * fraction, 1)
+            for fraction in allocator_fractions]
+        print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
+              f"backward batches/GPU={batches_per_gpu}; final padded-token "
+              f"budgets/GPU={self._token_budgets}; peak memory/GPU="
+              f"{peak_percentages}%; allocator caps/GPU="
+              f"{allocator_percentages}%", flush=True)
+        elapsed = time.time() - started
+        ratio_message = ""
+        if ratio_count:
+            ratio_message = (
+                f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
+                f"max={ratio_max:.3f}")
+        print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
+              f"avg loss: {total_loss / total_examples:.9f}  "
+              "avg logpi_theta - logpi_base: "
+              f"{total_logp_delta / total_examples:.9f}{ratio_message}  "
+              f"OOM-quarantined={quarantined_examples}", flush=True)
+        if fb_on:
+            print(feedback_stats.line(step_idx, fb_lambda))
+        return {
+            "training_seconds": elapsed,
+            "training_parallel_gpus": self._world_size,
+            "training_grad_norm": grad_norm,
+            "training_fast": True,
+            "training_fast_processes": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(self._token_budgets),
+            "fast_peak_memory_fraction": peak_fractions,
+            "fast_allocator_memory_fraction": allocator_fractions,
+            "oom_quarantined_examples": quarantined_examples,
+        }
 
     def offload_for_generation(self):
         if self._offloaded:
@@ -8366,16 +8528,13 @@ def main():
         and cfg.generation_backend == "vllm"
         and cfg.training_layout != "sharded"
     )
-    # The process-per-GPU adaptive scheduler implements the clipped-policy
-    # objectives.  Entropic/GRPO/CVaR already have an exact concurrent
-    # all-GPU implementation in ReplicatedDataParallelTrainer; keep --fast
-    # accepted and route those objectives there rather than rejecting them or
-    # changing their loss.
+    # --fast always selects the persistent process-per-GPU implementation.
+    # Both the standard policy objectives and clipped-policy objectives retain
+    # their existing losses; only scheduling, OOM recovery, and LoRA-gradient
+    # transport differ from the in-process replicated trainer.
     use_process_distributed_training = bool(
         use_replicated_training
         and cfg.fast
-        and (binary_coder_cfg.enabled
-             or _uses_clipped_policy_loss(cfg.advantage_mode))
     )
     if use_replicated_training:
         cfg.training_replica_device = 0

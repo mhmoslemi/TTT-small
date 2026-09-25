@@ -1,4 +1,4 @@
-"""Process-per-GPU implementation for the opt-in fast rank trainer.
+"""Process-per-GPU implementation for opt-in fast LoRA training.
 
 The main process is distributed rank 0. Persistent spawned workers own the
 remaining GPUs, so transformer forward/checkpoint recomputation on different
@@ -880,6 +880,387 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     }
 
 
+def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
+                        token_budget, total_examples, *,
+                        memory_fraction=0.80, fb_cfg=None, fb_on=False,
+                        fb_lambda=0.0, work_queue=None):
+    """Accumulate one rank's exact entropic/GRPO/CVaR gradients.
+
+    This is the process-per-GPU counterpart of
+    ``ReplicatedDataParallelTrainer.train_policy``.  The global example count
+    is supplied by rank 0 so summing LoRA gradients across ranks reproduces the
+    original global mean loss exactly, independent of dynamic work stealing.
+    """
+    from contextlib import nullcontext
+    import torch
+    import train_multy_CVaR as training
+    from feedback import (FeedbackStats, bound_feedback_advantage,
+                          feedback_advantage)
+
+    if not 0.0 < float(memory_fraction) <= 0.80:
+        raise ValueError("fast trainer memory_fraction must be in (0, 0.80]")
+    total_examples = int(total_examples)
+    if total_examples < 1:
+        raise ValueError("fast policy update requires at least one example")
+
+    backend.set_training_mode()
+    allocator_fraction = set_total_memory_ceiling(
+        logical_id, float(memory_fraction))
+    parameters = trainable_parameters(model)
+    gradient_accumulators = [None for _ in parameters]
+    total_loss = 0.0
+    total_logp_delta = 0.0
+    ratio_sum = 0.0
+    ratio_max = 0.0
+    ratio_count = 0
+    quarantined_examples = 0
+    backward_batches = 0
+    trained_examples = 0
+    peak_memory_fraction = 0.0
+    feedback_parts = []
+    kl_errors = []
+    budget = max(1, int(token_budget or cfg.max_seq_length))
+    emergency_allocator_fraction = None
+
+    def expand_for_long_rollout():
+        nonlocal allocator_fraction, emergency_allocator_fraction
+        if emergency_allocator_fraction is not None:
+            return emergency_allocator_fraction
+        try:
+            emergency_allocator_fraction = (
+                set_long_rollout_memory_ceiling(logical_id))
+        except RuntimeError as error:
+            print(f"[train-oom] cuda:{logical_id}: reserved GPU headroom is "
+                  f"unavailable ({error})", flush=True)
+            return None
+        allocator_fraction = max(
+            allocator_fraction, emergency_allocator_fraction)
+        return emergency_allocator_fraction
+
+    examples = list(examples or ())
+    if work_queue is not None and examples:
+        raise ValueError(
+            "fast trainer accepts either local examples or a shared queue")
+
+    def example_length(example):
+        return int(
+            example["prompt_ids"].shape[1]
+            + example["response_ids"].shape[1])
+
+    max_examples_per_batch = 64
+    if work_queue is None:
+        pending = sorted(examples, key=example_length)
+        max_examples_per_batch = min(64, max(1, len(examples)))
+
+        def take_batch():
+            if not pending:
+                return []
+            batch = [pending.pop()]
+            maximum = example_length(batch[0])
+            while pending and len(batch) < max_examples_per_batch:
+                candidate = pending[-1]
+                candidate_length = example_length(candidate)
+                next_maximum = max(maximum, candidate_length)
+                if next_maximum * (len(batch) + 1) > budget:
+                    break
+                batch.append(pending.pop())
+                maximum = next_maximum
+            return batch
+    else:
+        # Strategy work items retain the complete shared prompt on one rank so
+        # the exact blockwise scorer evaluates that prompt only once per pack.
+        queue_finished = False
+        deferred = None
+        prefix_remainder = []
+
+        def take_batch():
+            nonlocal queue_finished, deferred, prefix_remainder
+            if prefix_remainder:
+                batch, prefix_remainder = _take_shared_prefix_chunk(
+                    prefix_remainder, budget, max_examples_per_batch)
+                return batch
+            if queue_finished and deferred is None:
+                return []
+            if deferred is not None:
+                first, deferred = deferred, None
+            else:
+                first = work_queue.get()
+                if first is None:
+                    queue_finished = True
+                    return []
+            if (isinstance(first, dict)
+                    and SHARED_PREFIX_WORK_KEY in first):
+                batch, prefix_remainder = _take_shared_prefix_chunk(
+                    first[SHARED_PREFIX_WORK_KEY], budget,
+                    max_examples_per_batch)
+                return batch
+            batch = [first]
+            maximum = example_length(first)
+            while (not queue_finished
+                   and len(batch) < max_examples_per_batch):
+                candidate = work_queue.get()
+                if candidate is None:
+                    queue_finished = True
+                    break
+                if (isinstance(candidate, dict)
+                        and SHARED_PREFIX_WORK_KEY in candidate):
+                    deferred = candidate
+                    break
+                candidate_length = example_length(candidate)
+                next_maximum = max(maximum, candidate_length)
+                if next_maximum * (len(batch) + 1) > budget:
+                    deferred = candidate
+                    break
+                batch.append(candidate)
+                maximum = next_maximum
+            return batch
+
+    model.zero_grad(set_to_none=True)
+    while True:
+        cpu_batch = take_batch()
+        if not cpu_batch:
+            break
+        requested_padded_tokens = _padded_token_count(cpu_batch)
+
+        with torch.cuda.device(logical_id):
+            base_allocated = int(torch.cuda.memory_allocated())
+            base_reserved = int(torch.cuda.memory_reserved())
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            external_bytes = max(
+                0, int(total_bytes) - int(free_bytes) - base_reserved)
+            torch.cuda.reset_peak_memory_stats()
+            local_batch = _move_examples(cpu_batch, logical_id)
+
+            def attempt(active_batches):
+                attempt_losses = []
+                attempt_logp_deltas = []
+                attempt_ratio_means = []
+                attempt_ratio_maxima = []
+                attempt_ratio_count = 0
+                attempt_feedback = FeedbackStats()
+                attempt_kl_error = None
+
+                # Match the existing standard-policy trainer exactly. Unlike
+                # PPO's frozen-policy likelihood pass, this objective retains
+                # the model's ordinary training-mode dropout behavior.
+                with nullcontext():
+                    for batch in active_batches:
+                        current_logprobs = (
+                            training.compute_batched_token_logprobs(
+                                model, batch, with_grad=True,
+                                chunk=cfg.logprob_chunk,
+                                pad_token_id=tokenizer.pad_token_id))
+                        base_logprobs = [
+                            example.get("reference_logprobs")
+                            for example in batch
+                        ]
+                        supplied_reference = all(
+                            training._valid_example_token_logprobs(
+                                example, "reference_logprobs")
+                            for example in batch)
+                        if not supplied_reference:
+                            try:
+                                with (backend.disable_adapter(),
+                                      torch.no_grad()):
+                                    base_logprobs = (
+                                        training.compute_batched_token_logprobs(
+                                            model, batch, with_grad=False,
+                                            chunk=cfg.logprob_chunk,
+                                            pad_token_id=(
+                                                tokenizer.pad_token_id)))
+                            except Exception as error:
+                                attempt_kl_error = repr(error)
+                                base_logprobs = [
+                                    current_lp.detach()
+                                    for current_lp in current_logprobs
+                                ]
+
+                        batch_losses = []
+                        for example, current_lp, base_lp in zip(
+                                batch, current_logprobs, base_logprobs):
+                            base_lp = base_lp.to(current_lp.device)
+                            advantage = example["advantage"]
+                            logp_difference = (
+                                current_lp - base_lp).detach()
+                            average_difference = logp_difference.mean()
+                            kl_advantage = cfg.kl_penalty_coef * (
+                                average_difference
+                                - (current_lp - base_lp))
+                            effective_advantage = advantage + kl_advantage
+                            if fb_on and example.get("reprompt_text"):
+                                fb_advantage = feedback_advantage(
+                                    training.compute_token_logprobs, model,
+                                    tokenizer, example["reprompt_text"],
+                                    example["response_ids"],
+                                    current_lp.detach(), fb_cfg,
+                                    lam=fb_lambda,
+                                    chunk=cfg.logprob_chunk)
+                                if fb_advantage is None:
+                                    attempt_feedback.skipped += 1
+                                else:
+                                    fb_advantage, _ = (
+                                        bound_feedback_advantage(
+                                            fb_advantage,
+                                            reward_advantage=advantage,
+                                            cfg=fb_cfg))
+                                    attempt_feedback.add(fb_advantage)
+                                    effective_advantage = (
+                                        effective_advantage + fb_advantage)
+
+                            if training._valid_example_token_logprobs(
+                                    example, "behavior_logprobs"):
+                                behavior_lp = example[
+                                    "behavior_logprobs"].to(
+                                        current_lp.device)
+                                importance_ratio = torch.exp(
+                                    current_lp.detach() - behavior_lp)
+                                attempt_ratio_means.append(
+                                    importance_ratio.mean().detach())
+                                attempt_ratio_maxima.append(
+                                    importance_ratio.max().detach())
+                                attempt_ratio_count += 1
+                            else:
+                                importance_ratio = 1.0
+                            loss = -(
+                                importance_ratio
+                                * effective_advantage.detach()
+                                * current_lp).mean()
+                            if not torch.isfinite(loss).all():
+                                raise FloatingPointError(
+                                    "nonfinite policy/feedback loss")
+                            batch_losses.append(loss / total_examples)
+                            attempt_losses.append(loss.detach())
+                            attempt_logp_deltas.append(
+                                logp_difference.mean().detach())
+                        if batch_losses:
+                            sum(batch_losses[1:],
+                                batch_losses[0]).backward()
+
+                zero = torch.zeros(
+                    (), dtype=torch.float64,
+                    device=torch.device(f"cuda:{logical_id}"))
+                packed = torch.stack([
+                    (torch.stack(attempt_losses).sum()
+                     if attempt_losses else zero).to(torch.float64),
+                    (torch.stack(attempt_logp_deltas).sum()
+                     if attempt_logp_deltas else zero).to(torch.float64),
+                    (torch.stack(attempt_ratio_means).sum()
+                     if attempt_ratio_means else zero).to(torch.float64),
+                    (torch.stack(attempt_ratio_maxima).max()
+                     if attempt_ratio_maxima else zero).to(torch.float64),
+                ]).detach().cpu().tolist()
+                return (
+                    packed[0], packed[1], packed[2], packed[3],
+                    attempt_ratio_count, attempt_feedback,
+                    attempt_kl_error,
+                )
+
+            result, effective_batches, quarantined = (
+                training._run_oom_resilient_backward(
+                    model, [local_batch], attempt,
+                    device_label=f"cuda:{logical_id}",
+                    expand_memory=expand_for_long_rollout))
+            peak_allocated = int(torch.cuda.max_memory_allocated())
+            peak_reserved = int(torch.cuda.max_memory_reserved())
+            used_at_peak = min(
+                int(total_bytes), external_bytes + peak_reserved)
+            observed_fraction = used_at_peak / max(1, int(total_bytes))
+            peak_memory_fraction = max(
+                peak_memory_fraction, observed_fraction)
+
+            if result is not None:
+                with torch.no_grad():
+                    for parameter_index, parameter in enumerate(parameters):
+                        gradient = parameter.grad
+                        if gradient is None:
+                            continue
+                        accumulator = gradient_accumulators[parameter_index]
+                        if accumulator is None:
+                            gradient_accumulators[
+                                parameter_index] = gradient.detach()
+                        else:
+                            accumulator.add_(gradient)
+                        parameter.grad = None
+                total_loss += result[0]
+                total_logp_delta += result[1]
+                ratio_sum += result[2]
+                ratio_max = max(ratio_max, result[3])
+                ratio_count += result[4]
+                feedback_parts.append(result[5])
+                if result[6] is not None:
+                    kl_errors.append(result[6])
+
+            model.zero_grad(set_to_none=True)
+            quarantined_examples += len(quarantined)
+            backward_batches += len(effective_batches)
+            trained_examples += sum(
+                len(batch) for batch in effective_batches)
+            successful_padded_tokens = max(
+                (_padded_token_count(batch) for batch in effective_batches),
+                default=0)
+            longest_successful = max(
+                (int(example["prompt_ids"].shape[1]
+                     + example["response_ids"].shape[1])
+                 for batch in effective_batches for example in batch),
+                default=1)
+            backed_off = bool(len(effective_batches) > 1 or quarantined)
+            if not effective_batches:
+                budget = max(1, budget // 2)
+            elif backed_off:
+                budget = max(
+                    longest_successful,
+                    min(budget, successful_padded_tokens))
+            else:
+                active_bytes = max(1, peak_allocated - base_allocated)
+                target_process_bytes = max(
+                    base_allocated + 1,
+                    int(float(memory_fraction) * int(total_bytes))
+                    - external_bytes)
+                available_for_batch = max(
+                    1, target_process_bytes - base_allocated)
+                desired_budget = int(
+                    requested_padded_tokens
+                    * available_for_batch / active_bytes * 0.95)
+                if observed_fraction >= float(memory_fraction):
+                    desired_budget = min(
+                        desired_budget,
+                        int(budget * float(memory_fraction)
+                            / max(observed_fraction, 1e-9) * 0.95))
+                lower = max(longest_successful, int(budget * 0.70))
+                upper = max(lower, int(budget * 1.20))
+                desired_budget = min(upper, max(lower, desired_budget))
+                budget = max(
+                    longest_successful,
+                    int(round(0.5 * budget + 0.5 * desired_budget)))
+
+        del local_batch, effective_batches, quarantined
+
+    with torch.cuda.device(logical_id), torch.no_grad():
+        for parameter, accumulator in zip(
+                parameters, gradient_accumulators):
+            parameter.grad = accumulator
+        torch.cuda.synchronize(logical_id)
+
+    merged_feedback = _merge_feedback_stats(feedback_parts)
+    return {
+        "total_loss": total_loss,
+        "total_logp_delta": total_logp_delta,
+        "ratio_sum": ratio_sum,
+        "ratio_max": ratio_max,
+        "ratio_count": ratio_count,
+        "quarantined_examples": quarantined_examples,
+        "backward_batches": backward_batches,
+        "trained_examples": trained_examples,
+        "peak_memory_fraction": peak_memory_fraction,
+        "allocator_memory_fraction": allocator_fraction,
+        "long_rollout_memory_rescue": (
+            emergency_allocator_fraction is not None),
+        "token_budget": budget,
+        "feedback_stats": _feedback_stats_dict(merged_feedback),
+        "kl_errors": kl_errors,
+    }
+
+
 def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 command_queue, result_queue, dependency_log_path=None):
     """Persistent rank>0 worker command loop."""
@@ -956,6 +1337,25 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 stats = local_rank_update(
                     backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
+                    memory_fraction=command.get("memory_fraction", 0.80),
+                    fb_cfg=command.get("fb_cfg"),
+                    fb_on=bool(command.get("fb_on", False)),
+                    fb_lambda=float(command.get("fb_lambda", 0.0)),
+                    work_queue=work_queue)
+                result_queue.put({
+                    "event": "computed", "rank": int(rank),
+                    "stats": stats,
+                })
+            elif kind == "train_policy":
+                if offloaded:
+                    raise RuntimeError(
+                        "fast worker received training while offloaded")
+                step_cfg = SimpleNamespace(**dict(
+                    command.get("step_cfg") or vars(cfg)))
+                stats = local_policy_update(
+                    backend, model, tokenizer, (), step_cfg,
+                    int(rank), command["token_budget"],
+                    command["total_examples"],
                     memory_fraction=command.get("memory_fraction", 0.80),
                     fb_cfg=command.get("fb_cfg"),
                     fb_on=bool(command.get("fb_on", False)),
