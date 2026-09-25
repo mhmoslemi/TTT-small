@@ -4962,13 +4962,15 @@ class ProcessDistributedTrainer:
 
         if dist.is_initialized():
             raise RuntimeError(
-                "--fast cannot start because torch.distributed is already "
+                "the process trainer cannot start because torch.distributed is already "
                 "initialized in the main process")
         self.backend = primary_backend
         self.model = primary_model
         self.tokenizer = primary_tokenizer
         self.optimizer = optimizer
         self.cfg = cfg
+        self._process_label = (
+            "train-fast" if bool(cfg.fast) else "train-process")
         self._offloaded = False
         self._closed = False
         self._workers_idle = True
@@ -4989,7 +4991,7 @@ class ProcessDistributedTrainer:
             raise ValueError(
                 "num_training_gpus does not match training_gpu_ids")
         if self._world_size < 2:
-            raise ValueError("process-distributed --fast requires two GPUs")
+            raise ValueError("process-distributed training requires two GPUs")
 
         # Eight independent Python processes must not each create a full-sized
         # host thread pool. GPU 0 was loaded before this class is constructed;
@@ -5009,9 +5011,10 @@ class ProcessDistributedTrainer:
         self._init_method = rendezvous_path.as_uri()
         cfg_dict = dict(vars(cfg))
 
-        print(f"[train-fast] starting {self._world_size - 1} persistent "
+        print(f"[{self._process_label}] starting "
+              f"{self._world_size - 1} persistent "
               "worker processes; main process is rank 0", flush=True)
-        print("[train-fast] loading trainer replicas one at a time to cap "
+        print(f"[{self._process_label}] loading trainer replicas one at a time to cap "
               "host/GPU initialization peaks", flush=True)
         try:
             for rank in range(1, self._world_size):
@@ -5033,7 +5036,7 @@ class ProcessDistributedTrainer:
                     raise RuntimeError(
                         f"fast trainer rank {rank} has a different trainable "
                         "parameter layout")
-                print(f"[train-fast] trainer replica {rank + 1}/"
+                print(f"[{self._process_label}] trainer replica {rank + 1}/"
                       f"{self._world_size} loaded on logical GPU {rank}",
                       flush=True)
             for command_queue in self._command_queues.values():
@@ -5049,7 +5052,7 @@ class ProcessDistributedTrainer:
             self._abort_workers()
             raise
 
-        print(f"[train-fast] process-distributed trainer active on physical "
+        print(f"[{self._process_label}] process-distributed trainer active on physical "
               f"GPUs {self._physical_ids}; adaptive memory ceiling=80%, "
               "exact long-rollout rescue up to 96%",
               flush=True)
@@ -5176,7 +5179,7 @@ class ProcessDistributedTrainer:
                 self._work_queue.put({SHARED_PREFIX_WORK_KEY: group})
             ordered = copied
             print(
-                f"[train-fast] queued {len(groups)} shared strategy prompts / "
+                f"[{self._process_label}] queued {len(groups)} shared strategy prompts / "
                 f"{len(ordered)} examples by packed cost; each free GPU "
                 "claims one complete prompt group",
                 flush=True,
@@ -5185,7 +5188,7 @@ class ProcessDistributedTrainer:
             ordered = sorted(copied, key=estimated_cost, reverse=True)
             for example in ordered:
                 self._work_queue.put(example)
-            print(f"[train-fast] queued {len(ordered)} examples longest-first; "
+            print(f"[{self._process_label}] queued {len(ordered)} examples longest-first; "
                   "each free GPU claims the next adaptive batch", flush=True)
         for _ in range(self._world_size):
             self._work_queue.put(None)
@@ -5483,8 +5486,10 @@ class ProcessDistributedTrainer:
                                       local_policy_update,
                                       reduce_trainable_gradients)
 
+        process_label = self._process_label
+        adaptive_batches = bool(cfg.fast)
         if self._offloaded:
-            print(f"[train-fast] restoring {self._world_size} process "
+            print(f"[{process_label}] restoring {self._world_size} process "
                   "trainers for the update", flush=True)
             self.restore_after_generation()
 
@@ -5493,7 +5498,7 @@ class ProcessDistributedTrainer:
             return {
                 "training_seconds": 0.0,
                 "training_parallel_gpus": self._world_size,
-                "training_fast": True,
+                "training_fast": bool(cfg.fast),
                 "training_fast_processes": True,
                 "oom_quarantined_examples": 0,
             }
@@ -5509,8 +5514,12 @@ class ProcessDistributedTrainer:
               f"vLLM supplied old={supplied_old}/{total_examples}, "
               f"reference={supplied_reference}/{total_examples}",
               flush=True)
-        print(f"[train-fast] one process/GPU; memory ceiling=80%; "
-              "exact singleton rescue=96%; "
+        scheduler_label = (
+            "adaptive batches" if adaptive_batches else
+            f"configured microbatches up to "
+            f"{int(cfg.train_examples_per_microbatch)} examples")
+        print(f"[{process_label}] one process/GPU; {scheduler_label}; "
+              "memory ceiling=80%; exact singleton rescue=96%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -5525,13 +5534,15 @@ class ProcessDistributedTrainer:
                 "fb_cfg": fb_cfg,
                 "fb_on": bool(fb_on),
                 "fb_lambda": float(fb_lambda),
+                "adaptive_batches": adaptive_batches,
             })
 
         local_stats = local_policy_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0], total_examples,
             memory_fraction=0.80, fb_cfg=fb_cfg, fb_on=fb_on,
-            fb_lambda=fb_lambda, work_queue=self._work_queue)
+            fb_lambda=fb_lambda, work_queue=self._work_queue,
+            adaptive_batches=adaptive_batches)
         child_messages = self._collect_event(
             "computed", range(1, self._world_size))
         rank_stats = [local_stats] + [
@@ -5609,7 +5620,7 @@ class ProcessDistributedTrainer:
         allocator_percentages = [
             round(100.0 * fraction, 1)
             for fraction in allocator_fractions]
-        print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
+        print(f"[{process_label}] trained examples/GPU={trained_per_gpu}; "
               f"backward batches/GPU={batches_per_gpu}; final padded-token "
               f"budgets/GPU={self._token_budgets}; peak memory/GPU="
               f"{peak_percentages}%; allocator caps/GPU="
@@ -5631,7 +5642,7 @@ class ProcessDistributedTrainer:
             "training_seconds": elapsed,
             "training_parallel_gpus": self._world_size,
             "training_grad_norm": grad_norm,
-            "training_fast": True,
+            "training_fast": bool(cfg.fast),
             "training_fast_processes": True,
             "fast_trained_examples_per_gpu": trained_per_gpu,
             "fast_backward_batches_per_gpu": batches_per_gpu,
@@ -8528,13 +8539,18 @@ def main():
         and cfg.generation_backend == "vllm"
         and cfg.training_layout != "sharded"
     )
-    # --fast always selects the persistent process-per-GPU implementation.
-    # Both the standard policy objectives and clipped-policy objectives retain
-    # their existing losses; only scheduling, OOM recovery, and LoRA-gradient
-    # transport differ from the in-process replicated trainer.
+    # Standard entropic/GRPO/CVaR updates use isolated GPU processes even
+    # without --fast.  The former same-interpreter threaded replicas are not a
+    # safe execution boundary for concurrent autograd.  --fast remains an
+    # optional scheduling choice: it enables adaptive batches; without it the
+    # configured microbatch ceiling is honored.  Clipped-policy modes retain
+    # their existing default trainer unless --fast is explicitly requested.
+    standard_policy_objective = not bool(
+        binary_coder_cfg.enabled
+        or _uses_clipped_policy_loss(cfg.advantage_mode))
     use_process_distributed_training = bool(
         use_replicated_training
-        and cfg.fast
+        and (cfg.fast or standard_policy_objective)
     )
     if use_replicated_training:
         cfg.training_replica_device = 0
@@ -8586,9 +8602,11 @@ def main():
     training_scheduler = (
         "disabled (--no-train)" if cfg.no_train
         else ("adaptive process-per-GPU (--fast)"
-              if use_process_distributed_training
+              if use_process_distributed_training and cfg.fast
+              else ("configured process-per-GPU"
+                    if use_process_distributed_training
               else ("concurrent length-balanced replicas (--fast)"
-                    if cfg.fast and use_replicated_training else "default"))
+                    if cfg.fast and use_replicated_training else "default")))
     )
     print(f"Training layout:    {training_layout}")
     print(f"Training scheduler: {training_scheduler}")

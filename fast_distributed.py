@@ -883,7 +883,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
 def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         token_budget, total_examples, *,
                         memory_fraction=0.80, fb_cfg=None, fb_on=False,
-                        fb_lambda=0.0, work_queue=None):
+                        fb_lambda=0.0, work_queue=None,
+                        adaptive_batches=True):
     """Accumulate one rank's exact entropic/GRPO/CVaR gradients.
 
     This is the process-per-GPU counterpart of
@@ -947,10 +948,14 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             example["prompt_ids"].shape[1]
             + example["response_ids"].shape[1])
 
-    max_examples_per_batch = 64
+    configured_example_cap = max(
+        1, int(getattr(cfg, "train_examples_per_microbatch", 1) or 1))
+    max_examples_per_batch = (
+        64 if adaptive_batches else configured_example_cap)
     if work_queue is None:
         pending = sorted(examples, key=example_length)
-        max_examples_per_batch = min(64, max(1, len(examples)))
+        max_examples_per_batch = min(
+            max_examples_per_batch, max(1, len(examples)))
 
         def take_batch():
             if not pending:
@@ -1204,13 +1209,13 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                  for batch in effective_batches for example in batch),
                 default=1)
             backed_off = bool(len(effective_batches) > 1 or quarantined)
-            if not effective_batches:
+            if adaptive_batches and not effective_batches:
                 budget = max(1, budget // 2)
-            elif backed_off:
+            elif adaptive_batches and backed_off:
                 budget = max(
                     longest_successful,
                     min(budget, successful_padded_tokens))
-            else:
+            elif adaptive_batches:
                 active_bytes = max(1, peak_allocated - base_allocated)
                 target_process_bytes = max(
                     base_allocated + 1,
@@ -1360,7 +1365,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     fb_cfg=command.get("fb_cfg"),
                     fb_on=bool(command.get("fb_on", False)),
                     fb_lambda=float(command.get("fb_lambda", 0.0)),
-                    work_queue=work_queue)
+                    work_queue=work_queue,
+                    adaptive_batches=bool(command.get(
+                        "adaptive_batches", True)))
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
