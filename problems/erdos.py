@@ -74,15 +74,16 @@ def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
     if not np.isfinite(computed_c5):
         raise ValueError(f"Computed C5 is not finite: {computed_c5}")
 
-    if not np.isclose(computed_c5, c5_achieved, atol=1e-4):
-        raise ValueError(f"C5 mismatch: reported {c5_achieved:.6f}, computed {computed_c5:.6f}")
+    if not np.isclose(computed_c5, c5_achieved, atol=1e-8, rtol=0.0):
+        raise ValueError(
+            f"C5 mismatch: reported {c5_achieved:.12f}, "
+            f"computed {computed_c5:.12f}")
 
     return computed_c5
 
 
 def evaluate_erdos_solution(h_values: np.ndarray, c5_bound: float, n_points: int) -> float:
-    verify_c5_solution(h_values, c5_bound, n_points)
-    return float(c5_bound)
+    return float(verify_c5_solution(h_values, c5_bound, n_points))
 
 
 def verify_erdos_solution(result) -> bool:
