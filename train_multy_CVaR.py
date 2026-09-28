@@ -3372,6 +3372,89 @@ def _prepare_binary_overlap_examples(
     return prepared
 
 
+def _prepare_entropic_overlap_group(
+        tokenizer, group_id, responses, reward_futures, prompt_jobs,
+        prompt_ids_by_job, num_groups):
+    """Materialize one reward-complete entropic group on CPU.
+
+    Entropic advantages depend on every reward in their group, but they do not
+    depend on rewards from any other group.  As soon as one group is complete,
+    this builds the exact examples used by the ordinary post-evaluation path so
+    process-distributed forward/backward can begin while other groups remain in
+    the CPU evaluator.  Parameters are not updated here.
+    """
+    import torch
+
+    if len(responses) != len(reward_futures):
+        raise RuntimeError(
+            f"entropic overlap group {group_id} has {len(responses)} "
+            f"responses but {len(reward_futures)} reward futures")
+    if any(not future.done() for future in reward_futures):
+        raise RuntimeError(
+            f"entropic overlap group {group_id} was prepared before all of "
+            "its rewards completed")
+
+    rewards = np.asarray(
+        [float(future.result().reward) for future in reward_futures],
+        dtype=np.float64,
+    )
+    if rewards.size == 0:
+        return []
+    advantages, _beta, _label, _info = compute_group_advantages(
+        rewards, "entropic", return_info=True)
+    constant = float(rewards.max() - rewards.min()) < 1e-12
+    if constant:
+        return []
+
+    prepared = []
+    for rollout_index, (record, advantage) in enumerate(
+            zip(responses, advantages)):
+        token_ids = list(record.get("token_ids") or ())
+        if not token_ids:
+            continue
+        job_idx = int(record["job_idx"])
+        if job_idx not in prompt_ids_by_job:
+            prompt_ids_by_job[job_idx] = tokenizer(
+                prompt_jobs[job_idx]["prompt_text"],
+                return_tensors="pt").input_ids.cpu()
+
+        behavior_values = record.get("behavior_logprobs")
+        reference_values = record.get("reference_logprobs")
+        behavior_logprobs = (
+            torch.as_tensor(behavior_values, dtype=torch.float32).cpu()
+            if behavior_values is not None
+            and len(behavior_values) == len(token_ids) else None)
+        reference_logprobs = (
+            torch.as_tensor(reference_values, dtype=torch.float32).cpu()
+            if reference_values is not None
+            and len(reference_values) == len(token_ids) else None)
+        example = {
+            "prompt_ids": prompt_ids_by_job[job_idx],
+            "response_ids": torch.tensor(
+                [token_ids], dtype=torch.long, device="cpu"),
+            "advantage": float(advantage),
+            "behavior_logprobs": behavior_logprobs,
+            "reference_logprobs": reference_logprobs,
+            "reprompt_text": None,
+            "failure_signature": "",
+            "reward_constant": False,
+            "rank_entropy_gate": False,
+            "group_id": int(group_id),
+            "x_grpo_context_id": int(record["context_id"]),
+            "x_grpo_fold_index": int(record["fold_index"]),
+            "rollout_index": int(rollout_index),
+            "prompt_job_id": job_idx,
+            "x_grpo_group_size": len(responses),
+            "x_grpo_all_tied": False,
+            "x_grpo_trial_advantages": (),
+            "sample_weight": 1.0 / (int(num_groups) * len(responses)),
+            "_overlap_key": (int(group_id), int(rollout_index)),
+        }
+        record["_entropic_overlap_example"] = example
+        prepared.append(example)
+    return prepared
+
+
 def _precompute_binary_coder_backward(
         backend, model, tokenizer, optimizer, examples, cfg, step_idx):
     """Run the exact one-epoch binary backward while rewards finish on CPU.
@@ -4974,6 +5057,7 @@ class ProcessDistributedTrainer:
         self._offloaded = False
         self._closed = False
         self._workers_idle = True
+        self._entropic_overlap = None
         self._dist_initialized = False
         self._queue_module = queue
         self._context = mp.get_context("spawn")
@@ -5121,7 +5205,7 @@ class ProcessDistributedTrainer:
             copied_examples.append(copied)
         return copied_examples
 
-    def _queue_examples(self, examples):
+    def _queue_examples(self, examples, *, seal=True, announce=True):
         """Queue expensive examples first; idle ranks steal the next work."""
         import torch
 
@@ -5178,20 +5262,23 @@ class ProcessDistributedTrainer:
             for group in groups:
                 self._work_queue.put({SHARED_PREFIX_WORK_KEY: group})
             ordered = copied
-            print(
-                f"[{self._process_label}] queued {len(groups)} shared strategy prompts / "
-                f"{len(ordered)} examples by packed cost; each free GPU "
-                "claims one complete prompt group",
-                flush=True,
-            )
+            if announce:
+                print(
+                    f"[{self._process_label}] queued {len(groups)} shared strategy prompts / "
+                    f"{len(ordered)} examples by packed cost; each free GPU "
+                    "claims one complete prompt group",
+                    flush=True,
+                )
         else:
             ordered = sorted(copied, key=estimated_cost, reverse=True)
             for example in ordered:
                 self._work_queue.put(example)
-            print(f"[{self._process_label}] queued {len(ordered)} examples longest-first; "
-                  "each free GPU claims the next adaptive batch", flush=True)
-        for _ in range(self._world_size):
-            self._work_queue.put(None)
+            if announce:
+                print(f"[{self._process_label}] queued {len(ordered)} examples longest-first; "
+                      "each free GPU claims the next adaptive batch", flush=True)
+        if seal:
+            for _ in range(self._world_size):
+                self._work_queue.put(None)
         return ordered
 
     @staticmethod
@@ -5478,6 +5565,264 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
+    def begin_entropic_overlap(self, cfg, step_idx,
+                               normalization_examples):
+        """Start a streaming entropic backward before CPU evaluation ends."""
+        from concurrent.futures import ThreadPoolExecutor
+        from fast_distributed import local_policy_update
+
+        if str(getattr(cfg, "advantage_mode", "")).lower() != "entropic":
+            raise ValueError("streaming policy overlap is entropic-only")
+        if self._closed or not self._workers_idle:
+            raise RuntimeError(
+                "process trainer is not idle for an entropic overlap update")
+        if self._entropic_overlap is not None:
+            raise RuntimeError("an entropic overlap update is already active")
+        normalization_examples = int(normalization_examples)
+        if normalization_examples < 1:
+            raise ValueError(
+                "entropic overlap needs a positive normalization count")
+        if self._offloaded:
+            print(f"[{self._process_label}] restoring {self._world_size} "
+                  "process trainers while CPU evaluation continues",
+                  flush=True)
+            self.restore_after_generation()
+
+        adaptive_batches = bool(cfg.fast)
+        self.model.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "train_policy",
+                "step_cfg": dict(vars(cfg)),
+                "token_budget": self._token_budgets[rank],
+                # The exact post-filter count is reward-dependent. Divide by
+                # the known pre-reward upper bound during backward, then apply
+                # the small exact correction on every rank before reduction.
+                "total_examples": normalization_examples,
+                "memory_fraction": 0.80,
+                "fb_cfg": None,
+                "fb_on": False,
+                "fb_lambda": 0.0,
+                "adaptive_batches": adaptive_batches,
+            })
+
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="entropic-rank0-overlap")
+        state = {
+            "step_idx": int(step_idx),
+            "started_at": time.time(),
+            "computed_at": None,
+            "executor": executor,
+            "future": None,
+            "queued_examples": 0,
+            "normalization_examples": normalization_examples,
+            "scheduled_keys": set(),
+            "supplied_old": 0,
+            "supplied_reference": 0,
+            "sealed": False,
+        }
+        future = executor.submit(
+            local_policy_update,
+            self.backend, self.model, self.tokenizer, (), cfg, 0,
+            self._token_budgets[0], normalization_examples,
+            memory_fraction=0.80, fb_cfg=None, fb_on=False,
+            fb_lambda=0.0, work_queue=self._work_queue,
+            adaptive_batches=adaptive_batches)
+        state["future"] = future
+
+        def _record_completion(_future):
+            state["computed_at"] = time.time()
+
+        future.add_done_callback(_record_completion)
+        self._entropic_overlap = state
+        return state
+
+    def queue_entropic_overlap(self, examples):
+        """Feed one reward-complete group to the active GPU consumers."""
+        state = self._entropic_overlap
+        if state is None or state["sealed"]:
+            raise RuntimeError("entropic overlap queue is not open")
+        queued = self._queue_examples(
+            examples, seal=False, announce=False)
+        state["queued_examples"] += len(queued)
+        state["supplied_old"] += sum(
+            _valid_example_token_logprobs(example, "behavior_logprobs")
+            for example in queued)
+        state["supplied_reference"] += sum(
+            _valid_example_token_logprobs(example, "reference_logprobs")
+            for example in queued)
+        state["scheduled_keys"].update(
+            example["_overlap_key"] for example in queued)
+        return len(queued)
+
+    def seal_entropic_overlap(self):
+        """Tell every GPU consumer that no more completed groups remain."""
+        state = self._entropic_overlap
+        if state is None:
+            return
+        if not state["sealed"]:
+            for _ in range(self._world_size):
+                self._work_queue.put(None)
+            state["sealed"] = True
+
+    def finish_entropic_overlap(self, cfg, step_idx, expected_examples, *,
+                                apply_update=True):
+        """Finish, globally normalize, and optionally apply streamed gradients."""
+        import torch
+        from fast_distributed import (broadcast_trainable_parameters,
+                                      reduce_trainable_gradients)
+
+        state = self._entropic_overlap
+        if state is None:
+            raise RuntimeError("no entropic overlap update is active")
+        self.seal_entropic_overlap()
+        expected_examples = int(expected_examples)
+        queued_examples = int(state["queued_examples"])
+        if apply_update and expected_examples != queued_examples:
+            raise RuntimeError(
+                "entropic overlap final example count changed: "
+                f"queued={queued_examples}, final={expected_examples}")
+
+        try:
+            local_stats = state["future"].result()
+            child_messages = self._collect_event(
+                "computed", range(1, self._world_size))
+            rank_stats = [local_stats] + [
+                child_messages[rank]["stats"]
+                for rank in range(1, self._world_size)
+            ]
+            accounted_examples = sum(
+                int(stats["trained_examples"])
+                + int(stats["quarantined_examples"])
+                for stats in rank_stats)
+            if accounted_examples != queued_examples:
+                raise RuntimeError(
+                    "streaming entropic queue lost or duplicated work: "
+                    f"accounted for {accounted_examples}/{queued_examples} "
+                    "examples")
+
+            gradient_scale = (
+                float(state["normalization_examples"]) / expected_examples
+                if apply_update and expected_examples > 0 else 1.0)
+            for command_queue in self._command_queues.values():
+                command_queue.put({
+                    "kind": "finish_update",
+                    "gradient_scale": gradient_scale,
+                    "apply_update": bool(apply_update),
+                })
+
+            grad_norm = None
+            update_error = None
+            if apply_update:
+                with torch.no_grad():
+                    for parameter in self.model.parameters():
+                        if parameter.requires_grad and parameter.grad is not None:
+                            parameter.grad.mul_(gradient_scale)
+                reduce_trainable_gradients(
+                    self.model, destination_rank=0)
+                try:
+                    grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                        [parameter for parameter in self.model.parameters()
+                         if parameter.requires_grad],
+                        max_norm=cfg.grad_clip, error_if_nonfinite=True)
+                    self.optimizer.step()
+                    grad_norm = float(grad_norm_tensor.item())
+                except BaseException as error:
+                    update_error = error
+                finally:
+                    self.model.zero_grad(set_to_none=True)
+                    broadcast_trainable_parameters(
+                        self.model, source_rank=0)
+            else:
+                self.model.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
+
+            self._collect_event("updated", range(1, self._world_size))
+            self._workers_idle = True
+            if update_error is not None:
+                raise update_error
+        except BaseException:
+            self._workers_idle = False
+            self._abort_workers()
+            raise
+        finally:
+            state["executor"].shutdown(wait=True, cancel_futures=False)
+            self._entropic_overlap = None
+
+        for rank, stats in enumerate(rank_stats):
+            self._token_budgets[rank] = max(
+                1, int(stats["token_budget"]))
+        if not apply_update:
+            return {}
+
+        total_loss = sum(
+            float(stats["total_loss"]) for stats in rank_stats)
+        total_logp_delta = sum(
+            float(stats["total_logp_delta"]) for stats in rank_stats)
+        ratio_sum = sum(
+            float(stats["ratio_sum"]) for stats in rank_stats)
+        ratio_max = max(
+            float(stats["ratio_max"]) for stats in rank_stats)
+        ratio_count = sum(
+            int(stats["ratio_count"]) for stats in rank_stats)
+        quarantined_examples = sum(
+            int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [
+            int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [
+            int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [
+            float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [
+            float(stats["allocator_memory_fraction"])
+            for stats in rank_stats]
+        kl_errors = [
+            error for stats in rank_stats for error in stats["kl_errors"]]
+        if kl_errors:
+            print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
+                  "training without KL penalty on affected examples",
+                  flush=True)
+        peak_percentages = [
+            round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [
+            round(100.0 * fraction, 1)
+            for fraction in allocator_fractions]
+        print(f"[{self._process_label}] trained examples/GPU="
+              f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
+              f"final padded-token budgets/GPU={self._token_budgets}; "
+              f"peak memory/GPU={peak_percentages}%; allocator caps/GPU="
+              f"{allocator_percentages}%", flush=True)
+        completed_at = state["computed_at"] or time.time()
+        elapsed = max(0.0, completed_at - state["started_at"])
+        ratio_message = ""
+        if ratio_count:
+            ratio_message = (
+                f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
+                f"max={ratio_max:.3f}")
+        print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
+              f"avg loss: {total_loss / expected_examples:.9f}  "
+              "avg logpi_theta - logpi_base: "
+              f"{total_logp_delta / expected_examples:.9f}{ratio_message}  "
+              f"OOM-quarantined={quarantined_examples} "
+              "(forward/backward overlapped CPU evaluation)", flush=True)
+        return {
+            "training_seconds": elapsed,
+            "training_parallel_gpus": self._world_size,
+            "training_grad_norm": grad_norm,
+            "training_fast": bool(cfg.fast),
+            "training_fast_processes": True,
+            "training_overlapped_evaluation": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(self._token_budgets),
+            "fast_peak_memory_fraction": peak_fractions,
+            "fast_allocator_memory_fraction": allocator_fractions,
+            "oom_quarantined_examples": quarantined_examples,
+        }
+
     def train_policy(self, examples, cfg, step_idx, *, fb_cfg=None,
                      fb_on=False, fb_lambda=0.0):
         """Run the exact standard policy loss on the process-per-GPU path."""
@@ -5727,6 +6072,22 @@ class ProcessDistributedTrainer:
             return
         self._closed = True
         import torch.distributed as dist
+
+        # A downstream save/evaluation exception can bypass the normal overlap
+        # finalizer. Unblock rank 0's queue consumer before aborting worker
+        # processes; otherwise ThreadPoolExecutor's non-daemon thread could keep
+        # the interpreter alive indefinitely during error shutdown.
+        if self._entropic_overlap is not None:
+            state = self._entropic_overlap
+            self.seal_entropic_overlap()
+            try:
+                state["future"].result()
+            except Exception:
+                pass
+            finally:
+                state["executor"].shutdown(
+                    wait=True, cancel_futures=False)
+                self._entropic_overlap = None
 
         if (not self._workers_idle or not self._dist_initialized
                 or self._dead_workers(range(1, self._world_size))):
@@ -6013,7 +6374,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                ensure_trainer_ready=None):
     import os
     import torch
-    from concurrent.futures import ThreadPoolExecutor, wait
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from queue import Queue
 
     from sampler import State
@@ -6096,6 +6457,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     spo_rs_updates = []
     binary_coder_diagnostics = []
     binary_overlap_state = None
+    entropic_overlap_state = None
     all_children = []
     all_child_strategy_keys = []
     saved_rollouts = 0
@@ -7222,6 +7584,129 @@ code block.'''
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
+            # Entropic advantages need every reward in their own group, not the
+            # rewards of later groups. Stream each completed group into the
+            # process-per-GPU trainer while the remaining sandbox jobs continue
+            # on CPU. All forwards see the frozen pre-update policy; gradients
+            # are accumulated only, globally normalized after the final group,
+            # and applied below the rollout persistence barrier.
+            entropic_overlap_eligible = bool(
+                active_advantage_mode == "entropic"
+                and training_enabled
+                and parallel_trainer is not None
+                and hasattr(parallel_trainer, "begin_entropic_overlap")
+                and cfg.generation_backend == "vllm"
+                and not fb_candidate_on
+                and memory is None
+                and extractor is None
+                and not deferred_rollouts
+                and not evaluation_trainer_offloaded
+            )
+            if entropic_overlap_eligible:
+                pending_groups = {
+                    int(group_id) for group_id in range(num_groups)
+                    if reward_futures[group_id]
+                }
+                overlap_normalization_examples = sum(
+                    bool(record.get("token_ids"))
+                    for responses in group_responses.values()
+                    for record in responses)
+                overlap_prompt_ids = {}
+                try:
+                    while pending_groups:
+                        ready_groups = [
+                            group_id for group_id in sorted(pending_groups)
+                            if all(future.done() for future in
+                                   reward_futures[group_id])
+                        ]
+                        if not ready_groups:
+                            unfinished = [
+                                future for group_id in pending_groups
+                                for future in reward_futures[group_id]
+                                if not future.done()
+                            ]
+                            if not unfinished:
+                                continue
+                            wait(unfinished, return_when=FIRST_COMPLETED)
+                            continue
+
+                        for group_id in ready_groups:
+                            prepared = _prepare_entropic_overlap_group(
+                                tokenizer, group_id,
+                                group_responses[group_id],
+                                reward_futures[group_id], prompt_jobs,
+                                overlap_prompt_ids, num_groups)
+                            if prepared:
+                                if entropic_overlap_state is None:
+                                    pending_before = sum(
+                                        not future.done()
+                                        for future in all_futs)
+                                    entropic_overlap_state = (
+                                        parallel_trainer.
+                                        begin_entropic_overlap(
+                                            cfg, step_idx,
+                                            overlap_normalization_examples))
+                                    print(
+                                        f"[step {step_idx}] entropic "
+                                        "evaluation/training overlap started; "
+                                        f"{pending_before}/{len(all_futs)} CPU "
+                                        "evaluations still pending",
+                                        flush=True,
+                                    )
+                                queued = (
+                                    parallel_trainer.queue_entropic_overlap(
+                                        prepared))
+                                remaining = sum(
+                                    not future.done() for future in all_futs)
+                                print(
+                                    f"[step {step_idx}] entropic overlap: "
+                                    f"group {group_id} reward-complete; queued "
+                                    f"{queued} examples to all GPUs; "
+                                    f"{remaining}/{len(all_futs)} CPU "
+                                    "evaluations still pending",
+                                    flush=True,
+                                )
+                            pending_groups.remove(group_id)
+
+                    if entropic_overlap_state is not None:
+                        parallel_trainer.seal_entropic_overlap()
+                        print(
+                            f"[step {step_idx}] entropic overlap queued "
+                            f"{entropic_overlap_state['queued_examples']} "
+                            "examples "
+                            f"(old logprobs "
+                            f"{entropic_overlap_state['supplied_old']}/"
+                            f"{entropic_overlap_state['queued_examples']}, "
+                            f"reference "
+                            f"{entropic_overlap_state['supplied_reference']}/"
+                            f"{entropic_overlap_state['queued_examples']}); "
+                            "backward continues while rollout "
+                            "artifacts are processed; optimizer step deferred",
+                            flush=True,
+                        )
+                except Exception as error:
+                    if entropic_overlap_state is not None:
+                        parallel_trainer.finish_entropic_overlap(
+                            cfg, step_idx,
+                            entropic_overlap_state["queued_examples"],
+                            apply_update=False)
+                    elif not parallel_trainer._workers_idle:
+                        # A restore/start failure can leave the distributed
+                        # process group unusable; an ordinary retry on that same
+                        # trainer would deadlock rather than provide a fallback.
+                        raise
+                    for responses in group_responses.values():
+                        for record in responses:
+                            record.pop("_entropic_overlap_example", None)
+                    entropic_overlap_state = None
+                    print(
+                        f"[warn] entropic evaluation/training overlap was "
+                        f"disabled for this step ({type(error).__name__}: "
+                        f"{error}); falling back to the unchanged "
+                        "post-evaluation update",
+                        flush=True,
+                    )
+
             # Binary usability is a per-rollout label and the fast objective
             # has one update epoch, no KL, no entropy, and no feedback. On the
             # sharded trainer we can therefore launch each policy forward while
@@ -7857,7 +8342,9 @@ code block.'''
                 continue
             if len(token_ids) == 0:
                 continue
-            prepared = record.get("_binary_overlap_example")
+            prepared = (
+                record.get("_binary_overlap_example")
+                or record.get("_entropic_overlap_example"))
             res = outs[r_idx]
             if prepared is not None:
                 prepared_advantage = prepared.get("advantage")
@@ -7919,10 +8406,11 @@ code block.'''
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before the
-    # optimizer can mutate the adapter.  Binary coder mode may already have
-    # accumulated exact gradients during CPU evaluation, but its single update
-    # is deliberately deferred until this barrier.  stepXX.summary.json remains
-    # the completion marker and is written only after the adapter/checkpoint.
+    # optimizer can mutate the adapter. Binary coder and streamed entropic mode
+    # may already have accumulated exact gradients during CPU evaluation, but
+    # their single update is deliberately deferred until this barrier.
+    # stepXX.summary.json remains the completion marker and is written only
+    # after the adapter/checkpoint.
     save_suffix = ("with training disabled"
                    if not training_enabled else "before adapter update")
     print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
@@ -8038,12 +8526,41 @@ code block.'''
             )
             binary_overlap_state = None
 
+    if entropic_overlap_state is not None:
+        actual_keys = {
+            example.get("_overlap_key") for example in all_examples
+            if example.get("_overlap_key") is not None
+        }
+        advantages_complete = all(
+            math.isfinite(float(example["advantage"]))
+            for example in all_examples)
+        advantages_match = not any(
+            example.get("_overlap_label_mismatch", False)
+            for example in all_examples)
+        expected_keys = entropic_overlap_state["scheduled_keys"]
+        if (actual_keys != expected_keys
+                or not advantages_complete or not advantages_match):
+            parallel_trainer.finish_entropic_overlap(
+                cfg, step_idx,
+                entropic_overlap_state["queued_examples"],
+                apply_update=False)
+            print(
+                f"[warn] discarded streamed entropic gradients because the "
+                f"final training set changed ({len(actual_keys)}/"
+                f"{len(expected_keys)} records); using the unchanged "
+                "post-evaluation update",
+                flush=True,
+            )
+            entropic_overlap_state = None
+
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples))
                       if training_enabled else "disabled")
     rollout_phase_label = (
         "rollout+eval+overlapped-backward wall time"
-        if binary_overlap_state is not None else "rollout+eval time")
+        if (binary_overlap_state is not None
+            or entropic_overlap_state is not None)
+        else "rollout+eval time")
     print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
           f"training examples: {training_label}  "
           f"new children: {len(all_children)}")
@@ -8279,9 +8796,14 @@ code block.'''
     print(f"[step {step_idx}] starting adapter training; rollout artifacts "
           f"are already on disk", flush=True)
     if parallel_trainer is not None:
-        step_stats.update(parallel_trainer.train_policy(
-            all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-            fb_lambda=fb_lambda))
+        if entropic_overlap_state is not None:
+            step_stats.update(parallel_trainer.finish_entropic_overlap(
+                cfg, step_idx, len(all_examples), apply_update=True))
+            entropic_overlap_state = None
+        else:
+            step_stats.update(parallel_trainer.train_policy(
+                all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
+                fb_lambda=fb_lambda))
         best = sampler.best_state()
         if best is not None:
             raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""

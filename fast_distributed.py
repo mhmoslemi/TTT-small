@@ -7,6 +7,7 @@ parameters are communicated, each as one flattened NCCL buffer per update.
 """
 
 from types import SimpleNamespace
+import math
 import traceback
 
 
@@ -1386,8 +1387,21 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     "calibration": calibration,
                 })
             elif kind == "finish_update":
-                reduce_trainable_gradients(model, destination_rank=0)
-                broadcast_trainable_parameters(model, source_rank=0)
+                gradient_scale = float(command.get("gradient_scale", 1.0))
+                apply_update = bool(command.get("apply_update", True))
+                if not math.isfinite(gradient_scale) or gradient_scale <= 0.0:
+                    raise ValueError(
+                        "finish_update gradient_scale must be finite and "
+                        "positive")
+                if apply_update:
+                    if gradient_scale != 1.0:
+                        with torch.no_grad():
+                            for parameter in model.parameters():
+                                if (parameter.requires_grad
+                                        and parameter.grad is not None):
+                                    parameter.grad.mul_(gradient_scale)
+                    reduce_trainable_gradients(model, destination_rank=0)
+                    broadcast_trainable_parameters(model, source_rank=0)
                 model.zero_grad(set_to_none=True)
                 result_queue.put({"event": "updated", "rank": int(rank)})
             elif kind == "stop":
