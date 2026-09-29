@@ -330,6 +330,111 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(effective, [[example]])
         self.assertEqual(quarantined, [])
 
+    def test_training_oom_profile_reuses_learned_work_cap(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        examples = [{
+            "prompt_ids": torch.zeros((1, 1), dtype=torch.long),
+            "response_ids": torch.zeros((1, 1), dtype=torch.long),
+        } for _ in range(4)]
+        first_attempts = []
+
+        def first_attempt(batches):
+            maximum = max(len(batch) for batch in batches)
+            first_attempts.append(maximum)
+            if maximum > 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            model(torch.ones((1, 2))).sum().backward()
+            return "learned"
+
+        with patch("torch.cuda.empty_cache"):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [examples], first_attempt, device_label="cuda:0")
+
+        self.assertEqual(result, "learned")
+        self.assertEqual(first_attempts, [4, 2, 1])
+        self.assertEqual(max(len(batch) for batch in effective), 1)
+        self.assertEqual(quarantined, [])
+
+        reused_attempts = []
+
+        def reused_attempt(batches):
+            reused_attempts.append(max(len(batch) for batch in batches))
+            model(torch.ones((1, 2))).sum().backward()
+            return "reused"
+
+        with patch("torch.cuda.empty_cache"):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [examples], reused_attempt, device_label="cuda:0")
+
+        self.assertEqual(result, "reused")
+        self.assertEqual(reused_attempts, [1])
+        self.assertEqual(max(len(batch) for batch in effective), 1)
+        self.assertEqual(quarantined, [])
+
+    def test_training_oom_profile_reuses_offload_and_headroom(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        example = {
+            "prompt_ids": torch.zeros((1, 1), dtype=torch.long),
+            "response_ids": torch.zeros((1, 1), dtype=torch.long),
+        }
+        state = {"offload": False, "expanded": False}
+        attempts = []
+        expansions = []
+
+        class OffloadContext:
+            def __enter__(self):
+                state["offload"] = True
+
+            def __exit__(self, _type, _value, _traceback):
+                state["offload"] = False
+
+        def attempt(_batches):
+            attempts.append((state["offload"], state["expanded"]))
+            if not state["offload"] or not state["expanded"]:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            model(torch.ones((1, 2))).sum().backward()
+            return "trained"
+
+        def expand_memory():
+            expansions.append(True)
+            state["expanded"] = True
+            return 0.96
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    side_effect=lambda **_kwargs: OffloadContext())):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0",
+                expand_memory=expand_memory)
+
+        self.assertEqual(result, "trained")
+        self.assertEqual(
+            attempts, [(False, False), (True, False), (True, True)])
+        self.assertEqual(expansions, [True])
+        self.assertEqual(effective, [[example]])
+        self.assertEqual(quarantined, [])
+
+        state["expanded"] = False
+        attempts.clear()
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    side_effect=lambda **_kwargs: OffloadContext())):
+            result, effective, quarantined = _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0",
+                expand_memory=expand_memory)
+
+        self.assertEqual(result, "trained")
+        self.assertEqual(attempts, [(True, True)])
+        self.assertEqual(expansions, [True, True])
+        self.assertEqual(effective, [[example]])
+        self.assertEqual(quarantined, [])
+
     def test_long_rollout_ceiling_counts_other_gpu_processes(self):
         from fast_distributed import set_long_rollout_memory_ceiling
 

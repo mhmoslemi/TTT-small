@@ -2387,6 +2387,51 @@ def _split_training_batches(batches):
     return split, changed
 
 
+def _split_training_batches_to_work_cap(batches, work_cap):
+    """Reuse a learned safe workload size without hard-coding batch counts.
+
+    The OOM controller's work estimate accounts for ordinary padded batches
+    and packed shared-prefix batches.  Recursively halving only batches above
+    the learned cap preserves every example and the original order while
+    avoiding a known-to-fail large attempt on later, similarly sized work.
+    """
+    work_cap = max(1, int(work_cap))
+    split = []
+    changed = False
+
+    def append(batch):
+        nonlocal changed
+        batch = list(batch)
+        if (len(batch) <= 1
+                or _gradient_checkpointing_work_units([batch]) <= work_cap):
+            split.append(batch)
+            return
+        middle = (len(batch) + 1) // 2
+        changed = True
+        append(batch[:middle])
+        append(batch[middle:])
+
+    for batch in batches:
+        if batch:
+            append(batch)
+    return split, changed
+
+
+def _oom_profile_work_floor(work):
+    """Lower edge of the workload neighborhood covered by an OOM result."""
+    work = max(1, int(work))
+    # Lengths of sibling rollouts are rarely identical.  A narrow 12.5%
+    # neighborhood lets the next comparable branch reuse the proven mode,
+    # while materially shorter work still gets a chance to use the fast path.
+    return max(1, work - max(1, work // 8))
+
+
+def _remember_oom_profile_minimum(profile, key, value):
+    value = max(1, int(value))
+    previous = profile.get(key)
+    profile[key] = value if previous is None else min(int(previous), value)
+
+
 def _gradient_checkpointing_work_units(batches):
     """Estimate the largest independently executed batch's activation load."""
     largest = 0
@@ -2428,8 +2473,9 @@ def _run_oom_resilient_backward(
     during backward cannot double-count a partially accumulated microbatch. A
     workload first runs without transformer gradient checkpointing. On OOM the
     same workload is retried with checkpointing before its batches are split.
-    The smallest workload known to require checkpointing is remembered by the
-    model, avoiding repeated failed probes for equally large later batches.
+    The learned safe work cap, checkpointing threshold, CPU-offload threshold,
+    and reserved-headroom threshold are retained on the persistent model, so
+    comparable later batches start directly in the proven execution mode.
     Once batches reach one example, saved-tensor CPU offload is tried. Fast
     training may then provide ``expand_memory`` to use the card headroom that
     normal adaptive batches deliberately reserve. A truly untrainable outlier
@@ -2441,8 +2487,22 @@ def _run_oom_resilient_backward(
 
     active = [list(batch) for batch in batches if batch]
     quarantined = []
+    profile = getattr(model, "_ttt_oom_execution_profile", None)
+    if not isinstance(profile, dict):
+        profile = {}
+        setattr(model, "_ttt_oom_execution_profile", profile)
+
+    cached_work_cap = profile.get("safe_work_cap")
+    reused_split = False
+    if cached_work_cap is not None:
+        active, reused_split = _split_training_batches_to_work_cap(
+            active, cached_work_cap)
+
     activation_offload = False
     memory_expanded = False
+    split_backoff = False
+    offload_trigger_work = None
+    headroom_trigger_work = None
     checkpoint_threshold = getattr(
         model, "_ttt_gradient_checkpointing_min_work", None)
     checkpointing_available = set_gradient_checkpointing(model, False)
@@ -2464,6 +2524,38 @@ def _run_oom_resilient_backward(
         return work
 
     active_work = select_checkpointing()
+    offload_min_work = profile.get("activation_offload_min_work")
+    if (offload_min_work is not None
+            and active_work >= int(offload_min_work)
+            and hasattr(torch.autograd.graph, "save_on_cpu")):
+        activation_offload = True
+    headroom_min_work = profile.get("headroom_min_work")
+    if (headroom_min_work is not None
+            and active_work >= int(headroom_min_work)
+            and expand_memory is not None):
+        expanded_fraction = expand_memory()
+        memory_expanded = expanded_fraction is not None
+
+    reused_modes = []
+    if reused_split:
+        reused_modes.append(
+            f"work cap {int(cached_work_cap)}")
+    if checkpointing:
+        reused_modes.append("gradient checkpointing")
+    if activation_offload:
+        reused_modes.append("CPU activation offload")
+    if memory_expanded:
+        reused_modes.append("reserved GPU headroom")
+    if reused_modes:
+        signature = tuple(reused_modes)
+        if getattr(model, "_ttt_reported_oom_profile", None) != signature:
+            print(
+                f"[train-oom] {device_label}: reusing learned safe mode "
+                f"({', '.join(reused_modes)})",
+                flush=True,
+            )
+            setattr(model, "_ttt_reported_oom_profile", signature)
+
     cuda_devices = sorted({
         parameter.device.index
         for parameter in model.parameters()
@@ -2480,6 +2572,18 @@ def _run_oom_resilient_backward(
             )
             with offload_context:
                 result = attempt(active)
+            if split_backoff and active:
+                successful_work = _gradient_checkpointing_work_units(active)
+                _remember_oom_profile_minimum(
+                    profile, "safe_work_cap", successful_work)
+            if offload_trigger_work is not None:
+                _remember_oom_profile_minimum(
+                    profile, "activation_offload_min_work",
+                    _oom_profile_work_floor(offload_trigger_work))
+            if headroom_trigger_work is not None:
+                _remember_oom_profile_minimum(
+                    profile, "headroom_min_work",
+                    _oom_profile_work_floor(headroom_trigger_work))
             set_gradient_checkpointing(model, False)
             return result, active, quarantined
         except BaseException as error:
@@ -2494,10 +2598,13 @@ def _run_oom_resilient_backward(
                 with torch.cuda.device(cuda_device):
                     torch.cuda.empty_cache()
             if cuda_oom and not checkpointing and checkpointing_available:
+                learned_checkpoint_floor = _oom_profile_work_floor(
+                    active_work)
                 checkpoint_threshold = (
-                    active_work
+                    learned_checkpoint_floor
                     if checkpoint_threshold is None else
-                    min(int(checkpoint_threshold), active_work)
+                    min(int(checkpoint_threshold),
+                        learned_checkpoint_floor)
                 )
                 setattr(
                     model, "_ttt_gradient_checkpointing_min_work",
@@ -2514,6 +2621,7 @@ def _run_oom_resilient_backward(
             smaller, changed = _split_training_batches(active)
             if changed:
                 active = smaller
+                split_backoff = True
                 active_work = select_checkpointing()
                 reason = ("fused attention rejected the padded batch"
                           if kernel_unavailable else "CUDA OOM")
@@ -2524,6 +2632,7 @@ def _run_oom_resilient_backward(
             if cuda_oom and not activation_offload and hasattr(
                     torch.autograd.graph, "save_on_cpu"):
                 activation_offload = True
+                offload_trigger_work = active_work
                 print(f"[train-oom] {device_label}: singleton OOM; retrying "
                       "with saved activations offloaded to CPU", flush=True)
                 continue
@@ -2532,6 +2641,7 @@ def _run_oom_resilient_backward(
                 expanded_fraction = expand_memory()
                 if expanded_fraction is not None:
                     memory_expanded = True
+                    headroom_trigger_work = active_work
                     print(
                         f"[train-oom] {device_label}: singleton still exceeds "
                         "the normal ceiling; retrying the exact update with "
