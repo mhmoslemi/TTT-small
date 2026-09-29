@@ -259,6 +259,11 @@ def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
             continue
 
         try:
+            policy_sampling = {
+                key: gen_kwargs[key]
+                for key in ("top_k", "repetition_penalty")
+                if key in gen_kwargs
+            }
             with torch.inference_mode():
                 out = gen_model.generate(
                     **enc,
@@ -266,6 +271,7 @@ def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
                     do_sample=True,
                     temperature=gen_kwargs["temperature"],
                     top_p=gen_kwargs["top_p"],
+                    **policy_sampling,
                     pad_token_id=pad_id,
                 )
         except torch.cuda.OutOfMemoryError:
@@ -936,6 +942,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     seed=_vllm_job_seed(seed, step, rank, group_idx),
                     skip_special_tokens=True,
                 )
+                if gen_kwargs.get("full_policy_sampling", False):
+                    sampling_kwargs.update(
+                        top_k=-1, repetition_penalty=1.0)
                 if return_logprobs:
                     # vLLM always includes the sampled token in logprobs; zero
                     # asks for no additional top-k entries.
@@ -1503,7 +1512,8 @@ class GenerationPool:
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
-                        return_logprobs=False, progress_desc="rollouts"):
+                        return_logprobs=False, progress_desc="rollouts",
+                        full_policy_sampling=False):
         """
         Stream generation results as each (worker, group) job completes.
 
@@ -1532,7 +1542,10 @@ class GenerationPool:
             "top_p": top_p,
             "micro_batch": self.gen_micro_batch,
             "return_logprobs": bool(return_logprobs),
+            "full_policy_sampling": bool(full_policy_sampling),
         }
+        if full_policy_sampling:
+            gen_kwargs.update(top_k=0, repetition_penalty=1.0)
         total_expected = sum(count for wj in worker_jobs for (_, _, count) in wj)
 
         # Dispatch one task per worker (some may have empty job lists)
@@ -1731,7 +1744,8 @@ class GenerationPool:
 
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        counts_by_group=None, return_logprobs=False):
+                        counts_by_group=None, return_logprobs=False,
+                        full_policy_sampling=False):
         """
         Backward-compatible blocking variant. Returns:
           dict group_idx -> list of (text, token_ids, behavior_logprobs)
@@ -1745,7 +1759,8 @@ class GenerationPool:
                 prompts_by_group, group_size, adapter_path,
                 max_new_tokens, temperature, top_p, step_idx=step_idx,
                 counts_by_group=counts_by_group,
-                return_logprobs=return_logprobs):
+                return_logprobs=return_logprobs,
+                full_policy_sampling=full_policy_sampling):
             for item in job_results:
                 text, token_ids = item[:2]
                 behavior_logprobs = item[2] if len(item) > 2 else None
@@ -1778,7 +1793,8 @@ class HybridHFGenerationPool:
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
-                        progress_desc="rollouts"):
+                        progress_desc="rollouts",
+                        full_policy_sampling=False):
         counts = ([int(group_size)] * len(prompts_by_group)
                   if counts_by_group is None
                   else [int(value) for value in counts_by_group])
@@ -1803,7 +1819,8 @@ class HybridHFGenerationPool:
                         prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p,
                         step_idx=step_idx, show_progress=False,
-                        counts_by_group=remote_counts):
+                        counts_by_group=remote_counts,
+                        full_policy_sampling=full_policy_sampling):
                     events.put(("result", item))
             except BaseException as exc:
                 events.put(("error", exc))
@@ -1863,12 +1880,13 @@ class HybridHFGenerationPool:
 
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        counts_by_group=None):
+                        counts_by_group=None, full_policy_sampling=False):
         by_group = {idx: [] for idx in range(len(prompts_by_group))}
         for group_idx, results in self.iter_group_jobs(
                 prompts_by_group, group_size, adapter_path,
                 max_new_tokens, temperature, top_p, step_idx=step_idx,
-                counts_by_group=counts_by_group):
+                counts_by_group=counts_by_group,
+                full_policy_sampling=full_policy_sampling):
             by_group[group_idx].extend(
                 (text, token_ids, None) for text, token_ids in results)
         return by_group

@@ -57,11 +57,48 @@ _STRATEGY_FINAL_MARKERS = (
 )
 _LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
 _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
+_QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
 
 
 def _is_exact_qwen3_8b(model_name):
     return (str(model_name or "").strip().rstrip("/").lower()
             == _QWEN3_8B_MODEL_ID)
+
+
+def _is_exact_qwen3_30b_a3b(model_name):
+    """Match only the original hybrid-thinking A3B coder checkpoint.
+
+    Accept the canonical Hub id and an explicitly named local model directory,
+    while excluding Instruct-2507, Thinking-2507, Base, and quantized variants.
+    """
+    normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].lower() == (
+        _QWEN3_30B_A3B_MODEL_BASENAME)
+
+
+def _uses_sequence_level_policy_ratio(cfg):
+    """Use the MoE-stable sequence ratio only for plain Qwen3-30B-A3B."""
+    return _is_exact_qwen3_30b_a3b(getattr(cfg, "model_name", ""))
+
+
+def _detached_behavior_importance_ratio(cfg, current_logprobs,
+                                        behavior_logprobs):
+    """Return the existing token ratios or the A3B trajectory ratio.
+
+    Standard entropic/GRPO/CVaR updates use a detached importance weight rather
+    than the differentiable clipped surrogate. Keep that objective unchanged
+    except that plain Qwen3-30B-A3B receives one geometric-mean response weight
+    instead of volatile individual-token MoE weights.
+    """
+    import torch
+
+    current = current_logprobs.detach()
+    behavior = torch.as_tensor(
+        behavior_logprobs, dtype=current.dtype, device=current.device)
+    log_ratios = current - behavior
+    if _uses_sequence_level_policy_ratio(cfg):
+        return log_ratios.mean().exp()
+    return log_ratios.exp()
 
 
 def _dual_resident_qwen3_8b_strategy_coder_pools(config):
@@ -386,16 +423,22 @@ def _resolve_rank_options(merged):
             or epochs < 1):
         raise ValueError("rank_update_epochs must be a positive integer")
     merged["rank_update_epochs"] = int(epochs)
-    if _uses_clipped_policy_loss(merged.get("advantage_mode")):
+    sequence_policy = _is_exact_qwen3_30b_a3b(merged.get("model_name"))
+    if (_uses_clipped_policy_loss(merged.get("advantage_mode"))
+            or sequence_policy):
         if int(merged["group_size"]) < 2:
-            raise ValueError("clipped-policy modes require group_size >= 2")
+            raise ValueError(
+                "sequence/clipped policy modes require group_size >= 2")
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
             raise ValueError(
-                "clipped-policy modes require a finite nonnegative kl_penalty_coef")
+                "sequence/clipped policy modes require a finite nonnegative "
+                "kl_penalty_coef")
         if (float(merged["temperature"]) != 1.0
                 or float(merged["top_p"]) != 1.0):
-            print("[config] clipped-policy mode sets temperature=1 and top_p=1 "
+            label = ("Qwen3-30B-A3B sequence-policy mode"
+                     if sequence_policy else "clipped-policy mode")
+            print(f"[config] {label} sets temperature=1 and top_p=1 "
                   "to match the policy likelihood used by the loss")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
@@ -1725,8 +1768,9 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
             temperature=cfg.temperature,
             top_p=cfg.top_p,
             **({"top_k": 0, "repetition_penalty": 1.0}
-               if _uses_clipped_policy_loss(
-                   getattr(cfg, "advantage_mode", "entropic")) else {}),
+               if (_uses_clipped_policy_loss(
+                       getattr(cfg, "advantage_mode", "entropic"))
+                   or _uses_sequence_level_policy_ratio(cfg)) else {}),
             pad_token_id=pad_id,
             num_return_sequences=n_samples,
         )
@@ -1817,6 +1861,8 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         "top_p": float(top_p if top_p is not None else cfg.top_p),
         "micro_batch": int(getattr(cfg, "gen_micro_batch", 0) or 0),
     }
+    if _uses_sequence_level_policy_ratio(cfg):
+        gen_kwargs.update(top_k=0, repetition_penalty=1.0)
     yield from _iter_hf_job_batches(
         model, tokenizer, jobs, model.device, int(cfg.max_seq_length),
         gen_kwargs, cap_state=cap_state, log_prefix="trainer rollout")
@@ -2545,12 +2591,16 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
                    advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
                    clip_epsilon_low=None, clip_epsilon_high=None,
                    kl_coef=0.0, entropy_coef=0.0, token_entropies=None,
+                   sequence_level_ratio=False,
                    return_tensor_metrics=False):
     """One trajectory's loss; callers average equally within each parent.
 
-    Per-token rho = exp(current_lp - old_lp) is differentiable; old_lp and the
-    scalar group advantage are frozen. Policy/reference regularization uses the
-    same centered log-probability correction as entropic mode:
+    Normally, per-token rho = exp(current_lp - old_lp) is differentiable. For
+    the plain Qwen3-30B-A3B MoE coder, callers select the GSPO-style trajectory
+    ratio exp(mean(current_lp - old_lp)); the same scalar ratio and asymmetric
+    bounds are then used for the complete response. Old log-probabilities and
+    the scalar group advantage are frozen. Policy/reference regularization uses
+    the same centered log-probability correction as entropic mode:
         d = log pi_theta - log pi_ref
         A_KL = kl_coef * (mean(d) - d).
     Its policy-gradient surrogate is kept separate from the rank PPO surrogate
@@ -2594,14 +2644,17 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
         raise ValueError("rank policy logprobs must be finite")
 
     log_ratios = cur - old
-    token_ratios = log_ratios.exp()
-    clipped_token_ratios = token_ratios.clamp(
+    if sequence_level_ratio:
+        policy_ratios = log_ratios.mean().exp()
+    else:
+        policy_ratios = log_ratios.exp()
+    clipped_policy_ratios = policy_ratios.clamp(
         1.0 - epsilon_low, 1.0 + epsilon_high)
     policy_loss = -torch.minimum(
-        token_ratios * adv, clipped_token_ratios * adv).mean()
-    ratio = token_ratios.mean()
+        policy_ratios * adv, clipped_policy_ratios * adv).mean()
+    ratio = policy_ratios.mean()
     clipped_fraction = (
-        token_ratios.detach() != clipped_token_ratios.detach()
+        policy_ratios.detach() != clipped_policy_ratios.detach()
     ).double().mean()
     policy_reference_delta = cur.new_zeros(())
     kl_policy_loss = cur.new_zeros(())
@@ -2619,10 +2672,11 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
             policy_reference_delta - (cur - ref)
         )
         # This is the KL component of entropic mode's policy-gradient loss.
-        # The detached current/behavior ratio supplies the same importance
-        # weighting without changing the rank PPO objective itself.
+        # Keep the current/reference centering unchanged. In sequence-ratio
+        # mode, one detached trajectory weight replaces volatile per-token MoE
+        # weights without changing how pi_theta and pi_ref are compared.
         kl_policy_loss = -(
-            token_ratios.detach() * kl_advantage.detach() * cur
+            policy_ratios.detach() * kl_advantage.detach() * cur
         ).mean()
 
     entropy_estimate = cur.new_zeros(())
@@ -2743,6 +2797,7 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
             current_logprobs, old_logprobs, advantage,
             clip_epsilon_low=clip_epsilon_low,
             clip_epsilon_high=clip_epsilon_high,
+            sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
             return_tensor_metrics=return_tensor_metrics)
     return rank_grpo_loss(
         current_logprobs, old_logprobs, reference_logprob, advantage,
@@ -2752,7 +2807,48 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
         kl_coef=kl_coef,
         entropy_coef=entropy_coef,
         token_entropies=token_entropies,
+        sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
         return_tensor_metrics=return_tensor_metrics)
+
+
+def _a3b_sequence_clipped_standard_loss(
+        cfg, current_logprobs, behavior_logprobs, reference_logprobs,
+        advantage, *, feedback_advantage=None):
+    """Apply the A3B sequence surrogate inside standard advantage modes.
+
+    Entropic, GRPO, and CVaR retain their existing advantages, centered
+    current/reference correction, sample normalization, and optional feedback
+    term. Only the reward-policy importance ratio and clipping unit become one
+    length-normalized response ratio. The helper is deliberately unavailable
+    to every other coder model.
+    """
+    import torch
+
+    if not _uses_sequence_level_policy_ratio(cfg):
+        raise ValueError(
+            "the sequence-clipped standard loss is Qwen3-30B-A3B only")
+    epsilon, epsilon_low, epsilon_high, kl_coef = (
+        _clipped_policy_options(cfg))
+    old = (current_logprobs.detach()
+           if behavior_logprobs is None else behavior_logprobs)
+    loss, metrics = clipped_policy_loss(
+        cfg, current_logprobs, old, reference_logprobs, advantage,
+        clip_epsilon=epsilon,
+        clip_epsilon_low=epsilon_low,
+        clip_epsilon_high=epsilon_high,
+        kl_coef=kl_coef,
+        return_tensor_metrics=True)
+    if feedback_advantage is not None:
+        feedback = torch.as_tensor(
+            feedback_advantage, dtype=current_logprobs.dtype,
+            device=current_logprobs.device).detach()
+        # Feedback remains the same auxiliary score-function term. Weight it
+        # with the detached trajectory ratio so no token-level MoE ratio is
+        # reintroduced outside the GSPO-style reward surrogate.
+        loss = loss - (
+            metrics["ratio"] * feedback * current_logprobs
+        ).mean()
+    return loss, metrics
 
 
 def _x_grpo_batched_autograd_unavailable(error):
@@ -4848,6 +4944,7 @@ class ReplicatedDataParallelTrainer:
               f"configured max={int(cfg.train_examples_per_microbatch)}, "
               f"effective max={largest_batch}, "
               f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
+        sequence_policy = _uses_sequence_level_policy_ratio(cfg)
         self._zero_gradients()
 
         def accumulate(item):
@@ -4898,6 +4995,7 @@ class ReplicatedDataParallelTrainer:
                         kl_advantage = cfg.kl_penalty_coef * (
                             average_difference - (current_lp - base_lp))
                         effective_advantage = advantage + kl_advantage
+                        feedback_policy_advantage = None
                         if fb_on and example.get("reprompt_text"):
                             fb_advantage = feedback_advantage(
                                 compute_token_logprobs, model, tokenizer,
@@ -4911,24 +5009,41 @@ class ReplicatedDataParallelTrainer:
                                     fb_advantage,
                                     reward_advantage=advantage, cfg=fb_cfg)
                                 stats.add(fb_advantage)
+                                feedback_policy_advantage = fb_advantage
                                 effective_advantage = (
                                     effective_advantage + fb_advantage)
                         behavior_lp = example.get("behavior_logprobs")
-                        if _valid_example_token_logprobs(
-                                example, "behavior_logprobs"):
-                            importance_ratio = torch.exp(
-                                current_lp.detach() - behavior_lp)
+                        has_behavior = _valid_example_token_logprobs(
+                            example, "behavior_logprobs")
+                        if sequence_policy:
+                            loss, policy_metrics = (
+                                _a3b_sequence_clipped_standard_loss(
+                                    cfg, current_lp,
+                                    behavior_lp if has_behavior else None,
+                                    base_lp, advantage,
+                                    feedback_advantage=(
+                                        feedback_policy_advantage)))
+                            importance_ratio = policy_metrics["ratio"]
+                        elif has_behavior:
+                            importance_ratio = (
+                                _detached_behavior_importance_ratio(
+                                    cfg, current_lp, behavior_lp))
+                            loss = -(
+                                importance_ratio
+                                * effective_advantage.detach()
+                                * current_lp).mean()
+                        else:
+                            importance_ratio = 1.0
+                            loss = -(
+                                effective_advantage.detach()
+                                * current_lp).mean()
+                        if has_behavior:
                             ratio_sum += float(
                                 importance_ratio.mean().item())
                             ratio_max = max(
                                 ratio_max,
                                 float(importance_ratio.max().item()))
                             ratio_count += 1
-                        else:
-                            importance_ratio = 1.0
-                        loss = -(
-                            importance_ratio * effective_advantage.detach()
-                            * current_lp).mean()
                         batch_losses.append(loss / n_examples)
                         total_loss += float(loss.detach().item())
                         total_logp_delta += float(
@@ -7160,6 +7275,8 @@ code block.'''
                     "temperature": cfg.temperature,
                     "top_p": cfg.top_p,
                     "step_idx": step_idx,
+                    "full_policy_sampling": (
+                        _uses_sequence_level_policy_ratio(cfg)),
                 }
                 if cfg.generation_backend == "vllm":
                     generation_options["return_logprobs"] = training_enabled
@@ -7203,6 +7320,8 @@ code block.'''
                         "top_p": cfg.top_p,
                         "step_idx": int(step_idx) + 3_000_000,
                         "progress_desc": "compact code retries",
+                        "full_policy_sampling": (
+                            _uses_sequence_level_policy_ratio(cfg)),
                     }
                     if cfg.generation_backend == "vllm":
                         retry_options["return_logprobs"] = training_enabled
@@ -8817,6 +8936,7 @@ code block.'''
 
     train_t0 = time.time()
     n_examples = len(all_examples)
+    sequence_policy = _uses_sequence_level_policy_ratio(cfg)
     microbatches = _training_microbatches(all_examples, cfg)
     largest_batch = max((len(batch) for batch in microbatches), default=0)
     print(f"[train] LoRA microbatches={len(microbatches)}; "
@@ -8868,6 +8988,7 @@ code block.'''
                 kl_adv = cfg.kl_penalty_coef * (
                     avg_logp_diff - (cur_lp - base_lp))
                 eff_adv = adv + kl_adv
+                feedback_policy_advantage = None
 
                 if fb_on and ex.get("reprompt_text"):
                     fb_adv = feedback_advantage(
@@ -8880,16 +9001,25 @@ code block.'''
                         fb_adv, _fb_scale = bound_feedback_advantage(
                             fb_adv, reward_advantage=adv, cfg=fb_cfg)
                         fb_stats.add(fb_adv)
+                        feedback_policy_advantage = fb_adv
                         eff_adv = eff_adv + fb_adv
 
                 behavior_lp = ex.get("behavior_logprobs")
-                if _valid_example_token_logprobs(
-                        ex, "behavior_logprobs"):
-                    is_ratio = torch.exp(cur_lp.detach() - behavior_lp)
-                    is_ratio_sum += float(is_ratio.mean().item())
-                    is_ratio_max = max(
-                        is_ratio_max, float(is_ratio.max().item()))
-                    is_ratio_count += 1
+                has_behavior = _valid_example_token_logprobs(
+                    ex, "behavior_logprobs")
+                if sequence_policy:
+                    loss, policy_metrics = (
+                        _a3b_sequence_clipped_standard_loss(
+                            cfg, cur_lp,
+                            behavior_lp if has_behavior else None,
+                            base_lp, adv,
+                            feedback_advantage=(
+                                feedback_policy_advantage)))
+                    is_ratio = policy_metrics["ratio"]
+                elif has_behavior:
+                    is_ratio = _detached_behavior_importance_ratio(
+                        cfg, cur_lp, behavior_lp)
+                    loss = -(is_ratio * eff_adv.detach() * cur_lp).mean()
                 else:
                     if (behavior_lp is not None
                             and not hasattr(train_step, "_is_len_warned")):
@@ -8897,8 +9027,13 @@ code block.'''
                               "for affected examples")
                         train_step._is_len_warned = True
                     is_ratio = 1.0
+                    loss = -(eff_adv.detach() * cur_lp).mean()
 
-                loss = -(is_ratio * eff_adv.detach() * cur_lp).mean()
+                if has_behavior:
+                    is_ratio_sum += float(is_ratio.mean().item())
+                    is_ratio_max = max(
+                        is_ratio_max, float(is_ratio.max().item()))
+                    is_ratio_count += 1
                 batch_losses.append(loss / n_examples)
                 total_loss += float(loss.detach().item())
                 total_logp_delta += float(logp_diff.mean().item())
@@ -9166,6 +9301,9 @@ def main():
         print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     "
           f"{'binary-coder' if binary_coder_cfg.enabled else getattr(cfg, 'advantage_mode', 'entropic')}")
+    if _uses_sequence_level_policy_ratio(cfg):
+        print("MoE policy ratio:    sequence-level geometric mean "
+              "(Qwen3-30B-A3B only; existing asymmetric low/high bounds)")
     if binary_coder_cfg.enabled:
         print(f"Binary coder phase: steps 0-{binary_coder_cfg.init_steps - 1}; "
               f"verified +/-1 advantages, LoRA rank "

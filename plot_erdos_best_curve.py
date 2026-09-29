@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 
+# Match the numeric part of folder names such as "step03".
 _STEP_RE = re.compile(r"step(\d+)")
 
 # CVD-friendly palette and paper-style surface from the reference plot.
@@ -27,26 +28,35 @@ SURFACE = "#fcfcfb"
 
 
 def _finite_float(value):
+    """Convert a value to a finite float, or return None if it is invalid."""
+    # Convert strings and numeric values to a float.
     try:
         value = float(value)
     except (TypeError, ValueError):
         return None
+    # Reject NaN and infinity because they cannot be plotted as valid scores.
     return value if math.isfinite(value) else None
 
 
 def _step_number(meta, path: Path):
+    """Read the step from metadata, falling back to the parent folder name."""
+    # Prefer the explicit step stored in the rollout metadata.
     try:
         return int(meta["step"])
     except (KeyError, TypeError, ValueError):
+        # Older metadata may omit it, so extract it from a "stepXX" folder.
         match = _STEP_RE.search(path.parent.name)
         return int(match.group(1)) if match else None
 
 
 def _raw_score(meta, problem):
     """Return the raw metric, including old Erdos reward-only metadata."""
+    # Use the stored raw score when it is present and finite.
     raw = _finite_float(meta.get("raw_score"))
     if raw is not None:
         return raw
+
+    # Fall back to reward for metadata written by older runs.
     reward = _finite_float(meta.get("reward"))
     if problem == "erdos" and reward is not None and reward > 0:
         # problems/erdos.py uses reward = 1 / (1e-8 + c5_bound).
@@ -56,14 +66,18 @@ def _raw_score(meta, problem):
 
 def _run_info(run_dir):
     """Return config plus the metric name and optimization direction."""
+    # Load the run configuration when it exists; otherwise use an empty config.
     config_path = Path(run_dir) / "config.json"
     try:
         config = json.loads(config_path.read_text()) if config_path.is_file() else {}
     except (OSError, json.JSONDecodeError):
         config = {}
 
+    # Normalize the problem names before choosing the plotted metric.
     problem = str(config.get("problem", "unknown")).strip().lower()
     problem_type = str(config.get("problem_type", "")).strip().lower()
+
+    # Return the display metric and whether larger values are better.
     if problem in ("circle_packing", "circle", "circles"):
         return config, problem, "sum of radii", True
     if problem in ("erdos", "erdos_min_overlap", "erdos_minimum_overlap"):
@@ -85,43 +99,59 @@ def _run_info(run_dir):
 
 def load_best_curve(run_dir):
     """Return (steps, cumulative_best, per_step_best, valid_rollout_count)."""
+    # Validate the requested run directory.
     run_dir = Path(run_dir)
     if not run_dir.is_dir():
         raise ValueError(f"not a directory: {run_dir}")
 
+    # Determine which score to read and whether to minimize or maximize it.
     _, problem, metric_name, maximize = _run_info(run_dir)
 
+    # Collect the best valid score found inside each training step.
     best_by_step = {}
     seen_steps = set()
     valid_count = 0
     pattern = "step*/step*_group*_rollout*.meta.json"
     for path in sorted(run_dir.glob(pattern)):
+        # Skip rollout files that cannot be read or decoded.
         try:
             meta = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+
+        # Skip metadata without a usable, non-negative step number.
         step = _step_number(meta, path)
         if step is None or step < 0:
             continue
         seen_steps.add(step)
+
+        # Only valid rollouts are allowed to affect the curve.
         if not meta.get("valid"):
             continue
+
+        # Read reward directly for custom problems, otherwise use the raw metric.
         score = (_finite_float(meta.get("reward")) if metric_name == "reward"
                  else _raw_score(meta, problem))
         if score is None:
             continue
+
+        # Keep only the best score within this step.
         valid_count += 1
         choose = max if maximize else min
         initial = -math.inf if maximize else math.inf
         best_by_step[step] = choose(best_by_step.get(step, initial), score)
 
+    # Stop with a clear error when there is no usable rollout data.
     if not seen_steps:
         raise ValueError(f"no rollout metadata found under {run_dir}/step*/")
     if not best_by_step:
         raise ValueError("the run contains no valid rollout with a numeric score")
 
+    # Build one entry for every step, using NaN for steps with no valid score.
     steps = list(range(0, max(seen_steps) + 1))
     per_step = [best_by_step.get(step, math.nan) for step in steps]
+
+    # Turn the per-step scores into a best-score-seen-so-far curve.
     cumulative = []
     best = -math.inf if maximize else math.inf
     choose = max if maximize else min
@@ -134,6 +164,7 @@ def load_best_curve(run_dir):
 
 def improvement_indices(values, min_delta, maximize=False):
     """Indices where the running best improves by at least ``min_delta``."""
+    # Compare each finite value with the last improvement that received a label.
     out = []
     previous_labeled = None
     for i, value in enumerate(values):
@@ -150,10 +181,13 @@ def improvement_indices(values, min_delta, maximize=False):
 
 def plateau_index(values, tol=5e-10, maximize=False):
     """First step whose value equals the final best at displayed precision."""
+    # The last finite value is the final best value of the cumulative curve.
     finite = [value for value in values if math.isfinite(value)]
     if not finite:
         return None
     final = finite[-1]
+
+    # Find the earliest step that reached that final value within tolerance.
     for i, value in enumerate(values):
         reached = value >= final - tol if maximize else value <= final + tol
         if math.isfinite(value) and reached:
@@ -163,17 +197,22 @@ def plateau_index(values, tol=5e-10, maximize=False):
 
 def halo(ax, x, y, color, base=9.5):
     """Soft glow around the point where the run reaches its final score."""
+    # Draw increasingly small transparent circles behind the point.
     for mult, alpha in ((3.6, 0.06), (2.8, 0.09), (2.1, 0.14), (1.5, 0.22)):
         ax.plot([x], [y], ls="none", marker="o", ms=base * mult,
                 color=color, alpha=alpha, mec="none", zorder=3)
+    # Add an outline around the center of the glow.
     ax.plot([x], [y], ls="none", marker="o", ms=base * 2.05,
             mfc="none", mec=color, mew=1.3, alpha=0.55, zorder=6)
 
 
 def place_labels(fig, ax, annotations, direction="up", pad=3.0):
     """Lay labels out without overlaps while preserving vertical order."""
+    # Nothing needs to be adjusted when there are no labels.
     if not annotations:
         return
+
+    # Render once so every annotation has a measurable pixel bounding box.
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     pixels_per_point = fig.dpi / 72.0
@@ -185,6 +224,7 @@ def place_labels(fig, ax, annotations, direction="up", pad=3.0):
     placed = []
 
     def slide(box, go_down):
+        """Move one label vertically until it no longer overlaps a placed label."""
         x0, x1 = box.x0 - pad, box.x1 + pad
         y0, y1 = box.y0, box.y1
         height = y1 - y0
@@ -201,9 +241,12 @@ def place_labels(fig, ax, annotations, direction="up", pad=3.0):
                 break
         return x0, x1, y0, y1
 
+    # Place labels in vertical order, reversing the order when moving downward.
     for i in order:
         box = boxes[i]
         x0, x1, y0, y1 = slide(box, down)
+
+        # Try the opposite direction if the first position leaves the axes.
         if ((down and y0 < axes_box.y0 + 2)
                 or (not down and y1 > axes_box.y1 - 2)):
             fx0, fx1, fy0, fy1 = slide(box, not down)
@@ -213,6 +256,7 @@ def place_labels(fig, ax, annotations, direction="up", pad=3.0):
         annotations[i].xyann = (dx, dy + (y0 - box.y0) / pixels_per_point)
         placed.append((x0, x1, y0, y1))
 
+    # Render again, then pull any remaining out-of-bounds label inside the axes.
     fig.canvas.draw()
     for annotation in annotations:
         box = annotation.get_window_extent(renderer)
@@ -229,6 +273,7 @@ def place_labels(fig, ax, annotations, direction="up", pad=3.0):
 
 def config_caption(run_dir, valid_count, metric_name, maximize):
     """Compact subtitle containing the settings that define this run."""
+    # Reload the config values used in the subtitle.
     config_path = Path(run_dir) / "config.json"
     try:
         config = json.loads(config_path.read_text()) if config_path.is_file() else {}
@@ -242,15 +287,21 @@ def config_caption(run_dir, valid_count, metric_name, maximize):
     problem = config.get("problem", "unknown")
     # direction = "higher is better" if maximize else "lower is better"
     direction = ""
+
+    # Combine the main run settings into one line.
     return (f"{problem} · {metric_name} · {model} · {groups} groups × {size} "
             f"rollouts · {memory} · {valid_count:,} valid rollouts · {direction}")
 
 
 def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
                     max_step=None):
+    """Load a run, draw its best-so-far curve, and save PNG and PDF files."""
+    # Load the problem settings and score history.
     run_dir = Path(run_dir)
     _, problem, metric_name, maximize = _run_info(run_dir)
     steps, cumulative, per_step, valid_count = load_best_curve(run_dir)
+
+    # Import plotting dependencies only when a plot is requested.
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -263,6 +314,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
             "`pip install matplotlib`"
         ) from exc
 
+    # Optionally trim the data to the requested final training step.
     if max_step is not None:
         keep = [i for i, step in enumerate(steps) if step <= max_step]
         steps = [steps[i] for i in keep]
@@ -271,11 +323,13 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
         if not steps or not any(math.isfinite(v) for v in cumulative):
             raise ValueError(f"no valid score at or before step {max_step}")
 
+    # Choose the improvements to mark and ensure the final plateau is included.
     improvements = improvement_indices(cumulative, min_label_delta, maximize)
     final_index = plateau_index(cumulative, maximize=maximize)
     if final_index is not None and final_index not in improvements:
         improvements = sorted(improvements + [final_index])
 
+    # Create the figure and apply the shared visual style.
     fig, ax = plt.subplots(figsize=(14.5, 6.4), dpi=150, facecolor="none")
     fig.subplots_adjust(left=0.075, right=0.982, top=0.84, bottom=0.13)
     ax.set_facecolor("none")
@@ -288,6 +342,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
         ax.spines[side].set_linewidth(0.8)
     ax.tick_params(colors=INK_SOFT, labelsize=9)
 
+    # Remove missing values before drawing the line and its point markers.
     finite_points = [(step, value) for step, value in zip(steps, cumulative)
                      if math.isfinite(value)]
     xs = [point[0] for point in finite_points]
@@ -296,6 +351,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     ax.plot(xs, ys, ls="none", marker="o", ms=4.8, color=BLUE,
             mec=SURFACE, mew=1.0, zorder=5)
 
+    # Read the optional target score from the run configuration.
     config_path = run_dir / "config.json"
     target = None
     if config_path.is_file():
@@ -303,13 +359,17 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
             target = _finite_float(json.loads(config_path.read_text()).get("target"))
         except (OSError, json.JSONDecodeError):
             pass
+    # Use the fixed Erdos target shown by this plot.
     target = 0.380876            
+
+    # Draw the target as a dashed horizontal reference line.
     if target is not None:
         ax.axhline(target, color=INK_MUTED, linewidth=1.2,
                    linestyle=(0, (5, 4)), zorder=2)
         ax.text(steps[0] + 0.15, target, f"target  {target:.6f}",
                 va="bottom", ha="left", fontsize=9, color=INK_SOFT, zorder=3)
 
+    # Mark meaningful improvements and create labels for selected points.
     annotations = []
     for order, index in enumerate(improvements):
         x, y = steps[index], cumulative[index]
@@ -333,6 +393,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
         )
         annotations.append(annotation)
 
+    # Include both curve values and the target when calculating y-axis limits.
     values_for_limits = list(ys)
     if target is not None:
         values_for_limits.append(target)
@@ -345,6 +406,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.6f"))
 
+    # Add axis labels and the run summary above the chart.
     ax.set_xlabel("training step", fontsize=10.5, color=INK, labelpad=8)
     direction_word = "highest" if maximize else "lowest"
     ax.set_ylabel(f"{direction_word} {metric_name} seen so far",
@@ -355,6 +417,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     fig.text(0.075, 0.86, config_caption(run_dir, valid_count, metric_name, maximize),
              ha="left", fontsize=14, color=INK)
 
+    # Build the legend for the best-so-far curve and optional target line.
     handles = [
         Line2D([], [], color=BLUE, lw=2.2, marker="o", ms=6,
                mec=SURFACE, mew=1.0,
@@ -365,17 +428,23 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
                               ls=(0, (5, 4)), label="target"))
     ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=9.5,
               facecolor=SURFACE, edgecolor=GRID, borderpad=0.7)
+
+    # Reposition annotations after every label has been created.
     place_labels(fig, ax, annotations)
 
+    # Resolve output paths and create the destination directory if needed.
     png_path = Path(output) if output else run_dir / "best_so_far.png"
     if png_path.suffix.lower() != ".png":
         png_path = png_path.with_suffix(".png")
     png_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path = png_path.with_suffix(".pdf")
+
+    # Save both image formats, then release the Matplotlib figure.
     fig.savefig(png_path, bbox_inches="tight", dpi=300, transparent=True)
     fig.savefig(pdf_path, bbox_inches="tight", transparent=True)
     plt.close(fig)
 
+    # Report the final result and return both generated paths to the caller.
     final_step = steps[final_index]
     final_best = cumulative[final_index]
     print(f"read {valid_count} valid rollouts across steps 0-{steps[-1]}")
@@ -385,6 +454,8 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
 
 
 def main():
+    """Parse command-line options and generate the requested curve."""
+    # Define the positional run directory and optional plot settings.
     parser = argparse.ArgumentParser(
         description="Plot the cumulative best valid score for any problem."
     )
@@ -397,6 +468,7 @@ def main():
                         help="plot only through this step")
     args = parser.parse_args()
 
+    # Generate the plot and present input/data errors through argparse.
     try:
         plot_best_curve(args.run_dir, output=args.out, title=args.title,
                         min_label_delta=args.min_label_delta,
@@ -406,4 +478,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Run the command-line entry point only when this file is executed directly.
     main()

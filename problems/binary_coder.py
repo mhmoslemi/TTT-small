@@ -151,8 +151,14 @@ def binary_coder_advantages(
 def binary_coder_clipped_loss(
         current_logprobs, old_logprobs, advantage, *,
         clip_epsilon_low: float, clip_epsilon_high: float,
+        sequence_level_ratio: bool = False,
         return_tensor_metrics: bool = False):
-    """Length-normalized asymmetric PPO loss for a binary coder outcome."""
+    """Asymmetric PPO loss for one binary coder outcome.
+
+    The default remains the existing token-level objective. The exact plain
+    Qwen3-30B-A3B path supplies ``sequence_level_ratio=True`` so its geometric
+    mean trajectory ratio is clipped once for the complete response.
+    """
     import torch
 
     low = float(clip_epsilon_low)
@@ -178,7 +184,9 @@ def binary_coder_clipped_loss(
         raise ValueError("binary coder advantage must be exactly -1 or +1")
     adv = current.new_tensor(advantage_value).detach()
 
-    ratios = torch.exp(current - old)
+    log_ratios = current - old
+    ratios = torch.exp(
+        log_ratios.mean() if sequence_level_ratio else log_ratios)
     clipped_ratios = ratios.clamp(1.0 - low, 1.0 + high)
     policy_loss = -torch.minimum(
         ratios * adv, clipped_ratios * adv).mean()

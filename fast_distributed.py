@@ -904,6 +904,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     total_examples = int(total_examples)
     if total_examples < 1:
         raise ValueError("fast policy update requires at least one example")
+    sequence_policy = training._uses_sequence_level_policy_ratio(cfg)
 
     backend.set_training_mode()
     allocator_fraction = set_total_memory_ceiling(
@@ -1093,6 +1094,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 average_difference
                                 - (current_lp - base_lp))
                             effective_advantage = advantage + kl_advantage
+                            feedback_policy_advantage = None
                             if fb_on and example.get("reprompt_text"):
                                 fb_advantage = feedback_advantage(
                                     training.compute_token_logprobs, model,
@@ -1110,27 +1112,46 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                             reward_advantage=advantage,
                                             cfg=fb_cfg))
                                     attempt_feedback.add(fb_advantage)
+                                    feedback_policy_advantage = fb_advantage
                                     effective_advantage = (
                                         effective_advantage + fb_advantage)
 
-                            if training._valid_example_token_logprobs(
-                                    example, "behavior_logprobs"):
-                                behavior_lp = example[
-                                    "behavior_logprobs"].to(
-                                        current_lp.device)
-                                importance_ratio = torch.exp(
-                                    current_lp.detach() - behavior_lp)
+                            has_behavior = (
+                                training._valid_example_token_logprobs(
+                                    example, "behavior_logprobs"))
+                            behavior_lp = (
+                                example["behavior_logprobs"].to(
+                                    current_lp.device)
+                                if has_behavior else None)
+                            if sequence_policy:
+                                loss, policy_metrics = (
+                                    training.
+                                    _a3b_sequence_clipped_standard_loss(
+                                        cfg, current_lp, behavior_lp,
+                                        base_lp, advantage,
+                                        feedback_advantage=(
+                                            feedback_policy_advantage)))
+                                importance_ratio = policy_metrics["ratio"]
+                            elif has_behavior:
+                                importance_ratio = (
+                                    training.
+                                    _detached_behavior_importance_ratio(
+                                        cfg, current_lp, behavior_lp))
+                                loss = -(
+                                    importance_ratio
+                                    * effective_advantage.detach()
+                                    * current_lp).mean()
+                            else:
+                                importance_ratio = 1.0
+                                loss = -(
+                                    effective_advantage.detach()
+                                    * current_lp).mean()
+                            if has_behavior:
                                 attempt_ratio_means.append(
                                     importance_ratio.mean().detach())
                                 attempt_ratio_maxima.append(
                                     importance_ratio.max().detach())
                                 attempt_ratio_count += 1
-                            else:
-                                importance_ratio = 1.0
-                            loss = -(
-                                importance_ratio
-                                * effective_advantage.detach()
-                                * current_lp).mean()
                             if not torch.isfinite(loss).all():
                                 raise FloatingPointError(
                                     "nonfinite policy/feedback loss")
