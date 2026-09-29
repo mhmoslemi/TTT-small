@@ -1413,7 +1413,8 @@ def load_config():
                              derive_vllm_parallel_layout,
                              detect_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
-                             validate_attention_heads, validate_selected_gpus)
+                             validate_attention_heads, validate_selected_gpus,
+                             vllm_runtime_reserve_gib)
 
     inventory_source = "AVAILABLE_GPUS"
     inventory_value = os.environ.get("AVAILABLE_GPUS")
@@ -1556,6 +1557,21 @@ def load_config():
     # replica, turn the replica factor into PP so the weights and KV cache are
     # sharded across the exact same GPU inventory.
     if generation_backend == "vllm":
+        separate_local_strategy_pool = bool(
+            merged["strategies"]
+            and merged.get("strategy_backend", "local") == "local"
+            and (str(merged.get("strategy_model_name")
+                     or merged.get("model_name"))
+                 != str(merged.get("model_name"))
+                 or merged["dual_resident_qwen3_8b_strategy_coder_pools"]))
+        # This must match GenerationPool's two runtime flags.  The old layout
+        # used the uncapped 90% allocator budget, then process startup lowered
+        # it for scoring/sleep residency; Qwen3-32B consequently selected
+        # TP=1 even though its 32K KV cache could not fit after that cap.
+        merged["vllm_runtime_reserve_gib"] = vllm_runtime_reserve_gib(
+            co_resident_sleep=separate_local_strategy_pool,
+            token_scoring=not bool(merged["no_train"]),
+        )
         known_heads = detect_attention_heads(merged.get("model_name", ""))
         layout = derive_vllm_parallel_layout(
             merged, roles, memory, known_heads)
@@ -1615,6 +1631,10 @@ def load_config():
                     "load_in_4bit": False,
                     "vllm_quantization": merged.get(
                         "strategy_vllm_quantization", ""),
+                    "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(
+                        co_resident_sleep=True,
+                        token_scoring=False,
+                    ),
                 })
                 strategy_heads = detect_attention_heads(strategy_name)
                 strategy_layout = derive_vllm_parallel_layout(

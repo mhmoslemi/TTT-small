@@ -60,6 +60,8 @@ import time
 import traceback
 import multiprocessing as mp
 
+from gpu_runtime import vllm_runtime_reserve_gib
+
 # Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
 # process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
 # metadata. Two alternating, RAM-resident pools therefore cannot each claim
@@ -69,14 +71,12 @@ import multiprocessing as mp
 # top of the steady model/KV allocation, while the sleeping strategy engine
 # and offloaded trainer still retain CUDA context state.  Twelve GiB left less
 # than one projection's headroom in real 96-GiB runs; keep sixteen unclaimed.
-VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 16.0
 # Prompt-logprob scoring materializes a vocabulary projection for every prefill
 # chunk.  On 150k-vocabulary coder models that transient is substantially
 # larger than ordinary generation activations, and CUDA-graph memory can make
 # vLLM exceed its nominal utilization target by several GiB.  Preserve enough
 # real headroom for the projection instead of letting an otherwise healthy
 # engine die after rollouts have already completed.
-VLLM_TOKEN_SCORING_RESERVE_GIB = 24.0
 VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS = 4096
 VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
 
@@ -1129,15 +1129,14 @@ class GenerationPool:
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must not contain duplicates")
 
-        reserve_gib = 0.0
+        reserve_gib = vllm_runtime_reserve_gib(
+            co_resident_sleep=self.vllm_co_resident_sleep,
+            token_scoring=self.vllm_token_scoring,
+        )
         reserve_reasons = []
         if self.vllm_co_resident_sleep:
-            reserve_gib = max(
-                reserve_gib, VLLM_CORESIDENT_SLEEP_RESERVE_GIB)
             reserve_reasons.append("shared sleep residency")
         if self.vllm_token_scoring:
-            reserve_gib = max(
-                reserve_gib, VLLM_TOKEN_SCORING_RESERVE_GIB)
             reserve_reasons.append("exact token scoring")
         if self.backend == "vllm" and reserve_gib > 0.0:
             self.vllm_gpu_memory_utilization = (

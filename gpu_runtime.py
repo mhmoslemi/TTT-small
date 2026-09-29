@@ -21,6 +21,23 @@ GPU_PROBLEM_NAMES = {
     "mla_decode_nvidia", "mla",
 }
 
+# GenerationPool applies these reserves before starting vLLM.  Keep them in
+# this dependency-light module as the single source of truth so configuration
+# planning and process startup cannot disagree about the usable GPU budget.
+VLLM_CORESIDENT_SLEEP_RESERVE_GIB = 16.0
+VLLM_TOKEN_SCORING_RESERVE_GIB = 24.0
+
+
+def vllm_runtime_reserve_gib(*, co_resident_sleep: bool,
+                             token_scoring: bool) -> float:
+    """Return the per-GPU headroom required by the requested vLLM phase."""
+    reserve = 0.0
+    if co_resident_sleep:
+        reserve = max(reserve, VLLM_CORESIDENT_SLEEP_RESERVE_GIB)
+    if token_scoring:
+        reserve = max(reserve, VLLM_TOKEN_SCORING_RESERVE_GIB)
+    return reserve
+
 
 def parse_gpu_ids(value, *, field: str = "AVAILABLE_GPUS") -> List[int]:
     if value is None:
@@ -181,6 +198,11 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
     name = str(model_name or "").lower()
     if "gpt-oss-120b" in name:
         return 76.0
+    if "qwen3-32b" in name:
+        # vLLM 0.28 measured 61.55 GiB after loading the BF16 checkpoint.
+        # The parameter-count fallback is only 59.60 GiB and can therefore
+        # admit a TP=1 layout that has no room for its configured KV cache.
+        return 62.0
     return None
 
 
@@ -262,6 +284,14 @@ def _resolved_vllm_utilization(raw_value, total_gib: float,
     return util
 
 
+def _effective_vllm_budget_gib(cfg: dict, total_gib: float,
+                               utilization: float) -> float:
+    """Mirror GenerationPool's allocator cap during layout planning."""
+    reserve = max(0.0, float(cfg.get("vllm_runtime_reserve_gib", 0.0) or 0.0))
+    return min(float(total_gib) * float(utilization),
+               max(0.0, float(total_gib) - reserve))
+
+
 def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
     parallel_size = max(1, int(parallel_size))
     model_name = cfg.get("model_name", "")
@@ -325,8 +355,18 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         _kv_bytes_per_token(cfg.get("model_name", "")) * max_len
         / parallel_size / (1024.0 ** 3)
     )
-    kv_budget = max(0.0, min_total * float(cfg["vllm_gpu_memory_utilization"])
-                    - weight_gib_per_gpu - 4.0)
+    effective_budget = _effective_vllm_budget_gib(
+        cfg, min_total, float(cfg["vllm_gpu_memory_utilization"]))
+    reserve_gib = max(
+        0.0, float(cfg.get("vllm_runtime_reserve_gib", 0.0) or 0.0))
+    if (using_vllm and reserve_gib > 0.0
+            and effective_budget
+            < min_total * float(cfg["vllm_gpu_memory_utilization"]) - 1e-9):
+        notes.append(
+            f"vLLM layout budget={effective_budget:.1f} GiB/GPU after "
+            f"{reserve_gib:.1f} GiB runtime reserve")
+    kv_budget = max(
+        0.0, effective_budget - weight_gib_per_gpu - 4.0)
     estimated_sequences = int(kv_budget / max(kv_gib_per_seq_gpu, 0.01))
     # A synthetic fallback keeps auto knobs deterministic on CPU-only hosts,
     # but it is not evidence for rejecting a run. Hard admission failures are
@@ -337,7 +377,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             f"{cfg.get('model_name')} is estimated to require at least "
             f"{required:.1f} GiB per generation GPU for one "
             f"{max_len}-token request, but the vLLM budget is "
-            f"{min_total * float(cfg['vllm_gpu_memory_utilization']):.1f} GiB. "
+            f"{effective_budget:.1f} GiB. "
             "Use a checkpoint-native/explicit vllm_quantization, reduce "
             "max_seq_length, choose generation_backend=hf, or provide a "
             "larger compatible TP*PP group.")
@@ -502,7 +542,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)
-    budget = min_total * util
+    budget = _effective_vllm_budget_gib(cfg, min_total, util)
 
     tp = compatible_tp[-1]
     required = _minimum_vllm_gib_per_gpu(cfg, tp)

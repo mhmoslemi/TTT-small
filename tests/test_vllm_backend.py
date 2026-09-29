@@ -675,6 +675,47 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(layout.pipeline_parallel_size, 1)
         self.assertEqual(layout.replicas, 3)
 
+    def test_qwen32_scoring_reserve_selects_four_tp2_engines(self):
+        """The rollout layout must use GenerationPool's effective budget.
+
+        On the measured 96-GiB host, TP=1 loaded 61.55 GiB of weights but had
+        only 6.34 GiB of KV after the exact-scoring reserve; a 32K request
+        needs 8 GiB.  TP=2 preserves the full context and all eight cards.
+        """
+        roles = allocate_gpu_roles(list(range(8)), "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 94.97, 93.16)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "Qwen/Qwen3-32B",
+            "generation_backend": "vllm",
+            "max_seq_length": 32768,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_runtime_reserve_gib": 24.0,
+            "vllm_max_num_batched_tokens": "auto",
+            "gen_micro_batch": "auto",
+            "logprob_chunk": "auto",
+        }
+
+        layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, detect_attention_heads(cfg["model_name"]))
+
+        self.assertEqual(layout.tensor_parallel_size, 2)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 4)
+        self.assertLessEqual(
+            layout.unsharded_stage_required_gib, layout.budget_gib)
+
+        cfg["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
+        cfg["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
+        notes = resolve_memory_settings(cfg, roles, memory)
+        self.assertEqual(cfg["gen_micro_batch"], 8)
+        self.assertTrue(any("24.0 GiB runtime reserve" in note
+                            for note in notes))
+
     def test_four_l40s_run_keeps_four_qwen8b_rollout_replicas(self):
         roles = allocate_gpu_roles([0, 1, 2, 3], "erdos")
         memory = {
