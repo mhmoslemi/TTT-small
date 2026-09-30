@@ -272,12 +272,15 @@ def _effective_max_length(cfg: dict) -> int:
 def _resolved_vllm_utilization(raw_value, total_gib: float,
                                free_gib: float) -> float:
     if _auto(raw_value):
-        # Size the allocator from memory that is actually free, retaining a
-        # 6-GiB CUDA/runtime reserve.  A former 50% floor could request more
-        # memory than existed (for example 47.8 GiB on a card with 45 GiB
-        # free), after which the startup preflight rejected its own auto value.
-        util = min(0.90, (free_gib - 6.0) / max(total_gib, 1.0))
-        return max(0.10, util)
+        # Generation and training alternate residency.  Configuration is
+        # resolved before the trainer has necessarily finished offloading, so
+        # launch-time ``free_gib`` is a transient observation and must not
+        # permanently shrink every vLLM engine in the run.  Plan against the
+        # steady-state card capacity here; GenerationPool applies the absolute
+        # phase reserve and performs a fresh free-memory admission check after
+        # the trainer/peer pool has been offloaded.
+        del total_gib, free_gib
+        return 0.90
     util = float(raw_value)
     if not 0.0 < util <= 1.0:
         raise ValueError("vllm_gpu_memory_utilization must be auto or in (0, 1]")
@@ -332,13 +335,14 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
     util = _resolved_vllm_utilization(raw_util, min_total, min_free)
     if _auto(raw_util):
-        # Leave at least 6 GiB outside vLLM and never claim more than 90% of a
-        # card. Account for memory already occupied before startup as well.
+        # Resolve to the steady-state allocator target.  Absolute phase
+        # reserves are accounted for below and current occupancy is validated
+        # immediately before GenerationPool starts its engines.
         cfg["vllm_gpu_memory_utilization"] = round(util, 3)
         if using_vllm:
             notes.append(f"vLLM memory utilization={util:.3f} "
-                         f"(minimum generation GPU free={min_free:.1f}/"
-                         f"{min_total:.1f} GiB)")
+                         f"(steady-state total={min_total:.1f} GiB/GPU; "
+                         "live free memory checked at pool startup)")
     else:
         cfg["vllm_gpu_memory_utilization"] = util
 
@@ -477,6 +481,11 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         return 32
     if "qwen3-32b" in name:
         return 64
+    if "deepseek-r1-distill-qwen-32b" in name:
+        # This checkpoint is distilled into the Qwen2.5-32B architecture.
+        # Knowing its 40 query heads lets eight GPUs form four independent
+        # TP=2 engines instead of conservatively forcing one TP=8 engine.
+        return 40
     if "qwen3-8b" in name:
         return 32
     if "gpt-oss-20b" in name:

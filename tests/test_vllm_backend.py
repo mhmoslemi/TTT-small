@@ -821,6 +821,63 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertTrue(any("24.0 GiB runtime reserve" in note
                             for note in notes))
 
+    def test_transient_low_free_gpu_does_not_collapse_qwen32_replicas(self):
+        """A previous phase may still occupy one card during config parsing."""
+        roles = allocate_gpu_roles(list(range(8)), "erdos")
+        memory = {
+            gpu_id: GPUMemory(
+                gpu_id, "RTX PRO 6000", 94.97,
+                19.6 if gpu_id == 7 else 93.2)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "Qwen/Qwen3-32B",
+            "generation_backend": "vllm",
+            "max_seq_length": 32768,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_runtime_reserve_gib": 24.0,
+        }
+
+        layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, detect_attention_heads(cfg["model_name"]))
+
+        self.assertEqual(layout.tensor_parallel_size, 2)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 4)
+
+    def test_deepseek_r1_distill_qwen32_uses_four_tp2_engines(self):
+        roles = allocate_gpu_roles(list(range(8)), "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 94.97, 93.2)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+            "generation_backend": "vllm",
+            "max_seq_length": 131072,
+            "memory": False,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_runtime_reserve_gib": 16.0,
+        }
+
+        heads = detect_attention_heads(cfg["model_name"])
+        layout = derive_vllm_parallel_layout(cfg, roles, memory, heads)
+        cfg["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
+        cfg["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
+        cfg["vllm_max_num_batched_tokens"] = "auto"
+        cfg["gen_micro_batch"] = "auto"
+        cfg["logprob_chunk"] = "auto"
+        resolve_memory_settings(cfg, roles, memory)
+
+        self.assertEqual(heads, 40)
+        self.assertEqual(layout.tensor_parallel_size, 2)
+        self.assertEqual(layout.pipeline_parallel_size, 1)
+        self.assertEqual(layout.replicas, 4)
+        self.assertEqual(cfg["gen_micro_batch"], 2)
+
     def test_four_l40s_run_keeps_four_qwen8b_rollout_replicas(self):
         roles = allocate_gpu_roles([0, 1, 2, 3], "erdos")
         memory = {
@@ -2344,7 +2401,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(strategy_layout.pipeline_parallel_size, 1)
         self.assertEqual(strategy_layout.replicas, 8)
 
-    def test_auto_vllm_budget_never_exceeds_current_free_memory(self):
+    def test_auto_vllm_budget_uses_steady_state_capacity(self):
         roles = allocate_gpu_roles(list(range(8)), "circle_packing")
         memory = {
             gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 95.6, 45.0)
@@ -2368,9 +2425,8 @@ class VLLMBackendTests(unittest.TestCase):
 
         requested_gib = (
             memory[0].total_gib * cfg["vllm_gpu_memory_utilization"])
-        self.assertAlmostEqual(
-            cfg["vllm_gpu_memory_utilization"], 0.408, places=3)
-        self.assertLessEqual(requested_gib, memory[0].free_gib - 5.9)
+        self.assertEqual(cfg["vllm_gpu_memory_utilization"], 0.9)
+        self.assertGreater(requested_gib, memory[0].free_gib)
         self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
 
     def test_gpu_mode_roles_type_and_replica_count_come_from_inventory(self):

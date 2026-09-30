@@ -1639,10 +1639,21 @@ def load_config():
                 strategy_heads = detect_attention_heads(strategy_name)
                 strategy_layout = derive_vllm_parallel_layout(
                     strategy_layout_cfg, roles, memory, strategy_heads)
+                strategy_layout_cfg["vllm_tensor_parallel_size"] = (
+                    strategy_layout.tensor_parallel_size)
+                strategy_layout_cfg["vllm_pipeline_parallel_size"] = (
+                    strategy_layout.pipeline_parallel_size)
+                for note in resolve_memory_settings(
+                        strategy_layout_cfg, roles, memory):
+                    print(f"[memory] auto strategy: {note}")
                 merged["strategy_vllm_tensor_parallel_size"] = (
                     strategy_layout.tensor_parallel_size)
                 merged["strategy_vllm_pipeline_parallel_size"] = (
                     strategy_layout.pipeline_parallel_size)
+                merged["strategy_gen_micro_batch"] = int(
+                    strategy_layout_cfg["gen_micro_batch"])
+                merged["strategy_vllm_max_num_batched_tokens"] = int(
+                    strategy_layout_cfg["vllm_max_num_batched_tokens"])
                 validate_attention_heads(
                     strategy_heads,
                     strategy_layout.tensor_parallel_size,
@@ -9862,12 +9873,18 @@ def main():
                     "model_name": cfg.strategy_model_name,
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
+                    "gen_micro_batch": getattr(
+                        cfg, "strategy_gen_micro_batch",
+                        cfg.gen_micro_batch),
                     "vllm_quantization": (
                         cfg.strategy_vllm_quantization),
                     "vllm_tensor_parallel_size": (
                         cfg.strategy_vllm_tensor_parallel_size),
                     "vllm_pipeline_parallel_size": (
                         cfg.strategy_vllm_pipeline_parallel_size),
+                    "vllm_max_num_batched_tokens": getattr(
+                        cfg, "strategy_vllm_max_num_batched_tokens",
+                        cfg.vllm_max_num_batched_tokens),
                     "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
                     "vllm_token_scoring": False,
                     "vllm_persistent_workers": getattr(
