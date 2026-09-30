@@ -58,6 +58,7 @@ _STRATEGY_FINAL_MARKERS = (
 _LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
 _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
 _QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
+_FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
 
 
 def _is_exact_qwen3_8b(model_name):
@@ -2312,6 +2313,28 @@ def compute_batched_token_logprobs(
     return gathered_examples
 
 
+def _requires_fused_long_singleton(cfg, sequence_tokens):
+    """Whether one long trajectory should use unmasked fused attention.
+
+    Multi-example batches require padding or the custom shared-prefix mask and
+    therefore cannot enter the exact full-sequence Flash-SDPA path.  Keep the
+    configured microbatch cap for ordinary trajectories, but isolate genuinely
+    long ones when the user explicitly enabled fused long attention.
+    """
+    return bool(
+        getattr(cfg, "fused_long_attention", False)
+        and int(sequence_tokens) >= _FUSED_LONG_SINGLETON_MIN_TOKENS
+    )
+
+
+def _exceeds_fused_long_pack(cfg, packed_tokens):
+    """Prevent a masked multi-example pack from becoming a long sequence."""
+    return bool(
+        getattr(cfg, "fused_long_attention", False)
+        and int(packed_tokens) >= _FUSED_LONG_SINGLETON_MIN_TOKENS
+    )
+
+
 def _training_microbatches(examples, cfg, *, partition_key=None):
     """Length-bucket examples into real model batches.
 
@@ -2344,10 +2367,21 @@ def _training_microbatches(examples, cfg, *, partition_key=None):
         for example in ordered:
             length = int(example["prompt_ids"].shape[1]
                          + example["response_ids"].shape[1])
+            if _requires_fused_long_singleton(cfg, length):
+                if current:
+                    batches.append(current)
+                    current = []
+                    current_max = 0
+                batches.append([example])
+                continue
             next_max = max(current_max, length)
             exceeds_tokens = bool(
                 current and next_max * (len(current) + 1) > token_cap)
-            if current and (len(current) >= example_cap or exceeds_tokens):
+            exceeds_fused_pack = bool(
+                current and _exceeds_fused_long_pack(
+                    cfg, next_max * (len(current) + 1)))
+            if current and (len(current) >= example_cap or exceeds_tokens
+                            or exceeds_fused_pack):
                 batches.append(current)
                 current = []
                 current_max = 0
@@ -2477,20 +2511,22 @@ def _gradient_checkpointing_work_units(batches):
 
 
 def _run_oom_resilient_backward(
-        model, batches, attempt, *, device_label, expand_memory=None):
+        model, batches, attempt, *, device_label, expand_memory=None,
+        start_checkpointed=False, start_with_headroom=False):
     """Retry with checkpointing, smaller batches, and memory fallbacks.
 
     Each attempt starts the local replica's gradients from zero, so an OOM
-    during backward cannot double-count a partially accumulated microbatch. A
-    workload first runs without transformer gradient checkpointing. On OOM the
-    same workload is retried with checkpointing before its batches are split.
+    during backward cannot double-count a partially accumulated microbatch.
+    Ordinary workloads first run without transformer gradient checkpointing.
+    A caller that has identified an exact fused long singleton can start with
+    checkpointing and reserved GPU headroom, avoiding known-failing attempts.
+    Otherwise an OOM retries with checkpointing before batches are split.
     The learned safe work cap, checkpointing threshold, CPU-offload threshold,
     and reserved-headroom threshold are retained on the persistent model, so
     comparable later batches start directly in the proven execution mode.
-    Once batches reach one example, saved-tensor CPU offload is tried. Fast
-    training may then provide ``expand_memory`` to use the card headroom that
-    normal adaptive batches deliberately reserve. A truly untrainable outlier
-    is quarantined only after every exact fallback has failed.
+    Once batches reach one example, fast training uses reserved card headroom
+    before the much slower saved-tensor CPU offload. A truly untrainable
+    outlier is quarantined only after every exact fallback has failed.
     """
     import gc
     import torch
@@ -2524,8 +2560,11 @@ def _run_oom_resilient_backward(
         work = _gradient_checkpointing_work_units(active)
         wanted = bool(
             checkpointing_available
-            and checkpoint_threshold is not None
-            and work >= int(checkpoint_threshold)
+            and (
+                bool(start_checkpointed)
+                or (checkpoint_threshold is not None
+                    and work >= int(checkpoint_threshold))
+            )
         )
         if wanted != checkpointing:
             if not set_gradient_checkpointing(model, wanted):
@@ -2535,17 +2574,18 @@ def _run_oom_resilient_backward(
         return work
 
     active_work = select_checkpointing()
+    headroom_min_work = profile.get("headroom_min_work")
+    if ((bool(start_with_headroom)
+         or (headroom_min_work is not None
+             and active_work >= int(headroom_min_work)))
+            and expand_memory is not None):
+        expanded_fraction = expand_memory()
+        memory_expanded = expanded_fraction is not None
     offload_min_work = profile.get("activation_offload_min_work")
     if (offload_min_work is not None
             and active_work >= int(offload_min_work)
             and hasattr(torch.autograd.graph, "save_on_cpu")):
         activation_offload = True
-    headroom_min_work = profile.get("headroom_min_work")
-    if (headroom_min_work is not None
-            and active_work >= int(headroom_min_work)
-            and expand_memory is not None):
-        expanded_fraction = expand_memory()
-        memory_expanded = expanded_fraction is not None
 
     reused_modes = []
     if reused_split:
@@ -2560,8 +2600,18 @@ def _run_oom_resilient_backward(
     if reused_modes:
         signature = tuple(reused_modes)
         if getattr(model, "_ttt_reported_oom_profile", None) != signature:
+            mode_source = (
+                "starting long-sequence mode"
+                if start_checkpointed or start_with_headroom else
+                "reusing learned safe mode"
+            )
+            log_prefix = (
+                "[train-memory]"
+                if start_checkpointed or start_with_headroom else
+                "[train-oom]"
+            )
             print(
-                f"[train-oom] {device_label}: reusing learned safe mode "
+                f"{log_prefix} {device_label}: {mode_source} "
                 f"({', '.join(reused_modes)})",
                 flush=True,
             )
@@ -2640,27 +2690,28 @@ def _run_oom_resilient_backward(
                       f"microbatch {max(len(batch) for batch in active)}",
                       flush=True)
                 continue
-            if cuda_oom and not activation_offload and hasattr(
-                    torch.autograd.graph, "save_on_cpu"):
-                activation_offload = True
-                offload_trigger_work = active_work
-                print(f"[train-oom] {device_label}: singleton OOM; retrying "
-                      "with saved activations offloaded to CPU", flush=True)
-                continue
-            if (cuda_oom and activation_offload and not memory_expanded
+            if (cuda_oom and not memory_expanded
                     and expand_memory is not None):
                 expanded_fraction = expand_memory()
                 if expanded_fraction is not None:
                     memory_expanded = True
                     headroom_trigger_work = active_work
                     print(
-                        f"[train-oom] {device_label}: singleton still exceeds "
-                        "the normal ceiling; retrying the exact update with "
+                        f"[train-oom] {device_label}: singleton OOM; retrying "
+                        "the exact update with "
                         f"reserved GPU headroom (allocator cap "
                         f"{100.0 * float(expanded_fraction):.1f}%)",
                         flush=True,
                     )
                     continue
+            if cuda_oom and not activation_offload and hasattr(
+                    torch.autograd.graph, "save_on_cpu"):
+                activation_offload = True
+                offload_trigger_work = active_work
+                print(f"[train-oom] {device_label}: singleton still OOM after "
+                      "GPU headroom; retrying with saved activations offloaded "
+                      "to CPU", flush=True)
+                continue
 
             victim_index = max(
                 range(len(active)),

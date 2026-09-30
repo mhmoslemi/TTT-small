@@ -225,6 +225,11 @@ def _disable_fused_long_attention(reason):
         _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = True
 
 
+def fused_long_attention_is_active():
+    """Whether scheduling should still isolate long full-sequence calls."""
+    return bool(_FUSED_LONG_ATTENTION and not _FUSED_LONG_ATTENTION_DISABLED)
+
+
 def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
     """Return exact fused causal attention, or None when unsupported.
 
@@ -255,12 +260,18 @@ def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
                 enable_gqa=bool(groups != 1),
             )
     except torch.OutOfMemoryError:
-        # The outer OOM-resilient trainer will retry this batch. Disable this
-        # path first so that retry immediately uses bounded blockwise attention.
-        _disable_fused_long_attention("CUDA OOM")
+        # This can be an activation/model-memory OOM rather than a failure of
+        # Flash SDPA itself.  Keep the fused kernel enabled so the outer
+        # trainer can retry the same exact attention with checkpointing and
+        # additional allocator headroom.  Permanently falling back here makes
+        # every later long rollout use the much slower blockwise kernel.
         raise
     except (TypeError, RuntimeError) as error:
         message = str(error).lower()
+        if "out of memory" in message:
+            # Some PyTorch/CUDA combinations surface allocator failures as a
+            # plain RuntimeError rather than torch.OutOfMemoryError.
+            raise
         unsupported = (
             isinstance(error, TypeError)
             or "no available kernel" in message

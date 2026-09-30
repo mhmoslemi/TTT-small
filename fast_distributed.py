@@ -42,20 +42,30 @@ def _shared_prefix_token_count(batch):
         for example in batch)
 
 
-def _take_shared_prefix_chunk(examples, token_budget, example_cap=64):
+def _take_shared_prefix_chunk(examples, token_budget, example_cap=64,
+                              singleton_predicate=None,
+                              packed_token_limit=None):
     """Take the largest leading exact-prefix pack within the token budget."""
     examples = list(examples)
     if not examples:
         return [], []
+    if singleton_predicate is not None and singleton_predicate(examples[0]):
+        return examples[:1], examples[1:]
     prompt = int(examples[0]["prompt_ids"].shape[1])
     used = prompt
     count = 0
     for example in examples:
-        contribution = max(0, int(example["response_ids"].shape[1]) - 1)
-        if count and (count >= int(example_cap)
-                      or used + contribution > int(token_budget)):
+        if count and singleton_predicate is not None and singleton_predicate(
+                example):
             break
-        used += contribution
+        contribution = max(0, int(example["response_ids"].shape[1]) - 1)
+        next_used = used + contribution
+        if count and (count >= int(example_cap)
+                      or next_used > int(token_budget)
+                      or (packed_token_limit is not None
+                          and next_used >= int(packed_token_limit))):
+            break
+        used = next_used
         count += 1
     count = max(1, count)
     return examples[:count], examples[count:]
@@ -156,10 +166,10 @@ def set_long_rollout_memory_ceiling(
         logical_id, fraction=LONG_ROLLOUT_MEMORY_FRACTION):
     """Use reserved card headroom for an otherwise untrainable singleton.
 
-    This is reached only after the batch has been reduced to one rollout and
-    saved activations have already been moved to CPU. External allocations
-    (including sleeping vLLM processes and NCCL) remain part of the total, so
-    the final four percent of the card is still left untouched.
+    This is used after the batch has been reduced to one rollout and before
+    resorting to saved-activation CPU offload. External allocations (including
+    sleeping vLLM processes and NCCL) remain part of the total, so the final
+    four percent of the card is still left untouched.
     """
     return _set_total_memory_ceiling(
         logical_id, fraction,
@@ -896,6 +906,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     from contextlib import nullcontext
     import torch
     import train_multy_CVaR as training
+    from model_backend import fused_long_attention_is_active
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           feedback_advantage)
 
@@ -950,6 +961,19 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             example["prompt_ids"].shape[1]
             + example["response_ids"].shape[1])
 
+    def needs_fused_long_singleton(example):
+        return bool(
+            fused_long_attention_is_active()
+            and training._requires_fused_long_singleton(
+                cfg, example_length(example))
+        )
+
+    def fused_pack_limit():
+        if (fused_long_attention_is_active()
+                and getattr(cfg, "fused_long_attention", False)):
+            return training._FUSED_LONG_SINGLETON_MIN_TOKENS
+        return None
+
     configured_example_cap = max(
         1, int(getattr(cfg, "train_examples_per_microbatch", 1) or 1))
     max_examples_per_batch = (
@@ -964,11 +988,19 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 return []
             batch = [pending.pop()]
             maximum = example_length(batch[0])
+            if needs_fused_long_singleton(batch[0]):
+                return batch
             while pending and len(batch) < max_examples_per_batch:
                 candidate = pending[-1]
+                if needs_fused_long_singleton(candidate):
+                    break
                 candidate_length = example_length(candidate)
                 next_maximum = max(maximum, candidate_length)
-                if next_maximum * (len(batch) + 1) > budget:
+                next_padded_tokens = next_maximum * (len(batch) + 1)
+                pack_limit = fused_pack_limit()
+                if (next_padded_tokens > budget
+                        or (pack_limit is not None
+                            and next_padded_tokens >= pack_limit)):
                     break
                 batch.append(pending.pop())
                 maximum = next_maximum
@@ -984,7 +1016,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             nonlocal queue_finished, deferred, prefix_remainder
             if prefix_remainder:
                 batch, prefix_remainder = _take_shared_prefix_chunk(
-                    prefix_remainder, budget, max_examples_per_batch)
+                    prefix_remainder, budget, max_examples_per_batch,
+                    singleton_predicate=needs_fused_long_singleton,
+                    packed_token_limit=fused_pack_limit())
                 return batch
             if queue_finished and deferred is None:
                 return []
@@ -999,10 +1033,14 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                     and SHARED_PREFIX_WORK_KEY in first):
                 batch, prefix_remainder = _take_shared_prefix_chunk(
                     first[SHARED_PREFIX_WORK_KEY], budget,
-                    max_examples_per_batch)
+                    max_examples_per_batch,
+                    singleton_predicate=needs_fused_long_singleton,
+                    packed_token_limit=fused_pack_limit())
                 return batch
             batch = [first]
             maximum = example_length(first)
+            if needs_fused_long_singleton(first):
+                return batch
             while (not queue_finished
                    and len(batch) < max_examples_per_batch):
                 candidate = work_queue.get()
@@ -1013,9 +1051,16 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         and SHARED_PREFIX_WORK_KEY in candidate):
                     deferred = candidate
                     break
+                if needs_fused_long_singleton(candidate):
+                    deferred = candidate
+                    break
                 candidate_length = example_length(candidate)
                 next_maximum = max(maximum, candidate_length)
-                if next_maximum * (len(batch) + 1) > budget:
+                next_padded_tokens = next_maximum * (len(batch) + 1)
+                pack_limit = fused_pack_limit()
+                if (next_padded_tokens > budget
+                        or (pack_limit is not None
+                            and next_padded_tokens >= pack_limit)):
                     deferred = candidate
                     break
                 batch.append(candidate)
@@ -1028,6 +1073,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
         if not cpu_batch:
             break
         requested_padded_tokens = _padded_token_count(cpu_batch)
+        fused_long_singleton = bool(
+            len(cpu_batch) == 1
+            and needs_fused_long_singleton(cpu_batch[0]))
 
         with torch.cuda.device(logical_id):
             base_allocated = int(torch.cuda.memory_allocated())
@@ -1186,7 +1234,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 training._run_oom_resilient_backward(
                     model, [local_batch], attempt,
                     device_label=f"cuda:{logical_id}",
-                    expand_memory=expand_for_long_rollout))
+                    expand_memory=expand_for_long_rollout,
+                    start_checkpointed=fused_long_singleton,
+                    start_with_headroom=fused_long_singleton))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
