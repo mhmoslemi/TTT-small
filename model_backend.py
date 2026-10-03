@@ -390,6 +390,17 @@ def _ttt_blockwise_attention_forward(
     """
     import torch.nn.functional as F
 
+    # GPT-OSS normalizes every attention row together with a learned sink
+    # logit. Plain SDPA/FlashAttention has no representation for that extra
+    # denominator term, so accepting s_aux here would silently change both
+    # forward probabilities and LoRA gradients. GPT-OSS is deliberately kept
+    # on Unsloth's sink-aware implementation instead.
+    attention_sinks = kwargs.get("s_aux", getattr(module, "sinks", None))
+    if attention_sinks is not None:
+        raise RuntimeError(
+            "ttt_blockwise_attention cannot preserve learned attention "
+            "sinks; use the GPT-OSS sink-aware Unsloth training backend")
+
     shared_layout = _shared_prefix_attention_layout(attention_mask)
     if shared_layout is not None:
         if int(query.shape[0]) != 1:
@@ -418,6 +429,10 @@ def _ttt_blockwise_attention_forward(
         and sliding_window is None
         and query_length == key_length
         and query_length > 1
+        # Different fused/blockwise dropout kernels consume RNG differently.
+        # Restrict the interchangeable fast path to deterministic attention;
+        # all supported large-coder checkpoints configure dropout=0.
+        and float(dropout) == 0.0
     )
     if fused_eligible:
         fused = _try_fused_long_attention(
@@ -683,6 +698,120 @@ def _configure_exact_long_training(model, cfg):
     return model
 
 
+def _validate_gpt_oss_training_attention(model, cfg):
+    """Refuse attention backends that drop GPT-OSS's pretrained semantics."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
+        return
+
+    config = getattr(model, "config", None)
+    if str(getattr(config, "model_type", "")).lower() != "gpt_oss":
+        raise RuntimeError(
+            "GPT-OSS coder profile loaded a non-GPT-OSS training config")
+
+    layer_types = tuple(getattr(config, "layer_types", ()) or ())
+    if not ({"full_attention", "sliding_attention"} <= set(layer_types)):
+        raise RuntimeError(
+            "GPT-OSS training config lost its alternating full/sliding "
+            "attention layout")
+    sink_modules = sum(
+        1 for module in model.modules()
+        if getattr(module, "sinks", None) is not None)
+    if sink_modules < 1:
+        raise RuntimeError(
+            "GPT-OSS training model has no learned attention-sink modules")
+
+    implementation = getattr(config, "_attn_implementation", None)
+    if isinstance(implementation, dict):
+        implementation = (
+            implementation.get("")
+            or implementation.get("text_config")
+            or implementation.get("model")
+        )
+    implementation = str(implementation or "eager").lower()
+    unsafe = (
+        implementation == "sdpa"
+        or implementation == _hf_training_attention_implementation()
+        or implementation.startswith("flash_attention")
+    )
+    if unsafe:
+        raise RuntimeError(
+            f"GPT-OSS training selected {implementation!r}, which cannot "
+            "preserve learned attention sinks during backward; expected "
+            "Unsloth's sink-aware eager/flex implementation")
+
+    model._ttt_attention_backend = f"gpt-oss-sink-aware:{implementation}"
+    print(
+        "[memory] GPT-OSS exact long attention: sink-aware "
+        f"{implementation} via Unsloth; generic Flash-SDPA is prohibited",
+        flush=True,
+    )
+
+
+def _validate_hf_training_attention(model, cfg):
+    """Validate the structural assumptions behind exact fused Qwen training."""
+    profile = str(getattr(cfg, "coder_model_profile", ""))
+    if profile not in {
+            "qwen3-30b-a3b-thinking-2507", "qwen3.8-27b"}:
+        return
+
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            text_config = get_text_config()
+        except (AttributeError, TypeError):
+            text_config = config
+    else:
+        text_config = getattr(config, "text_config", None) or config
+
+    implementation = getattr(text_config, "_attn_implementation", None)
+    if isinstance(implementation, dict):
+        implementation = (
+            implementation.get("")
+            or implementation.get("text_config")
+            or implementation.get("model")
+        )
+    if str(implementation) != _hf_training_attention_implementation():
+        raise RuntimeError(
+            f"{profile} did not install the exact TTT attention backend "
+            f"(got {implementation!r})")
+
+    attention_dropout = float(
+        getattr(text_config, "attention_dropout", 0.0) or 0.0)
+    if attention_dropout != 0.0:
+        raise RuntimeError(
+            f"{profile} now configures attention_dropout="
+            f"{attention_dropout}; fused and blockwise dropout consume "
+            "different RNG streams, so refusing to claim equivalent "
+            "training behavior")
+
+    if any(getattr(module, "sinks", None) is not None
+           for module in model.modules()):
+        raise RuntimeError(
+            f"{profile} unexpectedly contains learned attention sinks; "
+            "generic Flash-SDPA cannot preserve their normalization")
+
+    layer_types = tuple(getattr(text_config, "layer_types", ()) or ())
+    if profile == "qwen3.8-27b":
+        if not ({"linear_attention", "full_attention"} <= set(layer_types)):
+            raise RuntimeError(
+                "Qwen3.8 training config lost its expected hybrid "
+                "Gated-DeltaNet/full-attention layout")
+        detail = (
+            "Flash-SDPA for eligible full-attention layers; exact FLA "
+            "Gated-DeltaNet; independent rollout states")
+    else:
+        if "linear_attention" in layer_types:
+            raise RuntimeError(
+                f"{profile} unexpectedly contains stateful linear-attention "
+                "layers")
+        detail = "Flash-SDPA for eligible full-attention calls"
+
+    model._ttt_attention_backend = f"qwen-exact:{implementation}"
+    print(f"[memory] {profile} exact long attention: {detail}; "
+          "exact bounded fallback retained", flush=True)
+
+
 # ======================================================================
 # Unsloth backend
 # ======================================================================
@@ -725,6 +854,7 @@ class UnslothBackend(_ModelPlacementBackend):
                if _training_max_memory(self.cfg) else {}),
         )
         self._remember_training_placement(model)
+        _validate_gpt_oss_training_attention(model, self.cfg)
         target_modules = _resolve_lora_target_modules(
             self.cfg, getattr(model, "config", None))
         print("[backend=unsloth] attaching LoRA ...")
@@ -872,6 +1002,7 @@ class HFBackend(_ModelPlacementBackend):
         model = AutoModelForCausalLM.from_pretrained(
             training_name, **model_kwargs)
         self._remember_training_placement(model)
+        _validate_hf_training_attention(model, self.cfg)
 
         if use_4bit:
             if _expert_count(hf_config) > 0:

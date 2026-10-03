@@ -20,6 +20,10 @@ def _shared_prefix_examples(batch):
     batch = list(batch or ())
     if len(batch) < 2:
         return False
+    if not all(
+            bool(example.get("_shared_prefix_packing_allowed", True))
+            for example in batch):
+        return False
     prompt_job_id = batch[0].get("prompt_job_id")
     if prompt_job_id is None:
         return False

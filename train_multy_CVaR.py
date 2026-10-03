@@ -2264,6 +2264,14 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
     if str(getattr(decoder_config, "_attn_implementation", "")) != (
             "ttt_blockwise_attention"):
         return None
+    # Hybrid Gated-DeltaNet layers carry a recurrent state along the sequence.
+    # A custom mask isolates the full-attention layers, but cannot reset that
+    # recurrent state between concatenated response branches. Score hybrid
+    # models as ordinary padded batch rows so every rollout has independent
+    # state, matching the original one-rollout forward exactly.
+    layer_types = tuple(getattr(decoder_config, "layer_types", ()) or ())
+    if "linear_attention" in layer_types:
+        return None
 
     prompt = examples[0]["prompt_ids"]
     if prompt.ndim != 2 or int(prompt.shape[0]) != 1:
@@ -2705,6 +2713,9 @@ def _gradient_checkpointing_work_units(batches):
         shared_prefix = bool(
             len(batch) > 1
             and prompt_job_id is not None
+            and all(bool(example.get(
+                "_shared_prefix_packing_allowed", True))
+                    for example in batch)
             and all(
                 example.get("prompt_job_id") == prompt_job_id
                 and tuple(example["prompt_ids"].shape)
@@ -5764,7 +5775,22 @@ class ProcessDistributedTrainer:
             return total * total + response * maximum_length
 
         copied = self._cpu_examples(examples)
-        if bool(getattr(self.cfg, "strategies", False)):
+        # Packing response branches behind one shared prompt is exact for
+        # ordinary transformer attention because the registered branch mask
+        # isolates every response.  It is not valid for GPT-OSS (learned
+        # attention sinks and alternating sliding attention), nor for
+        # Qwen3.8's recurrent Gated-DeltaNet layers, whose state cannot be
+        # reset by an attention mask.  Keep those profiles as independent
+        # batch rows throughout scheduling and scoring.
+        shared_prefix_packing = str(getattr(
+            self.cfg, "coder_model_profile", "")) not in {
+                "gpt-oss-120b", "qwen3.8-27b",
+            }
+        for example in copied:
+            example["_shared_prefix_packing_allowed"] = shared_prefix_packing
+
+        if (bool(getattr(self.cfg, "strategies", False))
+                and shared_prefix_packing):
             from fast_distributed import SHARED_PREFIX_WORK_KEY
 
             grouped = {}
@@ -9825,8 +9851,20 @@ def main():
               f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
               f"reasoning_effort={cfg.strategy_reasoning_effort}")
     print(f"Max seq length:     {cfg.max_seq_length}")
-    print(f"Fused long attention: "
-          f"{'on' if cfg.fused_long_attention else 'off'}")
+    if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
+        fused_attention_label = (
+            "GPT-OSS sink-aware Unsloth path "
+            "(generic Flash-SDPA prohibited)")
+    elif getattr(cfg, "coder_model_profile", "") == "qwen3.8-27b":
+        fused_attention_label = (
+            "on for full-attention layers; exact FLA for Gated DeltaNet")
+    elif (getattr(cfg, "coder_model_profile", "")
+          == "qwen3-30b-a3b-thinking-2507"):
+        fused_attention_label = "on (exact Qwen full-attention path)"
+    else:
+        fused_attention_label = (
+            "on" if cfg.fused_long_attention else "off")
+    print(f"Fused long attention: {fused_attention_label}")
     print(f"Train microbatch:   up to "
           f"{cfg.train_examples_per_microbatch} examples/GPU")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
