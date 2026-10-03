@@ -58,7 +58,64 @@ _STRATEGY_FINAL_MARKERS = (
 _LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
 _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
 _QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
+_GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
+_QWEN3_30B_A3B_THINKING_MODEL_BASENAME = (
+    "qwen3-30b-a3b-thinking-2507")
+_QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
+
+
+_GPT_OSS_CODER_DEVELOPER_INSTRUCTIONS = '''Formatting re-enabled
+
+You are the implementation-only Python coder in a two-stage scientific-
+discovery pipeline. The user message supplies the authoritative task and may
+also contain a previous program, empirical lessons, and a planner-produced
+<strategy> block.
+
+Follow this precedence:
+1. Obey the task's evaluator, mathematical constraints, allowed resources,
+   runtime budget, required function signature, and return contract.
+2. Use the <strategy> as fallible implementation guidance. Preserve useful
+   ideas, but independently correct any mathematical, algorithmic, interface,
+   or feasibility error instead of blindly translating it.
+3. Treat previous programs and empirical lessons as evidence, not authority.
+
+Use the model's analysis channel for private reasoning and verification. The
+final channel is only the code artifact: emit exactly one complete fenced
+Python block beginning with ```python and ending with ```, with no prose,
+strategy, analysis, notes, example usage, or second code block before or after
+it. The program must be syntactically complete, define the requested top-level
+entry point, obey every source-size/data constraint, and close the fence well
+before the response limit. Before producing the final channel, check that the
+code's dimensions, optimization direction, feasibility handling, time-limit
+path, and return values agree with the task as written.'''
+
+
+def _coder_messages_for_template(messages, template_kind):
+    """Apply model-family prompt semantics without touching other coders.
+
+    Transformers' GPT-OSS chat template maps an input ``system`` message to
+    Harmony's developer-instruction role; Harmony itself supplies the actual
+    system header containing reasoning effort and channel declarations. This
+    keeps durable behavior/output rules above the task while leaving the full
+    task, parent state, memory, and strategy in the user message.
+    """
+    if str(template_kind) != "gpt-oss":
+        return messages
+
+    staged = [dict(message) for message in messages]
+    if staged and staged[0].get("role") == "system":
+        existing = str(staged[0].get("content", "")).strip()
+        staged[0]["content"] = _GPT_OSS_CODER_DEVELOPER_INSTRUCTIONS
+        if existing:
+            staged[0]["content"] += (
+                "\n\nAdditional task-specific instructions:\n" + existing)
+    else:
+        staged.insert(0, {
+            "role": "system",
+            "content": _GPT_OSS_CODER_DEVELOPER_INSTRUCTIONS,
+        })
+    return staged
 
 
 def _is_exact_qwen3_8b(model_name):
@@ -75,6 +132,127 @@ def _is_exact_qwen3_30b_a3b(model_name):
     normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
     return normalized.rsplit("/", 1)[-1].lower() == (
         _QWEN3_30B_A3B_MODEL_BASENAME)
+
+
+def _model_basename(model_name):
+    normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].lower()
+
+
+def _coder_model_profile(model_name):
+    """Return the automatic runtime contract for explicitly supported coders."""
+    basename = _model_basename(model_name)
+    if basename == _GPT_OSS_120B_MODEL_BASENAME:
+        return {
+            "name": "gpt-oss-120b",
+            "native_context": 131_072,
+            "max_output": 131_072,
+            "reasoning_effort": "high",
+            "template_kind": "gpt-oss",
+            "training_4bit": True,
+            "training_layout": "auto",
+        }
+    if basename == _QWEN3_30B_A3B_THINKING_MODEL_BASENAME:
+        return {
+            "name": "qwen3-30b-a3b-thinking-2507",
+            "native_context": 262_144,
+            "max_output": 262_144,
+            "reasoning_effort": "thinking-only",
+            "template_kind": "qwen-thinking",
+            "training_4bit": False,
+            "training_layout": "sharded",
+        }
+    if basename == _QWEN38_27B_MODEL_BASENAME:
+        return {
+            "name": "qwen3.8-27b",
+            "native_context": 262_144,
+            "max_output": 262_144,
+            "reasoning_effort": "xhigh",
+            "template_kind": "qwen3.8",
+            "training_4bit": False,
+            "training_layout": "sharded",
+        }
+    return None
+
+
+def _apply_coder_model_profile(merged):
+    """Wire reasoning, context, rollout, and exact-training behavior by model.
+
+    These values are intentionally derived from ``coder_model_name`` (which is
+    copied to ``model_name`` by ``--strategies``). The operator therefore only
+    changes the coder checkpoint; no matching collection of token, reasoning,
+    memory, or training-layout knobs is required.
+    """
+    profile = _coder_model_profile(merged.get("model_name"))
+    if profile is None:
+        merged.pop("coder_model_profile", None)
+        return
+
+    native_context = int(profile["native_context"])
+    context_topup = 0
+    if (bool(merged.get("memory", False))
+            and bool(merged.get("memory_grant_context", True))):
+        context_topup = max(
+            0, int(merged.get("memory_token_budget", 0) or 0))
+    if context_topup >= native_context:
+        raise ValueError(
+            f"memory_token_budget={context_topup} leaves no room inside "
+            f"{profile['name']}'s native {native_context}-token context")
+
+    merged["coder_model_profile"] = str(profile["name"])
+    merged["coder_template_kind"] = str(profile["template_kind"])
+    merged["coder_reasoning_effort"] = str(profile["reasoning_effort"])
+    merged["coder_preserve_thinking"] = bool(
+        profile["template_kind"] == "qwen3.8")
+    # main() adds the memory allowance later. Subtract it here so the final
+    # context, vLLM planner, and model-native ceiling all agree exactly.
+    merged["model_native_context_length"] = native_context
+    merged["max_seq_length"] = native_context - context_topup
+    merged["max_new_tokens"] = int(profile["max_output"])
+    merged["thinking"] = True
+
+    # Native GPT-OSS MXFP4 remains the vLLM checkpoint. Its trainable copy is
+    # selected independently by _resolve_training_model_name below.
+    merged["load_in_4bit"] = bool(profile["training_4bit"])
+    merged["training_model_name"] = ""
+    merged["training_layout"] = str(profile["training_layout"])
+
+    # On the 95+ GiB cards used by this project, the exact checkpoint/KV model
+    # admits one full-context engine per card. Five GiB remains outside vLLM
+    # for CUDA/NCCL and the bounded chosen-token projection. The ordinary
+    # conservative 24-GiB scoring reserve is retained for all other models.
+    merged["vllm_gpu_memory_utilization"] = 0.965
+    merged["vllm_quantization"] = ""
+    merged["gen_micro_batch"] = "auto"
+    merged["vllm_max_num_batched_tokens"] = "auto"
+    merged["vllm_runtime_reserve_override_gib"] = 5.0
+    merged["vllm_staged_loading"] = True
+    # Final TP=1 admission is decided after nvidia-smi identifies the cards.
+    # Blackwell can consume GPT-OSS's native MXFP4 layout directly; older
+    # architectures may need a large transient Marlin repack and must retain
+    # the conservative TP>=2 startup guard in gpu_runtime.py.
+    merged["allow_gpt_oss_tp1"] = False
+
+    # Exact long-context training policy. This does not shorten, approximate,
+    # or discard a trajectory. It selects exact memory-saving execution modes
+    # before known-failing ordinary attempts and raises if all exact modes are
+    # exhausted.
+    merged["strict_exact_long_training"] = True
+    merged["fused_long_attention"] = True
+    merged["long_training_checkpoint_min_tokens"] = 16_384
+    merged["long_training_headroom_min_tokens"] = 32_768
+    # CPU activation traffic is much slower than recomputation. Use it only
+    # after an actual OOM proves it necessary; the persistent OOM profile then
+    # starts comparable later trajectories in that exact fallback directly.
+    merged["long_training_cpu_offload_min_tokens"] = None
+
+    print(
+        f"[model-profile] {profile['name']}: native context="
+        f"{native_context}, max generated tokens={profile['max_output']}, "
+        f"reasoning={profile['reasoning_effort']}, rollout target=one "
+        "TP=1 engine/GPU; exact long-context training enabled",
+        flush=True,
+    )
 
 
 def _uses_sequence_level_policy_ratio(cfg):
@@ -1213,6 +1391,10 @@ def load_config():
                 merged["training_model_name"] = str(
                     merged.get("coder_training_model_name") or "").strip()
 
+    # Resolve after the hierarchy chooses its coder and before validating the
+    # resulting training layout and precision.
+    _apply_coder_model_profile(merged)
+
     training_layout = str(
         merged.get("training_layout") or "auto").strip().lower()
     if training_layout not in {"auto", "replicated", "sharded"}:
@@ -1502,6 +1684,26 @@ def load_config():
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
 
+    if merged.get("coder_model_profile") == "gpt-oss-120b":
+        generation_cards = [
+            memory[gpu_id] for gpu_id in gpu_ids if gpu_id in memory]
+        native_mxfp4_cards = bool(generation_cards) and all(
+            ("blackwell" in card.name.lower()
+             or "rtx pro 6000" in card.name.lower())
+            for card in generation_cards
+        )
+        # A CPU-only configuration inspection has no device evidence, so keep
+        # the conservative guard. On the target RTX PRO 6000 Blackwell host,
+        # this admits eight independent TP=1 engines over eight cards.
+        merged["allow_gpt_oss_tp1"] = native_mxfp4_cards
+        if native_mxfp4_cards:
+            print("[model-profile] GPT-OSS native MXFP4 Blackwell path: "
+                  "TP=1 rollout engines admitted")
+        else:
+            print("[model-profile] GPT-OSS TP=1 native-MXFP4 support was not "
+                  "confirmed on every rollout GPU; retaining automatic "
+                  "TP sharding")
+
     merged["training_model_name"] = _resolve_training_model_name(
         merged.get("model_name", ""), merged.get("training_model_name"),
         merged.get("load_in_4bit", False),
@@ -1517,6 +1719,12 @@ def load_config():
         print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
+    if (merged.get("coder_model_profile") == "gpt-oss-120b"
+            and merged["backend"] != "unsloth"):
+        raise ValueError(
+            "the automatic GPT-OSS-120B coder profile requires the Unsloth "
+            "BitsAndBytes training backend; native MXFP4 remains the vLLM "
+            "rollout checkpoint but is not differentiable")
     if merged["training_layout"] == "sharded":
         if merged["backend"] != "hf":
             raise ValueError(
@@ -1569,9 +1777,16 @@ def load_config():
         # used the uncapped 90% allocator budget, then process startup lowered
         # it for scoring/sleep residency; Qwen3-32B consequently selected
         # TP=1 even though its 32K KV cache could not fit after that cap.
-        merged["vllm_runtime_reserve_gib"] = vllm_runtime_reserve_gib(
+        automatic_runtime_reserve = vllm_runtime_reserve_gib(
             co_resident_sleep=separate_local_strategy_pool,
             token_scoring=not bool(merged["no_train"]),
+        )
+        profile_runtime_reserve = merged.get(
+            "vllm_runtime_reserve_override_gib")
+        merged["vllm_runtime_reserve_gib"] = (
+            automatic_runtime_reserve
+            if profile_runtime_reserve is None else
+            float(profile_runtime_reserve)
         )
         known_heads = detect_attention_heads(merged.get("model_name", ""))
         layout = derive_vllm_parallel_layout(
@@ -1655,6 +1870,8 @@ def load_config():
                     strategy_layout_cfg["gen_micro_batch"])
                 merged["strategy_vllm_max_num_batched_tokens"] = int(
                     strategy_layout_cfg["vllm_max_num_batched_tokens"])
+                merged["strategy_vllm_runtime_reserve_gib"] = float(
+                    strategy_layout_cfg["vllm_runtime_reserve_gib"])
                 validate_attention_heads(
                     strategy_heads,
                     strategy_layout.tensor_parallel_size,
@@ -2545,6 +2762,8 @@ def _run_oom_resilient_backward(
         active, reused_split = _split_training_batches_to_work_cap(
             active, cached_work_cap)
 
+    strict_exact_training = bool(
+        getattr(model, "_ttt_strict_exact_long_training", False))
     activation_offload = False
     memory_expanded = False
     split_backoff = False
@@ -2574,14 +2793,20 @@ def _run_oom_resilient_backward(
         return work
 
     active_work = select_checkpointing()
-    headroom_min_work = profile.get("headroom_min_work")
+    configured_headroom_min_work = getattr(
+        model, "_ttt_reserved_headroom_min_work", None)
+    headroom_min_work = profile.get(
+        "headroom_min_work", configured_headroom_min_work)
     if ((bool(start_with_headroom)
          or (headroom_min_work is not None
              and active_work >= int(headroom_min_work)))
             and expand_memory is not None):
         expanded_fraction = expand_memory()
         memory_expanded = expanded_fraction is not None
-    offload_min_work = profile.get("activation_offload_min_work")
+    configured_offload_min_work = getattr(
+        model, "_ttt_activation_offload_min_work", None)
+    offload_min_work = profile.get(
+        "activation_offload_min_work", configured_offload_min_work)
     if (offload_min_work is not None
             and active_work >= int(offload_min_work)
             and hasattr(torch.autograd.graph, "save_on_cpu")):
@@ -2724,6 +2949,20 @@ def _run_oom_resilient_backward(
             victim_tokens = int(
                 victim["prompt_ids"].shape[1]
                 + victim["response_ids"].shape[1])
+            if strict_exact_training:
+                set_gradient_checkpointing(model, False)
+                model.zero_grad(set_to_none=True)
+                failure = (
+                    "no compatible exact linear-memory attention kernel"
+                    if kernel_unavailable else
+                    "insufficient memory after checkpointing, reserved "
+                    "headroom, and CPU activation offload"
+                )
+                raise RuntimeError(
+                    f"exact long-context training failed for a "
+                    f"{victim_tokens}-token rollout on {device_label}: "
+                    f"{failure}. The configured coder profile forbids "
+                    "truncating or silently excluding this trajectory.") from error
             quarantined.append(victim)
             # Once the reserved-headroom path was required, keep activations
             # offloaded while checking the remaining long singletons. This
@@ -6835,15 +7074,53 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     int(memory_reservations.get(lesson.id, 0)) + 1)
 
     def _render(messages):
+        template_kind = str(
+            getattr(cfg, "coder_template_kind", "generic"))
+        render_messages = _coder_messages_for_template(
+            messages, template_kind)
+        template_options = {}
+        if template_kind == "gpt-oss":
+            template_options["reasoning_effort"] = str(
+                cfg.coder_reasoning_effort)
+        elif template_kind == "qwen3.8":
+            template_options.update({
+                "enable_thinking": True,
+                "reasoning_effort": str(cfg.coder_reasoning_effort),
+                "preserve_thinking": bool(cfg.coder_preserve_thinking),
+            })
+        elif template_kind == "qwen-thinking":
+            # Thinking-2507 is a thinking-only checkpoint. Its native template
+            # always opens the reasoning channel and deliberately exposes no
+            # lower/higher effort selector, so no template switch is needed.
+            pass
+        else:
+            template_options["enable_thinking"] = bool(cfg.thinking)
         try:
             return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-                enable_thinking=bool(cfg.thinking),
+                render_messages, tokenize=False, add_generation_prompt=True,
+                **template_options,
             )
         except TypeError:
+            # Older Qwen templates may not expose preserve_thinking even when
+            # they support enable_thinking/reasoning_effort. Remove only that
+            # optional history-control argument before the generic fallback.
+            if "preserve_thinking" in template_options:
+                reduced = dict(template_options)
+                reduced.pop("preserve_thinking", None)
+                try:
+                    return tokenizer.apply_chat_template(
+                        render_messages, tokenize=False,
+                        add_generation_prompt=True, **reduced)
+                except TypeError:
+                    pass
+            if template_kind in {"gpt-oss", "qwen3.8"}:
+                raise RuntimeError(
+                    f"the installed tokenizer/chat template cannot apply "
+                    f"the required {template_kind} reasoning controls "
+                    f"{template_options}; update transformers and refresh "
+                    "the model tokenizer files")
             return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+                render_messages, tokenize=False, add_generation_prompt=True)
 
     strategy_tokenizer = strategy_tokenizer or tokenizer
 
@@ -9807,6 +10084,8 @@ def main():
             # generation. Give that vocabulary projection explicit memory
             # headroom; this changes scheduling only, never the scores.
             vllm_token_scoring=not bool(cfg.no_train),
+            vllm_runtime_reserve_gib=float(
+                cfg.vllm_runtime_reserve_gib),
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
         )
@@ -9938,6 +10217,9 @@ def main():
                         cfg.vllm_max_num_batched_tokens),
                     "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
                     "vllm_token_scoring": False,
+                    "vllm_runtime_reserve_gib": float(getattr(
+                        cfg, "strategy_vllm_runtime_reserve_gib",
+                        16.0)),
                     "vllm_persistent_workers": getattr(
                         cfg, "strategy_vllm_persistent_workers", None),
                     "vllm_staged_loading": (

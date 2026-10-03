@@ -629,6 +629,17 @@ def _prepare_sparse_moe_for_kbit_training(model):
 def _resolve_lora_target_modules(cfg, model_config):
     """Avoid allocating a separate large LoRA across every MoE expert."""
     targets = list(cfg.target_modules)
+    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+        # Qwen3.8's full-attention blocks use q/k/v/o_proj, while each Gated
+        # DeltaNet block uses four input projections plus out_proj. Keep both
+        # members of every vLLM packed-LoRA group together (qkv+z and b+a), so
+        # the adapter is applied identically by PEFT during training and vLLM
+        # during the following rollout step.
+        for name in (
+                "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+                "out_proj"):
+            if name not in targets:
+                targets.append(name)
     experts = _expert_count(model_config)
     expert_mlp_targets = {"gate_proj", "up_proj", "down_proj"}
     removed = [name for name in targets if name in expert_mlp_targets]
@@ -639,6 +650,37 @@ def _resolve_lora_target_modules(cfg, model_config):
         targets = kept
     cfg.effective_target_modules = tuple(targets)
     return targets
+
+
+def _configure_exact_long_training(model, cfg):
+    """Attach the model-profile execution policy used by every trainer path."""
+    if not bool(getattr(cfg, "strict_exact_long_training", False)):
+        return model
+    model._ttt_strict_exact_long_training = True
+    model._ttt_gradient_checkpointing_min_work = int(getattr(
+        cfg, "long_training_checkpoint_min_tokens", 16_384))
+    model._ttt_reserved_headroom_min_work = int(getattr(
+        cfg, "long_training_headroom_min_tokens", 32_768))
+    cpu_offload_threshold = getattr(
+        cfg, "long_training_cpu_offload_min_tokens", None)
+    model._ttt_activation_offload_min_work = (
+        None if cpu_offload_threshold is None
+        else int(cpu_offload_threshold))
+    offload_description = (
+        "CPU activation offload only after a proven OOM"
+        if model._ttt_activation_offload_min_work is None else
+        "offload saved activations from "
+        f"{model._ttt_activation_offload_min_work}"
+    )
+    print(
+        "[memory] exact long-context policy: checkpoint from "
+        f"{model._ttt_gradient_checkpointing_min_work} work tokens, reserve "
+        f"headroom from {model._ttt_reserved_headroom_min_work}, "
+        f"{offload_description}; "
+        "trajectory exclusion disabled",
+        flush=True,
+    )
+    return model
 
 
 # ======================================================================
@@ -697,6 +739,7 @@ class UnslothBackend(_ModelPlacementBackend):
             random_state=self.cfg.seed,
         )
         set_gradient_checkpointing(model, False)
+        _configure_exact_long_training(model, self.cfg)
         tokenizer = _ensure_pad_token(tokenizer)
 
         if hasattr(model, "generation_config") and model.generation_config is not None:
@@ -780,6 +823,26 @@ class HFBackend(_ModelPlacementBackend):
             trust_remote_code=True,
             attn_implementation=attention_implementation,
         )
+        if str(getattr(self.cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+            # Qwen3.8 interleaves full attention with Gated DeltaNet. Its Hub
+            # inference kernel does not provide the backward implementation we
+            # need here. Require FLA's training-capable chunked GDN kernel and
+            # the matching causal-convolution kernel so Transformers cannot
+            # silently fall back to the token-by-token PyTorch recurrence.
+            missing = [
+                package for package in ("fla", "causal_conv1d")
+                if importlib.util.find_spec(package) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Qwen/Qwen3.8-27B exact training requires Hugging Face's "
+                    "training-capable flash-linear-attention and "
+                    "causal-conv1d packages. Missing imports: "
+                    f"{', '.join(missing)}. Install project requirements "
+                    "before launching; the slow recurrent fallback is "
+                    "deliberately not selected.")
+            print("[memory] Qwen3.8 exact chunked Gated DeltaNet training "
+                  "kernels ON (FLA + causal-conv1d)", flush=True)
         attention_detail = (
             "native SDPA + exact fused long-context attention + exact "
             "bounded fallback"
@@ -831,6 +894,7 @@ class HFBackend(_ModelPlacementBackend):
         )
         model = get_peft_model(model, peft_cfg)
         set_gradient_checkpointing(model, False)
+        _configure_exact_long_training(model, self.cfg)
         model.print_trainable_parameters()
 
         tokenizer = _ensure_pad_token(tokenizer)

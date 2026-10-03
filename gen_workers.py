@@ -60,7 +60,9 @@ import time
 import traceback
 import multiprocessing as mp
 
-from gpu_runtime import vllm_runtime_reserve_gib
+from gpu_runtime import (
+    vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
+)
 
 # Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
 # process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
@@ -1084,6 +1086,7 @@ class GenerationPool:
                  vllm_persistent_workers=None,
                  vllm_co_resident_sleep=False,
                  vllm_token_scoring=False,
+                 vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None):
         self.model_name = model_name
@@ -1129,9 +1132,13 @@ class GenerationPool:
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
             raise ValueError("gpu_ids must not contain duplicates")
 
-        reserve_gib = vllm_runtime_reserve_gib(
-            co_resident_sleep=self.vllm_co_resident_sleep,
-            token_scoring=self.vllm_token_scoring,
+        reserve_gib = (
+            _default_vllm_runtime_reserve_gib(
+                co_resident_sleep=self.vllm_co_resident_sleep,
+                token_scoring=self.vllm_token_scoring,
+            )
+            if vllm_runtime_reserve_gib is None else
+            max(0.0, float(vllm_runtime_reserve_gib))
         )
         reserve_reasons = []
         if self.vllm_co_resident_sleep:

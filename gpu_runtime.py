@@ -203,6 +203,13 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
         # The parameter-count fallback is only 59.60 GiB and can therefore
         # admit a TP=1 layout that has no room for its configured KV cache.
         return 62.0
+    if "qwen3-30b-a3b-thinking-2507" in name:
+        # 30.5B checkpoint in BF16, plus small serialization/alignment slack.
+        return 57.0
+    if "qwen3.8-27b" in name:
+        # The published checkpoint index is about 51.75 GiB; the simple 27B
+        # parameter-name estimate is slightly smaller than the real files.
+        return 52.0
     return None
 
 
@@ -212,6 +219,13 @@ def _kv_bytes_per_token(model_name: str) -> int:
         # 36 layers, 8 KV heads, head_dim 64, BF16 K+V. Sliding attention makes
         # this estimate conservative for most layers.
         return 73_728
+    if "qwen3-30b-a3b-thinking-2507" in name:
+        # 48 layers * 4 KV heads * 128 head dim * BF16 K+V.
+        return 98_304
+    if "qwen3.8-27b" in name:
+        # Only the full-attention layers grow a KV cache with sequence length;
+        # the interleaved Gated DeltaNet layers use fixed recurrent state.
+        return 65_536
     if ("120b" in name or "32b" in name or "30b" in name
             or "qwen3-coder-next" in name or "deepseek-v4" in name):
         return 262_144
@@ -313,7 +327,8 @@ def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
     # download/load.  Cards with at least 100 GiB of usable vLLM budget may
     # still select TP=1.
     if ("gpt-oss-120b" in str(model_name).lower()
-            and parallel_size == 1):
+            and parallel_size == 1
+            and not bool(cfg.get("allow_gpt_oss_tp1", False))):
         required = max(required, 100.0)
     return required
 
@@ -481,6 +496,10 @@ def known_attention_heads(model_name: str) -> Optional[int]:
         return 32
     if "qwen3-32b" in name:
         return 64
+    if "qwen3-30b-a3b-thinking-2507" in name:
+        return 32
+    if "qwen3.8-27b" in name:
+        return 24
     if "deepseek-r1-distill-qwen-32b" in name:
         # This checkpoint is distilled into the Qwen2.5-32B architecture.
         # Knowing its 40 query heads lets eight GPUs form four independent
