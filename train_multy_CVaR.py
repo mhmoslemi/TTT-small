@@ -5729,6 +5729,8 @@ class ProcessDistributedTrainer:
             f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
         self._init_method = rendezvous_path.as_uri()
         cfg_dict = dict(vars(cfg))
+        cfg_dict["_terminal_log_path"] = str(
+            Path(exp_dir).resolve() / "temirnal.log")
 
         print(f"[{self._process_label}] starting "
               f"{self._world_size - 1} persistent "

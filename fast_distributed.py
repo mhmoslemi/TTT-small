@@ -1350,12 +1350,18 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         import gc
         import os
         from datetime import timedelta
-        import torch
-        import torch.distributed as dist
         import train_multy_CVaR as training
-        from model_backend import load_backend
 
         training._install_console_timestamps()
+        terminal_log = training._install_terminal_log()
+        terminal_log_path = cfg_dict.get("_terminal_log_path")
+        if terminal_log_path:
+            terminal_log.bind(terminal_log_path)
+
+        import torch
+        import torch.distributed as dist
+        from model_backend import load_backend
+
         torch.set_num_threads(max(
             1, int(os.cpu_count() or world_size) // int(world_size)))
         torch.cuda.set_device(int(rank))
