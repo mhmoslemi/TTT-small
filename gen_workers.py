@@ -25,19 +25,22 @@ current-policy pass. Non-training generation calls keep the old compact
 (text, token_ids) result format.
 
 SEEDING. HF workers reseed random / numpy / torch from (seed, step, rank)
-before every task. vLLM workers use stable per-request seeds derived from
-(seed, step, rank, group). Keying on the step makes step t reproducible on its
-own, and the memory maker's offset calls cannot shift the rollout stream.
-Determinism holds for a fixed num_gpus, group_size AND gen_micro_batch, since
-distribute_jobs splits the group across workers and changing the split (or the
-micro-batch chunking) changes which sequence each worker draws.
+before every task. vLLM workers use stable per-rollout seeds derived from
+(seed, step, rank, group, rollout). Keying on the step makes step t
+reproducible on its own, and the memory maker's offset calls cannot shift the
+rollout stream. Async scheduling order and max_num_seqs therefore do not alter
+the samples; determinism still assumes a fixed worker/GPU split.
 
 OOM RECOVERY. The HF worker halves its per-call sequence count and retries when
 generate() OOMs. vLLM owns scheduling and KV-cache admission itself; an engine
 failure is sent back to the main process and aborts the step instead of hanging
 or silently converting an infrastructure problem into low rewards.
 
-No async. Plain torch.multiprocessing with persistent workers and queues.
+Each modern vLLM worker uses one persistent AsyncLLM engine.  Rollouts are
+submitted as independent requests and returned on completion, so a single long
+reasoning trace cannot hold every completed rollout on that GPU behind one
+synchronous ``LLM.generate`` call.  Older vLLM builds retain the synchronous
+compatibility path.
 
 Protocol (per step):
   main -> worker[w].task_queue:   (step, adapter_path, jobs, gen_kwargs)
@@ -45,9 +48,11 @@ Protocol (per step):
   worker[w] -> result_queue:      (rank, group_idx, [result, ...])
        where result is (text, token_ids), optionally with sampled logprobs as
        a third item when the caller requests them.
-       one message PER JOB, so the pool can stream results as they land.
+       AsyncLLM sends one message per completed rollout; the compatibility
+       path sends one per prompt job. The consumer accepts both forms.
 """
 
+import asyncio
 import importlib.metadata
 import os
 from array import array
@@ -535,6 +540,14 @@ def _vllm_job_seed(seed, step, rank, group_idx):
     return (worker_seed(seed, step, rank) + int(group_idx) * 104_729) % (2 ** 31 - 1)
 
 
+def _vllm_rollout_seed(seed, step, rank, group_idx, rollout_idx):
+    """Stable independent seed for one flattened rollout request."""
+    base = _vllm_job_seed(seed, step, rank, group_idx)
+    if base is None:
+        return None
+    return (int(base) + (int(rollout_idx) + 1) * 1_000_003) % (2 ** 31 - 1)
+
+
 def _python_development_header_path():
     """Return an installed Python.h path, or the expected path when absent."""
     import sysconfig
@@ -698,11 +711,30 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
+    async_engine = False
+    async_loop = None
+    RequestOutputKind = None
     try:
-        from vllm import LLM, SamplingParams
+        from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
+        try:
+            # vLLM's asynchronous frontend exposes each completed request
+            # immediately while retaining one continuously batched scheduler.
+            # This is the important distinction from offline LLM.generate(),
+            # which waits for the slowest request in the complete worker batch.
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.sampling_params import RequestOutputKind
+            from vllm.v1.engine.async_llm import AsyncLLM
+            engine_class = AsyncLLM
+            async_engine = True
+        except ImportError:
+            # Compatibility for older vLLM installations. Current supported
+            # deployments take the AsyncLLM path above.
+            from vllm import LLM
+            engine_class = LLM
         sleep_api_available = bool(
-            hasattr(LLM, "sleep") and hasattr(LLM, "wake_up"))
+            hasattr(engine_class, "sleep")
+            and hasattr(engine_class, "wake_up"))
 
         engine_seed = (worker_seed(seed, 0, rank) if seed is not None
                        else int.from_bytes(os.urandom(4), "little") % (2 ** 31 - 1))
@@ -732,7 +764,22 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
               f"PP={pipeline_parallel_size}, collectives="
               f"{'NCCL' if disable_custom_all_reduce else 'auto'}) ...",
               flush=True)
-        llm = LLM(**engine_kwargs)
+        if async_engine:
+            async_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(async_loop)
+
+            async def _start_async_engine():
+                # Construct inside a running loop so AsyncLLM starts its output
+                # handler immediately rather than deferring it to request one.
+                return AsyncLLM.from_engine_args(
+                    AsyncEngineArgs(**engine_kwargs))
+
+            llm = async_loop.run_until_complete(_start_async_engine())
+            print(f"[vllm worker {rank}] asynchronous completion streaming "
+                  f"enabled (max_num_seqs={int(gen_micro_batch or 0)})",
+                  flush=True)
+        else:
+            llm = LLM(**engine_kwargs)
     except Exception:
         detail = traceback.format_exc()
         if vllm_log_path:
@@ -759,6 +806,45 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         return LoRARequest(
             f"ttt_adapter_{adapter_id}", adapter_id, adapter_key)
 
+    request_serial = 0
+
+    def _next_request_id(kind):
+        nonlocal request_serial
+        request_serial += 1
+        return f"ttt-{rank}-{os.getpid()}-{kind}-{request_serial}"
+
+    def _run_async(awaitable):
+        if async_loop is None:
+            raise RuntimeError("asynchronous vLLM loop is unavailable")
+        return async_loop.run_until_complete(awaitable)
+
+    async def _async_final_output(prompt, sampling_params, lora_request,
+                                  request_id):
+        final_output = None
+        async for request_output in llm.generate(
+                prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request):
+            final_output = request_output
+        if final_output is None:
+            raise RuntimeError(
+                f"vLLM request {request_id} completed without an output")
+        return final_output
+
+    async def _async_control(command):
+        if command == "sleep":
+            await llm.sleep(level=sleep_level)
+        elif command == "wake_up":
+            if sleep_level == 2:
+                await llm.wake_up(tags=["weights"])
+                await llm.collective_rpc("reload_weights")
+                await llm.wake_up(tags=["kv_cache"])
+            else:
+                await llm.wake_up()
+        else:
+            raise ValueError(f"unknown vLLM control command {command!r}")
+
     sleep_level = int(sleep_level)
     basic_sleep = bool(hasattr(llm, "sleep") and hasattr(llm, "wake_up"))
     # Level 2 avoids keeping another full copy of every replica's weights in
@@ -784,11 +870,16 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 if command == "sleep":
                     print(f"[vllm worker {rank}] entering sleep level "
                           f"{sleep_level}", flush=True)
-                    llm.sleep(level=sleep_level)
+                    if async_engine:
+                        _run_async(_async_control(command))
+                    else:
+                        llm.sleep(level=sleep_level)
                 elif command == "wake_up":
                     print(f"[vllm worker {rank}] waking from sleep level "
                           f"{sleep_level}", flush=True)
-                    if sleep_level == 2:
+                    if async_engine:
+                        _run_async(_async_control(command))
+                    elif sleep_level == 2:
                         llm.wake_up(tags=["weights"])
                         llm.collective_rpc("reload_weights")
                         llm.wake_up(tags=["kv_cache"])
@@ -840,18 +931,49 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         prompt_logprobs=0,
                         detokenize=False,
                     )
+                    if async_engine:
+                        kwargs["output_kind"] = RequestOutputKind.FINAL_ONLY
                     if at_limit:
                         kwargs["logprob_token_ids"] = [
                             int(response_ids[-1])
                         ]
                     score_params.append(SamplingParams(**kwargs))
                     exact_limit.append(at_limit)
-                outputs = llm.generate(
-                    prompts,
-                    sampling_params=score_params,
-                    lora_request=_lora_request(score_adapter_path),
-                    use_tqdm=False,
-                )
+                score_lora_request = _lora_request(score_adapter_path)
+                if async_engine:
+                    async def _score_all():
+                        async def _score_one(job_pos):
+                            output = await _async_final_output(
+                                prompts[job_pos], score_params[job_pos],
+                                score_lora_request,
+                                _next_request_id("score"))
+                            return job_pos, output
+
+                        pending = [
+                            asyncio.create_task(_score_one(job_pos))
+                            for job_pos in range(len(prompts))
+                        ]
+                        completed_outputs = [None] * len(prompts)
+                        try:
+                            for future in asyncio.as_completed(pending):
+                                job_pos, output = await future
+                                completed_outputs[job_pos] = output
+                        except BaseException:
+                            for future in pending:
+                                future.cancel()
+                            await asyncio.gather(
+                                *pending, return_exceptions=True)
+                            raise
+                        return completed_outputs
+
+                    outputs = _run_async(_score_all())
+                else:
+                    outputs = llm.generate(
+                        prompts,
+                        sampling_params=score_params,
+                        lora_request=score_lora_request,
+                        use_tqdm=False,
+                    )
                 scored = []
                 for job_pos, (request_idx, prompt_ids, response_ids) in enumerate(
                         score_jobs):
@@ -931,60 +1053,123 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             if not runnable_jobs:
                 continue
 
-            prompts = [prompt for (_group_idx, prompt, _count) in runnable_jobs]
             return_logprobs = bool(gen_kwargs.get("return_logprobs", False))
-            sampling = []
-            for (group_idx, _prompt, count), max_tokens in zip(
-                    runnable_jobs, max_tokens_by_job):
-                sampling_kwargs = dict(
-                    n=int(count),
-                    max_tokens=int(max_tokens),
-                    temperature=float(gen_kwargs["temperature"]),
-                    top_p=float(gen_kwargs["top_p"]),
-                    seed=_vllm_job_seed(seed, step, rank, group_idx),
-                    skip_special_tokens=True,
-                )
-                if gen_kwargs.get("full_policy_sampling", False):
-                    sampling_kwargs.update(
-                        top_k=-1, repetition_penalty=1.0)
-                if return_logprobs:
-                    # vLLM always includes the sampled token in logprobs; zero
-                    # asks for no additional top-k entries.
-                    sampling_kwargs["logprobs"] = 0
-                sampling.append(SamplingParams(**sampling_kwargs))
-            outputs = llm.generate(
-                prompts,
-                sampling_params=sampling,
-                lora_request=lora_request,
-                use_tqdm=False,
-            )
 
-            for job_pos, (group_idx, _prompt, count) in enumerate(runnable_jobs):
-                request_output = (outputs[job_pos]
-                                  if job_pos < len(outputs) else None)
-                job_results = []
-                if request_output is not None:
-                    for candidate in request_output.outputs[:int(count)]:
-                        token_ids = list(candidate.token_ids)
+            def _rollout_result(candidate):
+                if candidate is None:
+                    return (("", [], None) if return_logprobs else ("", []))
+                token_ids = list(candidate.token_ids)
+                if return_logprobs:
+                    values = _chosen_token_logprobs(
+                        token_ids, getattr(candidate, "logprobs", None))
+                    return (
+                        candidate.text,
+                        token_ids,
+                        array("f", values) if values is not None else None,
+                    )
+                return candidate.text, token_ids
+
+            if async_engine:
+                async def _generate_all_rollouts():
+                    async def _generate_one(group_idx, prompt, max_tokens,
+                                            rollout_idx):
+                        sampling_kwargs = dict(
+                            n=1,
+                            max_tokens=int(max_tokens),
+                            temperature=float(gen_kwargs["temperature"]),
+                            top_p=float(gen_kwargs["top_p"]),
+                            seed=_vllm_rollout_seed(
+                                seed, step, rank, group_idx, rollout_idx),
+                            skip_special_tokens=True,
+                            output_kind=RequestOutputKind.FINAL_ONLY,
+                        )
+                        if gen_kwargs.get("full_policy_sampling", False):
+                            sampling_kwargs.update(
+                                top_k=-1, repetition_penalty=1.0)
                         if return_logprobs:
-                            values = _chosen_token_logprobs(
-                                token_ids,
-                                getattr(candidate, "logprobs", None))
-                            job_results.append(
-                                (candidate.text, token_ids,
-                                 array("f", values)
-                                 if values is not None else None))
-                        else:
-                            job_results.append((candidate.text, token_ids))
-                # Preserve the queue contract even if an engine/version returns
-                # fewer samples than requested; downstream treats these as
-                # invalid rollouts instead of blocking forever.
-                if len(job_results) < int(count):
-                    missing = int(count) - len(job_results)
-                    placeholder = (("", [], None) if return_logprobs
-                                   else ("", []))
-                    job_results.extend([placeholder for _ in range(missing)])
-                result_queue.put((rank, group_idx, job_results))
+                            # vLLM already computes sampling logits. Keep only
+                            # the chosen token's scalar logprob for exact PPO.
+                            sampling_kwargs["logprobs"] = 0
+                        output = await _async_final_output(
+                            prompt,
+                            SamplingParams(**sampling_kwargs),
+                            lora_request,
+                            _next_request_id("rollout"),
+                        )
+                        candidates = getattr(output, "outputs", None) or []
+                        candidate = candidates[0] if candidates else None
+                        return group_idx, _rollout_result(candidate)
+
+                    # Submit the complete worker queue at once. AsyncLLM keeps
+                    # exactly max_num_seqs active, admits another request as
+                    # soon as one finishes, and its paged-KV scheduler handles
+                    # long outliers without an application-side OOM guess.
+                    pending = []
+                    for (group_idx, prompt, count), max_tokens in zip(
+                            runnable_jobs, max_tokens_by_job):
+                        pending.extend(
+                            asyncio.create_task(_generate_one(
+                                group_idx, prompt, max_tokens, rollout_idx))
+                            for rollout_idx in range(int(count))
+                        )
+                    try:
+                        for future in asyncio.as_completed(pending):
+                            group_idx, rollout_result = await future
+                            # One message per completed rollout removes the
+                            # old whole-worker head-of-line barrier and starts
+                            # CPU evaluation immediately.
+                            result_queue.put(
+                                (rank, group_idx, [rollout_result]))
+                    except BaseException:
+                        for future in pending:
+                            future.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise
+
+                _run_async(_generate_all_rollouts())
+            else:
+                # Compatibility path for vLLM releases without AsyncLLM.
+                prompts = [
+                    prompt for (_group_idx, prompt, _count) in runnable_jobs]
+                sampling = []
+                for (group_idx, _prompt, count), max_tokens in zip(
+                        runnable_jobs, max_tokens_by_job):
+                    sampling_kwargs = dict(
+                        n=int(count),
+                        max_tokens=int(max_tokens),
+                        temperature=float(gen_kwargs["temperature"]),
+                        top_p=float(gen_kwargs["top_p"]),
+                        seed=_vllm_job_seed(seed, step, rank, group_idx),
+                        skip_special_tokens=True,
+                    )
+                    if gen_kwargs.get("full_policy_sampling", False):
+                        sampling_kwargs.update(
+                            top_k=-1, repetition_penalty=1.0)
+                    if return_logprobs:
+                        sampling_kwargs["logprobs"] = 0
+                    sampling.append(SamplingParams(**sampling_kwargs))
+                outputs = llm.generate(
+                    prompts,
+                    sampling_params=sampling,
+                    lora_request=lora_request,
+                    use_tqdm=False,
+                )
+
+                for job_pos, (group_idx, _prompt, count) in enumerate(
+                        runnable_jobs):
+                    request_output = (outputs[job_pos]
+                                      if job_pos < len(outputs) else None)
+                    candidates = (
+                        getattr(request_output, "outputs", None) or [])
+                    job_results = [
+                        _rollout_result(candidate)
+                        for candidate in candidates[:int(count)]
+                    ]
+                    if len(job_results) < int(count):
+                        job_results.extend(
+                            [_rollout_result(None)]
+                            * (int(count) - len(job_results)))
+                    result_queue.put((rank, group_idx, job_results))
         except Exception:
             detail = traceback.format_exc()
             print(f"[vllm worker {rank}] generation failed:\n{detail}",
@@ -994,6 +1179,17 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                           f"{os.path.abspath(os.fspath(vllm_log_path))}")
             result_queue.put((rank, None, {"error": detail}))
 
+    if async_engine:
+        try:
+            llm.shutdown()
+            _run_async(asyncio.sleep(0))
+        except Exception:
+            print(f"[vllm worker {rank}] asynchronous shutdown warning:\n"
+                  f"{traceback.format_exc()}", file=sys.stderr, flush=True)
+        finally:
+            if async_loop is not None:
+                async_loop.close()
+                asyncio.set_event_loop(None)
     print(f"[vllm worker {rank}] shutting down", flush=True)
 
 
@@ -1521,11 +1717,13 @@ class GenerationPool:
                         return_logprobs=False, progress_desc="rollouts",
                         full_policy_sampling=False):
         """
-        Stream generation results as each (worker, group) job completes.
+        Stream generation results as each worker result arrives.
 
-        Yields (group_idx, [(text, token_ids), ...]) per job. The caller can
-        dispatch each rollout for reward evaluation immediately, overlapping
-        CPU eval with ongoing GPU generation.
+        Yields ``(group_idx, results)``. Modern vLLM workers return a one-item
+        result list for every completed rollout; compatibility workers may
+        return a complete prompt job. The caller can dispatch each rollout for
+        reward evaluation immediately, overlapping CPU eval with ongoing GPU
+        generation.
 
         step_idx is passed through to the workers and keys their reseed, so
         pass the real step here. The memory maker passes step_idx + 1_000_000

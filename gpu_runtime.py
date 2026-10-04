@@ -216,9 +216,13 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
 def _kv_bytes_per_token(model_name: str) -> int:
     name = str(model_name or "").lower()
     if "gpt-oss" in name:
-        # 36 layers, 8 KV heads, head_dim 64, BF16 K+V. Sliding attention makes
-        # this estimate conservative for most layers.
-        return 73_728
+        # GPT-OSS alternates 18 full-attention layers with 18 locally banded
+        # layers (window 128). Only the full-attention half grows linearly with
+        # a long request; the local half contributes a tiny fixed per-sequence
+        # cache. Counting all 36 layers here unnecessarily serialized rollout
+        # generation even though vLLM's hybrid KV manager stores the windowed
+        # layers at their bounded size.
+        return 36_864
     if "qwen3-30b-a3b-thinking-2507" in name:
         # 48 layers * 4 KV heads * 128 head dim * BF16 K+V.
         return 98_304
@@ -402,10 +406,25 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             "larger compatible TP*PP group.")
 
     if _auto(cfg.get("gen_micro_batch", "auto")):
+        # ``max_num_seqs`` is an active scheduler ceiling, not a reservation of
+        # max_model_len for every request.  Basing it on full-context requests
+        # serialized long-thinking jobs (for example, two active Qwen3.8
+        # requests despite a ~580k-token paged-KV pool).  Plan against a
+        # conservative 64k active sequence instead.  vLLM owns the fixed paged
+        # KV allocation and exactly preempts/recomputes unusually long requests
+        # before that pool can overflow, so this raises throughput without
+        # shortening or approximating any rollout.
+        active_tokens = min(max_len, 65_536)
+        kv_gib_per_active_seq_gpu = (
+            _kv_bytes_per_token(cfg.get("model_name", "")) * active_tokens
+            / parallel_size / (1024.0 ** 3)
+        )
+        estimated_active_sequences = int(
+            kv_budget / max(kv_gib_per_active_seq_gpu, 0.01))
         # Keep CUDA graph/admission metadata bounded even when short responses
-        # would permit hundreds of sequences.  One is retained as a safe floor;
-        # vLLM will fail clearly at model load if the weights themselves do not fit.
-        cap = max(1, min(32, estimated_sequences))
+        # would permit hundreds of sequences. One is retained as a safe floor;
+        # vLLM profiles graph memory before fixing the KV-cache size.
+        cap = max(1, min(32, estimated_active_sequences))
         # Wide MoE models on sub-60-GiB cards rely on a comparatively tight
         # tensor-parallel layout.  Bound scheduler/CUDA-graph concurrency even
         # when the remaining paged-KV budget could theoretically admit many
@@ -417,7 +436,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             cap = min(cap, 8 if size_b <= 10 else (2 if size_b <= 40 else 1))
         cfg["gen_micro_batch"] = cap
         notes.append(f"generation max sequences={cap} "
-                     f"(estimated full-context KV capacity={max(0, estimated_sequences)})")
+                     f"(automatic {active_tokens}-token active target; "
+                     f"full-context KV capacity={max(0, estimated_sequences)})")
     else:
         cfg["gen_micro_batch"] = int(cfg.get("gen_micro_batch") or 0)
         if cfg["gen_micro_batch"] < 0:
