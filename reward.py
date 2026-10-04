@@ -50,55 +50,75 @@ def validate_packing(centers, radii):
 # ----------------------------------------------------------------------
 # Code extraction
 # ----------------------------------------------------------------------
-def extract_python_code(response: str) -> str | None:
-    """
-    Pull Python code out of a response. We try four strategies, in order:
+def _extract_code_from_scope(text: str) -> str | None:
+    """Extract the last code artifact from one answer scope."""
+    # A reasoning model can show several programs. Locate the LAST Python
+    # opener first, then take its complete body or (for the existing recovery
+    # behavior) its unterminated body through EOS. Checking complete matches
+    # first would incorrectly select an older draft when the true final fence
+    # is the one truncated at EOS.
+    openers = list(re.finditer(r"```python\s*\n?", text, re.IGNORECASE))
+    if openers:
+        body_start = openers[-1].end()
+        closing = text.find("```", body_start)
+        body_end = closing if closing >= 0 else len(text)
+        code = text[body_start:body_end].strip()
+        if code:
+            return code
 
-      1. A ```python ... ``` block (well-formed)
-      2. A ```python ... <end of string>  (model hit max_new_tokens mid-block)
-      3. A generic ``` ... ``` block (no language tag)
-      4. The raw response if it starts with 'import' or 'def '
-
-    Returns None only if all four fail. Returns code with no fences.
-    """
-    # 0) Strip any <think>...</think> reasoning block (Qwen3, R1, etc.).
-    #    If the closing </think> is missing (model still inside thinking when
-    #    truncated), we discard everything up to and including the open tag too,
-    #    because there's no actual code in there anyway.
-    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
-    if "<think>" in response and "</think>" not in response:
-        # Unterminated thinking — model never produced code
-        return None
-
-    # 1) Well-formed ```python ... ``` block, take the LAST one
-    matches = re.findall(r"```python\s*\n?(.*?)```", response, re.DOTALL)
+    matches = re.findall(r"```\s*\n?(.*?)```", text, flags=re.DOTALL)
     if matches:
         code = matches[-1].strip()
         if code:
             return code
 
-    # 2) Unterminated ```python ... <EOS>: take everything after the last ```python
-    m = re.search(r"```python\s*\n?(.*)$", response, re.DOTALL)
-    if m:
-        code = m.group(1).strip()
-        # Strip a trailing ``` if it leaked in
-        code = re.sub(r"\n?```\s*$", "", code).strip()
-        if code:
-            return code
-
-    # 3) Any ``` ... ``` block
-    matches = re.findall(r"```\s*\n?(.*?)```", response, re.DOTALL)
-    if matches:
-        code = matches[-1].strip()
-        if code:
-            return code
-
-    # 4) Raw response if it smells like Python
-    stripped = response.strip()
+    stripped = text.strip()
     if stripped.startswith(("import ", "from ", "def ", "class ", "#")):
         return stripped
-
     return None
+
+
+def extract_python_code(response: str, *, require_final_marker: bool = False
+                        ) -> str | None:
+    """
+    Pull the final Python answer out of a response.
+
+    When a reasoning-model final-answer delimiter is present, only text after
+    the last delimiter is eligible. This prevents executable-looking Python
+    drafts in the visible reasoning trace from being evaluated as the answer.
+    Models without an explicit delimiter retain the existing last-fence
+    behavior unless ``require_final_marker`` is set for a reasoning template
+    whose completed answers are contractually delimited.
+
+    Returns None if the final-answer scope contains no code. Returns code with
+    no fences otherwise.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return None
+
+    final_markers = (
+        "<|channel|>final<|message|>",
+        "</think>",
+        "</analysis>",
+        "</reasoning>",
+    )
+    marker_end = -1
+    for marker in final_markers:
+        position = response.lower().rfind(marker.lower())
+        if position >= 0:
+            marker_end = max(marker_end, position + len(marker))
+    if marker_end >= 0:
+        # Strictly scope extraction to the final answer. If the model ended its
+        # reasoning but never emitted final code, failing the rollout is safer
+        # than executing one of its earlier experimental snippets.
+        return _extract_code_from_scope(response[marker_end:])
+
+    if require_final_marker:
+        return None
+    if re.search(r"<think\b", response, flags=re.IGNORECASE):
+        # An opening reasoning tag with no closing marker has no final answer.
+        return None
+    return _extract_code_from_scope(response)
 
 
 # ----------------------------------------------------------------------
