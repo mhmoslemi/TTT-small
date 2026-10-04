@@ -28,11 +28,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import os
 import sys
 import argparse
+import importlib
+import importlib.util
 import json
 import logging
 import math
 import random
 import re
+import subprocess
 import threading
 import time
 from contextlib import (contextmanager, nullcontext, redirect_stderr,
@@ -173,6 +176,94 @@ def _coder_model_profile(model_name):
             "training_layout": "sharded",
         }
     return None
+
+
+def _ensure_qwen38_training_dependencies(cfg):
+    """Install and verify Qwen3.8's exact CUDA training kernels once.
+
+    This runs only in the launcher process, after the run log exists and before
+    model_backend imports torch. Existing environments for every other model
+    are untouched.
+    """
+    if (str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b"
+            or str(getattr(cfg, "backend", "")) != "hf"):
+        return
+
+    dependencies = (
+        ("causal_conv1d", "causal-conv1d>=1.4.0",
+         ("--no-build-isolation",)),
+        ("fla", "flash-linear-attention[cuda]", ()),
+    )
+
+    def import_failures():
+        failures = {}
+        for module_name, _, _ in dependencies:
+            try:
+                importlib.import_module(module_name)
+            except Exception as error:
+                failures[module_name] = (
+                    f"{type(error).__name__}: {error}")
+        return failures
+
+    failures = import_failures()
+    if not failures:
+        print("[setup] Qwen3.8 exact training kernels verified "
+              "(FLA + causal-conv1d)", flush=True)
+        return
+
+    print("[setup] Qwen3.8 exact training kernels are unavailable; "
+          "installing them once in the active server environment: "
+          + "; ".join(
+              f"{name} ({failures[name]})" for name in failures),
+          flush=True)
+    install_env = os.environ.copy()
+    install_env.setdefault("MAX_JOBS", "8")
+    install_env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+    for module_name, requirement, extra_options in dependencies:
+        if module_name not in failures:
+            continue
+        command = [
+            sys.executable, "-m", "pip", "install", "--upgrade",
+            "--upgrade-strategy", "only-if-needed", *extra_options,
+            requirement,
+        ]
+        # A present-but-unimportable binary was built for an incompatible
+        # torch/CUDA ABI. Rebuild it rather than accepting "already satisfied".
+        try:
+            installed_but_broken = (
+                importlib.util.find_spec(module_name) is not None)
+        except (ImportError, AttributeError, ValueError):
+            installed_but_broken = True
+        if installed_but_broken:
+            command.insert(5, "--force-reinstall")
+            command.insert(6, "--no-cache-dir")
+        print(f"[setup] running: {' '.join(command)}", flush=True)
+        try:
+            subprocess.run(command, check=True, env=install_env)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                "Qwen3.8 kernel installation failed in the active server "
+                f"environment (exit {error.returncode}): "
+                f"{' '.join(command)}") from error
+
+    importlib.invalidate_caches()
+    # Failed imports may leave package submodules cached while pip replaces
+    # their files. Clear only these optional packages before final validation.
+    for imported_name in tuple(sys.modules):
+        if (imported_name == "fla" or imported_name.startswith("fla.")
+                or imported_name == "causal_conv1d"
+                or imported_name.startswith("causal_conv1d.")):
+            sys.modules.pop(imported_name, None)
+    remaining = import_failures()
+    if remaining:
+        raise RuntimeError(
+            "Qwen3.8 kernel installation completed but import verification "
+            "still failed: " + "; ".join(
+                f"{name} ({detail})"
+                for name, detail in remaining.items()))
+    print("[setup] Qwen3.8 exact training kernels installed and verified "
+          "(FLA + causal-conv1d)", flush=True)
 
 
 def _apply_coder_model_profile(merged):
@@ -9743,6 +9834,8 @@ def main():
                 f"\n=== TTT dependency warnings parent_pid={os.getpid()} "
                 f"run_dir={Path(exp_dir).resolve()} ===\n")
         print(f"[logs] dependency warnings: {dependency_log_path}", flush=True)
+
+    _ensure_qwen38_training_dependencies(cfg)
 
     # One effective seed for every generation stream. None => not seeded, which
     # is the original behaviour. Set once here and threaded through unchanged.
