@@ -380,6 +380,84 @@ def _install_console_timestamps():
         sys.stderr = _TimestampedLineStream(sys.stderr)
 
 
+class _TerminalTeeStream:
+    """Mirror one console stream to the run log without changing its TTY."""
+
+    def __init__(self, console, sink):
+        self.console = console
+        self.sink = sink
+
+    def write(self, value):
+        value = str(value)
+        if not value:
+            return 0
+        with self.sink.lock:
+            self.console.write(value)
+            self.sink.write(value)
+        return len(value)
+
+    def flush(self):
+        with self.sink.lock:
+            self.console.flush()
+            self.sink.flush()
+
+    def __getattr__(self, name):
+        # Preserve fileno(), isatty(), encoding, etc. from the real terminal so
+        # tqdm and libraries keep exactly their existing console behaviour.
+        return getattr(self.console, name)
+
+
+class _TerminalLogSink:
+    """Buffer startup output, then append every write to the run log."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.log_file = None
+        self.pending = []
+
+    def write(self, value):
+        if self.log_file is None:
+            self.pending.append(value)
+            return
+        self.log_file.write(value)
+        # Keep the on-disk copy current even for progress/status writes that do
+        # not end in a newline.
+        self.log_file.flush()
+
+    def flush(self):
+        if self.log_file is not None:
+            self.log_file.flush()
+
+    def bind(self, log_path):
+        with self.lock:
+            if self.log_file is not None:
+                return
+            self.log_file = open(
+                log_path, "a", buffering=1, encoding="utf-8")
+            if self.pending:
+                self.log_file.write("".join(self.pending))
+                self.pending.clear()
+                self.log_file.flush()
+
+
+def _install_terminal_log():
+    """Start capturing timestamped stdout/stderr before the run dir exists."""
+    sink = _TerminalLogSink()
+
+    def attach(stream):
+        # Timestamps must be added before the tee so the terminal and file are
+        # byte-for-byte alike. _install_console_timestamps() normally makes
+        # this the active branch; the fallback also keeps this helper robust.
+        if isinstance(stream, _TimestampedLineStream):
+            stream.stream = _TerminalTeeStream(stream.stream, sink)
+            return stream
+        return _TerminalTeeStream(stream, sink)
+
+    sys.stdout = attach(sys.stdout)
+    sys.stderr = attach(sys.stderr)
+    return sink
+
+
 _ROUTED_DEPENDENCY_NOTICES = (
     "Skipping import of cpp extensions due to incompatible torch version.",
     "No prebuilt binary for CUDA",
@@ -9604,6 +9682,7 @@ def grow_batch(cur_g, cur_k, stats, cfg):
 # ======================================================================
 def main():
     _install_console_timestamps()
+    terminal_log = _install_terminal_log()
     cfg, merged = load_config()
     from problems.binary_coder import (
         BINARY_CODER_MODE, BinaryCoderConfig)
@@ -9623,6 +9702,9 @@ def main():
     exp_dir = make_experiment_dir(
         cfg, resume_dir=resume_dir, config_dict=merged
     )
+    terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
+    terminal_log.bind(terminal_log_path)
+    print(f"[logs] terminal output: {terminal_log_path}", flush=True)
     vllm_log_path = None
     strategy_vllm_log_path = None
     dependency_log_path = None
