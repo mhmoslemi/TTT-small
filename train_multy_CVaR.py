@@ -123,6 +123,44 @@ def _is_exact_qwen3_8b(model_name):
             == _QWEN3_8B_MODEL_ID)
 
 
+def _is_qwen3_8b_sampling_model(model_name):
+    """Recognize the canonical checkpoint or an exactly named local copy."""
+    normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].lower() == "qwen3-8b"
+
+
+def _apply_qwen3_8b_thinking_sampling(merged):
+    """Apply Qwen3-8B's recommended sampling only in thinking mode."""
+    merged["sampling_top_k"] = None
+    merged["sampling_min_p"] = None
+    merged["strategy_sampling_top_k"] = None
+    merged["strategy_sampling_min_p"] = None
+    merged["qwen3_8b_thinking_sampling"] = False
+    merged["strategy_qwen3_8b_thinking_sampling"] = False
+
+    if (_is_qwen3_8b_sampling_model(merged.get("model_name"))
+            and bool(merged.get("thinking", False))):
+        merged["temperature"] = 0.6
+        merged["top_p"] = 0.95
+        merged["sampling_top_k"] = 20
+        merged["sampling_min_p"] = 0.0
+        merged["qwen3_8b_thinking_sampling"] = True
+        print("[model-profile] Qwen3-8B coder thinking sampling: "
+              "temperature=0.6, top_p=0.95, top_k=20, min_p=0")
+
+    if (bool(merged.get("strategies", False))
+            and _is_qwen3_8b_sampling_model(
+                merged.get("strategy_model_name"))
+            and bool(merged.get("strategy_thinking", False))):
+        merged["strategy_temperature"] = 0.6
+        merged["strategy_top_p"] = 0.95
+        merged["strategy_sampling_top_k"] = 20
+        merged["strategy_sampling_min_p"] = 0.0
+        merged["strategy_qwen3_8b_thinking_sampling"] = True
+        print("[model-profile] Qwen3-8B strategist thinking sampling: "
+              "temperature=0.6, top_p=0.95, top_k=20, min_p=0")
+
+
 def _is_exact_qwen3_30b_a3b(model_name):
     """Match only the original hybrid-thinking A3B coder checkpoint.
 
@@ -630,6 +668,9 @@ def _resolve_binary_coder_options(merged):
                   "to match the policy likelihood used by the loss")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
+        merged["sampling_top_k"] = 0
+        merged["sampling_min_p"] = 0.0
+        merged["qwen3_8b_thinking_sampling"] = False
 
 
 def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
@@ -721,6 +762,9 @@ def _resolve_rank_options(merged):
                   "to match the policy likelihood used by the loss")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
+        merged["sampling_top_k"] = 0
+        merged["sampling_min_p"] = 0.0
+        merged["qwen3_8b_thinking_sampling"] = False
 
 
 def _resolve_x_grpo_options(merged):
@@ -1662,6 +1706,10 @@ def load_config():
     if not (0.0 <= cvar_lambda <= 1.0):
         raise ValueError("cvar_lambda must be in [0, 1]")
     merged["cvar_lambda"] = cvar_lambda
+    # This profile is derived after coder/strategist selection. Clipped-policy
+    # resolvers below remain authoritative when they require full-policy
+    # sampling for an exact likelihood ratio.
+    _apply_qwen3_8b_thinking_sampling(merged)
     _resolve_binary_coder_options(merged)
     _resolve_rank_options(merged)
     _resolve_x_grpo_options(merged)
@@ -2156,6 +2204,18 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     if max_new_tokens < 1:
         return [("", []) for _ in range(int(n_samples))]
 
+    policy_sampling = {}
+    sampling_top_k = getattr(cfg, "sampling_top_k", None)
+    sampling_min_p = getattr(cfg, "sampling_min_p", None)
+    if sampling_top_k is not None:
+        policy_sampling["top_k"] = int(sampling_top_k)
+    if sampling_min_p is not None:
+        policy_sampling["min_p"] = float(sampling_min_p)
+    if (_uses_clipped_policy_loss(
+            getattr(cfg, "advantage_mode", "entropic"))
+            or _uses_sequence_level_policy_ratio(cfg)):
+        policy_sampling.update(top_k=0, repetition_penalty=1.0)
+
     with torch.inference_mode():
         out = model.generate(
             **inputs,
@@ -2163,10 +2223,7 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
             do_sample=True,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
-            **({"top_k": 0, "repetition_penalty": 1.0}
-               if (_uses_clipped_policy_loss(
-                       getattr(cfg, "advantage_mode", "entropic"))
-                   or _uses_sequence_level_policy_ratio(cfg)) else {}),
+            **policy_sampling,
             pad_token_id=pad_id,
             num_return_sequences=n_samples,
         )
@@ -2222,7 +2279,7 @@ def generate_responses(model, tokenizer, prompt_text: str, group_size: int, cfg)
 
 def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
                          cfg, *, max_new_tokens=None, temperature=None,
-                         top_p=None, cap_state=None):
+                         top_p=None, top_k=None, min_p=None, cap_state=None):
     """Stream locally generated rollouts from cross-prompt HF batches."""
     if len(prompts_by_group) != len(counts_by_group):
         raise ValueError("counts_by_group must align with prompts_by_group")
@@ -2233,6 +2290,8 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         rank_cfg = SimpleNamespace(**vars(cfg))
         rank_cfg.temperature = 1.0
         rank_cfg.top_p = 1.0
+        rank_cfg.sampling_top_k = 0
+        rank_cfg.sampling_min_p = 0.0
         if max_new_tokens is not None:
             rank_cfg.max_new_tokens = int(max_new_tokens)
         for group_idx, (prompt, count) in enumerate(zip(prompts_by_group, counts_by_group)):
@@ -2257,6 +2316,14 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         "top_p": float(top_p if top_p is not None else cfg.top_p),
         "micro_batch": int(getattr(cfg, "gen_micro_batch", 0) or 0),
     }
+    resolved_top_k = (top_k if top_k is not None
+                      else getattr(cfg, "sampling_top_k", None))
+    resolved_min_p = (min_p if min_p is not None
+                      else getattr(cfg, "sampling_min_p", None))
+    if resolved_top_k is not None:
+        gen_kwargs["top_k"] = int(resolved_top_k)
+    if resolved_min_p is not None:
+        gen_kwargs["min_p"] = float(resolved_min_p)
     if _uses_sequence_level_policy_ratio(cfg):
         gen_kwargs.update(top_k=0, repetition_penalty=1.0)
     yield from _iter_hf_job_batches(
@@ -8067,6 +8134,14 @@ code block.'''
                                         temperature=float(
                                             cfg.strategy_temperature),
                                         top_p=float(cfg.strategy_top_p),
+                                        top_k=getattr(
+                                            cfg,
+                                            "strategy_sampling_top_k",
+                                            None),
+                                        min_p=getattr(
+                                            cfg,
+                                            "strategy_sampling_min_p",
+                                            None),
                                         step_idx=(
                                             int(step_idx) + 2_000_000
                                             + strategy_index * 10_000
@@ -8182,6 +8257,10 @@ code block.'''
                             "max_new_tokens": cfg.max_new_tokens,
                             "temperature": cfg.temperature,
                             "top_p": cfg.top_p,
+                            "top_k": getattr(
+                                cfg, "sampling_top_k", None),
+                            "min_p": getattr(
+                                cfg, "sampling_min_p", None),
                             "step_idx": int(step_idx) + int(seed_offset),
                             "progress_desc": progress_desc,
                             "full_policy_sampling": (
@@ -8244,6 +8323,10 @@ code block.'''
                                 "max_new_tokens": retry_limit,
                                 "temperature": cfg.temperature,
                                 "top_p": cfg.top_p,
+                                "top_k": getattr(
+                                    cfg, "sampling_top_k", None),
+                                "min_p": getattr(
+                                    cfg, "sampling_min_p", None),
                                 "step_idx": (
                                     int(step_idx) + int(seed_offset)
                                     + 3_000_000),
@@ -8334,6 +8417,8 @@ code block.'''
                         "max_new_tokens": cfg.max_new_tokens,
                         "temperature": cfg.temperature,
                         "top_p": cfg.top_p,
+                        "top_k": getattr(cfg, "sampling_top_k", None),
+                        "min_p": getattr(cfg, "sampling_min_p", None),
                         "step_idx": step_idx,
                         "full_policy_sampling": (
                             _uses_sequence_level_policy_ratio(cfg)),
@@ -8378,6 +8463,10 @@ code block.'''
                             "max_new_tokens": retry_limit,
                             "temperature": cfg.temperature,
                             "top_p": cfg.top_p,
+                            "top_k": getattr(
+                                cfg, "sampling_top_k", None),
+                            "min_p": getattr(
+                                cfg, "sampling_min_p", None),
                             "step_idx": int(step_idx) + 3_000_000,
                             "progress_desc": "compact code retries",
                             "full_policy_sampling": (
@@ -8435,6 +8524,10 @@ code block.'''
                     strategy_cfg.temperature = float(
                         cfg.strategy_temperature)
                     strategy_cfg.top_p = float(cfg.strategy_top_p)
+                    strategy_cfg.sampling_top_k = getattr(
+                        cfg, "strategy_sampling_top_k", None)
+                    strategy_cfg.sampling_min_p = getattr(
+                        cfg, "strategy_sampling_min_p", None)
                     with backend.disable_adapter():
                         for strategy_index in range(strategies_per_parent):
                             strategy_prompts = [
@@ -8462,6 +8555,14 @@ code block.'''
                                             temperature=float(
                                                 cfg.strategy_temperature),
                                             top_p=float(cfg.strategy_top_p),
+                                            top_k=getattr(
+                                                cfg,
+                                                "strategy_sampling_top_k",
+                                                None),
+                                            min_p=getattr(
+                                                cfg,
+                                                "strategy_sampling_min_p",
+                                                None),
                                             cap_state=cap_state)):
                                     if len(responses) != 1:
                                         raise RuntimeError(
@@ -10578,6 +10679,9 @@ def main():
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
+    if getattr(cfg, "qwen3_8b_thinking_sampling", False):
+        print("Coder sampling:     Qwen3-8B thinking profile "
+              "(temperature=0.6, top_p=0.95, top_k=20, min_p=0)")
     if getattr(problem, "two_stage_rollouts", False):
         print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
               f"strategies/parent x {cfg.programs_per_strategy} "
@@ -10598,6 +10702,9 @@ def main():
               f"top_p={cfg.strategy_top_p}, "
               f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
               f"reasoning_effort={cfg.strategy_reasoning_effort}")
+        if getattr(cfg, "strategy_qwen3_8b_thinking_sampling", False):
+            print("Strategy sampler:   Qwen3-8B thinking profile "
+                  "(top_k=20, min_p=0)")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         fused_attention_label = (
@@ -11066,7 +11173,7 @@ def main():
             def _local_hf_rollouts(prompts_by_group, counts_by_group,
                                    adapter_path,
                                    max_new_tokens, temperature, top_p,
-                                   step_idx):
+                                   step_idx, top_k=None, min_p=None):
                 backend.set_inference_mode()
                 if run_seed is not None:
                     local_seed = worker_seed(run_seed, step_idx, 0)
@@ -11083,6 +11190,7 @@ def main():
                             counts_by_group, cfg,
                             max_new_tokens=max_new_tokens,
                             temperature=temperature, top_p=top_p,
+                            top_k=top_k, min_p=min_p,
                             cap_state=local_cap)
                 finally:
                     backend.set_training_mode()

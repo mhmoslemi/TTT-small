@@ -80,7 +80,8 @@ class StrategyAPIGenerationPool:
             return messages
         return [{"role": "user", "content": str(prompt)}]
 
-    def _generate_one(self, prompt, *, max_new_tokens, temperature, top_p):
+    def _generate_one(self, prompt, *, max_new_tokens, temperature, top_p,
+                      top_k=None, min_p=None):
         request = {
             "model": self.model_name,
             "messages": self._messages(prompt),
@@ -88,9 +89,14 @@ class StrategyAPIGenerationPool:
             "temperature": float(temperature),
             "top_p": float(top_p),
         }
+        extra_body = {}
+        if top_k is not None:
+            extra_body["top_k"] = int(top_k)
+        if min_p is not None:
+            extra_body["min_p"] = float(min_p)
         if self._deepseek:
             effort = self.reasoning_effort if self.thinking else "none"
-            request["extra_body"] = {
+            extra_body.update({
                 # Keep provider-only fields in extra_body so this also works
                 # with OpenAI SDK releases whose typed Chat Completions
                 # signature predates reasoning_effort.
@@ -98,7 +104,9 @@ class StrategyAPIGenerationPool:
                 "thinking": {
                     "type": "enabled" if self.thinking else "disabled",
                 },
-            }
+            })
+        if extra_body:
+            request["extra_body"] = extra_body
 
         response = self._client.chat.completions.create(**request)
         if not response.choices:
@@ -129,7 +137,8 @@ class StrategyAPIGenerationPool:
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
-                        return_logprobs=False, progress_desc="strategies"):
+                        return_logprobs=False, progress_desc="strategies",
+                        top_k=None, min_p=None):
         del step_idx, show_progress
         if self._closed:
             raise RuntimeError("strategy API pool is already closed")
@@ -158,6 +167,8 @@ class StrategyAPIGenerationPool:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
             ): index
             for index, prompt in enumerate(prompts)
         }

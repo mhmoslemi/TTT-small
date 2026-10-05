@@ -268,7 +268,7 @@ def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
         try:
             policy_sampling = {
                 key: gen_kwargs[key]
-                for key in ("top_k", "repetition_penalty")
+                for key in ("top_k", "min_p", "repetition_penalty")
                 if key in gen_kwargs
             }
             with torch.inference_mode():
@@ -1083,6 +1083,13 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                             skip_special_tokens=True,
                             output_kind=RequestOutputKind.FINAL_ONLY,
                         )
+                        if gen_kwargs.get("top_k") is not None:
+                            top_k = int(gen_kwargs["top_k"])
+                            sampling_kwargs["top_k"] = (
+                                -1 if top_k == 0 else top_k)
+                        if gen_kwargs.get("min_p") is not None:
+                            sampling_kwargs["min_p"] = float(
+                                gen_kwargs["min_p"])
                         if gen_kwargs.get("full_policy_sampling", False):
                             sampling_kwargs.update(
                                 top_k=-1, repetition_penalty=1.0)
@@ -1142,6 +1149,13 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         seed=_vllm_job_seed(seed, step, rank, group_idx),
                         skip_special_tokens=True,
                     )
+                    if gen_kwargs.get("top_k") is not None:
+                        top_k = int(gen_kwargs["top_k"])
+                        sampling_kwargs["top_k"] = (
+                            -1 if top_k == 0 else top_k)
+                    if gen_kwargs.get("min_p") is not None:
+                        sampling_kwargs["min_p"] = float(
+                            gen_kwargs["min_p"])
                     if gen_kwargs.get("full_policy_sampling", False):
                         sampling_kwargs.update(
                             top_k=-1, repetition_penalty=1.0)
@@ -1715,7 +1729,7 @@ class GenerationPool:
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
                         return_logprobs=False, progress_desc="rollouts",
-                        full_policy_sampling=False):
+                        full_policy_sampling=False, top_k=None, min_p=None):
         """
         Stream generation results as each worker result arrives.
 
@@ -1748,6 +1762,10 @@ class GenerationPool:
             "return_logprobs": bool(return_logprobs),
             "full_policy_sampling": bool(full_policy_sampling),
         }
+        if top_k is not None:
+            gen_kwargs["top_k"] = int(top_k)
+        if min_p is not None:
+            gen_kwargs["min_p"] = float(min_p)
         if full_policy_sampling:
             gen_kwargs.update(top_k=0, repetition_penalty=1.0)
         total_expected = sum(count for wj in worker_jobs for (_, _, count) in wj)
@@ -1949,7 +1967,7 @@ class GenerationPool:
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         counts_by_group=None, return_logprobs=False,
-                        full_policy_sampling=False):
+                        full_policy_sampling=False, top_k=None, min_p=None):
         """
         Backward-compatible blocking variant. Returns:
           dict group_idx -> list of (text, token_ids, behavior_logprobs)
@@ -1964,7 +1982,8 @@ class GenerationPool:
                 max_new_tokens, temperature, top_p, step_idx=step_idx,
                 counts_by_group=counts_by_group,
                 return_logprobs=return_logprobs,
-                full_policy_sampling=full_policy_sampling):
+                full_policy_sampling=full_policy_sampling,
+                top_k=top_k, min_p=min_p):
             for item in job_results:
                 text, token_ids = item[:2]
                 behavior_logprobs = item[2] if len(item) > 2 else None
@@ -1998,7 +2017,7 @@ class HybridHFGenerationPool:
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
                         progress_desc="rollouts",
-                        full_policy_sampling=False):
+                        full_policy_sampling=False, top_k=None, min_p=None):
         counts = ([int(group_size)] * len(prompts_by_group)
                   if counts_by_group is None
                   else [int(value) for value in counts_by_group])
@@ -2024,7 +2043,8 @@ class HybridHFGenerationPool:
                         max_new_tokens, temperature, top_p,
                         step_idx=step_idx, show_progress=False,
                         counts_by_group=remote_counts,
-                        full_policy_sampling=full_policy_sampling):
+                        full_policy_sampling=full_policy_sampling,
+                        top_k=top_k, min_p=min_p):
                     events.put(("result", item))
             except BaseException as exc:
                 events.put(("error", exc))
@@ -2069,6 +2089,8 @@ class HybridHFGenerationPool:
                 "temperature": temperature,
                 "top_p": top_p,
                 "step_idx": step_idx,
+                "top_k": top_k,
+                "min_p": min_p,
             }
             for group_idx, results in self._local_iter(**local_kwargs):
                 yield from drain_remote(block=False)
@@ -2084,13 +2106,15 @@ class HybridHFGenerationPool:
 
     def generate_groups(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
-                        counts_by_group=None, full_policy_sampling=False):
+                        counts_by_group=None, full_policy_sampling=False,
+                        top_k=None, min_p=None):
         by_group = {idx: [] for idx in range(len(prompts_by_group))}
         for group_idx, results in self.iter_group_jobs(
                 prompts_by_group, group_size, adapter_path,
                 max_new_tokens, temperature, top_p, step_idx=step_idx,
                 counts_by_group=counts_by_group,
-                full_policy_sampling=full_policy_sampling):
+                full_policy_sampling=full_policy_sampling,
+                top_k=top_k, min_p=min_p):
             by_group[group_idx].extend(
                 (text, token_ids, None) for text, token_ids in results)
         return by_group
