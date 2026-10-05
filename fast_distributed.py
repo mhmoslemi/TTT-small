@@ -1104,11 +1104,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 # the model's ordinary training-mode dropout behavior.
                 with nullcontext():
                     for batch in active_batches:
-                        current_logprobs = (
-                            training.compute_batched_token_logprobs(
-                                model, batch, with_grad=True,
-                                chunk=cfg.logprob_chunk,
-                                pad_token_id=tokenizer.pad_token_id))
                         base_logprobs = [
                             example.get("reference_logprobs")
                             for example in batch
@@ -1128,11 +1123,16 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                             pad_token_id=(
                                                 tokenizer.pad_token_id)))
                             except Exception as error:
-                                attempt_kl_error = repr(error)
-                                base_logprobs = [
-                                    current_lp.detach()
-                                    for current_lp in current_logprobs
-                                ]
+                                raise RuntimeError(
+                                    "exact base-policy logprob fallback "
+                                    "failed; refusing to replace the "
+                                    "configured KL penalty with the current "
+                                    "policy") from error
+                        current_logprobs = (
+                            training.compute_batched_token_logprobs(
+                                model, batch, with_grad=True,
+                                chunk=cfg.logprob_chunk,
+                                pad_token_id=tokenizer.pad_token_id))
 
                         batch_losses = []
                         for example, current_lp, base_lp in zip(

@@ -151,6 +151,7 @@ def _coder_model_profile(model_name):
             "template_kind": "gpt-oss",
             "training_4bit": True,
             "training_layout": "auto",
+            "vllm_runtime_reserve_gib": 5.0,
         }
     if basename == _QWEN3_30B_A3B_THINKING_MODEL_BASENAME:
         return {
@@ -161,6 +162,7 @@ def _coder_model_profile(model_name):
             "template_kind": "qwen-thinking",
             "training_4bit": False,
             "training_layout": "sharded",
+            "vllm_runtime_reserve_gib": 5.0,
         }
     if basename == _QWEN38_27B_MODEL_BASENAME:
         return {
@@ -171,6 +173,12 @@ def _coder_model_profile(model_name):
             "template_kind": "qwen3.8",
             "training_4bit": False,
             "training_layout": "sharded",
+            # Qwen3.8 has a roughly 248K-token vocabulary. vLLM's exact
+            # prompt-logprob path materializes an FP32 softmax for an entire
+            # prefill chunk, so its transient projection is much larger than
+            # the ordinary generation activation. Keep enough actual card
+            # headroom instead of assigning that memory to the KV cache.
+            "vllm_runtime_reserve_gib": 16.0,
         }
     return None
 
@@ -218,14 +226,16 @@ def _apply_coder_model_profile(merged):
     merged["training_layout"] = str(profile["training_layout"])
 
     # On the 95+ GiB cards used by this project, the exact checkpoint/KV model
-    # admits one full-context engine per card. Five GiB remains outside vLLM
-    # for CUDA/NCCL and the bounded chosen-token projection. The ordinary
-    # conservative 24-GiB scoring reserve is retained for all other models.
+    # admits one full-context engine per card. The model profile leaves the
+    # measured amount of memory outside vLLM's KV cache for CUDA/NCCL and the
+    # bounded exact-token projection. Qwen3.8 needs more than the other
+    # profiles because its vocabulary projection is materially larger.
     merged["vllm_gpu_memory_utilization"] = 0.965
     merged["vllm_quantization"] = ""
     merged["gen_micro_batch"] = "auto"
     merged["vllm_max_num_batched_tokens"] = "auto"
-    merged["vllm_runtime_reserve_override_gib"] = 5.0
+    merged["vllm_runtime_reserve_override_gib"] = float(
+        profile["vllm_runtime_reserve_gib"])
     merged["vllm_staged_loading"] = True
     # Final TP=1 admission is decided after nvidia-smi identifies the cards.
     # Blackwell can consume GPT-OSS's native MXFP4 layout directly; older
@@ -5480,10 +5490,6 @@ class ReplicatedDataParallelTrainer:
                 stats = FeedbackStats()
                 kl_error = None
                 for batch in active_batches:
-                    current_logprobs = compute_batched_token_logprobs(
-                        model, batch, with_grad=True,
-                        chunk=cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id)
                     base_logprobs = [
                         example.get("reference_logprobs")
                         for example in batch
@@ -5500,10 +5506,14 @@ class ReplicatedDataParallelTrainer:
                                     chunk=cfg.logprob_chunk,
                                     pad_token_id=tokenizer.pad_token_id)
                         except Exception as error:
-                            kl_error = repr(error)
-                            base_logprobs = [
-                                current_lp.detach()
-                                for current_lp in current_logprobs]
+                            raise RuntimeError(
+                                "exact base-policy logprob fallback failed; "
+                                "refusing to replace the configured KL "
+                                "penalty with the current policy") from error
+                    current_logprobs = compute_batched_token_logprobs(
+                        model, batch, with_grad=True,
+                        chunk=cfg.logprob_chunk,
+                        pad_token_id=tokenizer.pad_token_id)
                     batch_losses = []
                     for example, current_lp, base_lp in zip(
                             batch, current_logprobs, base_logprobs):
@@ -8184,23 +8194,10 @@ code block.'''
                     except Exception as error:
                         reference_scores = [None] * len(score_pairs)
                         print(f"[warn] vLLM reference scoring failed ({error!r}); "
-                              "missing values will use their frozen "
-                              "rollout-policy scores", flush=True)
-                reference_behavior_fallbacks = 0
+                              "missing values will be recomputed exactly by "
+                              "the HF trainer", flush=True)
                 for record, values in zip(
                         vllm_logprob_records, reference_scores):
-                    behavior_values = record["behavior_logprobs"]
-                    if (not (spo_rs_mode or binary_coder_mode)
-                            and values is None
-                            and behavior_values is not None
-                            and len(behavior_values)
-                            == len(record["token_ids"])):
-                        # Never send an extreme context back through the HF
-                        # trainer merely because a vLLM score payload was
-                        # incomplete. The rollout policy is frozen for this
-                        # update, so it is the stable conservative reference.
-                        values = list(behavior_values)
-                        reference_behavior_fallbacks += 1
                     record["reference_logprobs"] = values
                 behavior_count = sum(
                     record["behavior_logprobs"] is not None
@@ -8208,6 +8205,9 @@ code block.'''
                 reference_count = sum(
                     record["reference_logprobs"] is not None
                     for record in vllm_logprob_records)
+                reference_hf_fallbacks = (
+                    0 if spo_rs_mode or binary_coder_mode else
+                    len(vllm_logprob_records) - reference_count)
                 eval_done_after = sum(
                     future.done() for futures in reward_futures.values()
                     for future in futures)
@@ -8233,8 +8233,8 @@ code block.'''
                       f"{behavior_count}/{len(vllm_logprob_records)}, "
                       f"reference {reference_label}{policy_label} in "
                       f"{time.time() - scoring_started:.1f}s "
-                      f"(rollout-policy fallbacks: "
-                      f"{reference_behavior_fallbacks}; "
+                      f"(HF exact reference fallbacks: "
+                      f"{reference_hf_fallbacks}; "
                       f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
 
@@ -9527,9 +9527,6 @@ code block.'''
         is_ratio_count = 0
         fb_stats = FeedbackStats()
         for batch in active_batches:
-            current_logprobs = compute_batched_token_logprobs(
-                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
-                pad_token_id=tokenizer.pad_token_id)
             base_logprobs = [
                 example.get("reference_logprobs") for example in batch]
             supplied_reference = all(
@@ -9544,13 +9541,13 @@ code block.'''
                             chunk=cfg.logprob_chunk,
                             pad_token_id=tokenizer.pad_token_id)
                 except Exception as error:
-                    if not hasattr(train_step, "_kl_warned"):
-                        print(f"[warn] disable_adapter failed ({error}); "
-                              "training without KL penalty")
-                        train_step._kl_warned = True
-                    base_logprobs = [
-                        current_lp.detach()
-                        for current_lp in current_logprobs]
+                    raise RuntimeError(
+                        "exact base-policy logprob fallback failed; "
+                        "refusing to replace the configured KL penalty "
+                        "with the current policy") from error
+            current_logprobs = compute_batched_token_logprobs(
+                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
+                pad_token_id=tokenizer.pad_token_id)
 
             batch_losses = []
             for ex, cur_lp, base_lp in zip(
