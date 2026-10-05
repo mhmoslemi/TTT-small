@@ -196,6 +196,9 @@ def _known_vllm_runtime_weight_floor_gib(model_name: str) -> Optional[float]:
     for a valid four-card layout.
     """
     name = str(model_name or "").lower()
+    if "deepseek-r1-0528-qwen3-8b" in name:
+        # Official BF16 safetensor shards total 16.4 decimal GB.
+        return 15.3
     if "gpt-oss-120b" in name:
         return 76.0
     if "qwen3-32b" in name:
@@ -508,6 +511,10 @@ def derive_vllm_tensor_parallel_size(num_gpus: int,
 def known_attention_heads(model_name: str) -> Optional[int]:
     """Fast preflight for the model families explicitly supported here."""
     name = str(model_name or "").lower()
+    if "deepseek-r1-0528-qwen3-8b" in name:
+        # Qwen3-8B architecture: exact TP=1 replicas use all cards in
+        # parallel instead of collapsing the strategist into one TP=8 engine.
+        return 32
     if "qwen2.5-coder-7b" in name:
         return 28
     if "qwen3-coder-next" in name:

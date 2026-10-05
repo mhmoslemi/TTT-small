@@ -62,6 +62,8 @@ _GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
 _QWEN3_30B_A3B_THINKING_MODEL_BASENAME = (
     "qwen3-30b-a3b-thinking-2507")
 _QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
+_DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = (
+    "deepseek-r1-0528-qwen3-8b")
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
 
 
@@ -175,6 +177,36 @@ def _is_exact_qwen3_30b_a3b(model_name):
 def _model_basename(model_name):
     normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
     return normalized.rsplit("/", 1)[-1].lower()
+
+
+def _apply_strategy_model_profile(merged, model_name):
+    """Apply exact, model-native strategist settings where fully specified."""
+    if (_model_basename(model_name)
+            != _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME):
+        return
+
+    # DeepSeek evaluates this checkpoint with 64K generations, but its native
+    # context is 128K. Expose that full output ceiling here; generation already
+    # subtracts the actual prompt length, so prompt + completion never exceeds
+    # 131072. It is a native reasoning model: thinking stays enabled and
+    # `high` is the strongest effort label exposed by this runner.
+    merged["strategy_max_new_tokens"] = 131_072
+    merged["strategy_max_seq_length"] = 131_072
+    merged["strategy_temperature"] = 0.6
+    merged["strategy_top_p"] = 0.95
+    merged["strategy_thinking"] = True
+    merged["strategy_reasoning_effort"] = "high"
+    merged["strategy_vllm_quantization"] = ""
+
+    # At 8B, one exact TP=1 engine fits on every rollout GPU. Start those
+    # replicas concurrently and retain all level-1 weight backups in host RAM
+    # between phases, avoiding the old 32B worker teardown/reload cycle.
+    merged["strategy_vllm_sleep_level"] = 1
+    merged["strategy_vllm_staged_loading"] = False
+    merged["strategy_vllm_persistent_workers"] = None
+    print("[model-profile] DeepSeek-R1-0528-Qwen3-8B strategist: "
+          "native reasoning, max_new=131072, max_seq=131072, "
+          "temperature=0.6, top_p=0.95, exact BF16, all replicas persistent")
 
 
 def _coder_model_profile(model_name):
@@ -1593,6 +1625,7 @@ def load_config():
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
+        _apply_strategy_model_profile(merged, strategy_model_name)
         strategy_backend = str(
             merged.get("strategy_backend") or "local"
         ).strip().lower()
