@@ -55,7 +55,7 @@ _STRATEGY_FINAL_MARKERS = (
     "<|channel|>final<|message|>",
     "assistantfinal",
 )
-_LOG_TIME_OFFSET_SECONDS = -5 * 60 * 60
+_LOG_TIME_OFFSET_SECONDS = -4 * 60 * 60
 _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
 _QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
 _GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
