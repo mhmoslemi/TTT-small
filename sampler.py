@@ -10,11 +10,7 @@ UCT uses the same c and reward scale but removes the prior:
     score(s) = Q(s) + c * scale * sqrt(log(1 + T) / (1 + n(s)))
 
   Q(s)   = max child reward seen so far from s (or R(s) if never expanded)
-  P(s)   = rank-based prior by default; the top states may be re-weighted by an
-           external Elo prior produced asynchronously by a MultiAgentReRanker
-           (see reranker/). The Elo prior only RESHUFFLES the prior mass already
-           assigned to the elite set, so the exploration mass on the tail is
-           preserved and P(s) still sums to 1.
+  P(s)   = rank-based prior over the archive.
   scale  = max(R) - min(R) over the non-seed archive
   T      = total expansions performed
   n(s)   = expansions of s OR ANY DESCENDANT (so a successful lineage
@@ -33,10 +29,7 @@ State carries two optional problem-agnostic payloads:
   - raw_score:   the TRUE metric for prompt display (separate from `value`).
   - construction: an injected global threaded parent -> child for warm starts.
 
-THREAD-SAFETY: a background re-ranker thread reads the buffer via
-snapshot_top_states() and writes the Elo prior via set_external_prior(). Both,
-plus the buffer-mutating section of update(), are guarded by self._prior_lock
-(an RLock). The background thread NEVER holds the lock during LLM calls.
+Archive reads, updates, and checkpoint serialization are guarded by an RLock.
 """
 
 import threading
@@ -92,22 +85,11 @@ class PUCTSampler:
         self._m = {}   # state.id -> best child reward seen
         self._T = 0    # total expansions
 
-        self._current_step = 0   # most recently STARTED training step; the
-                                 # re-ranker tags its cycles with this so its
-                                 # logs line up with the step dirs.
-
-
         # Archive starts with seeds
         self._states = []
         self._seed_ids = set()
 
-        # ---- Elo re-ranker hook (filled by a background MultiAgentReRanker) ----
-        # Guards: buffer-rebuild in update(), snapshot_top_states(), and the
-        # external prior read/write. RLock so _blended_prior (called from
-        # sample_states) can re-enter from the same thread.
-        self._prior_lock = threading.RLock()
-        self._external_prior = {}          # state.id -> non-negative Elo weight
-        self._external_prior_alpha = 1.0   # 1.0 = Elo fully replaces rank in elite set
+        self._lock = threading.RLock()
 
         if seed_states:
             for ss in seed_states:
@@ -203,81 +185,6 @@ class PUCTSampler:
         w = (N - order).astype(np.float64)
         return w / w.sum()
 
-    def _blended_prior(self, values: np.ndarray) -> np.ndarray:
-        """Rank prior over the whole buffer, with the Elo prior (if any) applied
-        ON TOP of the elite states. We only redistribute the prior mass the rank
-        prior already gave the elite group, so the tail's exploration mass is
-        untouched and the result still sums to 1."""
-        P = self._prior(values)
-        if P.size == 0:
-            return P
-
-        with self._prior_lock:
-            ext = dict(self._external_prior)            # id -> Elo weight
-            alpha = float(self._external_prior_alpha)
-        if not ext:
-            return P
-
-        # Indices of buffer states that currently have an Elo weight.
-        idx = [i for i, s in enumerate(self._states) if s.id in ext]
-        if len(idx) < 2:
-            return P
-        idx = np.array(idx, dtype=int)
-
-        m_K = float(P[idx].sum())                       # mass the rank prior gave this group
-        if m_K <= 0.0:
-            return P
-
-        elo_w = np.array([ext[self._states[i].id] for i in idx], dtype=np.float64)
-        elo_w = np.clip(elo_w, 0.0, None)
-        if elo_w.sum() <= 0.0:
-            return P
-        q_elo = elo_w / elo_w.sum()                     # Elo distribution over the group
-        q_rank = P[idx] / m_K                           # rank distribution over the same group
-
-        q = (1.0 - alpha) * q_rank + alpha * q_elo      # alpha=1 -> pure Elo
-        q = q / q.sum()
-
-        P = P.copy()
-        P[idx] = m_K * q                                # reshuffle within the group only
-        return P
-
-    # ------------------------------------------------------------------
-    # Thread-safe hooks for the background re-ranker
-    # ------------------------------------------------------------------
-    def snapshot_top_states(self, k: int):
-        """Thread-safe snapshot of the top-k states (by reward) that have actual
-        code. Returns lightweight dicts so the caller can run a slow LLM
-        tournament WITHOUT holding the sampler lock. (Top-k is by reward .value:
-        the full PUCT score also depends on visit counts and changes intra-step.)"""
-        with self._prior_lock:
-            cands = [s for s in self._states if s.code and s.code.strip()]
-            cands.sort(
-                key=lambda s: (s.value if s.value is not None else -np.inf),
-                reverse=True,
-            )
-            top = cands[: max(0, int(k))]
-            return [
-                {
-                    "id": s.id,
-                    "value": float(s.value) if s.value is not None else None,
-                    "raw_score": (float(s.raw_score)
-                                  if s.raw_score is not None else None),
-                    "code": s.code,
-                }
-                for s in top
-            ]
-
-    def set_external_prior(self, weights_by_id: dict, alpha: float = None):
-        """Install the Elo-derived prior. Only ids still in the buffer matter at
-        read time (sample_states filters). `alpha` interpolates Elo vs rank
-        within the elite set (1.0 = pure Elo)."""
-        with self._prior_lock:
-            self._external_prior = {str(k): float(v)
-                                    for k, v in (weights_by_id or {}).items()}
-            if alpha is not None:
-                self._external_prior_alpha = float(alpha)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -296,7 +203,7 @@ class PUCTSampler:
             P = np.zeros(len(values), dtype=np.float64)
             uct_numerator = np.log1p(self._T)
         else:
-            P = self._blended_prior(values)
+            P = self._prior(values)
             sqrtT = np.sqrt(1.0 + self._T)
 
         scored = []
@@ -369,8 +276,8 @@ class PUCTSampler:
         (parent, strategy) pair. The ordinary top-K-per-parent and global
         archive cap are then applied unchanged.
 
-        The whole body is guarded by _prior_lock so the background
-        snapshot_top_states() cannot iterate self._states while it is rebuilt.
+        The whole body is guarded so checkpoint reads cannot observe a
+        partially rebuilt archive.
         """
         children_with_parents = list(children_with_parents)
         strategy_top_r = int(strategy_top_r or 0)
@@ -389,7 +296,7 @@ class PUCTSampler:
                     "strategy_keys cannot contain None when strategy_top_r "
                     "is enabled")
 
-        with self._prior_lock:
+        with self._lock:
             # Do this before deduplication/pruning: every successfully evaluated
             # child counts toward the run's problem-native best-ever value.
             self._record_raw_states(
@@ -496,7 +403,7 @@ class PUCTSampler:
         self._T += count
 
     def best_state(self):
-        with self._prior_lock:
+        with self._lock:
             non_seeds = [s for s in self._states if s.id not in self._seed_ids]
             if not non_seeds:
                 return None
@@ -510,7 +417,7 @@ class PUCTSampler:
         beaten the initial construction. The record is independent of archive
         deduplication/pruning and is included in sampler checkpoints.
         """
-        with self._prior_lock:
+        with self._lock:
             return self._best_raw_max if maximize else self._best_raw_min
 
     def archive_size(self):
@@ -518,7 +425,7 @@ class PUCTSampler:
 
     def state_dict(self):
         """Return all search state required to continue in another process."""
-        with self._prior_lock:
+        with self._lock:
             return {
                 "version": 1,
                 "states": [asdict(s) for s in self._states],
@@ -526,9 +433,6 @@ class PUCTSampler:
                 "n": dict(self._n),
                 "m": dict(self._m),
                 "T": int(self._T),
-                "current_step": int(self._current_step),
-                "external_prior": dict(self._external_prior),
-                "external_prior_alpha": float(self._external_prior_alpha),
                 "selection_mode": "uct" if self.use_uct else "puct",
                 "best_raw_min": (asdict(self._best_raw_min)
                                  if self._best_raw_min is not None else None),
@@ -556,20 +460,12 @@ class PUCTSampler:
         if not seed_ids.issubset(restored_ids):
             raise ValueError("sampler checkpoint references missing seed states")
 
-        with self._prior_lock:
+        with self._lock:
             self._states = restored
             self._seed_ids = seed_ids
             self._n = {str(k): int(v) for k, v in payload.get("n", {}).items()}
             self._m = {str(k): float(v) for k, v in payload.get("m", {}).items()}
             self._T = int(payload.get("T", 0))
-            self._current_step = int(payload.get("current_step", 0))
-            self._external_prior = {
-                str(k): float(v)
-                for k, v in payload.get("external_prior", {}).items()
-            }
-            self._external_prior_alpha = float(
-                payload.get("external_prior_alpha", 1.0)
-            )
             raw_min = payload.get("best_raw_min")
             raw_max = payload.get("best_raw_max")
             self._best_raw_min = State(**raw_min) if raw_min else None
@@ -582,7 +478,7 @@ class PUCTSampler:
 
     def import_legacy_states(self, states, total_expansions: int = 0):
         """Best-effort archive import for runs created before checkpoints."""
-        with self._prior_lock:
+        with self._lock:
             existing_codes = {s.code for s in self._states if s.code}
             for state in states:
                 if state.code and state.code in existing_codes:
@@ -602,13 +498,6 @@ class PUCTSampler:
                 )
                 self._states = seeds + others[:self.max_buffer_size - len(seeds)]
             self._T = max(self._T, int(total_expansions))
-
-    def set_current_step(self, step: int):
-        self._current_step = int(step)
-
-    def get_current_step(self) -> int:
-        return self._current_step   
-
 
 if __name__ == "__main__":
     sampler = PUCTSampler(num_seeds=3, puct_c=1.0)

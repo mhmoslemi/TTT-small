@@ -35,6 +35,7 @@ fraction.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -384,6 +385,12 @@ def is_code_failure(res) -> bool:
         return False
     msg = str(getattr(res, "msg", "") or "").lower()
     return "timeout" not in msg
+
+
+def failure_signature(message: str) -> str:
+    """Normalize one verifier message for balanced feedback sampling."""
+    base = re.sub(r"\d+", "#", (message or "unknown").strip().lower())
+    return base[:120]
 
 
 def select_capped(indices: Sequence[int], cap: int) -> List[int]:

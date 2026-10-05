@@ -27,9 +27,8 @@ current-policy pass. Non-training generation calls keep the old compact
 SEEDING. HF workers reseed random / numpy / torch from (seed, step, rank)
 before every task. vLLM workers use stable per-rollout seeds derived from
 (seed, step, rank, group, rollout). Keying on the step makes step t
-reproducible on its own, and the memory maker's offset calls cannot shift the
-rollout stream. Async scheduling order and max_num_seqs therefore do not alter
-the samples; determinism still assumes a fixed worker/GPU split.
+reproducible on its own. Async scheduling order and max_num_seqs therefore do
+not alter the samples; determinism still assumes a fixed worker/GPU split.
 
 OOM RECOVERY. The HF worker halves its per-call sequence count and retries when
 generate() OOMs. vLLM owns scheduling and KV-cache admission itself; an engine
@@ -1982,9 +1981,7 @@ class GenerationPool:
         generation.
 
         step_idx is passed through to the workers and keys their reseed, so
-        pass the real step here. The memory maker passes step_idx + 1_000_000
-        so its calls draw from a separate slot and leave the rollout stream
-        untouched.
+        pass the real step here.
 
         Drives a "rollouts" progress bar over total rollouts (set
         show_progress=False to suppress). Stops after exactly total_expected

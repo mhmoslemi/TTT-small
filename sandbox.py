@@ -21,6 +21,15 @@ import tempfile
 import threading
 
 
+# Generated programs are untrusted with respect to output volume.  A single
+# ``print`` inside an optimization loop can otherwise write gigabytes into the
+# temporary capture file; Linux then fills host RAM with page cache and the
+# parent used to read the complete file back into a Python string.  The reward
+# metadata persists only a short diagnostic prefix, so retain a bounded prefix
+# at the source and discard everything after it.
+_CAPTURE_LIMIT_BYTES = 256 * 1024
+
+
 # Creating a Popen briefly allocates several parent-side descriptors. Serialize
 # only that millisecond-scale setup; the child processes themselves still run
 # fully concurrently on their assigned CPUs.
@@ -35,6 +44,97 @@ import sys
 import pickle
 import traceback
 import importlib.util
+
+STDOUT_PATH = "__STDOUT_PATH__"
+STDERR_PATH = "__STDERR_PATH__"
+CAPTURE_LIMIT_BYTES = int(os.environ.pop(
+    "TTT_SANDBOX_CAPTURE_LIMIT_BYTES", "262144"))
+
+
+class _BoundedCapture:
+    """Text/binary-compatible prefix capture with a hard byte ceiling."""
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, path, fd):
+        self._stream = open(path, "wb", buffering=0)
+        self._fd = int(fd)
+        self._remaining = max(0, CAPTURE_LIMIT_BYTES)
+        self._truncated = False
+        # Support the common ``sys.stdout.buffer.write(...)`` form without
+        # exposing the real file descriptor to native libraries. Native fd 1/2
+        # remains /dev/null, so C extensions cannot bypass the byte ceiling.
+        self.buffer = self
+
+    def write(self, value):
+        original_length = len(value) if hasattr(value, "__len__") else 0
+        if self._remaining <= 0:
+            return original_length
+        if isinstance(value, bytes):
+            truncated = len(value) > self._remaining
+            data = value[:self._remaining]
+        else:
+            rendered = str(value)
+            # Bound encoding work too: after capture fills, pathological print
+            # loops must not keep allocating a huge temporary bytes object.
+            prefix = rendered[:self._remaining]
+            data = prefix.encode(self.encoding, errors=self.errors)
+            truncated = (
+                len(prefix) < len(rendered) or len(data) > self._remaining)
+        if not truncated and len(data) <= self._remaining:
+            self._stream.write(data)
+            self._remaining -= len(data)
+            return original_length
+        marker = b"\n[... sandbox output truncated ...]\n"
+        keep = max(0, self._remaining - len(marker))
+        if keep:
+            self._stream.write(data[:keep])
+        marker_room = self._remaining - keep
+        if marker_room:
+            self._stream.write(marker[:marker_room])
+        self._remaining = 0
+        self._truncated = True
+        return original_length
+
+    def flush(self):
+        self._stream.flush()
+
+    def close(self):
+        self._stream.close()
+
+    def fileno(self):
+        # fd 1/2 is deliberately /dev/null in the Popen configuration below.
+        return self._fd
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _BoundedCapture(STDOUT_PATH, 1)
+sys.stderr = _BoundedCapture(STDERR_PATH, 2)
+
+# Apply the limit before importing NumPy/SciPy or the generated program.  It is
+# inherited by descendants.  RLIMIT_AS is a per-process last line of defence;
+# normal Erdős candidates are tiny, while a runaway dense allocation fails
+# that rollout instead of forcing the whole host into swap thrashing.
+MEMORY_LIMIT_BYTES = int(os.environ.pop(
+    "TTT_SANDBOX_MEMORY_LIMIT_BYTES", "0") or 0)
+if MEMORY_LIMIT_BYTES > 0 and sys.platform.startswith("linux"):
+    try:
+        import resource
+        _current_soft, _current_hard = resource.getrlimit(
+            resource.RLIMIT_AS)
+        _effective_limit = MEMORY_LIMIT_BYTES
+        if _current_hard != resource.RLIM_INFINITY:
+            _effective_limit = min(_effective_limit, int(_current_hard))
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (_effective_limit, _effective_limit),
+        )
+    except Exception as limit_error:
+        raise RuntimeError(
+            "failed to apply sandbox memory limit: " + str(limit_error))
 
 # Pin before importing the generated program. The affinity is inherited by
 # every subprocess it creates, so one candidate and its whole process tree stay
@@ -74,6 +174,12 @@ except Exception as e:
     except Exception:
         pass
     sys.stderr.write(tb)
+finally:
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
 '''
 
 
@@ -103,7 +209,7 @@ def _kill_tree(proc, pgid, hard=False):
 
 
 def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
-             *, cpu_id=None):
+             *, cpu_id=None, memory_limit_bytes=None):
     """
     Execute `code` (Python source) in a subprocess. Calls `entrypoint()`
     and returns whatever it returns.
@@ -146,6 +252,8 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
             .replace("__PROGRAM_PATH__", program_path)
             .replace("__FUNCTION_NAME__", entrypoint)
             .replace("__RESULTS_PATH__", results_path)
+            .replace("__STDOUT_PATH__", stdout_path)
+            .replace("__STDERR_PATH__", stderr_path)
         )
         with tempfile.NamedTemporaryFile(
                 suffix=".py", delete=False, mode="w") as f:
@@ -168,21 +276,28 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
             env[key] = t
         if pinned_cpu is not None:
             env["TTT_EVAL_CPU_ID"] = str(pinned_cpu)
+        env["TTT_SANDBOX_CAPTURE_LIMIT_BYTES"] = str(
+            _CAPTURE_LIMIT_BYTES)
+        if memory_limit_bytes is not None:
+            resolved_memory_limit = int(memory_limit_bytes)
+            if resolved_memory_limit <= 0:
+                raise ValueError("memory_limit_bytes must be positive")
+            env["TTT_SANDBOX_MEMORY_LIMIT_BYTES"] = str(
+                resolved_memory_limit)
+        else:
+            env.pop("TTT_SANDBOX_MEMORY_LIMIT_BYTES", None)
 
-        # Do not retain PIPE descriptors for the lifetime of every sandbox.
-        # The child writes to files, and the parent closes its handles as soon
-        # as Popen returns. Serializing only this setup also bounds transient
-        # errpipe descriptors without serializing any actual evaluation work.
+        # Python-level output is written by _BoundedCapture. Native libraries
+        # inherit /dev/null for fd 1/2, preventing them from bypassing the cap.
+        # No PIPE descriptors are retained for hundreds of concurrent jobs.
         with _SANDBOX_LAUNCH_LOCK:
-            with open(stdout_path, "wb") as stdout_file, open(
-                    stderr_path, "wb") as stderr_file:
-                proc = subprocess.Popen(
-                    [sys.executable, runner_path],
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    env=env,
-                    start_new_session=True,
-                )
+            proc = subprocess.Popen(
+                [sys.executable, runner_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
 
         try:
             pgid = os.getpgid(proc.pid)
@@ -210,7 +325,10 @@ def run_code(code: str, entrypoint: str, timeout_s: float, max_cpus: int = 1,
         def _read_capture(path):
             try:
                 with open(path, "rb") as capture:
-                    return capture.read()
+                    # Defensive bound as well as the child-side bound: never
+                    # materialize an unexpectedly large file in the trainer.
+                    return capture.read(_CAPTURE_LIMIT_BYTES + 1)[
+                        :_CAPTURE_LIMIT_BYTES]
             except OSError:
                 return b""
 

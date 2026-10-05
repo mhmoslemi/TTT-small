@@ -6,7 +6,7 @@ import yaml
 
 from sampler import PUCTSampler, State
 from experiment_io import make_experiment_dir
-from train_multy import (_legacy_resume_info, _restore_legacy_archive,
+from train_multy_CVaR import (_legacy_resume_info, _restore_legacy_archive,
                          load_config)
 
 
@@ -26,7 +26,6 @@ def test_sampler_checkpoint_round_trip():
         code="def run(): return 2.5", construction=[1.0, 2.0],
     )
     sampler.update([(child, parent)])
-    sampler.set_external_prior({child.id: 0.75}, alpha=0.4)
 
     restored = PUCTSampler(num_seeds=1)
     restored.load_state_dict(sampler.state_dict())
@@ -73,7 +72,7 @@ def test_experiment_config_keeps_problem_specific_keys(tmp_path):
     saved = json.loads((run_dir / "config.json").read_text())
 
     assert saved["task_yaml"] == "task.yml"
-    assert saved["_max_seq_length_includes_memory_topup"] is False
+    assert "_max_seq_length_includes_memory_topup" not in saved
 
 
 def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch):
@@ -85,13 +84,12 @@ def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch
         "model_name": "saved/model",
         "num_steps": 12,
         "groups_per_step": 3,
-        "_max_seq_length_includes_memory_topup": False,
     })
     (run_dir / "config.json").write_text(json.dumps(saved))
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", [
-        "train_multy.py", "--resume", str(run_dir), "--num-steps", "20",
+        "train_multy_CVaR.py", "--resume", str(run_dir), "--num-steps", "20",
     ])
     cfg, merged = load_config()
 
@@ -102,25 +100,27 @@ def test_resume_uses_saved_config_and_cli_can_extend_steps(tmp_path, monkeypatch
     assert merged["_resume_dir"] == str(run_dir.resolve())
 
 
-def test_old_saved_config_memory_topup_is_not_applied_twice(tmp_path, monkeypatch):
-    run_dir = tmp_path / "old-run"
+def test_resume_discards_retired_memory_and_reranker_settings(
+        tmp_path, monkeypatch):
+    run_dir = tmp_path / "old-feature-run"
     run_dir.mkdir()
     saved = vars(_complete_config())
     saved.update({
         "memory": True,
-        "memory_grant_context": True,
         "memory_token_budget": 1200,
-        "max_seq_length": 33200,
+        "reranker_enabled": True,
     })
     (run_dir / "config.json").write_text(json.dumps(saved))
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", [
-        "train_multy.py", "--resume", str(run_dir),
+        "train_multy_CVaR.py", "--resume", str(run_dir),
     ])
-    cfg, _ = load_config()
+    cfg, merged = load_config()
 
-    assert cfg.max_seq_length == 32000
+    assert not hasattr(cfg, "memory")
+    assert "memory_token_budget" not in merged
+    assert "reranker_enabled" not in merged
 
 
 def test_legacy_run_restarts_at_adapter_step_and_recovers_archive(tmp_path):

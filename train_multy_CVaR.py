@@ -106,7 +106,7 @@ def _coder_messages_for_template(messages, template_kind):
     Harmony's developer-instruction role; Harmony itself supplies the actual
     system header containing reasoning effort and channel declarations. This
     keeps durable behavior/output rules above the task while leaving the full
-    task, parent state, memory, and strategy in the user message.
+    task, parent state, and strategy in the user message.
     """
     if str(template_kind) != "gpt-oss":
         return messages
@@ -274,7 +274,7 @@ def _apply_coder_model_profile(merged):
     These values are intentionally derived from ``coder_model_name`` (which is
     copied to ``model_name`` by ``--strategies``). The operator therefore only
     changes the coder checkpoint; no matching collection of token, reasoning,
-    memory, or training-layout knobs is required.
+    or training-layout knobs is required.
     """
     profile = _coder_model_profile(merged.get("model_name"))
     if profile is None:
@@ -282,25 +282,13 @@ def _apply_coder_model_profile(merged):
         return
 
     native_context = int(profile["native_context"])
-    context_topup = 0
-    if (bool(merged.get("memory", False))
-            and bool(merged.get("memory_grant_context", True))):
-        context_topup = max(
-            0, int(merged.get("memory_token_budget", 0) or 0))
-    if context_topup >= native_context:
-        raise ValueError(
-            f"memory_token_budget={context_topup} leaves no room inside "
-            f"{profile['name']}'s native {native_context}-token context")
-
     merged["coder_model_profile"] = str(profile["name"])
     merged["coder_template_kind"] = str(profile["template_kind"])
     merged["coder_reasoning_effort"] = str(profile["reasoning_effort"])
     merged["coder_preserve_thinking"] = bool(
         profile["template_kind"] == "qwen3.8")
-    # main() adds the memory allowance later. Subtract it here so the final
-    # context, vLLM planner, and model-native ceiling all agree exactly.
     merged["model_native_context_length"] = native_context
-    merged["max_seq_length"] = native_context - context_topup
+    merged["max_seq_length"] = native_context
     merged["max_new_tokens"] = int(profile["max_output"])
     merged["thinking"] = True
 
@@ -961,7 +949,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "automatic fallback. Without this flag attention is unchanged.")
     p.add_argument(
         "--no-train", action="store_const", const=True, default=None,
-        help="Run rollout, evaluation, search/archive, and memory updates but "
+        help="Run rollout, evaluation, and search/archive updates but "
              "skip training-only logprob scoring, backward passes, and "
              "optimizer updates entirely.")
     p.add_argument(
@@ -1238,76 +1226,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    dest="vllm_enable_expert_parallel",
                    action="store_const", const=False)
 
-    # ---- memory (Sec. 2.2) ----
-    p.add_argument("--memory-version", type=lambda value: value.upper(),
-                   choices=["V1", "V2"], default=None,
-                   help="Memory implementation: V1 preserves historical "
-                        "behavior; V2 enables corrected causal memory.")
-    p.add_argument("--memory", dest="memory", action="store_const",
-                   const=True, default=None,
-                   help="Master switch for the memory module. Every other "
-                        "--memory-* flag is ignored unless this is set.")
-    p.add_argument("--no-memory", dest="memory", action="store_const",
-                   const=False,
-                   help="Force memory off, overriding the YAML.")
-    p.add_argument("--memory-lookup-mode",
-                   choices=["select", "all", "none"], default=None,
-                   help="select = the model picks ids from the index (one extra "
-                        "call per step); all = inject the whole bank; none = "
-                        "never inject.")
-    p.add_argument("--memory-lookup-max-select", type=int, default=None)
-    p.add_argument("--memory-lookup-fallback",
-                   choices=["none", "recent", "importance"], default=None)
-    p.add_argument("--memory-catalog-max-lessons", type=int, default=None)
-    p.add_argument("--memory-token-budget", type=int, default=None)
-    p.add_argument("--memory-arm-control-fraction", type=float, default=None,
-                   help="Share of each existing group generated without memory.")
-    p.add_argument("--memory-arm-explore-fraction", type=float, default=None,
-                   help="Share of each group assigned to an under-tested lesson.")
-    p.add_argument("--memory-arm-max-lessons", type=int, default=None,
-                   help="Maximum lessons placed together in one causal arm.")
-    p.add_argument("--memory-arm-exploration-c", type=float, default=None,
-                   help="UCB uncertainty weight for the exploratory memory arm.")
-    p.add_argument("--memory-arm-comparison-n", type=int, default=None,
-                   help="V2 fixed best-of-n comparison budget. 0 derives it "
-                        "from the initial group size and arm fractions.")
-    p.add_argument("--memory-outcome-credit", action="store_const",
-                   const=True, default=None,
-                   help="Credit lessons from matched best@K uplift vs null arms.")
-    p.add_argument("--memory-no-text-reinforce", dest="memory_text_reinforce",
-                   action="store_const", const=False, default=None,
-                   help="Do not treat LLM paraphrase/confirmation as evidence.")
-    p.add_argument("--memory-extract-mode",
-                   choices=["contrast", "split"], default=None,
-                   help="contrast = one call over successes and failures "
-                        "together, asked why some worked and others did not.")
-    p.add_argument("--memory-curate-every", type=int, default=None,
-                   help="Rewrite the whole bank every N steps. 0 disables.")
-    p.add_argument("--memory-curate-max-items", type=int, default=None)
-    p.add_argument("--memory-extract-from",
-                   choices=["both", "failure", "success"], default=None,
-                   help="Which side of the batch produces lessons. 'failure' "
-                        "skips the positive call entirely: one extraction call "
-                        "per step instead of two.")
-    p.add_argument("--memory-failures-only", dest="memory_extract_from",
-                   action="store_const", const="failure", default=None,
-                   help="Shorthand for --memory-extract-from failure.")
-    p.add_argument("--memory-lessons-per-call", type=int, default=None)
-    p.add_argument("--memory-require-full-lessons", action="store_const",
-                   const=True, default=None)
-    p.add_argument("--memory-max-examples-per-call", type=int, default=None)
-    p.add_argument("--memory-reinforce-delta", type=float, default=None)
-    p.add_argument("--memory-max-new-tokens", type=int, default=None)
-    p.add_argument("--memory-max-code-lines", type=int, default=None)
-    p.add_argument("--memory-allow-constructions", dest="memory_forbid_constructions",
-                   action="store_const", const=False, default=None,
-                   help="Disable the construction guard. Not recommended: this "
-                        "is what let one coordinate formula reach 99%% of "
-                        "programs and cap the run.")
-    p.add_argument("--memory-dedup-jaccard", type=float, default=None)
-    p.add_argument("--memory-inject-mode",
-                   choices=["append", "system"], default=None)
-
     # ---- feedback signal (Sec. 2.3) ----
     p.add_argument("--feedback", dest="feedback", action="store_const",
                    const=True, default=None,
@@ -1533,18 +1451,14 @@ def load_config():
     # while --problem just selects the file). With no YAML, --problem is the key.
     merged["problem"] = ydict.get("problem", problem_name)
 
-    # 2) Saved config overlay. Older code wrote max_seq_length after adding the
-    # memory allowance; undo that convention before main() adds it again.
+    # 2) Saved config overlay. Retired feature keys are ignored so current runs
+    # can resume checkpoints written before those optional systems were removed.
     if saved:
-        marker = saved.pop("_max_seq_length_includes_memory_topup", None)
-        if (marker is None and saved.get("memory")
-                and saved.get("memory_grant_context", True)
-                and saved.get("memory_token_budget", 0)):
-            saved["max_seq_length"] = max(
-                1,
-                int(saved.get("max_seq_length", 0))
-                - int(saved.get("memory_token_budget", 0)),
-            )
+        saved.pop("_max_seq_length_includes_memory_topup", None)
+        for key in list(saved):
+            if (key == "memory" or key.startswith("memory_")
+                    or key.startswith("reranker_")):
+                saved.pop(key, None)
         merged.update(saved)
         # Runs created before the binary coder phase existed must retain their
         # original adapter rank/objective when resumed, even if the current
@@ -1797,14 +1711,6 @@ def load_config():
         raise ValueError("max_groups_per_step cannot be below groups_per_step")
     if int(merged["max_group_size"]) < int(merged["group_size"]):
         raise ValueError("max_group_size cannot be below group_size")
-
-    # Resolve V2's fixed comparison budget before config.json is written. This
-    # makes resume semantics explicit and fails impossible arm designs before
-    # any GPU discovery or model loading.
-    from memory import MemoryConfig
-    memory_preview = MemoryConfig.from_dict(merged, verbose=False)
-    merged["memory_version"] = memory_preview.version
-    merged["memory_arm_comparison_n"] = memory_preview.arm_comparison_n
 
     # Resolve every physical role from one ordered inventory. run.sh exports
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
@@ -7099,7 +7005,7 @@ def _load_adapter(model, adapter_dir, *, announce=True):
 
 
 def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
-                              optimizer, next_g, next_k, memory_path=None,
+                              optimizer, next_g, next_k,
                               spo_rs_tracker=None):
     """Atomically save the state required for an exact next-step resume."""
     import torch
@@ -7114,7 +7020,6 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
         "optimizer": optimizer.state_dict(),
         "next_groups_per_step": int(next_g),
         "next_group_size": int(next_k),
-        "memory_file": Path(memory_path).name if memory_path is not None else None,
         "spo_rs_tracker": (spo_rs_tracker.state_dict()
                            if spo_rs_tracker is not None else None),
     }
@@ -7257,11 +7162,31 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
     return max(1, cpu_budget // per_evaluation)
 
 
+def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
+    """Return a conservative automatic per-process sandbox address-space cap.
+
+    At most 40% of physical RAM can be committed by concurrently admitted
+    generated programs. The remainder is reserved for trainer replicas,
+    sleeping vLLM weight backups, the active rollout engines, and the parent
+    process. A four-GiB per-program ceiling is already far above the working
+    set required by the intended sub-1k-point discovery problem.
+    """
+    concurrent_sandboxes = max(1, int(concurrent_sandboxes))
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        physical_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total_bytes = page_size * physical_pages
+    except (AttributeError, OSError, TypeError, ValueError):
+        total_bytes = 8 * 1024**3
+    shared_budget = max(1, int(total_bytes * 0.40))
+    per_process = shared_budget // concurrent_sandboxes
+    return max(512 * 1024**2, min(4 * 1024**3, per_process))
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
-               memory=None, extractor=None, mem_cfg=None, lookup=None,
-               curator=None, fb_cfg=None, parallel_trainer=None,
+               fb_cfg=None, parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
                ensure_trainer_ready=None):
     import os
@@ -7276,12 +7201,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from problems.base import ParentContext, STRATEGY_OUTPUT_CONTRACT
     from gen_workers import make_progress_bar
 
-    from memory import (MemoryArm, RolloutRecord, allocate_memory_arms,
-                        build_injection, credit_memory_arms, inject_block,
-                        memory_protocol_block)
     from feedback import (FeedbackStats, bound_feedback_advantage,
-                          build_reprompt, feedback_advantage, format_feedback,
-                          is_code_failure, render_chat, select_balanced)
+                          build_reprompt, failure_signature,
+                          feedback_advantage, format_feedback, is_code_failure,
+                          render_chat, select_balanced)
 
     step_t0 = time.time()
     active_advantage_mode = str(
@@ -7302,7 +7225,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     requested_parent_contexts = (
         int(cfg.x_grpo_contexts_per_step)
         if x_grpo_mode else int(cfg.groups_per_step))
-    sampler.set_current_step(step_idx)
     parents = sampler.sample_states(requested_parent_contexts)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
@@ -7323,14 +7245,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
           f"generation/training", flush=True)
 
-    # The coefficient in force this step. When it reaches zero the whole
-    # feedback path is skipped: no reprompts built, no teacher forwards, so the
-    # annealed tail costs exactly what a no-feedback run costs.
-    import inspect as _inspect
-    prompt_parameters = _inspect.signature(problem.build_prompt).parameters
-    memory_aware_prompt = "memory" in prompt_parameters
-    memory_protocol_aware = "memory_protocol" in prompt_parameters
-    memory_v2 = bool(mem_cfg is not None and getattr(mem_cfg, "is_v2", False))
     # Only problems that declare it get their construction written to disk.
     save_ctor = (bool(getattr(problem, "saves_construction", False))
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
@@ -7359,14 +7273,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     all_child_strategy_keys = []
     strategy_pilot_diagnostics = []
     saved_rollouts = 0
-    mem_records = []            # RolloutRecord per rollout, for the memory maker
-    mem_arm_updates = []        # matched treatment-vs-null outcome diagnostics
-    mem_arm_rollouts = {}       # arm -> number of generated programs this step
-
     # ----- BUILD PROMPTS (one per parent/group) -----
-    # Three passes now, because memory lookup is a batched LLM call rather than
-    # a vector query: collect the parent contexts, ask the model once which
-    # lessons it wants for all of them, then render.
     parent_ctxs = []
     base_messages = []
 
@@ -7406,24 +7313,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     elif gen_pool is not None:
         adapter_path = _save_adapter(
             model, exp_dir, step_idx, cfg.model_name)
-
-    # ---- memory lookup (replaces the Eq. 7 retrieval) ----------------
-    # One call covering every parent. An empty bank makes no call at all, so
-    # step 0 is byte-identical to a --no-memory run.
-    chosen_by_group = {}
-    if memory is not None and lookup is not None:
-        chosen_by_group = lookup.select_batch(
-            parent_ctxs, step_idx=step_idx, adapter_path=adapter_path)
-
-    # V2 accounts for every treatment already scheduled in this batch before
-    # assigning exploratory arms. This prevents stale UCB statistics from
-    # sending every parent to the same untested lesson.
-    memory_reservations = {}
-    if memory_v2:
-        for chosen in chosen_by_group.values():
-            for lesson in chosen:
-                memory_reservations[lesson.id] = (
-                    int(memory_reservations.get(lesson.id, 0)) + 1)
 
     def _render(messages):
         template_kind = str(
@@ -7503,77 +7392,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     prompt_jobs = []
     for g, _parent in enumerate(parents):
-        pc = parent_ctxs[g]
-        chosen = chosen_by_group.get(g, [])
-        if x_grpo_mode:
-            fixed_lessons = (
-                list(chosen)[:max(0, int(mem_cfg.arm_max_lessons))]
-                if memory is not None and mem_cfg is not None
-                and getattr(mem_cfg, "lookup_mode", "select") != "none"
-                else [])
-            arms = [MemoryArm(
-                "selected" if fixed_lessons else "no_memory",
-                fixed_lessons,
-                int(cfg.group_size) * x_grpo_groups_per_context,
-            )]
-        elif memory is not None and mem_cfg is not None:
-            if memory_v2:
-                arms = allocate_memory_arms(
-                    cfg.group_size, chosen, memory, mem_cfg, step_idx,
-                    reservations=memory_reservations)
-            else:
-                arms = allocate_memory_arms(
-                    cfg.group_size, chosen, memory, mem_cfg, step_idx)
-        else:
-            arms = [MemoryArm("no_memory", [], int(cfg.group_size))]
-
-        # Rotate prompt order across parents and steps. This prevents a memory
-        # arm from always receiving the first or last segment of the sampler's
-        # RNG stream while remaining deterministic and resume-safe.
-        if len(arms) > 1:
-            shift = (int(step_idx) + int(g)) % len(arms)
-            arms = arms[shift:] + arms[:shift]
-
-        causal_protocol = bool(
-            memory_v2 and len(arms) > 1
-            and any(arm.lessons for arm in arms))
-
-        for arm in arms:
-            messages = base_messages[g]
-            kept, n_tok = [], 0
-            block = ""
-            if arm.lessons:
-                block, n_tok, kept = build_injection(
-                    arm.lessons, tokenizer,
-                    getattr(mem_cfg, "token_budget", 0),
-                    version=getattr(mem_cfg, "version", "V1"))
-            if causal_protocol:
-                if memory_aware_prompt and memory_protocol_aware:
-                    messages = problem.build_prompt(
-                        pc, memory=block, memory_protocol=True)
-                else:
-                    messages = inject_block(
-                        messages, memory_protocol_block(block),
-                        mode=getattr(mem_cfg, "inject_mode", "append"))
-            elif arm.lessons:
-                if memory_aware_prompt:
-                    messages = problem.build_prompt(pc, memory=block)
-                else:
-                    messages = inject_block(
-                        messages, block,
-                        mode=getattr(mem_cfg, "inject_mode", "append"))
-            prompt_text = _render(messages)
-            prompt_jobs.append({
-                "parent_group": g,
-                "arm": arm.name,
-                "memory_ids": [lesson.id for lesson in kept],
-                "memory_tokens": int(n_tok),
-                "messages": messages,
-                "prompt_text": prompt_text,
-                "count": int(arm.count),
-            })
-            mem_arm_rollouts[arm.name] = (
-                mem_arm_rollouts.get(arm.name, 0) + int(arm.count))
+        messages = base_messages[g]
+        count = (int(cfg.group_size) * x_grpo_groups_per_context
+                 if x_grpo_mode else int(cfg.group_size))
+        prompt_jobs.append({
+            "parent_group": g,
+            "messages": messages,
+            "prompt_text": _render(messages),
+            "count": count,
+        })
 
     two_stage_rollouts = bool(
         getattr(problem, "two_stage_rollouts", False))
@@ -7635,19 +7462,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "source_indices": list(schedule),
                     "strategies": [],
                 })
-        mem_arm_rollouts = {}
-        for chain in strategy_chains:
-            for source_idx in chain["source_indices"]:
-                arm = prompt_jobs[source_idx]["arm"]
-                mem_arm_rollouts[arm] = (
-                    mem_arm_rollouts.get(arm, 0) + programs_per_strategy)
-
-    if memory is not None and prompt_jobs:
-        vals = [job["memory_tokens"] for job in prompt_jobs]
-        print(f"[step {step_idx}] memory arms {mem_arm_rollouts}; injected "
-              f"{sum(v > 0 for v in vals)}/{len(vals)} prompt variants, "
-              f"{min(vals)}-{max(vals)} tokens; total rollout budget unchanged")
-
     def _record_strategy_response(chain, strategy_index, response_text):
         """Save and register a strategy at stream-arrival time."""
         if len(chain["strategies"]) != int(strategy_index):
@@ -7837,6 +7651,7 @@ code block.'''
     isolated_cpu_slots = None
     isolated_cpu_count = 0
     isolated_processes_per_cpu = 0
+    isolated_memory_limit_bytes = None
     if isolated_eval:
         isolated_cpu_ids = _isolated_evaluation_cpu_ids()
         isolated_cpu_count = len(isolated_cpu_ids)
@@ -7849,13 +7664,17 @@ code block.'''
                 isolated_cpu_slots.put(cpu_id)
         isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
         n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
+        isolated_memory_limit_bytes = (
+            _automatic_sandbox_memory_limit_bytes(n_reward_workers))
         print(f"[step {step_idx}] isolated evaluation pool: "
               f"{n_reward_workers} sandbox process(es) across "
               f"{isolated_cpu_count} CPU(s), up to "
               f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
               "process tree is pinned to one CPU and excess candidates remain "
               "queued; sandbox launches are FD-safe and do not reduce this "
-              "parallelism")
+              f"parallelism; automatic memory ceiling="
+              f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
+              "stdout+stderr capture is bounded")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
         print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
@@ -7909,7 +7728,8 @@ code block.'''
         try:
             return problem.compute_reward(
                 response_text, parent_ctx, cfg.sandbox_timeout_s,
-                cpu_id=cpu_id)
+                cpu_id=cpu_id,
+                memory_limit_bytes=isolated_memory_limit_bytes)
         finally:
             isolated_cpu_slots.put(cpu_id)
 
@@ -8061,8 +7881,9 @@ code block.'''
             raise RuntimeError("adaptive rollout allocation lost budget")
         return allocations
 
-    def _finish_strategy_pilots(pilot_records, source_job_indices):
-        """Wait for pilot rewards and preserve each chain's fixed budget."""
+    def _finish_strategy_pilots(
+            pilot_records, source_job_indices, *, rewards_already_ready=False):
+        """Finish one or more ready parent/fold pilot sets exactly."""
         expected_pilots = (
             len(source_job_indices) * pilot_programs_per_strategy)
         if len(pilot_records) != expected_pilots:
@@ -8075,7 +7896,13 @@ code block.'''
             raise RuntimeError(
                 "adaptive pilot allocation requires CPU rewards to run "
                 "concurrently with generation")
-        wait(pilot_futures)
+        if rewards_already_ready:
+            if not all(future.done() for future in pilot_futures):
+                raise RuntimeError(
+                    "pilot allocation was requested before its rewards were "
+                    "ready")
+        else:
+            wait(pilot_futures)
 
         rewards_by_source = {
             int(source_idx): [] for source_idx in source_job_indices}
@@ -8086,6 +7913,14 @@ code block.'''
         for record in pilot_records:
             source_idx = int(record["strategy_source_job_idx"])
             result = record["_reward_future"].result()
+            # Only a short prefix is persisted in rollout metadata. Drop the
+            # remainder as soon as the pilot statistic has consumed the result
+            # so completed futures cannot retain hundreds of MiB of diagnostic
+            # output while phase 2 is generated.
+            if len(result.stdout or "") > 4096:
+                result.stdout = (
+                    (result.stdout or "")[:4096]
+                    + "\n[... sandbox output truncated ...]")
             reward = float(result.reward)
             if not math.isfinite(reward):
                 raise RuntimeError(
@@ -8231,18 +8066,131 @@ code block.'''
                 raise RuntimeError(
                     "adaptive strategy allocation changed the fixed group "
                     "rollout budget")
-        # The adaptive scheduler can move programs between strategy prompts,
-        # which can also move them between memory arms. Keep the accounting
-        # aligned with the programs that were actually scheduled.
-        mem_arm_rollouts.clear()
-        for source_idx in source_job_indices:
-            job = prompt_jobs[int(source_idx)]
-            arm = job["arm"]
-            mem_arm_rollouts[arm] = (
-                mem_arm_rollouts.get(arm, 0)
-                + int(job["strategy_allocated_programs"]))
         return [followup_counts[int(source_idx)]
                 for source_idx in source_job_indices]
+
+    def _run_adaptive_followups_as_ready(
+            pilot_records, source_job_indices, run_phase):
+        """Allocate and generate each parent as soon as its pilots finish.
+
+        Thresholds still use all strategies and every pilot for that same
+        parent/fold. The only change is removal of the global all-parent reward
+        barrier: a ready parent keeps the rollout GPUs occupied while slow CPU
+        sandboxes belonging to other parents continue in parallel.
+        """
+        source_job_indices = [int(index) for index in source_job_indices]
+        source_position = {
+            source_idx: position
+            for position, source_idx in enumerate(source_job_indices)
+        }
+        records_by_source = {source_idx: []
+                             for source_idx in source_job_indices}
+        for record in pilot_records:
+            source_idx = int(record["strategy_source_job_idx"])
+            if source_idx not in records_by_source:
+                raise RuntimeError(
+                    f"pilot record references unknown strategy {source_idx}")
+            records_by_source[source_idx].append(record)
+        for source_idx, records in records_by_source.items():
+            if len(records) != pilot_programs_per_strategy:
+                raise RuntimeError(
+                    f"strategy job {source_idx} has {len(records)} pilot "
+                    f"records; expected {pilot_programs_per_strategy}")
+
+        pending_chains = {}
+        for source_idx in source_job_indices:
+            job = prompt_jobs[source_idx]
+            key = (int(job["parent_group"]),
+                   int(job.get("assigned_fold_index", 0)))
+            pending_chains.setdefault(key, []).append(source_idx)
+        for key, chain_indices in pending_chains.items():
+            chain_indices.sort(
+                key=lambda index: int(
+                    prompt_jobs[index]["strategy_index"]))
+            if len(chain_indices) != strategies_per_parent:
+                raise RuntimeError(
+                    f"parent {key[0]} fold {key[1]} has "
+                    f"{len(chain_indices)} strategy jobs; expected "
+                    f"{strategies_per_parent}")
+
+        remaining_per_chain = (
+            strategies_per_parent
+            * (programs_per_strategy - pilot_programs_per_strategy))
+        expected_followups = len(pending_chains) * remaining_per_chain
+        print(
+            f"[step {step_idx}] adaptive phase 2: "
+            f"{expected_followups} programs total; each parent is dispatched "
+            "as soon as its complete pilot set is evaluated",
+            flush=True,
+        )
+
+        all_followup_counts = [0] * len(source_job_indices)
+        dispatched = 0
+        dispatch_index = 0
+        while pending_chains:
+            ready_keys = []
+            for key, chain_indices in pending_chains.items():
+                chain_futures = [
+                    record.get("_reward_future")
+                    for source_idx in chain_indices
+                    for record in records_by_source[source_idx]
+                ]
+                if any(future is None for future in chain_futures):
+                    raise RuntimeError(
+                        "adaptive pilot allocation requires CPU rewards to "
+                        "run concurrently with generation")
+                if all(future.done() for future in chain_futures):
+                    ready_keys.append(key)
+
+            if not ready_keys:
+                incomplete = {
+                    record["_reward_future"]
+                    for chain_indices in pending_chains.values()
+                    for source_idx in chain_indices
+                    for record in records_by_source[source_idx]
+                    if not record["_reward_future"].done()
+                }
+                if not incomplete:
+                    raise RuntimeError(
+                        "adaptive pilot scheduler has no ready chain or "
+                        "pending reward")
+                wait(incomplete, return_when=FIRST_COMPLETED)
+                continue
+
+            ready_keys.sort()
+            ready_sources = [
+                source_idx
+                for key in ready_keys
+                for source_idx in pending_chains[key]
+            ]
+            ready_records = [
+                record
+                for source_idx in ready_sources
+                for record in records_by_source[source_idx]
+            ]
+            ready_followups = _finish_strategy_pilots(
+                ready_records, ready_sources, rewards_already_ready=True)
+            batch_counts = [0] * len(source_job_indices)
+            for source_idx, count in zip(
+                    ready_sources, ready_followups):
+                position = source_position[source_idx]
+                batch_counts[position] = int(count)
+                all_followup_counts[position] = int(count)
+            batch_total = sum(batch_counts)
+            if batch_total:
+                run_phase(
+                    batch_counts, dispatch_index, batch_total,
+                    dispatched + batch_total, expected_followups)
+                dispatched += batch_total
+                dispatch_index += 1
+            for key in ready_keys:
+                del pending_chains[key]
+
+        if dispatched != expected_followups:
+            raise RuntimeError(
+                "adaptive phase-2 dispatch changed the fixed rollout budget: "
+                f"{dispatched}/{expected_followups}")
+        return all_followup_counts
 
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
@@ -8603,20 +8551,21 @@ code block.'''
                         * len(source_job_indices),
                         phase="pilot", seed_offset=0,
                         progress_desc="pilot rollouts")
-                    followup_counts = _finish_strategy_pilots(
-                        pilot_records, source_job_indices)
-                    followup_total = sum(followup_counts)
-                    if followup_total:
-                        print(
-                            f"[step {step_idx}] adaptive phase 2: generating "
-                            f"{followup_total} allocated programs; CPU "
-                            "evaluation continues as each program arrives",
-                            flush=True,
-                        )
+
+                    def _run_ready_vllm_followups(
+                            counts, dispatch_index, _batch_total,
+                            dispatched_after, expected_total):
                         _run_vllm_code_phase(
-                            followup_counts, phase="adaptive",
-                            seed_offset=4_000_000,
-                            progress_desc="adaptive rollouts")
+                            counts, phase="adaptive",
+                            seed_offset=(
+                                4_000_000 + dispatch_index * 100_000),
+                            progress_desc=(
+                                "adaptive rollouts "
+                                f"{dispatched_after}/{expected_total}"))
+
+                    _run_adaptive_followups_as_ready(
+                        pilot_records, source_job_indices,
+                        _run_ready_vllm_followups)
                 else:
                     # Keep the disabled path structurally identical to the
                     # original one-pass rollout scheduler.
@@ -8932,20 +8881,21 @@ code block.'''
                         * len(source_job_indices),
                         phase="pilot", seed_offset=0,
                         progress_desc="pilot rollouts")
-                    followup_counts = _finish_strategy_pilots(
-                        pilot_records, source_job_indices)
-                    followup_total = sum(followup_counts)
-                    if followup_total:
-                        print(
-                            f"[step {step_idx}] adaptive phase 2: generating "
-                            f"{followup_total} allocated programs; CPU "
-                            "evaluation continues as each program arrives",
-                            flush=True,
-                        )
+
+                    def _run_ready_local_followups(
+                            counts, dispatch_index, _batch_total,
+                            dispatched_after, expected_total):
                         _run_local_code_phase(
-                            followup_counts, phase="adaptive",
-                            seed_offset=4_000_000,
-                            progress_desc="adaptive rollouts")
+                            counts, phase="adaptive",
+                            seed_offset=(
+                                4_000_000 + dispatch_index * 100_000),
+                            progress_desc=(
+                                "adaptive rollouts "
+                                f"{dispatched_after}/{expected_total}"))
+
+                    _run_adaptive_followups_as_ready(
+                        pilot_records, source_job_indices,
+                        _run_ready_local_followups)
                     cfg._local_generation_cap = int(cap_state["value"])
                 else:
                     # Keep the disabled path structurally identical to the
@@ -9238,8 +9188,6 @@ code block.'''
                 and hasattr(parallel_trainer, "begin_entropic_overlap")
                 and cfg.generation_backend == "vllm"
                 and not fb_candidate_on
-                and memory is None
-                and extractor is None
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
@@ -9363,8 +9311,6 @@ code block.'''
                 and cfg.generation_backend == "vllm"
                 and int(getattr(cfg, "rank_update_epochs", 1)) == 1
                 and not fb_candidate_on
-                and memory is None
-                and extractor is None
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
@@ -9779,30 +9725,6 @@ code block.'''
                   f"top ties={adv_info['top_count']} "
                   f"all tied={adv_info['all_tied']}")
 
-        # Outcome-based memory credit. All arms share this parent and the same
-        # total K budget; expected_subsample_max corrects unequal arm sizes.
-        arm_observations = {}
-        for r_idx, record in enumerate(responses):
-            job_idx = record["job_idx"]
-            job = prompt_jobs[job_idx]
-            obs = arm_observations.setdefault(job["arm"], {
-                "memory_ids": job["memory_ids"], "rewards": [], "valids": [],
-                "codes": [],
-            })
-            obs["rewards"].append(float(rewards[r_idx]))
-            obs["valids"].append(bool(valids[r_idx]))
-            obs["codes"].append(codes[r_idx])
-        if (memory is not None and mem_cfg is not None
-                and bool(getattr(mem_cfg, "outcome_credit", False))):
-            updates = credit_memory_arms(
-                memory, arm_observations, parent_val, step_idx,
-                parent_id=parent.id)
-            mem_arm_updates.extend({"group": g, **update} for update in updates)
-            for update in updates:
-                print(f"    memory {update['arm']}: n={update['n']} "
-                      f"tail uplift={update['tail_uplift']:+.9f} "
-                      f"valid={update['valid']}/{update['rollouts']}")
-
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, record in enumerate(responses):
             text = record["text"]
@@ -9873,9 +9795,6 @@ code block.'''
                 "parent_selection_score": (float(pick_info["score"])
                                            if pick_info.get("score") is not None else None),
                 "archive_eligible": archive_eligible,
-                "memory_arm": job["arm"],
-                "memory_ids": job["memory_ids"],
-                "memory_tokens": job["memory_tokens"],
                 "two_stage_rollout": bool(two_stage_rollouts),
                 "strategy": (job.get("strategy")
                              if two_stage_rollouts else None),
@@ -9941,10 +9860,6 @@ code block.'''
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             elif binary_coder_mode:
                 meta["binary_coder"] = group_binary_diagnostics[r_idx]
-            if memory_v2:
-                meta["memory_version"] = "V2"
-                meta["memory_comparison_n"] = int(
-                    getattr(mem_cfg, "arm_comparison_n", 0) or 0)
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
@@ -9952,27 +9867,6 @@ code block.'''
                                         if two_stage_rollouts else None),
                          artifacts_already_saved=True)
             saved_rollouts += 1
-            if memory is not None:
-                mem_records.append(RolloutRecord(
-                    step=step_idx, group=g, rollout=r_idx,
-                    parent_summary=(
-                        f"parent reward="
-                        f"{(parent.value if parent.value is not None else 0.0):.9f}"),
-                    parent_code=parent.code or "",
-                    parent_reward=(float(parent.value)
-                                   if parent.value is not None else None),
-                    response=text,
-                    code=res.code or "",
-                    reward=float(rewards[r_idx]),
-                    raw_score=res.raw_score,
-                    valid=bool(valids[r_idx]),
-                    parsed=bool(res.parsed),
-                    ran=bool(res.ran),
-                    msg=res.msg or "",
-                    stdout=res.stdout or "",
-                    memory_arm=job["arm"],
-                    memory_ids=list(job["memory_ids"]),
-                ))
 
         # ---- reprompt(x_p, f_i) for code failures only (Sec. 2.3) --------
         # Built here, while the RewardResult is in hand. The teacher forward
@@ -10027,8 +9921,7 @@ code block.'''
                 prepared.update({
                     "advantage": float(adv),
                     "reprompt_text": reprompt_by_key.get((g, r_idx)),
-                    "failure_signature": RolloutRecord(
-                        msg=res.msg or "").failure_signature(),
+                    "failure_signature": failure_signature(res.msg or ""),
                     "reward_constant": constant,
                     "rank_entropy_gate": rank_entropy_gate,
                     "x_grpo_group_size": len(responses),
@@ -10060,8 +9953,7 @@ code block.'''
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": reference_logprobs,
                 "reprompt_text": reprompt_by_key.get((g, r_idx)),
-                "failure_signature": RolloutRecord(
-                    msg=res.msg or "").failure_signature(),
+                "failure_signature": failure_signature(res.msg or ""),
                 "reward_constant": constant,
                 "rank_entropy_gate": rank_entropy_gate,
                 "group_id": g,
@@ -10299,7 +10191,7 @@ code block.'''
         step_best_result = None
         step_best_raw_score = None
 
-    # Report the problem-native metric before any memory or gradient work. This
+    # Report the problem-native metric before any gradient work. This
     # is deliberately separate from reward: some problems maximize the raw
     # quantity, while others (Erdos bounds, runtime, MSE) minimize it.
     best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
@@ -10346,20 +10238,6 @@ code block.'''
                    f"{problem.metric_name}: unavailable")
         print(f"\033[93m{message}\033[0m", flush=True)
 
-    # ----- MEMORY (Sec. 2.2) ---------------------------------------------
-    # Deliberately above the early return below. A step where every group had
-    # constant reward carries no RL signal but plenty of evidence, and that is
-    # exactly the step where the search is stuck and needs the lessons.
-    #
-    # update() extracts, applies the reinforcements the maker asked for, and
-    # inserts whatever is genuinely new, printing its own summary line.
-    if memory is not None and extractor is not None:
-        extractor.update(mem_records, step_idx, adapter_path=adapter_path)
-        # Curation runs after insertion, so it sees this step's lessons too.
-        if curator is not None and curator.due(step_idx):
-            curator.run(step_idx, adapter_path=adapter_path)
-        memory.save()
-
     step_stats = {
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
@@ -10389,8 +10267,6 @@ code block.'''
         "feedback_teacher_rollouts": int(feedback_teacher_rollouts),
         "feedback_step_cap": int(feedback_step_cap),
         "feedback_signature_cap": int(feedback_signature_cap),
-        "memory_arm_rollouts": mem_arm_rollouts,
-        "memory_arm_updates": mem_arm_updates,
         "evaluation_isolated": isolated_eval,
         "evaluation_workers": int(n_reward_workers),
         "evaluation_cpu_count": int(isolated_cpu_count),
@@ -10399,11 +10275,6 @@ code block.'''
     if adaptive_strategy_pilots:
         step_stats["strategy_pilot_allocation"] = (
             strategy_pilot_diagnostics)
-    if memory_v2:
-        step_stats["memory_version"] = "V2"
-        step_stats["memory_comparison_n"] = int(
-            getattr(mem_cfg, "arm_comparison_n", 0) or 0)
-
     if rank_mode:
         step_stats["rank_groups"] = rank_group_stats
     elif binary_coder_mode:
@@ -10786,20 +10657,6 @@ def main():
     print(f"[init] deterministic = {cfg.deterministic}"
           + (f" (seed {cfg.seed})" if cfg.deterministic else ""))
 
-    # ---- memory context top-up (must happen before the model loads) ----
-    # The injected block is granted context ON TOP of the no-memory setting,
-    # so max_new_tokens and the room available to the response are identical in
-    # both modes. Give the no-memory baseline the SAME final max_seq_length if
-    # you want step 0 to be bit-identical, since the backend reads it at load.
-    from memory import MemoryConfig
-    mem_cfg = MemoryConfig.from_dict(merged)
-    if mem_cfg.enabled and mem_cfg.grant_context and mem_cfg.token_budget > 0:
-        cfg.max_seq_length += mem_cfg.token_budget
-        merged["max_seq_length"] = cfg.max_seq_length
-        print(f"[memory] context raised by {mem_cfg.token_budget} tokens for the "
-              f"injected block: max_seq_length = {cfg.max_seq_length}. "
-              f"Use the same value for the no-memory baseline.")
-
     # Replicate the complete trainer whenever the profiled trainable copy fits
     # on one card, rather than layer-sharding one update across every card. The
     # main process still owns search/evaluation; only per-example gradient work
@@ -11014,7 +10871,6 @@ def main():
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
-    print(f"Memory:             {'on' if mem_cfg.enabled else 'off'}")
     feedback_label = (
         "disabled (--no-train)" if cfg.no_train else
         "off during binary coder phase" if binary_coder_cfg.enabled else
@@ -11371,10 +11227,8 @@ def main():
                     return
                 if (parallel_trainer is not None
                         or cfg.training_layout == "sharded"):
-                    # Memory lookup, rollouts, extraction, and curation may each
-                    # open a separate vLLM phase in one step. Keep the trainer
-                    # on CPU between those phases and restore it once, lazily,
-                    # when the actual gradient update begins.
+                    # Keep the trainer on CPU through generation and restore it
+                    # once, lazily, when the actual gradient update begins.
                     trainer_label = ("trainer replicas"
                                      if parallel_trainer is not None
                                      else "sharded trainer")
@@ -11520,46 +11374,12 @@ def main():
         else:
             print("[init] single-GPU generation (no worker pool)")
 
-    # ---- memory (Sec. 2.2) ----
-    from memory import setup_memory
-    mem_cfg, memory, extractor, lookup, curator = setup_memory(
-        merged, problem, cfg, mem_cfg=mem_cfg,
-        backend=backend, model=model, tokenizer=tokenizer,
-        # PoolMemoryLLM treats a shared-card vLLM call as its own phase: it
-        # offloads the trainer through the pool callback, generates, then
-        # releases the pool and restores training placement in a finally block.
-        gen_pool=gen_pool,
-        exp_dir=exp_dir, seed=run_seed,
-    )
-    if resume_payload is not None and memory is not None:
-        memory_file = resume_payload.get("memory_file")
-        if memory_file:
-            memory_path = Path(exp_dir) / memory_file
-            if not memory_path.is_file():
-                raise FileNotFoundError(
-                    f"checkpoint memory snapshot not found: {memory_path}"
-                )
-            n_lessons = memory.load(memory_path)
-            memory.save()  # undo a partially completed later step, if present
-            print(f"[resume] restored {n_lessons} memory lessons from "
-                  f"{memory_path.name}")
-    elif legacy_resume is not None and memory is not None:
-        print("[resume] warning: legacy memory.json cannot be rolled back to the "
-              "restarted step; it will be reused as-is")
     # ---- feedback-based program-repair signal (Sec. 2.3) ----
     from feedback import FeedbackConfig
     fb_cfg = FeedbackConfig.from_dict(merged)
     print(f"[init] {fb_cfg.describe()}")
     if not cfg.no_train and fb_cfg.enabled and fb_cfg.anneal_steps > 0:
         print(f"[init] lambda schedule: {fb_cfg.schedule_preview()}")
-
-    # ---- Elo re-ranker (retired and explicitly disabled) ----
-    reranker = None
-    if bool(merged.get("reranker_enabled", False)):
-        print("[init] saved config requested the retired Elo re-ranker; "
-              "forcing it off")
-    else:
-        print("[init] Elo re-ranker disabled")
 
     # ---- adaptive batch growth: start from the configured (G, K) ----
     if resume_payload is not None:
@@ -11657,8 +11477,6 @@ def main():
                                step_cfg, exp_dir, problem, gen_pool,
                                strategy_pool=strategy_pool,
                                strategy_tokenizer=strategy_tokenizer,
-                               memory=memory, extractor=extractor, mem_cfg=mem_cfg,
-                               lookup=lookup, curator=curator,
                                fb_cfg=step_fb_cfg,
                                parallel_trainer=parallel_trainer,
                                spo_rs_tracker=spo_rs_tracker,
@@ -11686,13 +11504,9 @@ def main():
             if step < cfg.growth_force_step:
                 cur_g, cur_k = grow_batch(cur_g, cur_k, stats, cfg)
 
-            # Version the memory and adapter first, then atomically advance the
-            # state pointer. A crash during any write leaves the previous
-            # adapter/checkpoint pair valid.
-            memory_path = None
-            if memory is not None:
-                memory_path = Path(exp_dir) / f"memory_step{step:03d}.json"
-                memory.save(memory_path)
+            # Version the adapter first, then atomically advance the state
+            # pointer. A crash during either write leaves the previous pair
+            # valid.
             if binary_coder_cfg.enabled:
                 if (runtime_training_active["value"]
                         or current_policy_adapter_path is None):
@@ -11714,7 +11528,7 @@ def main():
                     model, exp_dir, step, cfg.model_name)
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
-                next_g=cur_g, next_k=cur_k, memory_path=memory_path,
+                next_g=cur_g, next_k=cur_k,
                 spo_rs_tracker=spo_rs_tracker,
             )
             step_summary = {
@@ -11750,9 +11564,6 @@ def main():
                       flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
     finally:
-        if reranker is not None:
-            print("[shutdown] stopping Elo re-ranker ...")
-            reranker.stop()
         if strategy_pool is not None and strategy_pool is not gen_pool:
             print("[shutdown] stopping strategy generation pool ...")
             strategy_pool.shutdown()
@@ -11786,15 +11597,6 @@ def main():
     else:
         print("No valid solution was ever produced.")
         save_final_summary(exp_dir, None, None, None)
-    if memory is not None:
-        c = memory.counts()
-        print(f"\nMemory: {c['total']} lessons "
-              f"({c['success']}+/{c['failure']}-, "
-              f"{c['local']} local/{c['global']} global)")
-        print(f"        {memory.usage_summary()}")
-        print(f"        {memory.stats}")
-        memory.save()
-
     print(f"\nAll outputs saved under: {exp_dir}")
 
 

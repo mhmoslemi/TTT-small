@@ -71,6 +71,11 @@ def _fake_complete_yaml(stream):
         "num_gpus": None,
         "target_modules": [],
         "thinking": False,
+        "train_examples_per_microbatch": 1,
+        "vllm_sleep_level": 1,
+        "strategy_vllm_sleep_level": 1,
+        "vllm_staged_loading": True,
+        "strategy_vllm_staged_loading": True,
     }
     if "problem: gpu_mode" in stream.read():
         values.update({
@@ -450,7 +455,7 @@ class VLLMBackendTests(unittest.TestCase):
         setter.assert_called_once_with(0.86, device=2)
 
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
-        from train_multy import (_resolve_training_backend,
+        from train_multy_CVaR import (_resolve_training_backend,
                                  _resolve_training_model_name)
 
         self.assertEqual(
@@ -530,7 +535,7 @@ class VLLMBackendTests(unittest.TestCase):
         )
 
     def test_three_l40s_pass_gpt_oss_training_capacity_preflight(self):
-        from train_multy import (_resolve_training_memory_budgets,
+        from train_multy_CVaR import (_resolve_training_memory_budgets,
                                  _validate_known_training_capacity)
 
         memory = {
@@ -546,46 +551,37 @@ class VLLMBackendTests(unittest.TestCase):
             _validate_known_training_capacity(
                 "unsloth/gpt-oss-120b-unsloth-bnb-4bit", [38.0])
 
-    def test_three_gpu_gpt_oss_config_uses_all_cards_for_both_phases(self):
+    def test_three_l40s_reject_replicated_gpt_oss_training(self):
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
         memory = {
             gpu_id: GPUMemory(gpu_id, "L40S", 45.0, 44.0)
             for gpu_id in (0, 1, 2)
         }
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "config.yaml"
                 config_path.write_text("problem: circle_packing\n")
                 argv = [
-                    "train_multy.py", "--config", str(config_path),
+                    "train_multy_CVaR.py", "--config", str(config_path),
                     "--model-name", "openai/gpt-oss-120b",
                     "--backend", "vllm",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
                         "gpu_runtime.query_gpu_memory", return_value=memory):
-                    cfg, _ = load_config()
-
-        self.assertEqual(cfg.training_gpu_ids, "0,1,2")
-        self.assertEqual(cfg.gpu_ids, "0,1,2")
-        self.assertEqual(cfg.num_training_gpus, 3)
-        self.assertEqual(
-            cfg.training_model_name,
-            "unsloth/gpt-oss-120b-unsloth-bnb-4bit",
-        )
-        self.assertEqual(cfg.backend, "unsloth")
-        self.assertEqual(cfg.training_max_memory_gib, [38.0, 38.0, 38.0])
-        self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
-        self.assertEqual(cfg.vllm_pipeline_parallel_size, 3)
+                    with self.assertRaisesRegex(
+                            ValueError, "every replica GPU"):
+                        load_config()
 
     def test_training_process_exposes_every_ordered_training_gpu(self):
-        from train_multy import _pin_training_process
+        from train_multy_CVaR import _pin_training_process
 
         env = {}
         with patch.dict(os.environ, env, clear=True):
@@ -655,7 +651,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(events, ["cpu", "cuda:3"])
 
     def test_saved_adapter_names_the_generation_base(self):
-        from train_multy import _save_adapter
+        from train_multy_CVaR import _save_adapter
 
         class Model:
             def save_pretrained(self, path):
@@ -696,10 +692,7 @@ class VLLMBackendTests(unittest.TestCase):
         cfg = {
             "model_name": "/models/Qwen3-Coder-Next",
             "generation_backend": "vllm",
-            "max_seq_length": 32000,
-            "memory": True,
-            "memory_grant_context": True,
-            "memory_token_budget": 3400,
+            "max_seq_length": 35400,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_max_num_batched_tokens": "auto",
@@ -724,6 +717,7 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_load_config_resolves_qwen_coder_next_to_tp1_pp3(self):
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
 
         def qwen_coder_config(stream):
@@ -731,10 +725,7 @@ class VLLMBackendTests(unittest.TestCase):
             values.update({
                 "model_name": "/models/Qwen3-Coder-Next",
                 "generation_backend": "vllm",
-                "max_seq_length": 32000,
-                "memory": True,
-                "memory_grant_context": True,
-                "memory_token_budget": 3400,
+                "max_seq_length": 35400,
                 "vllm_max_num_batched_tokens": "auto",
                 "gen_micro_batch": "auto",
                 "logprob_chunk": "auto",
@@ -742,14 +733,14 @@ class VLLMBackendTests(unittest.TestCase):
             return values
 
         fake_yaml.safe_load = qwen_coder_config
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "qwen.yaml"
                 config_path.write_text("problem: erdos\n")
-                argv = ["train_multy.py", "--config", str(config_path)]
+                argv = ["train_multy_CVaR.py", "--config", str(config_path)]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
                         "gpu_runtime.query_gpu_memory", return_value={}):
@@ -768,7 +759,6 @@ class VLLMBackendTests(unittest.TestCase):
         cfg = {
             "model_name": "Qwen/Qwen3-8B",
             "max_seq_length": 8192,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
         }
@@ -796,7 +786,6 @@ class VLLMBackendTests(unittest.TestCase):
             "model_name": "Qwen/Qwen3-32B",
             "generation_backend": "vllm",
             "max_seq_length": 32768,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_runtime_reserve_gib": 24.0,
@@ -834,7 +823,6 @@ class VLLMBackendTests(unittest.TestCase):
             "model_name": "Qwen/Qwen3-32B",
             "generation_backend": "vllm",
             "max_seq_length": 32768,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_runtime_reserve_gib": 24.0,
@@ -857,7 +845,6 @@ class VLLMBackendTests(unittest.TestCase):
             "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
             "generation_backend": "vllm",
             "max_seq_length": 131072,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_runtime_reserve_gib": 16.0,
@@ -886,10 +873,7 @@ class VLLMBackendTests(unittest.TestCase):
         }
         cfg = {
             "model_name": "Qwen/Qwen3-8B",
-            "max_seq_length": 35400,
-            "memory": True,
-            "memory_grant_context": True,
-            "memory_token_budget": 3400,
+            "max_seq_length": 38800,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
         }
@@ -919,10 +903,7 @@ class VLLMBackendTests(unittest.TestCase):
         cfg = {
             "model_name": "openai/gpt-oss-120b",
             "generation_backend": "vllm",
-            "max_seq_length": 32000,
-            "memory": True,
-            "memory_grant_context": True,
-            "memory_token_budget": 3400,
+            "max_seq_length": 35400,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_max_num_batched_tokens": "auto",
@@ -961,7 +942,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(dup2.call_args_list, [call(73, 1), call(73, 2)])
 
     def test_known_dependency_notices_are_hidden_from_console(self):
-        from train_multy import _NoticeRoutingStream
+        from train_multy_CVaR import _NoticeRoutingStream
 
         visible = io.StringIO()
         diagnostic = io.StringIO()
@@ -993,7 +974,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIn("`torch_dtype` is deprecated", routed)
 
     def test_notice_router_restores_logging_handlers_before_closing(self):
-        from train_multy import _route_dependency_notices
+        from train_multy_CVaR import _route_dependency_notices
 
         visible = io.StringIO()
         logger = logging.getLogger(
@@ -1022,9 +1003,7 @@ class VLLMBackendTests(unittest.TestCase):
     def test_every_problem_yaml_matches_its_problem_contract(self):
         import yaml
 
-        from config_validation import (
-            RERANKER_REQUIRED_KEYS, validate_problem_config,
-        )
+        from config_validation import validate_problem_config
 
         config_dir = Path(__file__).resolve().parents[1] / "configs"
         self.assertFalse((config_dir / "defaults.yaml").exists())
@@ -1033,12 +1012,10 @@ class VLLMBackendTests(unittest.TestCase):
         for path in paths:
             data = yaml.safe_load(path.read_text())
             validate_problem_config(data, source=path)
-            self.assertFalse(data["reranker_enabled"], path.name)
-            self.assertTrue(
-                RERANKER_REQUIRED_KEYS <= set(data), path.name,
-            )
-            self.assertIn("memory_curate_max_new_tokens", data, path.name)
-            self.assertIn("memory_hygiene_profile", data, path.name)
+            self.assertFalse(any(
+                key == "memory" or key.startswith("memory_")
+                or key.startswith("reranker_")
+                for key in data), path.name)
             self.assertIn("adam_beta1", data, path.name)
             self.assertIn("adam_beta2", data, path.name)
             self.assertIn("adam_epsilon", data, path.name)
@@ -1065,17 +1042,11 @@ class VLLMBackendTests(unittest.TestCase):
             if data.get("problem_type") == "mla_decode_nvidia":
                 self.assertIn("mla_seed_runtime_us", data, path.name)
 
-    def test_memory_and_feedback_dataclasses_match_yaml_contract(self):
+    def test_feedback_dataclass_matches_yaml_contract(self):
         from dataclasses import fields
 
         from config_validation import COMMON_REQUIRED_KEYS
         from feedback import FeedbackConfig
-        from memory.config import MemoryConfig
-
-        memory_keys = {
-            "memory" if field.name == "enabled" else f"memory_{field.name}"
-            for field in fields(MemoryConfig)
-        }
         feedback_keys = {
             ("feedback" if field.name == "enabled" else
              "feedback_lambda" if field.name == "lambda_f" else
@@ -1085,24 +1056,23 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertEqual(
             {key for key in COMMON_REQUIRED_KEYS
-             if key == "memory" or key.startswith("memory_")},
-            memory_keys,
-        )
-        self.assertEqual(
-            {key for key in COMMON_REQUIRED_KEYS
              if key == "feedback" or key.startswith("feedback_")},
             feedback_keys,
         )
 
-    def test_complete_yaml_rejects_missing_disabled_reranker_switch(self):
+    def test_complete_yaml_rejects_retired_feature_keys(self):
         import yaml
 
         from config_validation import validate_problem_config
 
         path = Path(__file__).resolve().parents[1] / "configs" / "erdos.yaml"
         data = yaml.safe_load(path.read_text())
-        data.pop("reranker_enabled")
+        data["reranker_enabled"] = False
         with self.assertRaisesRegex(ValueError, "reranker_enabled"):
+            validate_problem_config(data, source=path)
+        data.pop("reranker_enabled")
+        data["memory"] = False
+        with self.assertRaisesRegex(ValueError, "memory"):
             validate_problem_config(data, source=path)
 
     def test_problem_yaml_contract_rejects_cross_problem_fields(self):
@@ -1115,7 +1085,7 @@ class VLLMBackendTests(unittest.TestCase):
             }, require_complete=False)
 
     def test_auto_reward_workers_accounts_for_cpus_per_evaluation(self):
-        from train_multy import _resolve_reward_workers
+        from train_multy_CVaR import _resolve_reward_workers
 
         cfg = types.SimpleNamespace(reward_workers=0, num_gpus=3)
         problem = types.SimpleNamespace(eval_cpus=10)
@@ -1156,7 +1126,7 @@ class VLLMBackendTests(unittest.TestCase):
                                    SeedState)
 
         class ExampleProblem(Problem):
-            def build_prompt(self, parent, memory=""):
+            def build_prompt(self, parent):
                 return []
 
             def preprocess(self, code, parent):
@@ -1177,7 +1147,8 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertTrue(result.valid)
         run_code.assert_called_once_with(
-            "pass", entrypoint="run", timeout_s=12, max_cpus=6)
+            "pass", entrypoint="run", timeout_s=12, max_cpus=6,
+            memory_limit_bytes=None)
 
     def test_offline_auto_backend_selects_hf_without_importing_unsloth(self):
         fake_torch = types.ModuleType("torch")
@@ -1207,7 +1178,6 @@ class VLLMBackendTests(unittest.TestCase):
             "vllm_quantization": "",
             "gen_micro_batch": "auto",
             "logprob_chunk": "auto",
-            "memory": False,
         }
         roles = allocate_gpu_roles([0], "erdos")
         memory = {0: GPUMemory(0, "L40S", 44.5, 43.7)}
@@ -2280,18 +2250,19 @@ class VLLMBackendTests(unittest.TestCase):
         # Config parsing itself does not need the heavy runtime dependencies.
         # Stub them so this test also runs on a CPU-only development machine.
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "empty.yaml"
                 config_path.write_text("{}\n")
                 argv = [
-                    "train_multy.py", "--config", str(config_path),
+                    "train_multy_CVaR.py", "--config", str(config_path),
                     "--backend", "vllm",
                     "--training-gpu-id", "0", "--gpu-ids", "0,1",
                 ]
@@ -2306,18 +2277,19 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_batch_maxima_and_gpu_count_are_derived(self):
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "empty.yaml"
                 config_path.write_text("{}\n")
                 argv = [
-                    "train_multy.py", "--config", str(config_path),
+                    "train_multy_CVaR.py", "--config", str(config_path),
                     "--groups-per-step", "5", "--group-size", "16",
                     "--gpu-ids", "1,0,2,4,6,7", "--thinking",
                     "--training-gpu-id", "1",
@@ -2380,7 +2352,6 @@ class VLLMBackendTests(unittest.TestCase):
         coder = {
             "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
             "max_seq_length": 32000,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
         }
@@ -2411,7 +2382,6 @@ class VLLMBackendTests(unittest.TestCase):
             "model_name": "Qwen/Qwen2.5-Coder-7B-Instruct",
             "generation_backend": "vllm",
             "max_seq_length": 32000,
-            "memory": False,
             "vllm_gpu_memory_utilization": "auto",
             "vllm_quantization": "",
             "vllm_tensor_parallel_size": 1,
@@ -2431,18 +2401,19 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_gpu_mode_roles_type_and_replica_count_come_from_inventory(self):
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "empty.yaml"
                 config_path.write_text("problem: gpu_mode\n")
                 argv = [
-                    "train_multy.py", "--config", str(config_path),
+                    "train_multy_CVaR.py", "--config", str(config_path),
                     "--problem", "gpu_mode", "--backend", "vllm",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
@@ -2461,18 +2432,19 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_six_fitting_gpus_become_six_parallel_replicas(self):
         fake_numpy = types.ModuleType("numpy")
+        fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = _fake_complete_yaml
-        sys.modules.pop("train_multy", None)
+        sys.modules.pop("train_multy_CVaR", None)
 
         with patch.dict(sys.modules, {"numpy": fake_numpy, "yaml": fake_yaml}):
-            from train_multy import load_config
+            from train_multy_CVaR import load_config
 
             with tempfile.TemporaryDirectory() as tmp:
                 config_path = Path(tmp) / "empty.yaml"
                 config_path.write_text("problem: gpu_mode\n")
                 argv = [
-                    "train_multy.py", "--config", str(config_path),
+                    "train_multy_CVaR.py", "--config", str(config_path),
                     "--problem", "gpu_mode", "--backend", "vllm",
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(

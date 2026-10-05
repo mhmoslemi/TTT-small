@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstruct and plot the parent/child search tree saved by train_multy.py.
+"""Reconstruct and plot the parent/child search tree saved by train_multy_CVaR.py.
 
 Examples:
     python3 plot_search_tree.py runs/my_run --out tree.png

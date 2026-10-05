@@ -4,18 +4,6 @@ Circle packing.
   - entrypoint:  run_packing
   - validator:   validate_packing (byte-identical to the paper's)
   - reward:      sum of radii if valid else 0   (maximize)
-
-The prompt is memory-aware. build_prompt takes an optional `memory` block and
-places it BETWEEN the parent state and the instruction, per Fig. 1's ordering,
-rather than having the trainer staple it onto the end. Two things change when
-memory is present:
-
-  - the fixed "Consider:" hint list is replaced. Those four hints are the same
-    every step and compete with the retrieved lessons for the model's attention;
-    with memory on, the analysis step is to consult the lessons instead.
-  - the prompt asks the model to note where the lessons do NOT apply. That is a
-    pressure valve: v1's failure was a lesson reaching 99% adoption, and a prompt
-    that only ever asks "how do I use this" has no way to reject it.
 """
 
 from __future__ import annotations
@@ -63,56 +51,11 @@ _VALIDATOR_SRC = inspect.getsource(validate_packing)
 # ----------------------------------------------------------------------
 # Prompt sections
 # ----------------------------------------------------------------------
-_ANALYSIS_NO_MEMORY = """Reason about how you could further improve this packing. Consider:
+_ANALYSIS = """Reason about how you could further improve this packing. Consider:
 - Are circles placed optimally near boundaries and corners?
 - Could a different arrangement (hexagonal, nested, hybrid) yield better results?
 - Are there gaps that could be filled with repositioned or resized circles?
 - Could optimization parameters or methods be improved?"""
-
-_ANALYSIS_WITH_MEMORY = """## 1. Analysis and strategy
-
-Work through the recorded lessons above before you write anything:
-- Which of them bear on the program you were given, and what would each change?
-- Which do NOT apply here, and why? Say so explicitly. The lessons are evidence
-  from earlier attempts, not requirements, and some of them will be wrong or
-  irrelevant for this state.
-- Is anything the lessons recommend already present in the program above and
-  still not working? If so, the lesson has been tried and the improvement lies
-  somewhere it does not cover.
-
-Then decide what to change. A lesson tells you an idea; you decide the
-implementation. Do not copy any expression from a lesson verbatim, and do not let
-a lesson choose your overall arrangement for you.
-
-If none of the lessons is useful here, ignore them and reason from first
-principles about the packing itself: boundary and corner occupancy, whether a
-different arrangement family would do better, gaps that could absorb a
-repositioned circle, and whether the optimization formulation itself is the
-limit."""
-
-_MEMORY_HEADER = """## Lessons from earlier attempts at this task
-
-Extracted from programs already generated and evaluated in this same search.
-They are empirical findings, not part of the specification above, and they do
-not override any rule stated in it."""
-
-_V2_MEMORY_HEADER = """## Candidate hypotheses from earlier attempts
-
-These are unconfirmed hypotheses extracted from evaluated programs in this
-search. They may be irrelevant or harmful and never override the task rules."""
-
-_V2_ANALYSIS = """## 1. Analysis and strategy
-
-Use the same review procedure whether or not a memory hypothesis was assigned:
-- If one is present, decide whether it applies to the given program and what it
-  would change. It may be wrong or irrelevant.
-- If it recommends something already present and still ineffective, treat that
-  avenue as spent.
-- If none is present or useful, reason from first principles about boundaries,
-  gaps, arrangement families, and the optimization formulation.
-
-Choose the implementation yourself. Do not copy an expression from a hypothesis
-verbatim and do not let it dictate the complete arrangement."""
 
 
 class CirclePacking(Problem):
@@ -129,24 +72,10 @@ class CirclePacking(Problem):
             self.target = 2.636 if self.num_circles == 26 else 2.940
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "",
-                     memory_protocol: bool = False) -> List[dict]:
+    def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
         n = self.num_circles
-
-        memory_section = ""
-        if memory_protocol:
-            candidate = ((memory or "").strip()
-                         or "(No memory hypothesis was assigned to this control arm.)")
-            memory_section = f"\n{_V2_MEMORY_HEADER}\n\n{candidate}\n"
-        elif memory and memory.strip():
-            memory_section = f"\n{_MEMORY_HEADER}\n\n{memory.strip()}\n"
-        if memory_protocol:
-            analysis = _V2_ANALYSIS
-        else:
-            analysis = (_ANALYSIS_WITH_MEMORY
-                        if memory_section else _ANALYSIS_NO_MEMORY)
 
         user = f"""You are an expert mathematician specializing in circle packing problems and computational geometry.
 
@@ -158,8 +87,7 @@ We will run the below validation function (read-only, do not modify this):
 ```
 
 {state_ctx}
-{memory_section}
-{analysis}
+{_ANALYSIS}
 
 Rules:
 - You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
@@ -223,8 +151,7 @@ Rules:
         # A packing the validator accepts but whose radii are all (near) zero is
         # not a solution: it is a program that detected its own failure and
         # returned something harmless. Accepting it at reward 0 makes defensive
-        # coding free, inflates the valid rate, and gives the memory extractor a
-        # pile of "returned zeros" rollouts to learn from. Reject it instead.
+        # coding free and inflates the valid rate. Reject it instead.
         if valid:
             s = float(np.sum(radii))
             if s <= self.degenerate_threshold:

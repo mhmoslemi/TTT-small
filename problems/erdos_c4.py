@@ -237,8 +237,6 @@ class ErdosC4Uncertainty(Problem):
     def build_prompt(
         self,
         parent: ParentContext,
-        memory: str = "",
-        memory_protocol: bool = False,
     ) -> List[dict]:
         state_ctx = render_state_context(
             self.metric_name,
@@ -256,40 +254,7 @@ coefficients. You may change both their values and their count, but the returned
 count must be between 1 and {self.max_coeff_count}.
 """
 
-        memory_section = ""
-        if memory_protocol:
-            candidate = (
-                (memory or "").strip()
-                or "(No memory hypothesis was assigned to this control arm.)"
-            )
-            memory_section = f"""
-## Candidate hypotheses from earlier attempts
-
-These are unconfirmed hypotheses extracted from programs generated and
-evaluated in this search. They may be wrong or irrelevant and do not override
-the mathematical specification.
-
-{candidate}
-"""
-        elif memory and memory.strip():
-            memory_section = f"""
-## Lessons from earlier attempts
-
-These are empirical observations from this search, not part of the
-specification, and they may be wrong or irrelevant.
-
-{memory.strip()}
-"""
-
-        if memory_protocol:
-            instruction = """Review the assigned hypothesis, if any, and decide
-whether it applies to this construction. Then produce a meaningfully improved
-search algorithm; do not copy a lesson expression verbatim."""
-        elif memory_section:
-            instruction = """Assess which lessons actually apply, then produce
-a meaningfully improved search algorithm. Treat already-tried, unsuccessful
-ideas as spent."""
-        elif parent.code and parent.code.strip():
+        if parent.code and parent.code.strip():
             instruction = """Reason about how to improve the previous search
 algorithm through a different parameterization, optimizer, initialization,
 precision strategy, or exploration schedule."""
@@ -346,7 +311,7 @@ exact rational polynomial arithmetic and does not trust a claimed score.
 - No filesystem or network I/O.
 
 {state_ctx}
-{construction_section}{memory_section}
+{construction_section}
 {instruction}
 
 ## Output format

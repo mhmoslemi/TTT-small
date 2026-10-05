@@ -8,22 +8,9 @@ from pathlib import Path
 
 
 # These settings are consumed by the shared training, generation, search,
-# memory, and feedback runtimes. Every checked-in preset carries them so a
+# and feedback runtimes. Every checked-in preset carries them so a
 # selected YAML is self-contained, but that does not make problem-specific
 # fields interchangeable.
-RERANKER_REQUIRED_KEYS = frozenset("""
-reranker_enabled reranker_backend reranker_model reranker_base_url
-reranker_api_key reranker_api_key_env reranker_temperature
-reranker_max_tokens reranker_request_timeout_s reranker_judge_gpu
-reranker_judge_batch_size reranker_judge_load_in_4bit reranker_top_p
-reranker_max_seq_length reranker_top_k reranker_debate
-reranker_tournament_mode reranker_num_random_matches reranker_both_orders
-reranker_judge_concurrency reranker_max_code_chars reranker_elo_init
-reranker_elo_k reranker_elo_softmax_temp reranker_prior_weight
-reranker_poll_interval_s reranker_min_states_to_rank reranker_goal
-""".split())
-
-
 COMMON_REQUIRED_KEYS = frozenset("""
 problem target
 fail_score model_name training_model_name coder_model_name
@@ -53,27 +40,13 @@ strategy_max_seq_length strategy_temperature strategy_top_p
 strategy_thinking strategy_reasoning_effort strategy_vllm_quantization
 deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
-memory memory_version memory_extract_mode memory_lessons_per_call memory_hygiene_profile
-memory_max_examples_per_call memory_max_chars_per_example
-memory_feedback_chars memory_max_new_tokens memory_forbid_constructions
-memory_max_code_lines memory_global_scope_allows_code memory_lookup_mode
-memory_lookup_max_select memory_lookup_fallback memory_lookup_max_new_tokens
-memory_lookup_temperature memory_catalog_max_lessons memory_catalog_chars
-memory_curate_every memory_curate_min_bank memory_curate_max_items
-memory_curate_max_new_tokens
-memory_curate_min_keep_frac memory_max_lessons memory_dedup_jaccard
-memory_reinforce_delta memory_persist memory_inject_mode memory_token_budget
-memory_grant_context memory_arm_control_fraction memory_arm_explore_fraction
-memory_arm_max_lessons memory_arm_exploration_c memory_arm_comparison_n memory_outcome_credit
-memory_text_reinforce memory_extract_from memory_require_full_lessons
-memory_temperature memory_top_p memory_use_gen_pool
 feedback feedback_lambda feedback_anneal_steps feedback_anneal_shape
 feedback_lambda_final feedback_clip feedback_chars feedback_max_per_step
 feedback_auto_fraction feedback_include_constant_groups feedback_inject_mode
 feedback_normalize feedback_adaptive feedback_validity_floor
 feedback_validity_target feedback_max_reward_ratio feedback_reward_scale_floor
 feedback_max_per_signature feedback_auto_signature_fraction
-""".split()) | RERANKER_REQUIRED_KEYS
+""".split())
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
@@ -326,15 +299,6 @@ def validate_problem_config(
         if key in data and not isinstance(data[key], bool):
             raise ValueError(
                 f"{_label(source)}: {key} must be true or false")
-    if "memory_top_p" in data and not 0 < float(data["memory_top_p"]) <= 1:
-        raise ValueError(f"{_label(source)}: memory_top_p must be in (0, 1]")
-    if "memory_version" in data and str(data["memory_version"]).upper() not in {
-            "V1", "V2"}:
-        raise ValueError(f"{_label(source)}: memory_version must be V1 or V2")
-    if ("memory_arm_comparison_n" in data
-            and int(data["memory_arm_comparison_n"]) < 0):
-        raise ValueError(
-            f"{_label(source)}: memory_arm_comparison_n must be >= 0")
     for key in ("adam_beta1", "adam_beta2"):
         if key in data and not 0 <= float(data[key]) < 1:
             raise ValueError(f"{_label(source)}: {key} must be in [0, 1)")
@@ -344,11 +308,6 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
     if "uct" in data and not isinstance(data["uct"], bool):
         raise ValueError(f"{_label(source)}: uct must be true or false")
-    if "reranker_enabled" in data and data["reranker_enabled"] is not False:
-        raise ValueError(
-            f"{_label(source)}: reranker_enabled must be false; the Elo "
-            "reranker implementation is not installed"
-        )
     if "reward_workers" in data and int(data["reward_workers"]) < 0:
         raise ValueError(f"{_label(source)}: reward_workers must be >= 0")
     if problem == "gpu_mode" and data.get("reward_workers") != 1:

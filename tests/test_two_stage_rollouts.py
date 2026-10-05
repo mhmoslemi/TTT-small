@@ -3,7 +3,7 @@ from train_multy_CVaR import _STRATEGY_FALLBACK, _extract_final_strategy
 
 
 class _DummyProblem(Problem):
-    def build_prompt(self, parent, memory="", memory_protocol=False):
+    def build_prompt(self, parent):
         raise NotImplementedError
 
     def preprocess(self, code, parent):

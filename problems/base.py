@@ -173,21 +173,8 @@ class Problem(ABC):
 
     # ---- prompt / sandbox program / scoring (subclasses implement) ----
     @abstractmethod
-    def build_prompt(self, parent: ParentContext, memory: str = "",
-                     memory_protocol: bool = False) -> List[dict]:
-        """
-        Build the chat messages for one parent.
-
-        `memory` is a pre-rendered block of retrieved lessons, or "" when memory
-        is off or nothing was selected. A problem that accepts it should place it
-        between the parent state and the instruction, and adapt the instruction
-        to it; a problem that ignores it still works, and the trainer falls back
-        to appending the block itself.
-
-        In memory V2, `memory_protocol` is true for every arm in a matched
-        comparison. The no-memory control then receives the same reasoning
-        wrapper with an explicit empty hypothesis, isolating lesson content.
-        """
+    def build_prompt(self, parent: ParentContext) -> List[dict]:
+        """Build the chat messages for one parent state."""
         ...
 
     def build_strategy_messages(
@@ -367,7 +354,8 @@ usage. Return only exactly one fenced Python code block, beginning with
 
     # ---- default reward path (subprocess sandbox) --------------------
     def compute_reward(self, response_text: str, parent: ParentContext,
-                       timeout_s: float, *, cpu_id: Optional[int] = None
+                       timeout_s: float, *, cpu_id: Optional[int] = None,
+                       memory_limit_bytes: Optional[int] = None
                        ) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
         code = extract_python_code(
@@ -388,6 +376,7 @@ usage. Return only exactly one fenced Python code block, beginning with
             timeout_s=timeout_s,
             max_cpus=(1 if cpu_id is not None else self.eval_cpus),
             cpu_id=cpu_id,
+            memory_limit_bytes=memory_limit_bytes,
         )
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]

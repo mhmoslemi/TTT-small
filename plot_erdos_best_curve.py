@@ -282,15 +282,11 @@ def config_caption(run_dir, valid_count, metric_name, maximize):
     model = Path(str(config.get("model_name", "?"))).name
     groups = config.get("groups_per_step", "?")
     size = config.get("group_size", "?")
-    # memory = "memory on" if config.get("memory") else "memory off"
-    memory = ""
     problem = config.get("problem", "unknown")
-    # direction = "higher is better" if maximize else "lower is better"
-    direction = ""
 
     # Combine the main run settings into one line.
     return (f"{problem} · {metric_name} · {model} · {groups} groups × {size} "
-            f"rollouts · {memory} · {valid_count:,} valid rollouts · {direction}")
+            f"rollouts · {valid_count:,} valid rollouts")
 
 
 def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,

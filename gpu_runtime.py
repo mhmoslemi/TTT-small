@@ -283,11 +283,7 @@ def _estimated_weight_gib(model_name: str, quantization: str) -> float:
 
 
 def _effective_max_length(cfg: dict) -> int:
-    max_len = max(1, int(cfg.get("max_seq_length", 4096)))
-    if (bool(cfg.get("memory", False))
-            and bool(cfg.get("memory_grant_context", True))):
-        max_len += max(0, int(cfg.get("memory_token_budget", 0) or 0))
-    return max_len
+    return max(1, int(cfg.get("max_seq_length", 4096)))
 
 
 def _resolved_vllm_utilization(raw_value, total_gib: float,

@@ -9,10 +9,6 @@ Two changes from the original:
   max_new_tokens, and extract_python_code (which looks for ```python fences)
   had nothing reliable to find.
 
-  build_prompt takes `memory` and places the retrieved lessons between the
-  parent state and the instruction, and adapts the instruction when they are
-  present, rather than having the trainer staple the block onto the end.
-
   The compute budget is config-driven. The prompt used to hardcode
   "budget_s=1000", and the sandbox calls run() with NO arguments, so that
   default is what actually executes: every rollout may burn 1000 seconds of
@@ -196,8 +192,7 @@ These are hard output constraints even if the proposed strategy suggests
 otherwise.''')
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "",
-                     memory_protocol: bool = False) -> List[dict]:
+    def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
 
@@ -208,57 +203,7 @@ You may want to start your search from the current construction, which you can a
 You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
 """
 
-        memory_section = ""
-        if memory_protocol:
-            candidate = ((memory or "").strip()
-                         or "(No memory hypothesis was assigned to this control arm.)")
-            memory_section = f"""
-## Candidate hypotheses from earlier attempts at this problem
-
-These are unconfirmed hypotheses extracted from programs generated and
-evaluated in this search. They may be irrelevant or harmful and do not override
-any task constraint.
-
-{candidate}
-"""
-        elif memory and memory.strip():
-            memory_section = f"""
-## Lessons from earlier attempts at this problem
-
-Extracted from programs already generated and evaluated in this same search.
-Empirical findings, not part of the specification above, and they do not
-override any constraint stated in it.
-
-{memory.strip()}
-"""
-
-        if memory_protocol:
-            code_section = '''Use the same review procedure whether or not a
-memory hypothesis was assigned:
-- If a hypothesis is present, decide whether it bears on this construction and
-  what it would change. It may be wrong or irrelevant.
-- If it recommends something already present and still not improving the bound,
-  treat that avenue as spent.
-- If no hypothesis is present or useful, reason from the task and parent alone.
-
-Then reason about how to improve the construction. Aim for a meaningfully
-different algorithmic idea, heuristic, parameterization, or sweep. Never copy a
-lesson expression verbatim. Unless you improve meaningfully, you are not
-rewarded.'''
-        elif memory_section:
-            code_section = '''Work through the lessons above before writing anything:
-- Which bear on the construction you were given, and what would each change?
-- Which do NOT apply here, and why? Say so explicitly. Some will be wrong or
-  irrelevant for this state.
-- Is anything they recommend already in the algorithm above and still not
-  improving the bound? Then that avenue is spent and the gain is elsewhere.
-
-Then reason about how to improve the construction. Aim for something different
-from the algorithm above: a different algorithmic idea, different heuristics, a
-different parameterization or sweep. A lesson gives you an idea; you choose the
-implementation, and you should not copy any expression from one verbatim.
-Unless you make a meaningful improvement, you will not be rewarded.'''
-        elif parent.code and parent.code.strip():
+        if parent.code and parent.code.strip():
             code_section = '''Reason about how you could further improve this construction.
 Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
 Unless you make a meaningful improvement, you will not be rewarded.'''
@@ -324,7 +269,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 **Lower is better**. Current record: C₅ ≤ 0.38085. Our goal is to find a construction that shows C₅ ≤ 0.38085.
 
 {state_ctx}
-{construction_section}{memory_section}
+{construction_section}
 {code_section}
 {direct_output_section}
 

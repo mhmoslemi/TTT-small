@@ -10,12 +10,9 @@ Needs:
   * the examples/gpu_mode/lib tree present (task.yml, reference.py, eval.py, utils.py)
   * run from the repo root so `examples` and `libkernelbot` resolve
 
-Two changes from the original, both for the memory and feedback components:
+Changes from the original for the feedback component:
 
-  build_prompt takes `memory` and places the retrieved lessons between the
-  parent kernel and the rules, adapting the instruction when they are present.
-
-  compute_reward now captures compiler and test output into res.stdout. The
+  compute_reward captures compiler and test output into res.stdout. The
   original discarded it and returned only a one-line msg, which meant the
   feedback signal's f_i was "Failed to pass test cases." with nothing in it.
   Triton compile errors and correctness mismatches are the richest textual
@@ -81,12 +78,6 @@ _DEFAULTS = {
     },
 }
 
-_MEMORY_HEADER = """## Lessons from earlier kernels in this search
-
-Extracted from kernels already generated and benchmarked here. Empirical
-findings, not part of the specification above, and they do not override any rule
-stated in it."""
-
 _ARCH_NOTES = {
     "l40s": """Target hardware: NVIDIA L40S (Ada Lovelace, sm_89, 48 GB GDDR6, no NVLink).
 Ada is not Hopper. The following do NOT exist on this device and will fail to
@@ -148,20 +139,6 @@ most of the computation in PyTorch and moves one hot region into a kernel scores
 one that fails to launch scores zero."""
 
 
-_ANALYSIS_WITH_MEMORY = """## Analysis
-
-Work through the lessons above before writing anything:
-- Which apply to the kernel you were given, and what would each change?
-- Which do NOT apply here, and why? Say so explicitly. They are evidence from
-  earlier attempts, and some will be wrong or irrelevant for this kernel.
-- Is anything they recommend already present above and still not fast enough?
-  Then that avenue is exhausted and the win is somewhere they do not cover.
-
-A lesson gives you an idea; you choose the implementation. Do not copy a kernel
-body or an autotune configuration verbatim, and do not let a lesson fix your
-tiling or memory-access strategy for you."""
-
-
 def _clip(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n // 3] + "\n...[truncated]...\n" + s[-(2 * n // 3):]
@@ -169,8 +146,7 @@ def _clip(s: str, n: int) -> str:
 
 def collect_logs(result, limit: int = 4000) -> str:
     """
-    Everything the runner said, as f_i for the feedback signal and as failure
-    evidence for the memory maker.
+    Everything the runner said as f_i for the feedback signal.
 
     Ordered worst-first on purpose: a compile error explains a failure and a
     benchmark log does not, and the feedback reprompt keeps the tail.
@@ -402,30 +378,9 @@ class GpuMode(Problem):
         self.entrypoint = "custom_kernel"
 
     # ------------------------------------------------------------------
-    def build_prompt(self, parent: ParentContext, memory: str = "",
-                     memory_protocol: bool = False) -> List[dict]:
+    def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
-
-        memory_section = ""
-        analysis = ""
-        if memory_protocol:
-            candidate = ((memory or "").strip()
-                         or "(No memory hypothesis was assigned to this control arm.)")
-            memory_section = (
-                "\n## Candidate hypotheses from earlier attempts\n\n"
-                "These are unconfirmed hypotheses from evaluated kernels. They "
-                "may be irrelevant or harmful and never override the task "
-                f"rules.\n\n{candidate}\n")
-            analysis = (
-                "\nReview the assigned hypothesis if present and decide whether "
-                "it applies to this parent. If none is assigned or useful, "
-                "reason from the kernel, shapes, and target hardware alone. "
-                "Choose the implementation yourself and do not copy a lesson "
-                "verbatim.\n")
-        elif memory and memory.strip():
-            memory_section = f"\n{_MEMORY_HEADER}\n\n{memory.strip()}\n"
-            analysis = f"\n{_ANALYSIS_WITH_MEMORY}\n"
 
         notes = arch_notes(self.gpu_type)
         arch_section = f"\n{notes}\n" if notes else ""
@@ -435,7 +390,6 @@ class GpuMode(Problem):
             user = f"""{TRIMUL_PROMPT}
 {arch_section}{launch_section}
 {state_ctx}
-{memory_section}{analysis}
 Rules:
 - The tensors arguments passed in will be already on your cuda device.
 - Define all of your code in one final ```python ``` block.
@@ -452,7 +406,6 @@ Rules:
             user = f"""{MLA_DECODE_PROMPT}
 {arch_section}{launch_section}
 {state_ctx}
-{memory_section}{analysis}
 {MLA_DECODE_PROMPT_END}
 """
         return [{"role": "user", "content": user}]

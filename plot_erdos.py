@@ -45,9 +45,8 @@ def as_array(value):
 
     experiment_io's _coerce falls back to str() for anything it cannot dump
     directly, so `construction` can arrive as a real list OR as the repr of one
-    ("[0.498, 0.826, ...]"). Same for memory_ids. Handle both rather than
-    assuming, since which one you get depends on the numpy dtype of the values
-    at save time.
+    ("[0.498, 0.826, ...]"). Handle both rather than assuming, since which one
+    you get depends on the numpy dtype of the values at save time.
     """
     if value is None:
         return None
