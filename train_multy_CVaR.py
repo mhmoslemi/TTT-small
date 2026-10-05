@@ -70,6 +70,7 @@ _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = (
     "deepseek-r1-0528-qwen3-8b")
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
 _ANSI_ORANGE = "\033[38;5;208m"
+_ANSI_YELLOW = "\033[93m"
 _ANSI_RESET = "\033[0m"
 
 
@@ -7941,21 +7942,79 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             remaining = (
                 strategies_per_parent
                 * (programs_per_strategy - pilot_programs_per_strategy))
-            followups = _allocate_largest_remainder(
-                remaining, weights,
-                [(mean, variance,
-                  int(prompt_jobs[source_idx]["strategy_index"]))
-                 for source_idx, mean, variance in zip(
-                     chain_indices, means, variances)],
-            )
+            tie_values = [
+                (mean, variance,
+                 int(prompt_jobs[source_idx]["strategy_index"]))
+                for source_idx, mean, variance in zip(
+                    chain_indices, means, variances)
+            ]
+
+            # A zero/zero pilot contains no evidence that the strategy itself
+            # is hopeless: all of its few programs may simply have failed.
+            # Give every such strategy a small, fixed-budget exploration floor
+            # before allocating the remainder by the existing four-scenario
+            # rule.  The floor is carved out of ``remaining`` rather than
+            # added to it, so the configured rollout count never changes.
+            zero_signal = [
+                abs(mean) <= 1e-12 and abs(variance) <= 1e-12
+                for mean, variance in zip(means, variances)
+            ]
+            requested_floor = max(
+                0, int(pilot_programs_per_strategy) // 3)
+            floor_allocations = [0] * len(chain_indices)
+            floor_demand = requested_floor * sum(zero_signal)
+            if floor_demand > 0:
+                floor_budget = min(remaining, floor_demand)
+                if floor_budget == floor_demand:
+                    floor_allocations = [
+                        requested_floor if is_zero else 0
+                        for is_zero in zero_signal
+                    ]
+                else:
+                    # This only occurs for configurations whose entire phase-2
+                    # budget is smaller than the requested floors. Share the
+                    # available budget fairly across zero-signal strategies.
+                    floor_allocations = _allocate_largest_remainder(
+                        floor_budget,
+                        [1.0 if is_zero else 0.0
+                         for is_zero in zero_signal],
+                        tie_values,
+                    )
+            weighted_budget = remaining - sum(floor_allocations)
+            weighted_allocations = _allocate_largest_remainder(
+                weighted_budget, weights, tie_values)
+            followups = [
+                int(floor_count) + int(weighted_count)
+                for floor_count, weighted_count in zip(
+                    floor_allocations, weighted_allocations)
+            ]
+            if sum(followups) != remaining:
+                raise RuntimeError(
+                    "adaptive rollout exploration floor lost budget")
             fallback_equal = not any(weight > 0.0 for weight in weights)
+            floor_total = sum(floor_allocations)
+            if requested_floor > 0 and any(zero_signal):
+                if floor_total == floor_demand:
+                    floor_label = (
+                        f"; zero-signal exploration floor="
+                        f"{requested_floor} for {sum(zero_signal)} "
+                        "strategy(s)")
+                else:
+                    floor_label = (
+                        f"; zero-signal exploration reserved={floor_total} "
+                        f"across {sum(zero_signal)} strategy(s) "
+                        f"(requested floor={requested_floor} each; "
+                        "phase-2 budget constrained)")
+            else:
+                floor_label = ""
             print(
                 f"[step {step_idx}] rollout pilot parent {parent_group}"
                 f"/fold {fold_index}: mean threshold={mean_threshold:.9f}, "
                 f"variance threshold={variance_threshold:.9f}; "
                 f"allocating {remaining} phase-2 rollouts"
                 + (" equally (all pilot statistics tied)"
-                   if fallback_equal else ""),
+                   if fallback_equal else "")
+                + floor_label,
                 flush=True,
             )
 
@@ -7980,6 +8039,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "scenario": str(scenario),
                     "followup_count": int(followup),
                     "allocated_programs": int(allocated),
+                    "source_job_idx": int(source_idx),
+                    "pilot_best_raw_score": (
+                        float(best_raw_score)
+                        if best_raw_score is not None else None),
                 }
                 strategy_pilot_diagnostics.append(diagnostic)
                 job.update({
@@ -8016,6 +8079,100 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "rollout budget")
         return [followup_counts[int(source_idx)]
                 for source_idx in source_job_indices]
+
+    def _print_adaptive_phase2_results():
+        """Repeat pilot diagnostics with each strategy's final best result."""
+        if not strategy_pilot_diagnostics:
+            return
+
+        records_by_source = {}
+        for responses in group_responses.values():
+            for record in responses:
+                source_idx = record.get("strategy_source_job_idx")
+                if source_idx is None:
+                    continue
+                records_by_source.setdefault(int(source_idx), []).append(
+                    record)
+
+        diagnostics_by_chain = {}
+        for diagnostic in strategy_pilot_diagnostics:
+            key = (int(diagnostic["parent_group"]),
+                   int(diagnostic["fold_index"]))
+            diagnostics_by_chain.setdefault(key, []).append(diagnostic)
+
+        for (parent_group, fold_index), diagnostics in sorted(
+                diagnostics_by_chain.items()):
+            diagnostics.sort(key=lambda item: int(item["strategy_index"]))
+            mean_threshold = float(diagnostics[0]["mean_threshold"])
+            variance_threshold = float(
+                diagnostics[0]["variance_threshold"])
+            phase2_total = sum(
+                int(item["followup_count"]) for item in diagnostics)
+            print(
+                f"[step {step_idx}] rollout phase 2 complete parent "
+                f"{parent_group}/fold {fold_index}: mean threshold="
+                f"{mean_threshold:.9f}, variance threshold="
+                f"{variance_threshold:.9f}; evaluated {phase2_total} "
+                "phase-2 rollouts",
+                flush=True,
+            )
+
+            for diagnostic in diagnostics:
+                source_idx = int(diagnostic["source_job_idx"])
+                followup_count = int(diagnostic["followup_count"])
+                pilot_best = diagnostic.get("pilot_best_raw_score")
+                pilot_best_text = (
+                    f"{float(pilot_best):.9f}"
+                    if pilot_best is not None else "unavailable"
+                )
+                line = (
+                    f"[step {step_idx}]   strategy "
+                    f"{int(diagnostic['strategy_index'])}: mean="
+                    f"{float(diagnostic['pilot_reward_mean']):.9f}, "
+                    f"variance="
+                    f"{float(diagnostic['pilot_reward_variance']):.9f}, "
+                    f"{diagnostic['scenario']}, phase2={followup_count}, "
+                    f"total={int(diagnostic['allocated_programs'])}, "
+                    f"{_ANSI_ORANGE}pilot best raw "
+                    f"{problem.metric_name}={pilot_best_text}"
+                    f"{_ANSI_RESET}"
+                )
+                if followup_count > 0:
+                    raw_scores = []
+                    for record in records_by_source.get(source_idx, []):
+                        future = record.get("_reward_future")
+                        if future is None or not future.done():
+                            raise RuntimeError(
+                                "phase-2 report requested before all strategy "
+                                "rewards were ready")
+                        result = future.result()
+                        raw_score = getattr(result, "raw_score", None)
+                        if (not bool(getattr(result, "valid", False))
+                                or raw_score is None):
+                            continue
+                        try:
+                            raw_score = float(raw_score)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(raw_score):
+                            raw_scores.append(raw_score)
+                    final_best = (
+                        (max(raw_scores) if problem.maximize
+                         else min(raw_scores))
+                        if raw_scores else None
+                    )
+                    diagnostic["final_best_raw_score"] = (
+                        float(final_best) if final_best is not None else None)
+                    final_best_text = (
+                        f"{final_best:.9f}"
+                        if final_best is not None else "unavailable"
+                    )
+                    line += (
+                        f" {_ANSI_YELLOW}--> best raw after new rollouts "
+                        f"{problem.metric_name}={final_best_text}"
+                        f"{_ANSI_RESET}"
+                    )
+                print(line, flush=True)
 
     def _run_adaptive_followups_as_ready(
             pilot_records, source_job_indices, run_phase):
@@ -9082,6 +9239,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # evaluation, so this is only a non-blocking correctness barrier.
     for save_future in rollout_io_futures:
         save_future.result()
+
+    # Reuse the completed verifier results for the final adaptive report. No
+    # rollout is evaluated a second time here.
+    if adaptive_strategy_pilots:
+        _print_adaptive_phase2_results()
 
     if spo_rs_mode and not training_enabled:
         # With policy optimization disabled, consecutive policies are exactly
