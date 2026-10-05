@@ -65,6 +65,8 @@ _QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
 _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = (
     "deepseek-r1-0528-qwen3-8b")
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
+_ANSI_ORANGE = "\033[38;5;208m"
+_ANSI_RESET = "\033[0m"
 
 
 _GPT_OSS_CODER_DEVELOPER_INSTRUCTIONS = '''Formatting re-enabled
@@ -7986,6 +7988,8 @@ code block.'''
 
         rewards_by_source = {
             int(source_idx): [] for source_idx in source_job_indices}
+        raw_scores_by_source = {
+            int(source_idx): [] for source_idx in source_job_indices}
         records_by_source = {
             int(source_idx): [] for source_idx in source_job_indices}
         for record in pilot_records:
@@ -7996,6 +8000,14 @@ code block.'''
                 raise RuntimeError(
                     f"pilot reward for strategy job {source_idx} is not finite")
             rewards_by_source[source_idx].append(reward)
+            raw_score = getattr(result, "raw_score", None)
+            if bool(getattr(result, "valid", False)) and raw_score is not None:
+                try:
+                    raw_score = float(raw_score)
+                except (TypeError, ValueError):
+                    raw_score = None
+                if raw_score is not None and math.isfinite(raw_score):
+                    raw_scores_by_source[source_idx].append(raw_score)
             records_by_source[source_idx].append(record)
 
         chains = {}
@@ -8077,6 +8089,11 @@ code block.'''
                     chain_indices, means, variances, scenarios, followups):
                 job = prompt_jobs[source_idx]
                 allocated = pilot_programs_per_strategy + int(followup)
+                raw_scores = raw_scores_by_source[source_idx]
+                best_raw_score = (
+                    (max(raw_scores) if problem.maximize else min(raw_scores))
+                    if raw_scores else None
+                )
                 diagnostic = {
                     "parent_group": int(parent_group),
                     "fold_index": int(fold_index),
@@ -8104,11 +8121,17 @@ code block.'''
                 followup_counts[source_idx] = int(followup)
                 for record in records_by_source[source_idx]:
                     _attach_strategy_plan(record, source_idx, "pilot")
+                best_raw_text = (
+                    f"{best_raw_score:.9f}"
+                    if best_raw_score is not None else "unavailable"
+                )
                 print(
                     f"[step {step_idx}]   strategy "
                     f"{int(job['strategy_index'])}: mean={mean:.9f}, "
                     f"variance={variance:.9f}, {scenario}, "
-                    f"phase2={int(followup)}, total={allocated}",
+                    f"phase2={int(followup)}, total={allocated}, "
+                    f"{_ANSI_ORANGE}pilot best raw "
+                    f"{problem.metric_name}={best_raw_text}{_ANSI_RESET}",
                     flush=True,
                 )
 
