@@ -169,7 +169,7 @@ def _coder_model_profile(model_name):
             "name": "qwen3.8-27b",
             "native_context": 262_144,
             "max_output": 262_144,
-            "reasoning_effort": "low", #xhigh
+            "reasoning_effort": "medium", #xhigh
             "template_kind": "qwen3.8",
             "training_4bit": False,
             "training_layout": "sharded",
