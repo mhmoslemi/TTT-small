@@ -93,6 +93,7 @@ def save_rollout(
     meta: dict,
     prompt_text: str = None,
     strategy_text: str = None,
+    artifacts_already_saved: bool = False,
 ):
     """
     Save one rollout as a .txt + .meta.json pair, plus optional prompt and
@@ -104,12 +105,10 @@ def save_rollout(
     step_dir = Path(exp_dir) / f"step{step:02d}"
     step_dir.mkdir(exist_ok=True)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
-    (step_dir / f"{base}.txt").write_text(response_text, errors="replace")
-    if strategy_text is not None:
-        (step_dir / f"{base}.strategy.txt").write_text(
-            strategy_text, errors="replace")
-    if prompt_text is not None:
-        (step_dir / f"{base}.prompt.txt").write_text(prompt_text, errors="replace")
+    if not artifacts_already_saved:
+        save_rollout_artifacts(
+            exp_dir, step, group, rollout, response_text,
+            prompt_text=prompt_text, strategy_text=strategy_text)
 
     # Make sure we can dump everything (numpy floats, bools, etc.)
     def _coerce(v):
@@ -128,7 +127,42 @@ def save_rollout(
         return str(v)
 
     safe_meta = {k: _coerce(v) for k, v in meta.items()}
-    (step_dir / f"{base}.meta.json").write_text(json.dumps(safe_meta, indent=2))
+    meta_path = step_dir / f"{base}.meta.json"
+    meta_tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+    meta_tmp.write_text(json.dumps(safe_meta, indent=2))
+    meta_tmp.replace(meta_path)
+
+
+def save_rollout_artifacts(
+    exp_dir: Path,
+    step: int,
+    group: int,
+    rollout: int,
+    response_text: str,
+    prompt_text: str = None,
+    strategy_text: str = None,
+    pending_meta: dict = None,
+):
+    """Persist generated text immediately, before reward evaluation finishes."""
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    step_dir.mkdir(exist_ok=True)
+    base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
+
+    def _atomic_text(path, value):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(str(value or ""), errors="replace")
+        tmp.replace(path)
+
+    _atomic_text(step_dir / f"{base}.txt", response_text)
+    if strategy_text is not None:
+        _atomic_text(step_dir / f"{base}.strategy.txt", strategy_text)
+    if prompt_text is not None:
+        _atomic_text(step_dir / f"{base}.prompt.txt", prompt_text)
+    if pending_meta is not None:
+        path = step_dir / f"{base}.meta.json"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(pending_meta, indent=2, default=str))
+        tmp.replace(path)
 
 
 def save_strategy_response(exp_dir: Path, step: int, parent_group: int,

@@ -7271,6 +7271,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     from sampler import State
     from experiment_io import (save_parent_selections, save_rollout,
+                               save_rollout_artifacts,
                                save_strategy_response)
     from problems.base import ParentContext, STRATEGY_OUTPUT_CONTRACT
     from gen_workers import make_progress_bar
@@ -7860,6 +7861,13 @@ code block.'''
         print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
               f"{getattr(problem, 'eval_cpus', 1)} CPU(s) per candidate")
     reward_pool = ThreadPoolExecutor(max_workers=n_reward_workers)
+    # Large response/prompt files are persisted as soon as generation returns,
+    # on a dedicated thread so disk I/O never blocks the generation scheduler.
+    # The complete reward/advantage metadata replaces the provisional metadata
+    # below after evaluation; the large text artifacts are written only once.
+    rollout_io_pool = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix=f"rollout-save-step{step_idx}")
+    rollout_io_futures = []
 
     # This bar must exist before generation begins.  Reward futures are added
     # incrementally as rollout batches arrive, so constructing it from
@@ -7949,14 +7957,16 @@ code block.'''
         else:
             fold_index = 0
             group_id = parent_group
+        rollout_index = int(queued_by_group[group_id])
         queued_by_parent[parent_group] = parent_ordinal + 1
-        queued_by_group[group_id] += 1
+        queued_by_group[group_id] = rollout_index + 1
         record = {
             "job_idx": int(job_idx),
             "parent_group": parent_group,
             "group_id": int(group_id),
             "context_id": parent_group,
             "fold_index": int(fold_index),
+            "rollout_index": rollout_index,
             "text": text,
             "token_ids": list(token_ids),
             "behavior_logprobs": behavior_logprobs,
@@ -7967,6 +7977,28 @@ code block.'''
         if strategy_source_job_idx is not None:
             record["strategy_source_job_idx"] = int(
                 strategy_source_job_idx)
+        save_future = rollout_io_pool.submit(
+            save_rollout_artifacts,
+            exp_dir, step_idx, int(group_id), rollout_index, text,
+            prompt_text=job["prompt_text"],
+            strategy_text=(job.get("strategy_response")
+                           if two_stage_rollouts else None),
+            pending_meta={
+                "status": "evaluation_pending",
+                "step": int(step_idx),
+                "group": int(group_id),
+                "parent_group": parent_group,
+                "rollout": rollout_index,
+                "n_response_tokens": len(token_ids),
+                "strategy_rollout_phase": (
+                    str(rollout_phase) if rollout_phase is not None else None),
+                "strategy_source_job_idx": (
+                    int(strategy_source_job_idx)
+                    if strategy_source_job_idx is not None else None),
+            },
+        )
+        record["_artifact_save_future"] = save_future
+        rollout_io_futures.append(save_future)
         if (training_enabled and cfg.generation_backend == "vllm"
                 and token_ids):
             vllm_logprob_records.append(record)
@@ -9407,6 +9439,7 @@ code block.'''
             eval_bar_closed = True
     finally:
         reward_pool.shutdown(wait=True)
+        rollout_io_pool.shutdown(wait=True)
         if not eval_bar_closed:
             eval_bar.close()
         if evaluation_trainer_offloaded:
@@ -9418,6 +9451,12 @@ code block.'''
             backend.restore_after_generation()
             _restore_optimizer_state_to_parameters(optimizer)
             backend.set_training_mode()
+
+    # Surface an unlikely disk failure before constructing the checkpoint.
+    # In the normal path every write completed concurrently with generation or
+    # evaluation, so this is only a non-blocking correctness barrier.
+    for save_future in rollout_io_futures:
+        save_future.result()
 
     if spo_rs_mode and not training_enabled:
         # With policy optimization disabled, consecutive policies are exactly
@@ -9771,6 +9810,13 @@ code block.'''
             job_idx = record["job_idx"]
             res = outs[r_idx]
             job = prompt_jobs[job_idx]
+            artifact_rollout_index = int(record.get(
+                "rollout_index", r_idx))
+            if artifact_rollout_index != r_idx:
+                raise RuntimeError(
+                    f"rollout persistence order changed for group {g}: "
+                    f"generated index {artifact_rollout_index}, final index "
+                    f"{r_idx}")
             # Allocate a durable ID even for invalid/duplicate candidates. A
             # valid candidate uses this exact State object in sampler.update,
             # so a child selected in a later step links back to this rollout.
@@ -9899,10 +9945,12 @@ code block.'''
                 meta["memory_version"] = "V2"
                 meta["memory_comparison_n"] = int(
                     getattr(mem_cfg, "arm_comparison_n", 0) or 0)
-            save_rollout(exp_dir, step_idx, g, r_idx, text, meta,
+            save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
+                         text, meta,
                          prompt_text=job["prompt_text"],
                          strategy_text=(job.get("strategy_response")
-                                        if two_stage_rollouts else None))
+                                        if two_stage_rollouts else None),
+                         artifacts_already_saved=True)
             saved_rollouts += 1
             if memory is not None:
                 mem_records.append(RolloutRecord(
