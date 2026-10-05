@@ -10266,10 +10266,44 @@ code block.'''
             flush=True,
         )
 
+    # Keep the best valid candidate produced by this exact step separate from
+    # the cumulative best. ``all_children`` still contains candidates removed
+    # later by deduplication or archive caps, so the per-step result reflects
+    # what was actually evaluated rather than only what survived the archive.
+    step_states = [child for child, _parent in all_children]
+    step_raw_states = []
+    for child in step_states:
+        try:
+            raw_score = float(child.raw_score)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(raw_score):
+            step_raw_states.append(child)
+    if step_raw_states:
+        step_best_result = (
+            max(step_raw_states, key=lambda state: float(state.raw_score))
+            if problem.maximize else
+            min(step_raw_states, key=lambda state: float(state.raw_score))
+        )
+        step_best_raw_score = float(step_best_result.raw_score)
+    elif step_states:
+        # Generic fallback for a problem that exposes only the normalized
+        # higher-is-better reward and no native raw metric.
+        step_best_result = max(
+            step_states,
+            key=lambda state: (float(state.value)
+                               if state.value is not None else -math.inf),
+        )
+        step_best_raw_score = None
+    else:
+        step_best_result = None
+        step_best_raw_score = None
+
     # Report the problem-native metric before any memory or gradient work. This
     # is deliberately separate from reward: some problems maximize the raw
     # quantity, while others (Erdos bounds, runtime, MSE) minimize it.
     best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
+    best_seen_result = best_raw if best_raw is not None else sampler.best_state()
     if best_raw is not None:
         direction = "higher is better" if problem.maximize else "lower is better"
         best_value = float(best_raw.raw_score)
@@ -10327,6 +10361,26 @@ code block.'''
         memory.save()
 
     step_stats = {
+        "result_metric_name": str(problem.metric_name),
+        "result_maximize": bool(problem.maximize),
+        "step_best_raw_score": step_best_raw_score,
+        "step_best_reward": (
+            float(step_best_result.value)
+            if (step_best_result is not None
+                and step_best_result.value is not None) else None),
+        "best_seen_raw_score": (
+            float(best_seen_result.raw_score)
+            if (best_seen_result is not None
+                and best_seen_result.raw_score is not None)
+            else None),
+        "best_seen_reward": (
+            float(best_seen_result.value)
+            if (best_seen_result is not None
+                and best_seen_result.value is not None)
+            else None),
+        "best_seen_step": (
+            int(best_seen_result.timestep)
+            if best_seen_result is not None else None),
         "best_valid_yield": float(best_valid_yield),
         "distinct_good": int(len(distinct_good_hashes)),
         "valid_fraction": float(valid_fraction),
@@ -10677,8 +10731,8 @@ def main():
 
     # Select the run directory before runtime-only context adjustments so a
     # fresh config.json stores the reusable base configuration.
-    from experiment_io import (make_experiment_dir, save_final_summary,
-                               save_step_summary)
+    from experiment_io import (append_step_result, make_experiment_dir,
+                               save_final_summary, save_step_summary)
     resume_dir = merged.pop("_resume_dir", None)
     exp_dir = make_experiment_dir(
         cfg, resume_dir=resume_dir, config_dict=merged
@@ -10686,6 +10740,9 @@ def main():
     terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
     terminal_log.bind(terminal_log_path)
     print(f"[logs] terminal output: {terminal_log_path}", flush=True)
+    result_log_path = Path(exp_dir).resolve() / "result.txt"
+    result_log_path.touch(exist_ok=True)
+    print(f"[logs] step results: {result_log_path}", flush=True)
     vllm_log_path = None
     strategy_vllm_log_path = None
     dependency_log_path = None
@@ -11536,6 +11593,9 @@ def main():
             completed_summary = json.loads(summary_path.read_text())
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
+        if "result_metric_name" in completed_summary:
+            append_step_result(
+                exp_dir, completed_step, completed_summary)
         cumulative_training_seconds += float(
             completed_summary.get(
                 "training_seconds",
@@ -11657,7 +11717,7 @@ def main():
                 next_g=cur_g, next_k=cur_k, memory_path=memory_path,
                 spo_rs_tracker=spo_rs_tracker,
             )
-            save_step_summary(exp_dir, step, {
+            step_summary = {
                 "step": step,
                 "completed": True,
                 "next_step": step + 1,
@@ -11667,7 +11727,9 @@ def main():
                 "next_groups_per_step": cur_g,
                 "next_group_size": cur_k,
                 **(stats or {}),
-            })
+            }
+            save_step_summary(exp_dir, step, step_summary)
+            append_step_result(exp_dir, step, step_summary)
             current_policy_adapter_path = Path(adapter_path)
             removed_adapters = _prune_adapter_snapshots(
                 exp_dir,

@@ -235,6 +235,50 @@ def save_step_summary(exp_dir: Path, step: int, summary: dict):
     )
 
 
+def append_step_result(exp_dir: Path, step: int, summary: dict):
+    """Append one idempotent per-step result line to the run-level log."""
+    step = int(step)
+    path = Path(exp_dir) / "result.txt"
+    marker = f"step={step:04d}\t"
+    if path.is_file():
+        try:
+            if any(line.startswith(marker)
+                   for line in path.read_text(errors="replace").splitlines()):
+                return path
+        except OSError:
+            pass
+
+    def _number(value):
+        if value is None:
+            return "unavailable"
+        try:
+            return f"{float(value):.12f}"
+        except (TypeError, ValueError):
+            return "unavailable"
+
+    metric = str(summary.get("result_metric_name") or "raw metric")
+    direction = ("maximize" if bool(summary.get("result_maximize", True))
+                 else "minimize")
+    step_raw = _number(summary.get("step_best_raw_score"))
+    step_reward = _number(summary.get("step_best_reward"))
+    run_raw = _number(summary.get("best_seen_raw_score"))
+    run_reward = _number(summary.get("best_seen_reward"))
+    found_step = summary.get("best_seen_step")
+    found_step = ("unavailable" if found_step is None
+                  else str(int(found_step)))
+    line = (
+        f"{marker}metric={metric}\tdirection={direction}\t"
+        f"step_best_raw={step_raw}\tstep_best_reward={step_reward}\t"
+        f"best_seen_raw={run_raw}\tbest_seen_reward={run_reward}\t"
+        f"best_seen_found_step={found_step}\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+    return path
+
+
 def save_final_summary(exp_dir: Path, best_value, best_code, best_step,
                        best_construction=None, best_raw_score=None):
     """
