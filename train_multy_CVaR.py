@@ -487,6 +487,11 @@ class _TerminalTeeStream:
             self.console.flush()
             self.sink.flush()
 
+    @property
+    def progress_stream(self):
+        """Real TTY used by dynamic bars, which must not enter terminal.log."""
+        return self.console
+
     def __getattr__(self, name):
         # Preserve fileno(), isatty(), encoding, etc. from the real terminal so
         # tqdm and libraries keep exactly their existing console behaviour.

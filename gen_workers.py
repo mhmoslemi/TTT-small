@@ -136,8 +136,12 @@ class _PrintBar:
 def make_progress_bar(total, desc="progress"):
     total = int(max(total, 1))
     if _HAS_TQDM:
+        # The main runner exposes the underlying TTY through progress_stream.
+        # Sending tqdm there preserves the live interactive bar while keeping
+        # carriage returns and cursor-control sequences out of terminal.log.
+        output = getattr(sys.stderr, "progress_stream", sys.stderr)
         return tqdm(total=total, desc=desc, unit="it",
-                    leave=False, dynamic_ncols=True)
+                    leave=False, dynamic_ncols=True, file=output)
     return _PrintBar(total, desc=desc)
 
 

@@ -88,6 +88,26 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_progress_bar_uses_console_only_stream(self):
+        from gen_workers import make_progress_bar
+
+        console = object()
+        wrapped_stderr = types.SimpleNamespace(progress_stream=console)
+        captured = {}
+
+        def fake_tqdm(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        with patch.object(sys, "stderr", wrapped_stderr), \
+             patch("gen_workers._HAS_TQDM", True), \
+             patch("gen_workers.tqdm", side_effect=fake_tqdm):
+            make_progress_bar(17, desc="evaluating")
+
+        self.assertIs(captured["file"], console)
+        self.assertEqual(captured["total"], 17)
+        self.assertEqual(captured["desc"], "evaluating")
+
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
         from model_backend import _hf_training_attention_implementation
 
