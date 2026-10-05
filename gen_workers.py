@@ -136,12 +136,12 @@ class _PrintBar:
 def make_progress_bar(total, desc="progress"):
     total = int(max(total, 1))
     if _HAS_TQDM:
-        # The main runner exposes the underlying TTY through progress_stream.
-        # Sending tqdm there preserves the live interactive bar while keeping
-        # carriage returns and cursor-control sequences out of terminal.log.
+        # The main runner exposes a TTY-preserving progress tee. It keeps the
+        # interactive in-place bar on the console and rewrites one saved row
+        # in temirnal.log instead of appending every carriage-return refresh.
         output = getattr(sys.stderr, "progress_stream", sys.stderr)
         return tqdm(total=total, desc=desc, unit="it",
-                    leave=False, dynamic_ncols=True, file=output)
+                    leave=True, dynamic_ncols=True, file=output)
     return _PrintBar(total, desc=desc)
 
 
@@ -1516,6 +1516,8 @@ class GenerationPool:
 
         # Jobs are distributed over independent engines, not over TP ranks.
         self.num_workers = len(gpu_groups)
+        self.tensor_parallel_size = int(tp)
+        self.pipeline_parallel_size = int(pp)
         configured_persistent_workers = (
             None if vllm_persistent_workers is None
             else int(vllm_persistent_workers))
@@ -1851,9 +1853,16 @@ class GenerationPool:
             raise ValueError("chain and stage counts must be non-negative")
         if not num_chains or not num_stages:
             return {"completed": 0, "retries": 0}
+        assigned_ranks = (
+            self.num_workers * self.tensor_parallel_size
+            * self.pipeline_parallel_size)
         print(f"[pool] dependency-pipelined strategy scheduler: "
               f"{num_chains} chain(s) x {num_stages} stage(s) across "
-              f"{self.num_workers} engine(s); no per-stage barriers",
+              f"{self.num_workers} engine(s), "
+              f"TP={self.tensor_parallel_size}, "
+              f"PP={self.pipeline_parallel_size} "
+              f"({assigned_ranks} GPU rank(s) assigned); no per-stage "
+              "barriers",
               flush=True)
 
         base_gen_kwargs = {

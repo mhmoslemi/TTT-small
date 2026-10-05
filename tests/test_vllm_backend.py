@@ -28,6 +28,7 @@ from gen_workers import (
 from feedback import FeedbackConfig, is_code_failure, render_chat
 from gpu_runtime import (
     GPUMemory,
+    align_vllm_layout_to_concurrency,
     allocate_gpu_roles,
     derive_vllm_parallel_layout,
     derive_vllm_tensor_parallel_size,
@@ -88,7 +89,7 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
-    def test_progress_bar_uses_console_only_stream(self):
+    def test_progress_bar_uses_declared_progress_stream(self):
         from gen_workers import make_progress_bar
 
         console = object()
@@ -107,6 +108,50 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIs(captured["file"], console)
         self.assertEqual(captured["total"], 17)
         self.assertEqual(captured["desc"], "evaluating")
+        self.assertTrue(captured["leave"])
+
+    def test_terminal_log_progress_rewrites_and_preserves_final_row(self):
+        from train_multy_CVaR import (
+            _TerminalLogSink,
+            _TerminalTeeStream,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "temirnal.log"
+            console = io.StringIO()
+            sink = _TerminalLogSink()
+            tee = _TerminalTeeStream(console, sink)
+            progress = tee.progress_stream
+
+            # Startup output is buffered before the run directory/log path is
+            # available; binding must replay both kinds of writes in order.
+            tee.write("startup status C₅\n")
+            progress.write("\rrollouts: 1/10")
+            sink.bind(log_path)
+            progress.write("\rrollouts: 7/10")
+            progress.flush()
+            live_log = log_path.read_text()
+            self.assertTrue(live_log.startswith("startup status C₅\n"))
+            self.assertNotIn("rollouts: 1/10", live_log)
+            self.assertEqual(live_log.count("rollouts: 7/10"), 1)
+
+            # Ordinary output may arrive while a bar is live. It must not be
+            # overwritten, and the bar's next refresh belongs after it.
+            tee.write("ordinary status\n")
+            progress.write("\rrollouts: 10/10")
+            progress.write("\n")
+            progress.flush()
+            final_log = log_path.read_text()
+            sink.log_file.close()
+
+        self.assertIn("startup status C₅\n", final_log)
+        self.assertIn("ordinary status\n", final_log)
+        self.assertNotIn("rollouts: 1/10", final_log)
+        self.assertNotIn("rollouts: 7/10", final_log)
+        self.assertEqual(final_log.count("rollouts: 10/10"), 1)
+        self.assertTrue(final_log.endswith("rollouts: 10/10\n"))
+        self.assertIn("\rrollouts: 1/10", console.getvalue())
+        self.assertIn("\rrollouts: 10/10", console.getvalue())
 
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
         from model_backend import _hf_training_attention_implementation
@@ -789,6 +834,66 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(layout.tensor_parallel_size, 1)
         self.assertEqual(layout.pipeline_parallel_size, 1)
         self.assertEqual(layout.replicas, 3)
+
+    def test_strategy_frontier_folds_idle_replicas_into_tensor_parallelism(self):
+        roles = allocate_gpu_roles(list(range(8)), "erdos")
+        memory = {
+            gpu_id: GPUMemory(
+                gpu_id, "RTX PRO 6000", 95.59, 95.0)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "generation_backend": "vllm",
+            "max_seq_length": 131072,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_runtime_reserve_gib": 16.0,
+        }
+        heads = detect_attention_heads(cfg["model_name"])
+        memory_layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, heads)
+        frontier_layout = align_vllm_layout_to_concurrency(
+            cfg, memory_layout, len(roles.generation), heads,
+            max_concurrency=4,
+        )
+
+        self.assertEqual(memory_layout.replicas, 8)
+        self.assertEqual(memory_layout.tensor_parallel_size, 1)
+        self.assertEqual(frontier_layout.replicas, 4)
+        self.assertEqual(frontier_layout.tensor_parallel_size, 2)
+        self.assertEqual(frontier_layout.pipeline_parallel_size, 1)
+        self.assertEqual(
+            frontier_layout.replicas
+            * frontier_layout.tensor_parallel_size
+            * frontier_layout.pipeline_parallel_size,
+            8,
+        )
+
+    def test_strategy_frontier_leaves_full_replica_parallelism_when_busy(self):
+        roles = allocate_gpu_roles(list(range(8)), "erdos")
+        memory = {
+            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 95.59, 95.0)
+            for gpu_id in roles.generation
+        }
+        cfg = {
+            "model_name": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "generation_backend": "vllm",
+            "max_seq_length": 131072,
+            "vllm_gpu_memory_utilization": "auto",
+            "vllm_quantization": "",
+            "vllm_runtime_reserve_gib": 16.0,
+        }
+        heads = detect_attention_heads(cfg["model_name"])
+        memory_layout = derive_vllm_parallel_layout(
+            cfg, roles, memory, heads)
+
+        frontier_layout = align_vllm_layout_to_concurrency(
+            cfg, memory_layout, len(roles.generation), heads,
+            max_concurrency=100,
+        )
+
+        self.assertEqual(frontier_layout, memory_layout)
 
     def test_qwen32_scoring_reserve_selects_four_tp2_engines(self):
         """The rollout layout must use GenerationPool's effective budget.

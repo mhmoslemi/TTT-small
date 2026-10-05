@@ -205,15 +205,17 @@ def _apply_strategy_model_profile(merged, model_name):
     merged["strategy_reasoning_effort"] = "high"
     merged["strategy_vllm_quantization"] = ""
 
-    # At 8B, one exact TP=1 engine fits on every rollout GPU. Start those
-    # replicas concurrently and retain all level-1 weight backups in host RAM
-    # between phases, avoiding the old 32B worker teardown/reload cycle.
+    # At 8B, the exact model fits without quantization. The strategy pool later
+    # folds replicas beyond the live parent-chain frontier into TP ranks, so
+    # every rollout GPU contributes even when there are fewer parents than
+    # cards. Retain every selected engine's level-1 backup between phases.
     merged["strategy_vllm_sleep_level"] = 1
     merged["strategy_vllm_staged_loading"] = False
     merged["strategy_vllm_persistent_workers"] = None
     print("[model-profile] DeepSeek-R1-0528-Qwen3-8B strategist: "
           "native reasoning, max_new=131072, max_seq=131072, "
-          "temperature=0.6, top_p=0.95, exact BF16, all replicas persistent")
+          "temperature=0.6, top_p=0.95, exact BF16, frontier-sized engines "
+          "persistent")
 
 
 def _coder_model_profile(model_name):
@@ -429,12 +431,29 @@ class _TimestampedLineStream:
     def __init__(self, stream):
         self.stream = stream
         self._line_start = True
+        self._dynamic_progress = False
         self._lock = threading.Lock()
 
     def write(self, value):
         value = str(value)
         if not value:
             return 0
+        progress_stream = getattr(self.stream, "progress_stream", None)
+        route_progress = bool(
+            progress_stream is not None
+            and ("\r" in value
+                 or (self._dynamic_progress
+                     and "\n" in value
+                     and not value.strip())))
+        if route_progress:
+            with self._lock:
+                progress_stream.write(value)
+                if "\r" in value and "\n" not in value:
+                    self._dynamic_progress = True
+                if "\n" in value:
+                    self._dynamic_progress = False
+                    self._line_start = True
+            return len(value)
         parts = value.split("\n")
         with self._lock:
             for index, part in enumerate(parts):
@@ -473,6 +492,7 @@ class _TerminalTeeStream:
     def __init__(self, console, sink):
         self.console = console
         self.sink = sink
+        self._progress_stream = _TerminalProgressTeeStream(console, sink)
 
     def write(self, value):
         value = str(value)
@@ -490,8 +510,8 @@ class _TerminalTeeStream:
 
     @property
     def progress_stream(self):
-        """Real TTY used by dynamic bars, which must not enter terminal.log."""
-        return self.console
+        """TTY-preserving stream whose saved progress row updates in place."""
+        return self._progress_stream
 
     def __getattr__(self, name):
         # Preserve fileno(), isatty(), encoding, etc. from the real terminal so
@@ -499,21 +519,109 @@ class _TerminalTeeStream:
         return getattr(self.console, name)
 
 
+class _TerminalProgressTeeStream:
+    """Show raw dynamic progress on the TTY and one live row in the log."""
+
+    def __init__(self, console, sink):
+        self.console = console
+        self.sink = sink
+
+    def write(self, value):
+        value = str(value)
+        if not value:
+            return 0
+        with self.sink.lock:
+            self.console.write(value)
+            self.sink.write_progress(value)
+        return len(value)
+
+    def flush(self):
+        with self.sink.lock:
+            self.console.flush()
+            self.sink.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.console, name)
+
+
 class _TerminalLogSink:
-    """Buffer startup output, then append every write to the run log."""
+    """Append ordinary output while rewriting one dynamic progress row."""
 
     def __init__(self):
         self.lock = threading.RLock()
         self.log_file = None
         self.pending = []
+        self._progress_offset = None
+        self._progress_text = None
+
+    @staticmethod
+    def _clean_progress_text(value):
+        # tqdm uses carriage returns for in-place updates and may include ANSI
+        # cursor/colour controls. Keep the visible text, not terminal control
+        # bytes, in the persistent plain-text log.
+        value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value))
+        candidates = []
+        for line in value.replace("\n", "\r\n").split("\r"):
+            cleaned = line.rstrip()
+            if cleaned.strip():
+                candidates.append(cleaned)
+        return candidates[-1] if candidates else None
+
+    def _remove_visible_progress(self):
+        if self.log_file is None or self._progress_offset is None:
+            return
+        self.log_file.seek(self._progress_offset)
+        self.log_file.truncate()
+        self.log_file.seek(0, os.SEEK_END)
+        self._progress_offset = None
+
+    def _show_progress(self):
+        if self.log_file is None or not self._progress_text:
+            return
+        self._remove_visible_progress()
+        self.log_file.seek(0, os.SEEK_END)
+        self._progress_offset = self.log_file.tell()
+        timestamp = time.strftime(
+            "[%H:%M:%S] ",
+            time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS),
+        )
+        self.log_file.write(timestamp + self._progress_text)
+        self.log_file.truncate()
+        self.log_file.seek(0, os.SEEK_END)
+
+    def _finish_progress(self):
+        if self.log_file is None or self._progress_text is None:
+            return
+        if self._progress_offset is None:
+            self._show_progress()
+        self.log_file.seek(0, os.SEEK_END)
+        self.log_file.write("\n")
+        self._progress_offset = None
+        self._progress_text = None
 
     def write(self, value):
+        value = str(value)
         if self.log_file is None:
-            self.pending.append(value)
+            self.pending.append(("ordinary", value))
             return
+        # A regular status line takes precedence over a transient bar. Remove
+        # the visible bar, append the status, and retain its latest text so a
+        # later refresh/close can redraw or finalize it after the status line.
+        self._remove_visible_progress()
+        self.log_file.seek(0, os.SEEK_END)
         self.log_file.write(value)
-        # Keep the on-disk copy current even for progress/status writes that do
-        # not end in a newline.
+        self.log_file.flush()
+
+    def write_progress(self, value):
+        if self.log_file is None:
+            self.pending.append(("progress", str(value)))
+            return
+        cleaned = self._clean_progress_text(value)
+        if cleaned is not None:
+            self._progress_text = cleaned
+            self._show_progress()
+        if "\n" in str(value):
+            self._finish_progress()
         self.log_file.flush()
 
     def flush(self):
@@ -524,12 +632,19 @@ class _TerminalLogSink:
         with self.lock:
             if self.log_file is not None:
                 return
+            mode = "r+" if os.path.exists(log_path) else "w+"
             self.log_file = open(
-                log_path, "a", buffering=1, encoding="utf-8")
+                log_path, mode, buffering=1, encoding="utf-8")
+            self.log_file.seek(0, os.SEEK_END)
             if self.pending:
-                self.log_file.write("".join(self.pending))
+                pending = list(self.pending)
                 self.pending.clear()
-                self.log_file.flush()
+                for kind, value in pending:
+                    if kind == "progress":
+                        self.write_progress(value)
+                    else:
+                        self.write(value)
+            self.log_file.flush()
 
 
 def _install_terminal_log():
@@ -537,9 +652,9 @@ def _install_terminal_log():
     sink = _TerminalLogSink()
 
     def attach(stream):
-        # Timestamps must be added before the tee so the terminal and file are
-        # byte-for-byte alike. _install_console_timestamps() normally makes
-        # this the active branch; the fallback also keeps this helper robust.
+        # Ordinary-line timestamps are added before the tee. Dynamic progress
+        # bypasses that wrapper and receives its saved timestamp from the sink
+        # each time the single persistent progress row is replaced.
         if isinstance(stream, _TimestampedLineStream):
             stream.stream = _TerminalTeeStream(stream.stream, sink)
             return stream
@@ -1722,7 +1837,8 @@ def load_config():
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
-    from gpu_runtime import (allocate_gpu_roles,
+    from gpu_runtime import (align_vllm_layout_to_concurrency,
+                             allocate_gpu_roles,
                              derive_vllm_parallel_layout,
                              detect_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
@@ -1938,15 +2054,16 @@ def load_config():
         layout = derive_vllm_parallel_layout(
             merged, roles, memory, known_heads)
         if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
-            # Qwen3-8B plus one native-context KV cache fits independently on
-            # each selected card.  Refuse an unsafe host rather than silently
-            # weakening this ablation into fewer tensor-parallel engines.
+            # The coder needs one independent TP=1 engine per selected card;
+            # the strategy topology is derived separately below from its live
+            # chain frontier. Refuse an unsafe host rather than silently
+            # weakening coder rollout parallelism.
             if (layout.tensor_parallel_size != 1
                     or layout.pipeline_parallel_size != 1):
                 raise ValueError(
                     "the dual-resident Qwen3-8B strategy/coder ablation "
-                    "requires one engine from each pool per GPU (TP=1, "
-                    "PP=1), but the available memory cannot fit that layout "
+                    "requires one coder engine per GPU (TP=1, PP=1), but "
+                    "the available memory cannot fit that layout "
                     "at the configured context")
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
@@ -1957,8 +2074,9 @@ def load_config():
         )
         if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
             print(f"[config] Qwen3-8B strategist/coder ablation: two "
-                  f"independent co-resident pools, each with {len(gpu_ids)} "
-                  "engines (one per GPU, TP=1, PP=1)")
+                  "independent co-resident pools; coder keeps "
+                  f"{len(gpu_ids)} TP=1 engines and strategist topology is "
+                  "matched to its live chain frontier")
         elif layout.pipeline_parallel_size > 1:
             print(f"[config] compatible TP={layout.tensor_parallel_size} "
                   f"replicas need about "
@@ -1980,53 +2098,79 @@ def load_config():
                 and merged.get("strategy_backend", "local") == "local"):
             strategy_name = str(
                 merged.get("strategy_model_name") or merged.get("model_name"))
-            if strategy_name == str(merged.get("model_name")):
-                merged["strategy_vllm_tensor_parallel_size"] = (
-                    layout.tensor_parallel_size)
-                merged["strategy_vllm_pipeline_parallel_size"] = (
-                    layout.pipeline_parallel_size)
-            else:
-                strategy_layout_cfg = dict(merged)
-                strategy_layout_cfg.update({
-                    "model_name": strategy_name,
-                    "max_seq_length": int(merged["strategy_max_seq_length"]),
-                    "load_in_4bit": False,
-                    "vllm_quantization": merged.get(
-                        "strategy_vllm_quantization", ""),
-                    "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(
-                        co_resident_sleep=True,
-                        token_scoring=False,
-                    ),
-                })
-                strategy_heads = detect_attention_heads(strategy_name)
-                strategy_layout = derive_vllm_parallel_layout(
-                    strategy_layout_cfg, roles, memory, strategy_heads)
-                strategy_layout_cfg["vllm_tensor_parallel_size"] = (
-                    strategy_layout.tensor_parallel_size)
-                strategy_layout_cfg["vllm_pipeline_parallel_size"] = (
-                    strategy_layout.pipeline_parallel_size)
-                for note in resolve_memory_settings(
-                        strategy_layout_cfg, roles, memory):
-                    print(f"[memory] auto strategy: {note}")
-                merged["strategy_vllm_tensor_parallel_size"] = (
-                    strategy_layout.tensor_parallel_size)
-                merged["strategy_vllm_pipeline_parallel_size"] = (
-                    strategy_layout.pipeline_parallel_size)
-                merged["strategy_gen_micro_batch"] = int(
-                    strategy_layout_cfg["gen_micro_batch"])
-                merged["strategy_vllm_max_num_batched_tokens"] = int(
-                    strategy_layout_cfg["vllm_max_num_batched_tokens"])
-                merged["strategy_vllm_runtime_reserve_gib"] = float(
-                    strategy_layout_cfg["vllm_runtime_reserve_gib"])
-                validate_attention_heads(
-                    strategy_heads,
-                    strategy_layout.tensor_parallel_size,
-                    strategy_name,
-                )
-                print(f"[config] strategy model {strategy_name}: "
-                      f"{strategy_layout.replicas} vLLM replica(s), "
-                      f"TP={strategy_layout.tensor_parallel_size}, "
-                      f"PP={strategy_layout.pipeline_parallel_size}")
+            strategy_layout_cfg = dict(merged)
+            strategy_layout_cfg.update({
+                "model_name": strategy_name,
+                "max_seq_length": int(merged["strategy_max_seq_length"]),
+                "load_in_4bit": False,
+                "vllm_quantization": merged.get(
+                    "strategy_vllm_quantization", ""),
+                "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(
+                    co_resident_sleep=True,
+                    token_scoring=False,
+                ),
+            })
+            strategy_heads = detect_attention_heads(strategy_name)
+            memory_strategy_layout = derive_vllm_parallel_layout(
+                strategy_layout_cfg, roles, memory, strategy_heads)
+            # Strategies within one parent are intentionally sequential, so
+            # the number of parents/folds—not strategies_per_parent—is the
+            # live request frontier. Convert replicas beyond that frontier to
+            # TP/PP ranks instead of leaving their GPUs idle for every stage.
+            strategy_frontier = int(merged["groups_per_step"])
+            if str(merged.get("advantage_mode", "")).lower() == "x-grpo":
+                strategy_frontier *= int(
+                    merged.get("x_grpo_contexts_per_step", 1))
+            strategy_layout = align_vllm_layout_to_concurrency(
+                strategy_layout_cfg,
+                memory_strategy_layout,
+                len(gpu_ids),
+                strategy_heads,
+                strategy_frontier,
+            )
+            strategy_layout_cfg["vllm_tensor_parallel_size"] = (
+                strategy_layout.tensor_parallel_size)
+            strategy_layout_cfg["vllm_pipeline_parallel_size"] = (
+                strategy_layout.pipeline_parallel_size)
+            for note in resolve_memory_settings(
+                    strategy_layout_cfg, roles, memory):
+                print(f"[memory] auto strategy: {note}")
+            merged["strategy_vllm_tensor_parallel_size"] = (
+                strategy_layout.tensor_parallel_size)
+            merged["strategy_vllm_pipeline_parallel_size"] = (
+                strategy_layout.pipeline_parallel_size)
+            merged["strategy_gen_micro_batch"] = int(
+                strategy_layout_cfg["gen_micro_batch"])
+            merged["strategy_vllm_max_num_batched_tokens"] = int(
+                strategy_layout_cfg["vllm_max_num_batched_tokens"])
+            merged["strategy_vllm_runtime_reserve_gib"] = float(
+                strategy_layout_cfg["vllm_runtime_reserve_gib"])
+            merged["strategy_generation_frontier"] = strategy_frontier
+            merged["separate_strategy_inference_pool"] = bool(
+                strategy_name != str(merged.get("model_name"))
+                or merged["dual_resident_qwen3_8b_strategy_coder_pools"]
+                or strategy_layout.tensor_parallel_size
+                != layout.tensor_parallel_size
+                or strategy_layout.pipeline_parallel_size
+                != layout.pipeline_parallel_size
+            )
+            validate_attention_heads(
+                strategy_heads,
+                strategy_layout.tensor_parallel_size,
+                strategy_name,
+            )
+            frontier_note = ""
+            if strategy_layout != memory_strategy_layout:
+                frontier_note = (
+                    f"; live frontier={strategy_frontier}, reshaped from "
+                    f"{memory_strategy_layout.replicas}xTP"
+                    f"{memory_strategy_layout.tensor_parallel_size} so every "
+                    "rollout GPU participates")
+            print(f"[config] strategy model {strategy_name}: "
+                  f"{strategy_layout.replicas} vLLM replica(s), "
+                  f"TP={strategy_layout.tensor_parallel_size}, "
+                  f"PP={strategy_layout.pipeline_parallel_size}"
+                  f"{frontier_note}")
     elif (merged["strategies"]
           and merged.get("strategy_backend", "local") == "local"
           and str(merged.get("strategy_model_name")
@@ -10963,8 +11107,10 @@ def main():
             cfg.generation_backend == "vllm"
             and getattr(problem, "two_stage_rollouts", False)
             and cfg.strategy_backend == "local"
-            and (cfg.strategy_model_name != cfg.model_name
-                 or dual_resident_qwen3_8b_pools))
+            and bool(getattr(
+                cfg, "separate_strategy_inference_pool",
+                cfg.strategy_model_name != cfg.model_name
+                or dual_resident_qwen3_8b_pools)))
         generation_utilization = float(cfg.vllm_gpu_memory_utilization)
         if dual_resident_qwen3_8b_pools:
             # Each physical card hosts two independent Qwen3-8B vLLM
@@ -11194,7 +11340,7 @@ def main():
             strategy_pool = gen_pool
         elif dual_resident_qwen3_8b_pools:
             print(f"[init] dual-resident Qwen3-8B pools: strategist and coder "
-                  f"each have {cfg.num_gpus} independent engine(s), one/GPU; "
+                  f"use independent GPU-complete inference topologies; "
                   "strategist is always base/no-LoRA, coder receives the "
                   "current LoRA", flush=True)
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
