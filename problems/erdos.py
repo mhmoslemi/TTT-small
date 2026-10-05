@@ -102,7 +102,6 @@ _VERIFIER_SRC = (
 
 class ErdosMinOverlap(Problem):
     two_stage_rollouts = True
-    retry_truncated_code = True
     name = "erdos"
     entrypoint = "run"
     metric_name = "C\u2085 bound"

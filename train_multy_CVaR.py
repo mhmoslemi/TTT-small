@@ -7560,66 +7560,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 })
         return code_jobs
 
-    generation_limit_cache = {}
-
-    def _job_generation_limit(job, requested_limit):
-        """Mirror the engine's prompt+response context-window limit."""
-        cache_key = (str(job["prompt_text"]), int(requested_limit))
-        cached = generation_limit_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        try:
-            prompt_tokens = len(tokenizer.encode(job["prompt_text"]))
-            limit = min(
-                int(requested_limit),
-                max(0, int(cfg.max_seq_length) - int(prompt_tokens)),
-            )
-        except Exception:
-            # The normal configured ceiling is still an exact signal in the
-            # overwhelmingly common case where the prompt has ample room.
-            limit = int(requested_limit)
-        generation_limit_cache[cache_key] = int(limit)
-        return int(limit)
-
-    def _hit_generation_limit(job, token_ids, requested_limit):
-        limit = _job_generation_limit(job, requested_limit)
-        return limit > 0 and len(token_ids) >= limit
-
-    def _make_code_retry_job(job, count):
-        messages = [dict(message) for message in job["messages"]]
-        instruction = '''## Required regeneration
-
-The preceding sampled answer reached the response limit and was incomplete.
-Generate the complete program again from scratch in a much more compact form.
-Do not reproduce or continue that answer. Never embed `initial_h_values` or
-any other long numeric sequence: when the prompt announces a parent array it
-already exists at runtime, and every larger array or pattern must be
-constructed algorithmically. Use at most 250 source lines, finish `run`,
-return the required tuple, and close the single Python fence. Output only that
-code block.'''
-        if messages and messages[-1].get("role") == "user":
-            messages[-1]["content"] = (
-                str(messages[-1].get("content", "")).rstrip()
-                + "\n\n" + instruction + "\n"
-            )
-        else:
-            messages.append({"role": "user", "content": instruction})
-        return {
-            **job,
-            "messages": messages,
-            "prompt_text": _render(messages),
-            "count": int(count),
-            "generation_retry": True,
-        }
-
-    def _append_code_retry_jobs(capped_counts):
-        retry_indices = []
-        for original_idx, count in sorted(capped_counts.items()):
-            retry_indices.append(len(prompt_jobs))
-            prompt_jobs.append(_make_code_retry_job(
-                prompt_jobs[int(original_idx)], int(count)))
-        return retry_indices
-
     spo_rs_divergence = 0.0
     spo_rs_context_divergences = {}
     spo_rs_missing_policy_scores = 0
@@ -7755,6 +7695,9 @@ code block.'''
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None, *,
                        rollout_phase=None, strategy_source_job_idx=None):
+        # Admit every sampled code response exactly once. Incomplete or
+        # malformed responses are preserved and the verifier assigns their
+        # failure reward; generation must not replace them with repaired draws.
         job = prompt_jobs[int(job_idx)]
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
@@ -8430,7 +8373,6 @@ code block.'''
                         if cfg.generation_backend == "vllm":
                             options["return_logprobs"] = training_enabled
                         phase_records = []
-                        capped_counts = {}
                         for local_idx, job_results in (
                                 gen_pool.iter_group_jobs(**options)):
                             source_idx = active_indices[int(local_idx)]
@@ -8438,14 +8380,6 @@ code block.'''
                                 text, token_ids = result[:2]
                                 behavior_logprobs = (
                                     result[2] if len(result) > 2 else None)
-                                if (getattr(
-                                        problem, "retry_truncated_code", False)
-                                        and _hit_generation_limit(
-                                            prompt_jobs[source_idx], token_ids,
-                                            cfg.max_new_tokens)):
-                                    capped_counts[source_idx] = (
-                                        capped_counts.get(source_idx, 0) + 1)
-                                    continue
                                 record = _queue_rollout(
                                     source_idx, text, token_ids,
                                     behavior_logprobs,
@@ -8454,84 +8388,6 @@ code block.'''
                                 _attach_strategy_plan(
                                     record, source_idx, phase)
                                 phase_records.append(record)
-
-                        if capped_counts:
-                            retry_total = sum(capped_counts.values())
-                            retry_limit = min(int(cfg.max_new_tokens), 8192)
-                            print(
-                                f"[warn] {retry_total} {phase} code "
-                                "response(s) reached the generation limit; "
-                                "replacing them with one compact regeneration "
-                                f"pass (max {retry_limit} tokens)",
-                                flush=True,
-                            )
-                            sorted_sources = sorted(capped_counts)
-                            retry_indices = _append_code_retry_jobs(
-                                capped_counts)
-                            for source_idx, retry_idx in zip(
-                                    sorted_sources, retry_indices):
-                                prompt_jobs[retry_idx][
-                                    "strategy_source_job_idx"] = source_idx
-                            retry_options = {
-                                "prompts_by_group": [
-                                    prompt_jobs[index]["prompt_text"]
-                                    for index in retry_indices],
-                                "group_size": max(capped_counts.values()),
-                                "counts_by_group": [
-                                    prompt_jobs[index]["count"]
-                                    for index in retry_indices],
-                                "adapter_path": adapter_path,
-                                "max_new_tokens": retry_limit,
-                                "temperature": cfg.temperature,
-                                "top_p": cfg.top_p,
-                                "top_k": getattr(
-                                    cfg, "sampling_top_k", None),
-                                "min_p": getattr(
-                                    cfg, "sampling_min_p", None),
-                                "step_idx": (
-                                    int(step_idx) + int(seed_offset)
-                                    + 3_000_000),
-                                "progress_desc": (
-                                    f"{phase} compact code retries"),
-                                "full_policy_sampling": (
-                                    _uses_sequence_level_policy_ratio(cfg)),
-                            }
-                            if cfg.generation_backend == "vllm":
-                                retry_options["return_logprobs"] = (
-                                    training_enabled)
-                            retry_still_capped = 0
-                            for retry_local_idx, job_results in (
-                                    gen_pool.iter_group_jobs(
-                                        **retry_options)):
-                                retry_job_idx = retry_indices[
-                                    int(retry_local_idx)]
-                                source_idx = int(prompt_jobs[retry_job_idx][
-                                    "strategy_source_job_idx"])
-                                for result in job_results:
-                                    text, token_ids = result[:2]
-                                    behavior_logprobs = (
-                                        result[2] if len(result) > 2 else None)
-                                    if _hit_generation_limit(
-                                            prompt_jobs[retry_job_idx],
-                                            token_ids, retry_limit):
-                                        retry_still_capped += 1
-                                    record = _queue_rollout(
-                                        retry_job_idx, text, token_ids,
-                                        behavior_logprobs,
-                                        rollout_phase=phase,
-                                        strategy_source_job_idx=source_idx)
-                                    _attach_strategy_plan(
-                                        record, source_idx, phase)
-                                    phase_records.append(record)
-                            if retry_still_capped:
-                                print(
-                                    f"[warn] {retry_still_capped}/"
-                                    f"{retry_total} compact code retries still "
-                                    "reached their limit; they remain failed "
-                                    "rollouts and retain their negative "
-                                    "training signal",
-                                    flush=True,
-                                )
                         expected = sum(active_counts)
                         if len(phase_records) != expected:
                             raise RuntimeError(
@@ -8587,78 +8443,14 @@ code block.'''
                     }
                     if cfg.generation_backend == "vllm":
                         generation_options["return_logprobs"] = training_enabled
-                    capped_counts = {}
                     for job_idx, job_results in gen_pool.iter_group_jobs(
                             **generation_options):
                         for result in job_results:
                             text, token_ids = result[:2]
                             behavior_logprobs = (
                                 result[2] if len(result) > 2 else None)
-                            if (getattr(problem, "retry_truncated_code", False)
-                                    and _hit_generation_limit(
-                                        prompt_jobs[int(job_idx)], token_ids,
-                                        cfg.max_new_tokens)):
-                                capped_counts[int(job_idx)] = (
-                                    capped_counts.get(int(job_idx), 0) + 1)
-                                continue
                             _queue_rollout(
                                 job_idx, text, token_ids, behavior_logprobs)
-                    if capped_counts:
-                        retry_total = sum(capped_counts.values())
-                        retry_limit = min(int(cfg.max_new_tokens), 8192)
-                        print(
-                            f"[warn] {retry_total} code response(s) reached the "
-                            "generation limit; replacing them with one compact "
-                            f"regeneration pass (max {retry_limit} tokens)",
-                            flush=True,
-                        )
-                        retry_indices = _append_code_retry_jobs(capped_counts)
-                        retry_options = {
-                            "prompts_by_group": [
-                                prompt_jobs[index]["prompt_text"]
-                                for index in retry_indices],
-                            "group_size": 1,
-                            "counts_by_group": [
-                                prompt_jobs[index]["count"]
-                                for index in retry_indices],
-                            "adapter_path": adapter_path,
-                            "max_new_tokens": retry_limit,
-                            "temperature": cfg.temperature,
-                            "top_p": cfg.top_p,
-                            "top_k": getattr(
-                                cfg, "sampling_top_k", None),
-                            "min_p": getattr(
-                                cfg, "sampling_min_p", None),
-                            "step_idx": int(step_idx) + 3_000_000,
-                            "progress_desc": "compact code retries",
-                            "full_policy_sampling": (
-                                _uses_sequence_level_policy_ratio(cfg)),
-                        }
-                        if cfg.generation_backend == "vllm":
-                            retry_options["return_logprobs"] = training_enabled
-                        retry_still_capped = 0
-                        for retry_local_idx, job_results in (
-                                gen_pool.iter_group_jobs(**retry_options)):
-                            retry_job_idx = retry_indices[int(retry_local_idx)]
-                            for result in job_results:
-                                text, token_ids = result[:2]
-                                behavior_logprobs = (
-                                    result[2] if len(result) > 2 else None)
-                                if _hit_generation_limit(
-                                        prompt_jobs[retry_job_idx], token_ids,
-                                        retry_limit):
-                                    retry_still_capped += 1
-                                _queue_rollout(
-                                    retry_job_idx, text, token_ids,
-                                    behavior_logprobs)
-                        if retry_still_capped:
-                            print(
-                                f"[warn] {retry_still_capped}/{retry_total} "
-                                "compact code retries still reached their "
-                                "limit; they remain failed rollouts and retain "
-                                "their negative training signal",
-                                flush=True,
-                            )
             else:
                 # In-process generation uses cross-prompt micro-batches rather
                 # than draining one parent at a time. Ordinary CPU verification
@@ -8774,7 +8566,6 @@ code block.'''
                         _seed_local_generation(
                             int(step_idx) + int(seed_offset))
                         phase_records = []
-                        capped_counts = {}
                         gen_bar = make_progress_bar(
                             sum(active_counts), desc=progress_desc)
                         try:
@@ -8786,17 +8577,6 @@ code block.'''
                                     cap_state=cap_state):
                                 source_idx = active_indices[int(local_idx)]
                                 for text, token_ids in responses:
-                                    if (getattr(
-                                            problem,
-                                            "retry_truncated_code", False)
-                                            and _hit_generation_limit(
-                                                prompt_jobs[source_idx],
-                                                token_ids,
-                                                cfg.max_new_tokens)):
-                                        capped_counts[source_idx] = (
-                                            capped_counts.get(source_idx, 0)
-                                            + 1)
-                                        continue
                                     record = _queue_rollout(
                                         source_idx, text, token_ids,
                                         rollout_phase=phase,
@@ -8807,61 +8587,6 @@ code block.'''
                                 gen_bar.update(len(responses))
                         finally:
                             gen_bar.close()
-
-                        if capped_counts:
-                            retry_total = sum(capped_counts.values())
-                            retry_limit = min(int(cfg.max_new_tokens), 8192)
-                            print(
-                                f"[warn] {retry_total} {phase} code "
-                                "response(s) reached the generation limit; "
-                                "replacing them with one compact regeneration "
-                                f"pass (max {retry_limit} tokens)",
-                                flush=True,
-                            )
-                            sorted_sources = sorted(capped_counts)
-                            retry_indices = _append_code_retry_jobs(
-                                capped_counts)
-                            for source_idx, retry_idx in zip(
-                                    sorted_sources, retry_indices):
-                                prompt_jobs[retry_idx][
-                                    "strategy_source_job_idx"] = source_idx
-                            _seed_local_generation(
-                                int(step_idx) + int(seed_offset) + 3_000_000)
-                            retry_still_capped = 0
-                            for retry_local_idx, responses in (
-                                    generate_prompt_jobs(
-                                        model, tokenizer,
-                                        [prompt_jobs[index]["prompt_text"]
-                                         for index in retry_indices],
-                                        [prompt_jobs[index]["count"]
-                                         for index in retry_indices],
-                                        cfg, max_new_tokens=retry_limit,
-                                        cap_state=cap_state)):
-                                retry_job_idx = retry_indices[
-                                    int(retry_local_idx)]
-                                source_idx = int(prompt_jobs[retry_job_idx][
-                                    "strategy_source_job_idx"])
-                                for text, token_ids in responses:
-                                    if _hit_generation_limit(
-                                            prompt_jobs[retry_job_idx],
-                                            token_ids, retry_limit):
-                                        retry_still_capped += 1
-                                    record = _queue_rollout(
-                                        retry_job_idx, text, token_ids,
-                                        rollout_phase=phase,
-                                        strategy_source_job_idx=source_idx)
-                                    _attach_strategy_plan(
-                                        record, source_idx, phase)
-                                    phase_records.append(record)
-                            if retry_still_capped:
-                                print(
-                                    f"[warn] {retry_still_capped}/"
-                                    f"{retry_total} compact code retries still "
-                                    "reached their limit; they remain failed "
-                                    "rollouts and retain their negative "
-                                    "training signal",
-                                    flush=True,
-                                )
                         expected = sum(active_counts)
                         if len(phase_records) != expected:
                             raise RuntimeError(
@@ -8903,7 +8628,6 @@ code block.'''
                     _seed_local_generation(step_idx)
                     gen_bar = make_progress_bar(
                         total_rollouts, desc="rollouts")
-                    capped_counts = {}
                     try:
                         for job_idx, responses in generate_prompt_jobs(
                                 model, tokenizer,
@@ -8911,58 +8635,8 @@ code block.'''
                                 [job["count"] for job in prompt_jobs], cfg,
                                 cap_state=cap_state):
                             for (text, token_ids) in responses:
-                                if (getattr(
-                                        problem, "retry_truncated_code", False)
-                                        and _hit_generation_limit(
-                                            prompt_jobs[int(job_idx)], token_ids,
-                                            cfg.max_new_tokens)):
-                                    capped_counts[int(job_idx)] = (
-                                        capped_counts.get(int(job_idx), 0) + 1)
-                                    continue
                                 _queue_rollout(job_idx, text, token_ids)
                             gen_bar.update(len(responses))
-                        if capped_counts:
-                            retry_total = sum(capped_counts.values())
-                            retry_limit = min(int(cfg.max_new_tokens), 8192)
-                            print(
-                                f"[warn] {retry_total} code response(s) "
-                                "reached the generation limit; replacing them "
-                                "with one compact regeneration pass "
-                                f"(max {retry_limit} tokens)",
-                                flush=True,
-                            )
-                            retry_indices = _append_code_retry_jobs(
-                                capped_counts)
-                            _seed_local_generation(
-                                int(step_idx) + 3_000_000)
-                            retry_still_capped = 0
-                            for retry_local_idx, responses in (
-                                    generate_prompt_jobs(
-                                        model, tokenizer,
-                                        [prompt_jobs[index]["prompt_text"]
-                                         for index in retry_indices],
-                                        [prompt_jobs[index]["count"]
-                                         for index in retry_indices],
-                                        cfg, max_new_tokens=retry_limit,
-                                        cap_state=cap_state)):
-                                retry_job_idx = retry_indices[
-                                    int(retry_local_idx)]
-                                for text, token_ids in responses:
-                                    if _hit_generation_limit(
-                                            prompt_jobs[retry_job_idx],
-                                            token_ids, retry_limit):
-                                        retry_still_capped += 1
-                                    _queue_rollout(
-                                        retry_job_idx, text, token_ids)
-                            if retry_still_capped:
-                                print(
-                                    f"[warn] {retry_still_capped}/"
-                                    f"{retry_total} compact code retries still "
-                                    "reached their limit; they remain failed "
-                                    "rollouts and retain their negative "
-                                    "training signal",
-                                    flush=True,
-                                )
                         cfg._local_generation_cap = int(cap_state["value"])
                     finally:
                         gen_bar.close()
@@ -9804,8 +9478,6 @@ code block.'''
                                         if two_stage_rollouts else None),
                 "programs_per_strategy": (
                     programs_per_strategy if two_stage_rollouts else None),
-                "generation_retry": bool(
-                    job.get("generation_retry", False)),
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
