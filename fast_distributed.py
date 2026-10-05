@@ -12,6 +12,7 @@ import traceback
 
 
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
+MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
 LONG_ROLLOUT_MEMORY_FRACTION = 0.96
 SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
 
@@ -118,10 +119,10 @@ def _set_allocator_memory_ceiling(logical_id, fraction, *, maximum, label):
 
 def set_allocator_memory_ceiling(
         logical_id, fraction=STANDARD_TRAINING_MEMORY_FRACTION):
-    """Make 80% an allocator limit, not merely a post-hoc target."""
+    """Apply the configured normal-training allocator limit."""
     return _set_allocator_memory_ceiling(
         logical_id, fraction,
-        maximum=STANDARD_TRAINING_MEMORY_FRACTION,
+        maximum=MAX_STANDARD_TRAINING_MEMORY_FRACTION,
         label="fast trainer")
 
 
@@ -162,7 +163,7 @@ def set_total_memory_ceiling(
     """Apply the normal conservative limit used by adaptive microbatches."""
     return _set_total_memory_ceiling(
         logical_id, fraction,
-        maximum=STANDARD_TRAINING_MEMORY_FRACTION,
+        maximum=MAX_STANDARD_TRAINING_MEMORY_FRACTION,
         label="fast trainer")
 
 
@@ -487,8 +488,10 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           feedback_advantage)
 
-    if not 0.0 < float(memory_fraction) <= 0.80:
-        raise ValueError("fast trainer memory_fraction must be in (0, 0.80]")
+    if not 0.0 < float(memory_fraction) <= (
+            MAX_STANDARD_TRAINING_MEMORY_FRACTION):
+        raise ValueError(
+            "fast trainer memory_fraction must be in (0, 0.90]")
 
     backend.set_training_mode()
     allocator_fraction = set_total_memory_ceiling(
@@ -914,8 +917,10 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     from feedback import (FeedbackStats, bound_feedback_advantage,
                           feedback_advantage)
 
-    if not 0.0 < float(memory_fraction) <= 0.80:
-        raise ValueError("fast trainer memory_fraction must be in (0, 0.80]")
+    if not 0.0 < float(memory_fraction) <= (
+            MAX_STANDARD_TRAINING_MEMORY_FRACTION):
+        raise ValueError(
+            "fast trainer memory_fraction must be in (0, 0.90]")
     total_examples = int(total_examples)
     if total_examples < 1:
         raise ValueError("fast policy update requires at least one example")
@@ -1365,7 +1370,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         torch.set_num_threads(max(
             1, int(os.cpu_count() or world_size) // int(world_size)))
         torch.cuda.set_device(int(rank))
-        set_total_memory_ceiling(int(rank), 0.80)
+        memory_fraction = float(
+            cfg_dict.get("training_memory_fraction", 0.80))
+        set_total_memory_ceiling(int(rank), memory_fraction)
         cfg = SimpleNamespace(**dict(cfg_dict))
         cfg.training_replica_device = int(rank)
         cfg.num_training_gpus = 1
@@ -1408,7 +1415,8 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     gc.collect()
                     with torch.cuda.device(int(rank)):
                         torch.cuda.empty_cache()
-                        set_total_memory_ceiling(int(rank), 0.80)
+                        set_total_memory_ceiling(
+                            int(rank), memory_fraction)
                         backend.restore_after_generation()
                         backend.set_training_mode()
                         torch.cuda.synchronize(int(rank))

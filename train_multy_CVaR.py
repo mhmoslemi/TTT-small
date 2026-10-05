@@ -147,10 +147,14 @@ def _coder_model_profile(model_name):
             "name": "gpt-oss-120b",
             "native_context": 131_072,
             "max_output": 131_072,
-            "reasoning_effort": "high",
+            "reasoning_effort": "Medium",
             "template_kind": "gpt-oss",
             "training_4bit": True,
-            "training_layout": "auto",
+            # The trainable Unsloth BitsAndBytes copy fits on one 95+ GiB
+            # card. Keep one complete QLoRA trainer per GPU; the native MXFP4
+            # checkpoint remains exclusive to vLLM rollout generation.
+            "training_layout": "replicated",
+            "training_memory_fraction": 0.88,
             "vllm_runtime_reserve_gib": 5.0,
         }
     if basename == _QWEN3_30B_A3B_THINKING_MODEL_BASENAME:
@@ -172,7 +176,12 @@ def _coder_model_profile(model_name):
             "reasoning_effort": "medium", #xhigh
             "template_kind": "qwen3.8",
             "training_4bit": False,
-            "training_layout": "sharded",
+            # A BF16 copy plus the LoRA state fits on each 95+ GiB card.  Use
+            # one complete trainer per GPU so independent rollouts execute in
+            # parallel; layer-sharding a single copy serializes the forward
+            # and backward passes across cards.
+            "training_layout": "replicated",
+            "training_memory_fraction": 0.88,
             # Qwen3.8 has a roughly 248K-token vocabulary. vLLM's exact
             # prompt-logprob path materializes an FP32 softmax for an entire
             # prefill chunk, so its transient projection is much larger than
@@ -224,6 +233,8 @@ def _apply_coder_model_profile(merged):
     merged["load_in_4bit"] = bool(profile["training_4bit"])
     merged["training_model_name"] = ""
     merged["training_layout"] = str(profile["training_layout"])
+    merged["training_memory_fraction"] = float(
+        profile.get("training_memory_fraction", 0.80))
 
     # On the 95+ GiB cards used by this project, the exact checkpoint/KV model
     # admits one full-context engine per card. The model profile leaves the
@@ -260,7 +271,8 @@ def _apply_coder_model_profile(merged):
         f"[model-profile] {profile['name']}: native context="
         f"{native_context}, max generated tokens={profile['max_output']}, "
         f"reasoning={profile['reasoning_effort']}, rollout target=one "
-        "TP=1 engine/GPU; exact long-context training enabled",
+        "TP=1 engine/GPU; training layout="
+        f"{profile['training_layout']}; exact long-context training enabled",
         flush=True,
     )
 
@@ -933,6 +945,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--programs-per-strategy", type=int, default=None,
                    help="LoRA-policy code rollouts sampled from each strategy.")
     p.add_argument(
+        "--pilot-programs-per-strategy", type=int, default=None,
+        help="Two-phase rollout allocation: first sample and evaluate this "
+             "many programs per strategy, then dynamically redistribute the "
+             "unchanged remaining per-parent rollout budget from pilot reward "
+             "mean/variance. -1 preserves the existing one-pass generation "
+             "path exactly.")
+    p.add_argument(
         "--strategy-archive-top-r", type=int, default=None,
         help="With --strategies, admit only the top-r valid unique programs "
              "from each generated strategy before applying the existing "
@@ -1339,7 +1358,8 @@ def _resolve_training_memory_budgets(training_gpu_ids, memory, *,
     return budgets
 
 
-def _validate_known_training_capacity(training_model_name, budgets):
+def _validate_known_training_capacity(
+        training_model_name, budgets, *, replicated=False):
     """Fail before loading a known giant checkpoint that cannot fit at all."""
     if not budgets:
         return
@@ -1352,13 +1372,19 @@ def _validate_known_training_capacity(training_model_name, budgets):
         required_gib, precision = 14.0, "trainable 4-bit"
     elif "gpt-oss-120b" in name:
         required_gib, precision = 196.0, "BF16 LoRA"
-    if required_gib is not None and sum(budgets) < required_gib:
+    available_gib = min(budgets) if replicated else sum(budgets)
+    if required_gib is not None and available_gib < required_gib:
+        placement = "on every replica GPU" if replicated else "in aggregate"
+        remedy = (
+            "Use larger cards or a smaller trainable checkpoint."
+            if replicated else
+            "Add GPUs or use a smaller trainable checkpoint."
+        )
         raise ValueError(
             f"{training_model_name} needs about {required_gib:.0f} GiB for "
-            f"{precision}, but the selected training GPUs have only "
-            f"{sum(budgets):.1f} GiB of safe aggregate placement budget "
-            f"{budgets}. Add GPUs or use load_in_4bit with the trainable "
-            "GPT-OSS BitsAndBytes checkpoint.")
+            f"{precision}, but the selected training GPUs provide only "
+            f"{available_gib:.1f} GiB of safe placement budget {placement} "
+            f"{budgets}. {remedy}")
 
 
 def load_config():
@@ -1443,6 +1469,10 @@ def load_config():
         # problem preset now enables the new phase for fresh runs.
         if "binary_coder_training" not in saved:
             merged["binary_coder_training"] = False
+        # A run saved before adaptive pilots existed must resume its original
+        # one-pass rollout schedule even if today's YAML enables pilots.
+        if "pilot_programs_per_strategy" not in saved:
+            merged["pilot_programs_per_strategy"] = -1
         print(f"[config] resuming original configuration from "
               f"{resume_dir / 'config.json'}")
 
@@ -1526,6 +1556,8 @@ def load_config():
             raise ValueError("strategy_backend must be 'local' or 'api'")
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
+        pilot_programs_per_strategy = int(
+            merged.get("pilot_programs_per_strategy", -1))
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
         strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
         strategy_max_seq_length = int(merged["strategy_max_seq_length"])
@@ -1537,6 +1569,15 @@ def load_config():
                 or strategy_max_seq_length < 1):
             raise ValueError(
                 "strategy counts and token limits must be positive")
+        if (pilot_programs_per_strategy == 0
+                or pilot_programs_per_strategy < -1):
+            raise ValueError(
+                "pilot_programs_per_strategy must be -1 (disabled) or a "
+                "positive integer")
+        if pilot_programs_per_strategy > programs_per_strategy:
+            raise ValueError(
+                "pilot_programs_per_strategy cannot exceed "
+                "programs_per_strategy")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
@@ -1554,6 +1595,8 @@ def load_config():
         merged["strategy_backend"] = strategy_backend
         merged["strategies_per_parent"] = strategies_per_parent
         merged["programs_per_strategy"] = programs_per_strategy
+        merged["pilot_programs_per_strategy"] = (
+            pilot_programs_per_strategy)
         merged["strategy_archive_top_r"] = strategy_archive_top_r
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
@@ -1824,11 +1867,21 @@ def load_config():
             raise ValueError(
                 "training_layout=sharded expects an unquantized trainable "
                 "checkpoint; set load_in_4bit: false")
+    training_memory_fraction = float(
+        merged.get("training_memory_fraction", 0.80))
+    if not 0.0 < training_memory_fraction <= 0.90:
+        raise ValueError(
+            "training_memory_fraction must be in (0, 0.90]")
+    merged["training_memory_fraction"] = training_memory_fraction
+    replicated_weight_budget = bool(
+        merged["fast"] or merged["training_layout"] == "replicated")
     training_budgets = _resolve_training_memory_budgets(
         training_gpu_ids, memory,
-        max_fraction=(0.80 if merged["fast"] else 0.90))
+        max_fraction=(
+            training_memory_fraction if replicated_weight_budget else 0.90))
     _validate_known_training_capacity(
-        merged["training_model_name"], training_budgets)
+        merged["training_model_name"], training_budgets,
+        replicated=replicated_weight_budget)
     merged["training_max_memory_gib"] = training_budgets
     if training_budgets:
         print(f"[memory] training weight budgets by logical GPU: "
@@ -1842,11 +1895,17 @@ def load_config():
         if (fast_clipped_policy
                 and int(merged["rank_update_epochs"]) != 1):
             raise ValueError("--fast requires one clipped-policy update epoch")
+        fast_backend_supported = bool(
+            merged["backend"] == "hf"
+            or (merged["backend"] == "unsloth"
+                and merged.get("coder_model_profile") == "gpt-oss-120b")
+        )
         if not (int(merged["num_training_gpus"]) > 1
-                and merged["backend"] == "hf"
+                and fast_backend_supported
                 and merged["generation_backend"] == "vllm"):
             raise ValueError(
-                "--fast requires replicated HF LoRA training with vLLM "
+                "--fast requires replicated HF LoRA training (or the "
+                "profiled GPT-OSS-120B Unsloth QLoRA trainer) with vLLM "
                 "generation on at least two training GPUs")
 
     # Consume every rollout GPU. Prefer compatible TP replicas for throughput.
@@ -5712,6 +5771,10 @@ class ProcessDistributedTrainer:
         self._processes = {}
         self._physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
         self._world_size = int(cfg.num_training_gpus)
+        self._memory_fraction = float(
+            getattr(cfg, "training_memory_fraction", 0.80))
+        self._memory_percentage = round(
+            100.0 * self._memory_fraction, 1)
         self._token_budgets = [
             max(1, int(cfg.max_seq_length))
             for _ in range(self._world_size)
@@ -5728,7 +5791,7 @@ class ProcessDistributedTrainer:
         torch.set_num_threads(max(
             1, int(os.cpu_count() or self._world_size) // self._world_size))
         torch.cuda.set_device(0)
-        set_total_memory_ceiling(0, 0.80)
+        set_total_memory_ceiling(0, self._memory_fraction)
         validate_model_device(self.model, 0)
         expected_signature = trainable_parameter_signature(self.model)
         os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
@@ -5784,7 +5847,8 @@ class ProcessDistributedTrainer:
             raise
 
         print(f"[{self._process_label}] process-distributed trainer active on physical "
-              f"GPUs {self._physical_ids}; adaptive memory ceiling=80%, "
+              f"GPUs {self._physical_ids}; adaptive memory ceiling="
+              f"{self._memory_percentage:g}%, "
               "exact long-rollout rescue up to 96%",
               flush=True)
 
@@ -6099,7 +6163,8 @@ class ProcessDistributedTrainer:
               f"{supplied_old}/{len(examples)}, reference="
               f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}",
               flush=True)
-        print(f"[train-fast] one process/GPU; memory ceiling=80%; "
+        print(f"[train-fast] one process/GPU; memory ceiling="
+              f"{self._memory_percentage:g}%; "
               "exact singleton rescue=96%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
@@ -6110,7 +6175,7 @@ class ProcessDistributedTrainer:
                 "kind": "train_rank",
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
-                "memory_fraction": 0.80,
+                "memory_fraction": self._memory_fraction,
                 "fb_cfg": fb_cfg,
                 "fb_on": bool(fb_on),
                 "fb_lambda": float(fb_lambda),
@@ -6118,7 +6183,8 @@ class ProcessDistributedTrainer:
 
         local_stats = local_rank_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
-            self._token_budgets[0], memory_fraction=0.80,
+            self._token_budgets[0],
+            memory_fraction=self._memory_fraction,
             fb_cfg=fb_cfg, fb_on=fb_on, fb_lambda=fb_lambda,
             work_queue=self._work_queue)
         child_messages = self._collect_event(
@@ -6263,7 +6329,7 @@ class ProcessDistributedTrainer:
                 # the known pre-reward upper bound during backward, then apply
                 # the small exact correction on every rank before reduction.
                 "total_examples": normalization_examples,
-                "memory_fraction": 0.80,
+                "memory_fraction": self._memory_fraction,
                 "fb_cfg": None,
                 "fb_on": False,
                 "fb_lambda": 0.0,
@@ -6290,7 +6356,8 @@ class ProcessDistributedTrainer:
             local_policy_update,
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0], normalization_examples,
-            memory_fraction=0.80, fb_cfg=None, fb_on=False,
+            memory_fraction=self._memory_fraction,
+            fb_cfg=None, fb_on=False,
             fb_lambda=0.0, work_queue=self._work_queue,
             adaptive_batches=adaptive_batches)
         state["future"] = future
@@ -6526,7 +6593,8 @@ class ProcessDistributedTrainer:
             f"configured microbatches up to "
             f"{int(cfg.train_examples_per_microbatch)} examples")
         print(f"[{process_label}] one process/GPU; {scheduler_label}; "
-              "memory ceiling=80%; exact singleton rescue=96%; "
+              f"memory ceiling={self._memory_percentage:g}%; "
+              "exact singleton rescue=96%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -6537,7 +6605,7 @@ class ProcessDistributedTrainer:
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "total_examples": total_examples,
-                "memory_fraction": 0.80,
+                "memory_fraction": self._memory_fraction,
                 "fb_cfg": fb_cfg,
                 "fb_on": bool(fb_on),
                 "fb_lambda": float(fb_lambda),
@@ -6547,7 +6615,8 @@ class ProcessDistributedTrainer:
         local_stats = local_policy_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0], total_examples,
-            memory_fraction=0.80, fb_cfg=fb_cfg, fb_on=fb_on,
+            memory_fraction=self._memory_fraction,
+            fb_cfg=fb_cfg, fb_on=fb_on,
             fb_lambda=fb_lambda, work_queue=self._work_queue,
             adaptive_batches=adaptive_batches)
         child_messages = self._collect_event(
@@ -6701,7 +6770,7 @@ class ProcessDistributedTrainer:
             gc.collect()
             with torch.cuda.device(0):
                 torch.cuda.empty_cache()
-                set_total_memory_ceiling(0, 0.80)
+                set_total_memory_ceiling(0, self._memory_fraction)
                 self.backend.restore_after_generation()
                 self.backend.set_training_mode()
                 torch.cuda.synchronize(0)
@@ -7061,6 +7130,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     binary_coder_mode = active_advantage_mode == "binary-coder"
     if spo_rs_mode and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
+    if spo_rs_mode and not spo_rs_tracker.initialized:
+        raise ValueError(
+            "SPO-RS tracker must be initialized from pre-step history before "
+            "rollouts are sampled")
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
     x_grpo_groups_per_context = (
         int(cfg.groups_per_step) if x_grpo_mode else 1)
@@ -7122,6 +7195,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     entropic_overlap_state = None
     all_children = []
     all_child_strategy_keys = []
+    strategy_pilot_diagnostics = []
     saved_rollouts = 0
     mem_records = []            # RolloutRecord per rollout, for the memory maker
     mem_arm_updates = []        # matched treatment-vs-null outcome diagnostics
@@ -7345,6 +7419,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
     programs_per_strategy = (
         int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
+    pilot_programs_per_strategy = (
+        int(getattr(cfg, "pilot_programs_per_strategy", -1))
+        if two_stage_rollouts else -1)
+    adaptive_strategy_pilots = bool(
+        two_stage_rollouts and pilot_programs_per_strategy > 0)
     if (two_stage_rollouts
             and int(cfg.group_size)
             != strategies_per_parent * programs_per_strategy):
@@ -7650,6 +7729,11 @@ code block.'''
     queued_by_group = {g: 0 for g in range(num_groups)}
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
+    if adaptive_strategy_pilots and defer_gpu_evaluation:
+        raise ValueError(
+            "adaptive strategy pilots require CPU evaluation concurrent with "
+            "rollout generation; set pilot_programs_per_strategy=-1 for the "
+            "shared-GPU evaluator")
 
     def _run_isolated_reward(response_text, parent_ctx):
         cpu_id = isolated_cpu_slots.get()
@@ -7676,9 +7760,12 @@ code block.'''
                 cfg.sandbox_timeout_s
             )
         reward_futures[g].append(fut)
+        record["_reward_future"] = fut
         fut.add_done_callback(_record_evaluation_completion)
+        return fut
 
-    def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None):
+    def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None, *,
+                       rollout_phase=None, strategy_source_job_idx=None):
         job = prompt_jobs[int(job_idx)]
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
@@ -7714,6 +7801,11 @@ code block.'''
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
         }
+        if rollout_phase is not None:
+            record["strategy_rollout_phase"] = str(rollout_phase)
+        if strategy_source_job_idx is not None:
+            record["strategy_source_job_idx"] = int(
+                strategy_source_job_idx)
         if (training_enabled and cfg.generation_backend == "vllm"
                 and token_ids):
             vllm_logprob_records.append(record)
@@ -7721,6 +7813,222 @@ code block.'''
             deferred_rollouts.append(record)
         else:
             _submit_rollout(record)
+        return record
+
+    def _strategy_plan_metadata(source_job_idx):
+        source_job = prompt_jobs[int(source_job_idx)]
+        return {
+            "strategy_pilot_reward_mean": source_job.get(
+                "strategy_pilot_reward_mean"),
+            "strategy_pilot_reward_variance": source_job.get(
+                "strategy_pilot_reward_variance"),
+            "strategy_pilot_mean_threshold": source_job.get(
+                "strategy_pilot_mean_threshold"),
+            "strategy_pilot_variance_threshold": source_job.get(
+                "strategy_pilot_variance_threshold"),
+            "strategy_pilot_scenario": source_job.get(
+                "strategy_pilot_scenario"),
+            "strategy_pilot_followup_count": source_job.get(
+                "strategy_pilot_followup_count"),
+            "strategy_allocated_programs": source_job.get(
+                "strategy_allocated_programs"),
+        }
+
+    def _attach_strategy_plan(record, source_job_idx, rollout_phase):
+        record["strategy_rollout_phase"] = str(rollout_phase)
+        record["strategy_source_job_idx"] = int(source_job_idx)
+        record.update(_strategy_plan_metadata(source_job_idx))
+
+    def _allocate_largest_remainder(total, weights, tie_values):
+        total = int(total)
+        if total < 0:
+            raise RuntimeError("adaptive rollout budget became negative")
+        if total == 0:
+            return [0] * len(weights)
+        normalized = [max(0.0, float(weight)) for weight in weights]
+        fallback = not any(weight > 0.0 for weight in normalized)
+        if fallback:
+            normalized = [1.0] * len(normalized)
+        weight_sum = sum(normalized)
+        quotas = [total * weight / weight_sum for weight in normalized]
+        allocations = [int(math.floor(quota)) for quota in quotas]
+        leftover = total - sum(allocations)
+        order = sorted(
+            range(len(allocations)),
+            key=lambda index: (
+                -(quotas[index] - allocations[index]),
+                -float(tie_values[index][0]),
+                -float(tie_values[index][1]),
+                int(tie_values[index][2]),
+            ),
+        )
+        for index in order[:leftover]:
+            allocations[index] += 1
+        if sum(allocations) != total:
+            raise RuntimeError("adaptive rollout allocation lost budget")
+        return allocations
+
+    def _finish_strategy_pilots(pilot_records, source_job_indices):
+        """Wait for pilot rewards and preserve each chain's fixed budget."""
+        expected_pilots = (
+            len(source_job_indices) * pilot_programs_per_strategy)
+        if len(pilot_records) != expected_pilots:
+            raise RuntimeError(
+                "pilot generation returned "
+                f"{len(pilot_records)}/{expected_pilots} rollouts")
+        pilot_futures = [record.get("_reward_future")
+                         for record in pilot_records]
+        if any(future is None for future in pilot_futures):
+            raise RuntimeError(
+                "adaptive pilot allocation requires CPU rewards to run "
+                "concurrently with generation")
+        wait(pilot_futures)
+
+        rewards_by_source = {
+            int(source_idx): [] for source_idx in source_job_indices}
+        records_by_source = {
+            int(source_idx): [] for source_idx in source_job_indices}
+        for record in pilot_records:
+            source_idx = int(record["strategy_source_job_idx"])
+            result = record["_reward_future"].result()
+            reward = float(result.reward)
+            if not math.isfinite(reward):
+                raise RuntimeError(
+                    f"pilot reward for strategy job {source_idx} is not finite")
+            rewards_by_source[source_idx].append(reward)
+            records_by_source[source_idx].append(record)
+
+        chains = {}
+        for source_idx in source_job_indices:
+            job = prompt_jobs[int(source_idx)]
+            key = (int(job["parent_group"]),
+                   int(job.get("assigned_fold_index", 0)))
+            chains.setdefault(key, []).append(int(source_idx))
+
+        followup_counts = {int(source_idx): 0
+                           for source_idx in source_job_indices}
+        for (parent_group, fold_index), chain_indices in sorted(
+                chains.items()):
+            chain_indices.sort(
+                key=lambda index: int(prompt_jobs[index]["strategy_index"]))
+            if len(chain_indices) != strategies_per_parent:
+                raise RuntimeError(
+                    f"parent {parent_group} fold {fold_index} has "
+                    f"{len(chain_indices)} strategy jobs; expected "
+                    f"{strategies_per_parent}")
+
+            means = []
+            variances = []
+            for source_idx in chain_indices:
+                rewards = rewards_by_source[source_idx]
+                if len(rewards) != pilot_programs_per_strategy:
+                    raise RuntimeError(
+                        f"strategy job {source_idx} has {len(rewards)} pilot "
+                        f"rewards; expected {pilot_programs_per_strategy}")
+                values = np.asarray(rewards, dtype=np.float64)
+                means.append(float(values.mean()))
+                variances.append(float(values.var(ddof=0)))
+
+            mean_threshold = float(np.median(
+                np.asarray(means, dtype=np.float64)))
+            variance_threshold = float(np.median(
+                np.asarray(variances, dtype=np.float64)))
+            scenarios = []
+            weights = []
+            for mean, variance in zip(means, variances):
+                # Exact threshold ties stay on the low side. If every strategy
+                # ties on both statistics, the zero-weight fallback below
+                # restores the original equal per-strategy allocation.
+                high_mean = mean > mean_threshold
+                high_variance = variance > variance_threshold
+                if high_mean and high_variance:
+                    scenario, weight = "high-mean/high-variance", 4.0
+                elif high_mean:
+                    scenario, weight = "high-mean/low-variance", 3.0
+                elif high_variance:
+                    scenario, weight = "low-mean/high-variance", 2.0
+                else:
+                    scenario, weight = "low-mean/low-variance", 0.0
+                scenarios.append(scenario)
+                weights.append(weight)
+
+            remaining = (
+                strategies_per_parent
+                * (programs_per_strategy - pilot_programs_per_strategy))
+            followups = _allocate_largest_remainder(
+                remaining, weights,
+                [(mean, variance,
+                  int(prompt_jobs[source_idx]["strategy_index"]))
+                 for source_idx, mean, variance in zip(
+                     chain_indices, means, variances)],
+            )
+            fallback_equal = not any(weight > 0.0 for weight in weights)
+            print(
+                f"[step {step_idx}] rollout pilot parent {parent_group}"
+                f"/fold {fold_index}: mean threshold={mean_threshold:.9f}, "
+                f"variance threshold={variance_threshold:.9f}; "
+                f"allocating {remaining} phase-2 rollouts"
+                + (" equally (all pilot statistics tied)"
+                   if fallback_equal else ""),
+                flush=True,
+            )
+
+            for source_idx, mean, variance, scenario, followup in zip(
+                    chain_indices, means, variances, scenarios, followups):
+                job = prompt_jobs[source_idx]
+                allocated = pilot_programs_per_strategy + int(followup)
+                diagnostic = {
+                    "parent_group": int(parent_group),
+                    "fold_index": int(fold_index),
+                    "strategy_index": int(job["strategy_index"]),
+                    "pilot_count": int(pilot_programs_per_strategy),
+                    "pilot_reward_mean": float(mean),
+                    "pilot_reward_variance": float(variance),
+                    "mean_threshold": float(mean_threshold),
+                    "variance_threshold": float(variance_threshold),
+                    "scenario": str(scenario),
+                    "followup_count": int(followup),
+                    "allocated_programs": int(allocated),
+                }
+                strategy_pilot_diagnostics.append(diagnostic)
+                job.update({
+                    "strategy_pilot_reward_mean": float(mean),
+                    "strategy_pilot_reward_variance": float(variance),
+                    "strategy_pilot_mean_threshold": float(mean_threshold),
+                    "strategy_pilot_variance_threshold": float(
+                        variance_threshold),
+                    "strategy_pilot_scenario": str(scenario),
+                    "strategy_pilot_followup_count": int(followup),
+                    "strategy_allocated_programs": int(allocated),
+                })
+                followup_counts[source_idx] = int(followup)
+                for record in records_by_source[source_idx]:
+                    _attach_strategy_plan(record, source_idx, "pilot")
+                print(
+                    f"[step {step_idx}]   strategy "
+                    f"{int(job['strategy_index'])}: mean={mean:.9f}, "
+                    f"variance={variance:.9f}, {scenario}, "
+                    f"phase2={int(followup)}, total={allocated}",
+                    flush=True,
+                )
+
+            if (sum(pilot_programs_per_strategy + count
+                    for count in followups) != int(cfg.group_size)):
+                raise RuntimeError(
+                    "adaptive strategy allocation changed the fixed group "
+                    "rollout budget")
+        # The adaptive scheduler can move programs between strategy prompts,
+        # which can also move them between memory arms. Keep the accounting
+        # aligned with the programs that were actually scheduled.
+        mem_arm_rollouts.clear()
+        for source_idx in source_job_indices:
+            job = prompt_jobs[int(source_idx)]
+            arm = job["arm"]
+            mem_arm_rollouts[arm] = (
+                mem_arm_rollouts.get(arm, 0)
+                + int(job["strategy_allocated_programs"]))
+        return [followup_counts[int(source_idx)]
+                for source_idx in source_job_indices]
 
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
@@ -7849,90 +8157,257 @@ code block.'''
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
 
-                generation_options = {
-                    "prompts_by_group": [
-                        job["prompt_text"] for job in prompt_jobs],
-                    "group_size": cfg.group_size,
-                    "counts_by_group": [
-                        job["count"] for job in prompt_jobs],
-                    "adapter_path": adapter_path,
-                    "max_new_tokens": cfg.max_new_tokens,
-                    "temperature": cfg.temperature,
-                    "top_p": cfg.top_p,
-                    "step_idx": step_idx,
-                    "full_policy_sampling": (
-                        _uses_sequence_level_policy_ratio(cfg)),
-                }
-                if cfg.generation_backend == "vllm":
-                    generation_options["return_logprobs"] = training_enabled
-                capped_counts = {}
-                for job_idx, job_results in gen_pool.iter_group_jobs(
-                        **generation_options):
-                    for result in job_results:
-                        text, token_ids = result[:2]
-                        behavior_logprobs = (
-                            result[2] if len(result) > 2 else None)
-                        if (getattr(problem, "retry_truncated_code", False)
-                                and _hit_generation_limit(
-                                    prompt_jobs[int(job_idx)], token_ids,
-                                    cfg.max_new_tokens)):
-                            capped_counts[int(job_idx)] = (
-                                capped_counts.get(int(job_idx), 0) + 1)
-                            continue
-                        _queue_rollout(
-                            job_idx, text, token_ids, behavior_logprobs)
-                if capped_counts:
-                    retry_total = sum(capped_counts.values())
-                    retry_limit = min(int(cfg.max_new_tokens), 8192)
+                if adaptive_strategy_pilots:
+                    source_job_indices = list(range(len(prompt_jobs)))
+
+                    def _run_vllm_code_phase(
+                            counts, *, phase, seed_offset, progress_desc):
+                        active = [
+                            (source_idx, int(count))
+                            for source_idx, count in zip(
+                                source_job_indices, counts)
+                            if int(count) > 0
+                        ]
+                        if not active:
+                            return []
+                        active_indices = [item[0] for item in active]
+                        active_counts = [item[1] for item in active]
+                        options = {
+                            "prompts_by_group": [
+                                prompt_jobs[index]["prompt_text"]
+                                for index in active_indices],
+                            "group_size": max(active_counts),
+                            "counts_by_group": active_counts,
+                            "adapter_path": adapter_path,
+                            "max_new_tokens": cfg.max_new_tokens,
+                            "temperature": cfg.temperature,
+                            "top_p": cfg.top_p,
+                            "step_idx": int(step_idx) + int(seed_offset),
+                            "progress_desc": progress_desc,
+                            "full_policy_sampling": (
+                                _uses_sequence_level_policy_ratio(cfg)),
+                        }
+                        if cfg.generation_backend == "vllm":
+                            options["return_logprobs"] = training_enabled
+                        phase_records = []
+                        capped_counts = {}
+                        for local_idx, job_results in (
+                                gen_pool.iter_group_jobs(**options)):
+                            source_idx = active_indices[int(local_idx)]
+                            for result in job_results:
+                                text, token_ids = result[:2]
+                                behavior_logprobs = (
+                                    result[2] if len(result) > 2 else None)
+                                if (getattr(
+                                        problem, "retry_truncated_code", False)
+                                        and _hit_generation_limit(
+                                            prompt_jobs[source_idx], token_ids,
+                                            cfg.max_new_tokens)):
+                                    capped_counts[source_idx] = (
+                                        capped_counts.get(source_idx, 0) + 1)
+                                    continue
+                                record = _queue_rollout(
+                                    source_idx, text, token_ids,
+                                    behavior_logprobs,
+                                    rollout_phase=phase,
+                                    strategy_source_job_idx=source_idx)
+                                _attach_strategy_plan(
+                                    record, source_idx, phase)
+                                phase_records.append(record)
+
+                        if capped_counts:
+                            retry_total = sum(capped_counts.values())
+                            retry_limit = min(int(cfg.max_new_tokens), 8192)
+                            print(
+                                f"[warn] {retry_total} {phase} code "
+                                "response(s) reached the generation limit; "
+                                "replacing them with one compact regeneration "
+                                f"pass (max {retry_limit} tokens)",
+                                flush=True,
+                            )
+                            sorted_sources = sorted(capped_counts)
+                            retry_indices = _append_code_retry_jobs(
+                                capped_counts)
+                            for source_idx, retry_idx in zip(
+                                    sorted_sources, retry_indices):
+                                prompt_jobs[retry_idx][
+                                    "strategy_source_job_idx"] = source_idx
+                            retry_options = {
+                                "prompts_by_group": [
+                                    prompt_jobs[index]["prompt_text"]
+                                    for index in retry_indices],
+                                "group_size": max(capped_counts.values()),
+                                "counts_by_group": [
+                                    prompt_jobs[index]["count"]
+                                    for index in retry_indices],
+                                "adapter_path": adapter_path,
+                                "max_new_tokens": retry_limit,
+                                "temperature": cfg.temperature,
+                                "top_p": cfg.top_p,
+                                "step_idx": (
+                                    int(step_idx) + int(seed_offset)
+                                    + 3_000_000),
+                                "progress_desc": (
+                                    f"{phase} compact code retries"),
+                                "full_policy_sampling": (
+                                    _uses_sequence_level_policy_ratio(cfg)),
+                            }
+                            if cfg.generation_backend == "vllm":
+                                retry_options["return_logprobs"] = (
+                                    training_enabled)
+                            retry_still_capped = 0
+                            for retry_local_idx, job_results in (
+                                    gen_pool.iter_group_jobs(
+                                        **retry_options)):
+                                retry_job_idx = retry_indices[
+                                    int(retry_local_idx)]
+                                source_idx = int(prompt_jobs[retry_job_idx][
+                                    "strategy_source_job_idx"])
+                                for result in job_results:
+                                    text, token_ids = result[:2]
+                                    behavior_logprobs = (
+                                        result[2] if len(result) > 2 else None)
+                                    if _hit_generation_limit(
+                                            prompt_jobs[retry_job_idx],
+                                            token_ids, retry_limit):
+                                        retry_still_capped += 1
+                                    record = _queue_rollout(
+                                        retry_job_idx, text, token_ids,
+                                        behavior_logprobs,
+                                        rollout_phase=phase,
+                                        strategy_source_job_idx=source_idx)
+                                    _attach_strategy_plan(
+                                        record, source_idx, phase)
+                                    phase_records.append(record)
+                            if retry_still_capped:
+                                print(
+                                    f"[warn] {retry_still_capped}/"
+                                    f"{retry_total} compact code retries still "
+                                    "reached their limit; they remain failed "
+                                    "rollouts and retain their negative "
+                                    "training signal",
+                                    flush=True,
+                                )
+                        expected = sum(active_counts)
+                        if len(phase_records) != expected:
+                            raise RuntimeError(
+                                f"{phase} generation returned "
+                                f"{len(phase_records)}/{expected} rollouts")
+                        return phase_records
+
                     print(
-                        f"[warn] {retry_total} code response(s) reached the "
-                        "generation limit; replacing them with one compact "
-                        f"regeneration pass (max {retry_limit} tokens)",
+                        f"[step {step_idx}] rollout pilot: "
+                        f"{pilot_programs_per_strategy} programs x "
+                        f"{len(source_job_indices)} strategies; CPU evaluation "
+                        "starts as each program arrives",
                         flush=True,
                     )
-                    retry_indices = _append_code_retry_jobs(capped_counts)
-                    retry_options = {
+                    pilot_records = _run_vllm_code_phase(
+                        [pilot_programs_per_strategy]
+                        * len(source_job_indices),
+                        phase="pilot", seed_offset=0,
+                        progress_desc="pilot rollouts")
+                    followup_counts = _finish_strategy_pilots(
+                        pilot_records, source_job_indices)
+                    followup_total = sum(followup_counts)
+                    if followup_total:
+                        print(
+                            f"[step {step_idx}] adaptive phase 2: generating "
+                            f"{followup_total} allocated programs; CPU "
+                            "evaluation continues as each program arrives",
+                            flush=True,
+                        )
+                        _run_vllm_code_phase(
+                            followup_counts, phase="adaptive",
+                            seed_offset=4_000_000,
+                            progress_desc="adaptive rollouts")
+                else:
+                    # Keep the disabled path structurally identical to the
+                    # original one-pass rollout scheduler.
+                    generation_options = {
                         "prompts_by_group": [
-                            prompt_jobs[index]["prompt_text"]
-                            for index in retry_indices],
-                        "group_size": 1,
+                            job["prompt_text"] for job in prompt_jobs],
+                        "group_size": cfg.group_size,
                         "counts_by_group": [
-                            prompt_jobs[index]["count"]
-                            for index in retry_indices],
+                            job["count"] for job in prompt_jobs],
                         "adapter_path": adapter_path,
-                        "max_new_tokens": retry_limit,
+                        "max_new_tokens": cfg.max_new_tokens,
                         "temperature": cfg.temperature,
                         "top_p": cfg.top_p,
-                        "step_idx": int(step_idx) + 3_000_000,
-                        "progress_desc": "compact code retries",
+                        "step_idx": step_idx,
                         "full_policy_sampling": (
                             _uses_sequence_level_policy_ratio(cfg)),
                     }
                     if cfg.generation_backend == "vllm":
-                        retry_options["return_logprobs"] = training_enabled
-                    retry_still_capped = 0
-                    for retry_local_idx, job_results in (
-                            gen_pool.iter_group_jobs(**retry_options)):
-                        retry_job_idx = retry_indices[int(retry_local_idx)]
+                        generation_options["return_logprobs"] = training_enabled
+                    capped_counts = {}
+                    for job_idx, job_results in gen_pool.iter_group_jobs(
+                            **generation_options):
                         for result in job_results:
                             text, token_ids = result[:2]
                             behavior_logprobs = (
                                 result[2] if len(result) > 2 else None)
-                            if _hit_generation_limit(
-                                    prompt_jobs[retry_job_idx], token_ids,
-                                    retry_limit):
-                                retry_still_capped += 1
+                            if (getattr(problem, "retry_truncated_code", False)
+                                    and _hit_generation_limit(
+                                        prompt_jobs[int(job_idx)], token_ids,
+                                        cfg.max_new_tokens)):
+                                capped_counts[int(job_idx)] = (
+                                    capped_counts.get(int(job_idx), 0) + 1)
+                                continue
                             _queue_rollout(
-                                retry_job_idx, text, token_ids,
-                                behavior_logprobs)
-                    if retry_still_capped:
+                                job_idx, text, token_ids, behavior_logprobs)
+                    if capped_counts:
+                        retry_total = sum(capped_counts.values())
+                        retry_limit = min(int(cfg.max_new_tokens), 8192)
                         print(
-                            f"[warn] {retry_still_capped}/{retry_total} "
-                            "compact code retries still reached their limit; "
-                            "they remain failed rollouts and retain their "
-                            "negative training signal",
+                            f"[warn] {retry_total} code response(s) reached the "
+                            "generation limit; replacing them with one compact "
+                            f"regeneration pass (max {retry_limit} tokens)",
                             flush=True,
                         )
+                        retry_indices = _append_code_retry_jobs(capped_counts)
+                        retry_options = {
+                            "prompts_by_group": [
+                                prompt_jobs[index]["prompt_text"]
+                                for index in retry_indices],
+                            "group_size": 1,
+                            "counts_by_group": [
+                                prompt_jobs[index]["count"]
+                                for index in retry_indices],
+                            "adapter_path": adapter_path,
+                            "max_new_tokens": retry_limit,
+                            "temperature": cfg.temperature,
+                            "top_p": cfg.top_p,
+                            "step_idx": int(step_idx) + 3_000_000,
+                            "progress_desc": "compact code retries",
+                            "full_policy_sampling": (
+                                _uses_sequence_level_policy_ratio(cfg)),
+                        }
+                        if cfg.generation_backend == "vllm":
+                            retry_options["return_logprobs"] = training_enabled
+                        retry_still_capped = 0
+                        for retry_local_idx, job_results in (
+                                gen_pool.iter_group_jobs(**retry_options)):
+                            retry_job_idx = retry_indices[int(retry_local_idx)]
+                            for result in job_results:
+                                text, token_ids = result[:2]
+                                behavior_logprobs = (
+                                    result[2] if len(result) > 2 else None)
+                                if _hit_generation_limit(
+                                        prompt_jobs[retry_job_idx], token_ids,
+                                        retry_limit):
+                                    retry_still_capped += 1
+                                _queue_rollout(
+                                    retry_job_idx, text, token_ids,
+                                    behavior_logprobs)
+                        if retry_still_capped:
+                            print(
+                                f"[warn] {retry_still_capped}/{retry_total} "
+                                "compact code retries still reached their "
+                                "limit; they remain failed rollouts and retain "
+                                "their negative training signal",
+                                flush=True,
+                            )
             else:
                 # In-process generation uses cross-prompt micro-batches rather
                 # than draining one parent at a time. Ordinary CPU verification
@@ -8018,68 +8493,215 @@ code block.'''
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
 
-                _seed_local_generation(step_idx)
-                gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
-                capped_counts = {}
-                try:
-                    for job_idx, responses in generate_prompt_jobs(
-                            model, tokenizer,
-                            [job["prompt_text"] for job in prompt_jobs],
-                            [job["count"] for job in prompt_jobs], cfg,
-                            cap_state=cap_state):
-                        for (text, token_ids) in responses:
-                            if (getattr(
-                                    problem, "retry_truncated_code", False)
-                                    and _hit_generation_limit(
-                                        prompt_jobs[int(job_idx)], token_ids,
-                                        cfg.max_new_tokens)):
-                                capped_counts[int(job_idx)] = (
-                                    capped_counts.get(int(job_idx), 0) + 1)
-                                continue
-                            _queue_rollout(job_idx, text, token_ids)
-                        gen_bar.update(len(responses))
-                    if capped_counts:
-                        retry_total = sum(capped_counts.values())
-                        retry_limit = min(int(cfg.max_new_tokens), 8192)
-                        print(
-                            f"[warn] {retry_total} code response(s) reached "
-                            "the generation limit; replacing them with one "
-                            "compact regeneration pass "
-                            f"(max {retry_limit} tokens)",
-                            flush=True,
-                        )
-                        retry_indices = _append_code_retry_jobs(capped_counts)
-                        _seed_local_generation(int(step_idx) + 3_000_000)
-                        retry_still_capped = 0
-                        for retry_local_idx, responses in generate_prompt_jobs(
-                                model, tokenizer,
-                                [prompt_jobs[index]["prompt_text"]
-                                 for index in retry_indices],
-                                [prompt_jobs[index]["count"]
-                                 for index in retry_indices],
-                                cfg,
-                                max_new_tokens=retry_limit,
-                                cap_state=cap_state):
-                            retry_job_idx = retry_indices[
-                                int(retry_local_idx)]
-                            for text, token_ids in responses:
-                                if _hit_generation_limit(
-                                        prompt_jobs[retry_job_idx], token_ids,
-                                        retry_limit):
-                                    retry_still_capped += 1
-                                _queue_rollout(
-                                    retry_job_idx, text, token_ids)
-                        if retry_still_capped:
+                if adaptive_strategy_pilots:
+                    source_job_indices = list(range(len(prompt_jobs)))
+
+                    def _run_local_code_phase(
+                            counts, *, phase, seed_offset, progress_desc):
+                        active = [
+                            (source_idx, int(count))
+                            for source_idx, count in zip(
+                                source_job_indices, counts)
+                            if int(count) > 0
+                        ]
+                        if not active:
+                            return []
+                        active_indices = [item[0] for item in active]
+                        active_counts = [item[1] for item in active]
+                        _seed_local_generation(
+                            int(step_idx) + int(seed_offset))
+                        phase_records = []
+                        capped_counts = {}
+                        gen_bar = make_progress_bar(
+                            sum(active_counts), desc=progress_desc)
+                        try:
+                            for local_idx, responses in generate_prompt_jobs(
+                                    model, tokenizer,
+                                    [prompt_jobs[index]["prompt_text"]
+                                     for index in active_indices],
+                                    active_counts, cfg,
+                                    cap_state=cap_state):
+                                source_idx = active_indices[int(local_idx)]
+                                for text, token_ids in responses:
+                                    if (getattr(
+                                            problem,
+                                            "retry_truncated_code", False)
+                                            and _hit_generation_limit(
+                                                prompt_jobs[source_idx],
+                                                token_ids,
+                                                cfg.max_new_tokens)):
+                                        capped_counts[source_idx] = (
+                                            capped_counts.get(source_idx, 0)
+                                            + 1)
+                                        continue
+                                    record = _queue_rollout(
+                                        source_idx, text, token_ids,
+                                        rollout_phase=phase,
+                                        strategy_source_job_idx=source_idx)
+                                    _attach_strategy_plan(
+                                        record, source_idx, phase)
+                                    phase_records.append(record)
+                                gen_bar.update(len(responses))
+                        finally:
+                            gen_bar.close()
+
+                        if capped_counts:
+                            retry_total = sum(capped_counts.values())
+                            retry_limit = min(int(cfg.max_new_tokens), 8192)
                             print(
-                                f"[warn] {retry_still_capped}/{retry_total} "
-                                "compact code retries still reached their "
-                                "limit; they remain failed rollouts and retain "
-                                "their negative training signal",
+                                f"[warn] {retry_total} {phase} code "
+                                "response(s) reached the generation limit; "
+                                "replacing them with one compact regeneration "
+                                f"pass (max {retry_limit} tokens)",
                                 flush=True,
                             )
+                            sorted_sources = sorted(capped_counts)
+                            retry_indices = _append_code_retry_jobs(
+                                capped_counts)
+                            for source_idx, retry_idx in zip(
+                                    sorted_sources, retry_indices):
+                                prompt_jobs[retry_idx][
+                                    "strategy_source_job_idx"] = source_idx
+                            _seed_local_generation(
+                                int(step_idx) + int(seed_offset) + 3_000_000)
+                            retry_still_capped = 0
+                            for retry_local_idx, responses in (
+                                    generate_prompt_jobs(
+                                        model, tokenizer,
+                                        [prompt_jobs[index]["prompt_text"]
+                                         for index in retry_indices],
+                                        [prompt_jobs[index]["count"]
+                                         for index in retry_indices],
+                                        cfg, max_new_tokens=retry_limit,
+                                        cap_state=cap_state)):
+                                retry_job_idx = retry_indices[
+                                    int(retry_local_idx)]
+                                source_idx = int(prompt_jobs[retry_job_idx][
+                                    "strategy_source_job_idx"])
+                                for text, token_ids in responses:
+                                    if _hit_generation_limit(
+                                            prompt_jobs[retry_job_idx],
+                                            token_ids, retry_limit):
+                                        retry_still_capped += 1
+                                    record = _queue_rollout(
+                                        retry_job_idx, text, token_ids,
+                                        rollout_phase=phase,
+                                        strategy_source_job_idx=source_idx)
+                                    _attach_strategy_plan(
+                                        record, source_idx, phase)
+                                    phase_records.append(record)
+                            if retry_still_capped:
+                                print(
+                                    f"[warn] {retry_still_capped}/"
+                                    f"{retry_total} compact code retries still "
+                                    "reached their limit; they remain failed "
+                                    "rollouts and retain their negative "
+                                    "training signal",
+                                    flush=True,
+                                )
+                        expected = sum(active_counts)
+                        if len(phase_records) != expected:
+                            raise RuntimeError(
+                                f"{phase} generation returned "
+                                f"{len(phase_records)}/{expected} rollouts")
+                        return phase_records
+
+                    print(
+                        f"[step {step_idx}] rollout pilot: "
+                        f"{pilot_programs_per_strategy} programs x "
+                        f"{len(source_job_indices)} strategies; CPU evaluation "
+                        "starts as each program arrives",
+                        flush=True,
+                    )
+                    pilot_records = _run_local_code_phase(
+                        [pilot_programs_per_strategy]
+                        * len(source_job_indices),
+                        phase="pilot", seed_offset=0,
+                        progress_desc="pilot rollouts")
+                    followup_counts = _finish_strategy_pilots(
+                        pilot_records, source_job_indices)
+                    followup_total = sum(followup_counts)
+                    if followup_total:
+                        print(
+                            f"[step {step_idx}] adaptive phase 2: generating "
+                            f"{followup_total} allocated programs; CPU "
+                            "evaluation continues as each program arrives",
+                            flush=True,
+                        )
+                        _run_local_code_phase(
+                            followup_counts, phase="adaptive",
+                            seed_offset=4_000_000,
+                            progress_desc="adaptive rollouts")
                     cfg._local_generation_cap = int(cap_state["value"])
-                finally:
-                    gen_bar.close()
+                else:
+                    # Keep the disabled path structurally identical to the
+                    # original one-pass rollout scheduler.
+                    _seed_local_generation(step_idx)
+                    gen_bar = make_progress_bar(
+                        total_rollouts, desc="rollouts")
+                    capped_counts = {}
+                    try:
+                        for job_idx, responses in generate_prompt_jobs(
+                                model, tokenizer,
+                                [job["prompt_text"] for job in prompt_jobs],
+                                [job["count"] for job in prompt_jobs], cfg,
+                                cap_state=cap_state):
+                            for (text, token_ids) in responses:
+                                if (getattr(
+                                        problem, "retry_truncated_code", False)
+                                        and _hit_generation_limit(
+                                            prompt_jobs[int(job_idx)], token_ids,
+                                            cfg.max_new_tokens)):
+                                    capped_counts[int(job_idx)] = (
+                                        capped_counts.get(int(job_idx), 0) + 1)
+                                    continue
+                                _queue_rollout(job_idx, text, token_ids)
+                            gen_bar.update(len(responses))
+                        if capped_counts:
+                            retry_total = sum(capped_counts.values())
+                            retry_limit = min(int(cfg.max_new_tokens), 8192)
+                            print(
+                                f"[warn] {retry_total} code response(s) "
+                                "reached the generation limit; replacing them "
+                                "with one compact regeneration pass "
+                                f"(max {retry_limit} tokens)",
+                                flush=True,
+                            )
+                            retry_indices = _append_code_retry_jobs(
+                                capped_counts)
+                            _seed_local_generation(
+                                int(step_idx) + 3_000_000)
+                            retry_still_capped = 0
+                            for retry_local_idx, responses in (
+                                    generate_prompt_jobs(
+                                        model, tokenizer,
+                                        [prompt_jobs[index]["prompt_text"]
+                                         for index in retry_indices],
+                                        [prompt_jobs[index]["count"]
+                                         for index in retry_indices],
+                                        cfg, max_new_tokens=retry_limit,
+                                        cap_state=cap_state)):
+                                retry_job_idx = retry_indices[
+                                    int(retry_local_idx)]
+                                for text, token_ids in responses:
+                                    if _hit_generation_limit(
+                                            prompt_jobs[retry_job_idx],
+                                            token_ids, retry_limit):
+                                        retry_still_capped += 1
+                                    _queue_rollout(
+                                        retry_job_idx, text, token_ids)
+                            if retry_still_capped:
+                                print(
+                                    f"[warn] {retry_still_capped}/"
+                                    f"{retry_total} compact code retries still "
+                                    "reached their limit; they remain failed "
+                                    "rollouts and retain their negative "
+                                    "training signal",
+                                    flush=True,
+                                )
+                        cfg._local_generation_cap = int(cap_state["value"])
+                    finally:
+                        gen_bar.close()
 
             if x_grpo_mode:
                 expected_per_context = (
@@ -8093,6 +8715,17 @@ code block.'''
                     raise RuntimeError(
                         "X-GRPO requires exactly K*G rollouts from every fixed "
                         f"context; expected {expected_per_context}, got "
+                        f"{incomplete}")
+            elif adaptive_strategy_pilots:
+                incomplete = {
+                    parent_group: count
+                    for parent_group, count in queued_by_parent.items()
+                    if count != int(cfg.group_size)
+                }
+                if incomplete:
+                    raise RuntimeError(
+                        "adaptive strategy generation must preserve exactly "
+                        f"{int(cfg.group_size)} rollouts per parent; got "
                         f"{incomplete}")
 
             # CPU reward processes were submitted as each rollout arrived and
@@ -8646,12 +9279,12 @@ code block.'''
             transformed = spo_rs_tracker.transformed_rewards(
                 [sample["reward"] for sample in samples])
             normalized = spo_rs_tracker.normalized_advantages(transformed)
-            initialized = normalized is None
-            if initialized:
-                normalized = np.zeros_like(transformed)
+            if normalized is None:
+                raise RuntimeError(
+                    "SPO-RS lost its pre-step historical baseline")
             update = spo_rs_tracker.update(
                 transformed,
-                divergence=(0.0 if initialized else spo_rs_divergence),
+                divergence=spo_rs_divergence,
                 policy_adapter=adapter_path,
                 step=step_idx,
             )
@@ -8671,30 +9304,23 @@ code block.'''
                 rollout_key = (sample["group"], sample["rollout"])
                 spo_rs_prepared[rollout_key] = {
                     "advantage": float(normalized[sample_index]),
-                    "trainable": not initialized,
+                    "trainable": True,
                     "info": {
                         **update,
                         "transformed_reward": float(transformed[sample_index]),
-                        "used_for_policy_update": not initialized,
+                        "used_for_policy_update": True,
                     },
                 }
 
-            if initialized:
-                print(f"[step {step_idx}] SPO-RS global tracker: initialized "
-                      f"v={update['value_after']:.9f} "
-                      f"N_eff={update['effective_count_after']:.2f} from "
-                      f"M={update['group_size']} rollouts; policy update "
-                      "starts on the next step", flush=True)
-            else:
-                divergence_label = (
-                    "missing" if update["divergence"] is None
-                    else f"{update['divergence']:.6f}")
-                print(f"[step {step_idx}] SPO-RS global tracker: "
-                      f"v={update['value_before']:.9f}->"
-                      f"{update['value_after']:.9f} "
-                      f"M={update['group_size']} D={divergence_label} "
-                      f"rho={update['rho']:.6f} "
-                      f"eta={update['eta']:.6f}", flush=True)
+            divergence_label = (
+                "missing" if update["divergence"] is None
+                else f"{update['divergence']:.6f}")
+            print(f"[step {step_idx}] SPO-RS global tracker: "
+                  f"v={update['value_before']:.9f}->"
+                  f"{update['value_after']:.9f} "
+                  f"M={update['group_size']} D={divergence_label} "
+                  f"rho={update['rho']:.6f} "
+                  f"eta={update['eta']:.6f}", flush=True)
 
     for group_spec in group_specs:
         g = int(group_spec["group_id"])
@@ -8948,6 +9574,29 @@ code block.'''
                     cfg.max_saved_construction) if save_ctor else None),
                 "seed": int(cfg.seed),
             }
+            if adaptive_strategy_pilots:
+                meta.update({
+                    "pilot_programs_per_strategy": (
+                        pilot_programs_per_strategy),
+                    "strategy_rollout_phase": record.get(
+                        "strategy_rollout_phase"),
+                    "strategy_source_job_idx": record.get(
+                        "strategy_source_job_idx"),
+                    "strategy_pilot_reward_mean": record.get(
+                        "strategy_pilot_reward_mean"),
+                    "strategy_pilot_reward_variance": record.get(
+                        "strategy_pilot_reward_variance"),
+                    "strategy_pilot_mean_threshold": record.get(
+                        "strategy_pilot_mean_threshold"),
+                    "strategy_pilot_variance_threshold": record.get(
+                        "strategy_pilot_variance_threshold"),
+                    "strategy_pilot_scenario": record.get(
+                        "strategy_pilot_scenario"),
+                    "strategy_pilot_followup_count": record.get(
+                        "strategy_pilot_followup_count"),
+                    "strategy_allocated_programs": record.get(
+                        "strategy_allocated_programs"),
+                })
             if rank_mode:
                 meta["rank_selection"] = {
                     **rank_diagnostics,
@@ -9363,6 +10012,9 @@ code block.'''
         "evaluation_cpu_count": int(isolated_cpu_count),
         "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
     }
+    if adaptive_strategy_pilots:
+        step_stats["strategy_pilot_allocation"] = (
+            strategy_pilot_diagnostics)
     if memory_v2:
         step_stats["memory_version"] = "V2"
         step_stats["memory_comparison_n"] = int(
@@ -9761,14 +10413,20 @@ def main():
               f"injected block: max_seq_length = {cfg.max_seq_length}. "
               f"Use the same value for the no-memory baseline.")
 
-    # Replicate the compact QLoRA trainer rather than layer-sharding it. The
+    # Replicate the complete trainer whenever the profiled trainable copy fits
+    # on one card, rather than layer-sharding one update across every card. The
     # main process still owns search/evaluation; only per-example gradient work
     # runs concurrently. vLLM phase sharing gives these replicas exclusive use
     # of the cards during training and requires them to offload for generation.
+    replicated_backend_supported = bool(
+        cfg.backend == "hf"
+        or (cfg.backend == "unsloth"
+            and getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
+    )
     use_replicated_training = bool(
         not cfg.no_train
         and int(cfg.num_training_gpus) > 1
-        and cfg.backend == "hf"
+        and replicated_backend_supported
         and cfg.generation_backend == "vllm"
         and cfg.training_layout != "sharded"
     )
@@ -9783,7 +10441,8 @@ def main():
         or _uses_clipped_policy_loss(cfg.advantage_mode))
     use_process_distributed_training = bool(
         use_replicated_training
-        and (cfg.fast or standard_policy_objective)
+        and (cfg.fast or standard_policy_objective
+             or getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
     )
     if use_replicated_training:
         cfg.training_replica_device = 0
@@ -9923,6 +10582,14 @@ def main():
         print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
               f"strategies/parent x {cfg.programs_per_strategy} "
               f"programs/strategy = {cfg.group_size}/parent")
+        if int(getattr(cfg, "pilot_programs_per_strategy", -1)) == -1:
+            print("Rollout pilot:      off (-1; unchanged one-pass generation)")
+        else:
+            print(
+                f"Rollout pilot:      "
+                f"{int(cfg.pilot_programs_per_strategy)}/strategy, then "
+                "dynamic per-parent median mean/variance allocation; fixed "
+                f"total={cfg.group_size}/parent")
         print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
               f"then existing top {cfg.topk_children_per_parent}/parent")
         print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
@@ -9948,6 +10615,9 @@ def main():
     print(f"Fused long attention: {fused_attention_label}")
     print(f"Train microbatch:   up to "
           f"{cfg.train_examples_per_microbatch} examples/GPU")
+    if use_process_distributed_training:
+        print(f"Training memory cap: {100.0 * float(cfg.training_memory_fraction):g}% "
+              "per GPU (96% exact long-rollout rescue)")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
@@ -10123,6 +10793,37 @@ def main():
             print(f"[resume] replaced {source} with one run-wide SPO-RS "
                   f"tracker initialized from {len(rewards)} rewards in step "
                   f"{last_step}")
+        else:
+            # Step 0 needs a baseline that exists before its responses are
+            # sampled. The verified seed archive is already available history
+            # on exactly the problem reward scale, so use it once rather than
+            # leaking step-0 rewards into their own advantages or suppressing
+            # the first policy update.
+            seed_rewards = []
+            for seed in seeds:
+                try:
+                    reward = float(seed.value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(reward):
+                    seed_rewards.append(reward)
+            if not seed_rewards:
+                raise ValueError(
+                    "a fresh SPO-RS run requires at least one finite verified "
+                    "seed reward to initialize its pre-step baseline")
+            initial_adapter = Path(_save_adapter(
+                model, exp_dir, -1, cfg.model_name,
+                directory_name="adapter_initial"))
+            transformed = spo_rs_tracker.transformed_rewards(seed_rewards)
+            initialization = spo_rs_tracker.update(
+                transformed, divergence=0.0,
+                policy_adapter=initial_adapter, step=-1)
+            current_policy_adapter_path = initial_adapter
+            print("[init] SPO-RS global tracker initialized before step 0 "
+                  f"from {len(seed_rewards)} verified seed rewards: "
+                  f"v={initialization['value_after']:.9f}, "
+                  f"N_eff={initialization['effective_count_after']:.2f}; "
+                  "step 0 policy update enabled", flush=True)
 
     # ---- generation pool ----
     gen_pool = None

@@ -41,7 +41,8 @@ vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
 vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
 num_steps groups_per_step group_size strategies_per_parent
-programs_per_strategy strategy_archive_top_r num_seed_states max_groups_per_step
+programs_per_strategy pilot_programs_per_strategy strategy_archive_top_r
+num_seed_states max_groups_per_step
 max_group_size growth_force_step growth_valid_yield growth_distinct_min
 growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
@@ -229,6 +230,20 @@ def validate_problem_config(
                 "strategy_max_seq_length", "binary_coder_lora_rank"):
         if key in data:
             _positive_int(data, key, source)
+    if "pilot_programs_per_strategy" in data:
+        pilot_count = data["pilot_programs_per_strategy"]
+        if (isinstance(pilot_count, bool)
+                or not isinstance(pilot_count, int)
+                or pilot_count == 0 or pilot_count < -1):
+            raise ValueError(
+                f"{_label(source)}: pilot_programs_per_strategy must be -1 "
+                "(disabled) or a positive integer")
+        programs_per_strategy = data.get("programs_per_strategy")
+        if (pilot_count > 0 and isinstance(programs_per_strategy, int)
+                and pilot_count > programs_per_strategy):
+            raise ValueError(
+                f"{_label(source)}: pilot_programs_per_strategy cannot exceed "
+                "programs_per_strategy")
     if "binary_coder_training" in data:
         if not isinstance(data["binary_coder_training"], bool):
             raise ValueError(
