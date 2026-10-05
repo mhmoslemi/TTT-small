@@ -33,6 +33,7 @@ import logging
 import math
 import random
 import re
+import shutil
 import threading
 import time
 from contextlib import (contextmanager, nullcontext, redirect_stderr,
@@ -6986,9 +6987,9 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
                   directory_name=None):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
-    Adapters are retained because completed checkpoints refer to their matching
-    step directory; an interrupted write can therefore never invalidate the
-    previous resumable checkpoint.
+    The caller writes a new step directory before advancing the checkpoint,
+    then prunes superseded snapshots. This preserves crash-safe resume and a
+    fresh path for LoRA caches without retaining the full adapter history.
     """
     out_dir = (str(Path(exp_dir) / str(directory_name))
                if directory_name is not None
@@ -7006,6 +7007,58 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
             config_path.write_text(
                 json.dumps(adapter_config, indent=2) + "\n", encoding="utf-8")
     return out_dir
+
+
+def _prune_adapter_snapshots(exp_dir, keep_paths):
+    """Delete completed adapter snapshots not required by the live state.
+
+    A normal run retains only the checkpoint's current adapter. SPO-RS passes
+    its preceding sampling adapter as a second keep path because the exact
+    consecutive-policy KL at the next step requires both policies.
+    """
+    root = Path(exp_dir)
+    keep_names = {
+        Path(path).name for path in keep_paths if path is not None
+    }
+    removed = []
+    for path in root.iterdir():
+        is_step_adapter = bool(
+            re.fullmatch(r"adapter_step\d+", path.name))
+        if (not is_step_adapter and path.name != "adapter_initial"):
+            continue
+        if path.name in keep_names:
+            continue
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                continue
+        except OSError as error:
+            print(f"[warn] could not remove superseded adapter {path}: "
+                  f"{error}", flush=True)
+            continue
+        removed.append(path.name)
+    return removed
+
+
+def _live_adapter_snapshots(exp_dir, current_adapter, spo_rs_tracker=None):
+    """Return the minimal adapter set required to continue this run."""
+    candidates = []
+    if current_adapter is not None:
+        candidates.append(Path(current_adapter))
+    if spo_rs_tracker is not None:
+        previous_name = spo_rs_tracker.last_policy_adapter
+        if previous_name is not None:
+            candidates.append(Path(exp_dir) / previous_name)
+    keep = []
+    seen = set()
+    for path in candidates:
+        if path.name not in seen:
+            keep.append(path)
+            seen.add(path.name)
+    return keep
 
 
 def _load_adapter(model, adapter_dir, *, announce=True):
@@ -8238,48 +8291,114 @@ code block.'''
                                     "parent/fold chain")
                             return responses
 
-                        for strategy_index in range(strategies_per_parent):
-                            chain_indices = list(range(len(strategy_chains)))
-                            strategy_prompts = [
-                                _strategy_prompt(
-                                    source_prompt_jobs, chain, strategy_index)
-                                for chain in strategy_chains
-                            ]
-                            responses = _generate_strategy_batch(
-                                strategy_prompts, chain_indices,
-                                strategy_index)
-                            malformed = [
-                                chain_index
-                                for chain_index, response in responses.items()
-                                if _extract_final_strategy(response)[1]
-                                is not None
-                            ]
-                            if malformed:
+                        if hasattr(planning_pool, "run_sequential_chains"):
+                            def _build_ready_strategy_prompt(
+                                    chain_index, strategy_index, retry):
+                                return _strategy_prompt(
+                                    source_prompt_jobs,
+                                    strategy_chains[int(chain_index)],
+                                    int(strategy_index),
+                                    retry=bool(retry),
+                                )
+
+                            def _handle_ready_strategy(
+                                    chain_index, strategy_index,
+                                    response, retry):
+                                extraction_issue = _extract_final_strategy(
+                                    response)[1]
+                                if extraction_issue is not None and not retry:
+                                    return True
+                                _record_strategy_response(
+                                    strategy_chains[int(chain_index)],
+                                    int(strategy_index),
+                                    response,
+                                )
+                                return False
+
+                            def _announce_strategy_retry(
+                                    chain_index, strategy_index):
                                 print(
                                     f"[warn] strategy "
-                                    f"{strategy_index + 1}/"
-                                    f"{strategies_per_parent}: retrying "
-                                    f"{len(malformed)} malformed or truncated "
-                                    "answer(s) with a constrained final pass",
+                                    f"{int(strategy_index) + 1}/"
+                                    f"{strategies_per_parent}, chain "
+                                    f"{int(chain_index) + 1}/"
+                                    f"{len(strategy_chains)}: retrying one "
+                                    "malformed or truncated answer with a "
+                                    "constrained final pass",
                                     flush=True,
                                 )
-                                retry_prompts = [
+
+                            planning_pool.run_sequential_chains(
+                                num_chains=len(strategy_chains),
+                                num_stages=strategies_per_parent,
+                                prompt_builder=_build_ready_strategy_prompt,
+                                result_handler=_handle_ready_strategy,
+                                on_retry=_announce_strategy_retry,
+                                adapter_path=None,
+                                max_new_tokens=int(
+                                    cfg.strategy_max_new_tokens),
+                                temperature=float(
+                                    cfg.strategy_temperature),
+                                top_p=float(cfg.strategy_top_p),
+                                top_k=getattr(
+                                    cfg, "strategy_sampling_top_k", None),
+                                min_p=getattr(
+                                    cfg, "strategy_sampling_min_p", None),
+                                step_idx=int(step_idx) + 2_000_000,
+                                progress_desc="strategies pipelined",
+                            )
+                        else:
+                            # API and legacy pools retain the compatible
+                            # depth-batched path. Local vLLM pools use the
+                            # dependency-pipelined scheduler above.
+                            for strategy_index in range(
+                                    strategies_per_parent):
+                                chain_indices = list(range(
+                                    len(strategy_chains)))
+                                strategy_prompts = [
                                     _strategy_prompt(
-                                        source_prompt_jobs,
+                                        source_prompt_jobs, chain,
+                                        strategy_index)
+                                    for chain in strategy_chains
+                                ]
+                                responses = _generate_strategy_batch(
+                                    strategy_prompts, chain_indices,
+                                    strategy_index)
+                                malformed = [
+                                    chain_index
+                                    for chain_index, response
+                                    in responses.items()
+                                    if _extract_final_strategy(response)[1]
+                                    is not None
+                                ]
+                                if malformed:
+                                    print(
+                                        f"[warn] strategy "
+                                        f"{strategy_index + 1}/"
+                                        f"{strategies_per_parent}: retrying "
+                                        f"{len(malformed)} malformed or "
+                                        "truncated answer(s) with a "
+                                        "constrained final pass",
+                                        flush=True,
+                                    )
+                                    retry_prompts = [
+                                        _strategy_prompt(
+                                            source_prompt_jobs,
+                                            strategy_chains[chain_index],
+                                            strategy_index,
+                                            retry=True)
+                                        for chain_index in malformed
+                                    ]
+                                    responses.update(
+                                        _generate_strategy_batch(
+                                            retry_prompts, malformed,
+                                            strategy_index, retry=True))
+                                for chain_index in chain_indices:
+                                    _record_strategy_response(
                                         strategy_chains[chain_index],
                                         strategy_index,
-                                        retry=True)
-                                    for chain_index in malformed
-                                ]
-                                responses.update(_generate_strategy_batch(
-                                    retry_prompts, malformed, strategy_index,
-                                    retry=True))
-                            for chain_index in chain_indices:
-                                _record_strategy_response(
-                                    strategy_chains[chain_index],
-                                    strategy_index,
-                                    responses[chain_index],
-                                )
+                                        responses[chain_index],
+                                    )
                     finally:
                         if (planning_pool is not gen_pool
                                 and not getattr(
@@ -10994,6 +11113,16 @@ def main():
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
 
+    removed_adapters = _prune_adapter_snapshots(
+        exp_dir,
+        _live_adapter_snapshots(
+            exp_dir, current_policy_adapter_path, spo_rs_tracker),
+    )
+    if removed_adapters:
+        print(f"[checkpoint] removed {len(removed_adapters)} superseded "
+              "adapter snapshot(s) while restoring the rolling checkpoint",
+              flush=True)
+
     # ---- generation pool ----
     gen_pool = None
     strategy_pool = None
@@ -11492,6 +11621,23 @@ def main():
                 **(stats or {}),
             })
             current_policy_adapter_path = Path(adapter_path)
+            removed_adapters = _prune_adapter_snapshots(
+                exp_dir,
+                _live_adapter_snapshots(
+                    exp_dir, current_policy_adapter_path, spo_rs_tracker),
+            )
+            if removed_adapters:
+                retained = (
+                    "two rolling adapters for consecutive-policy KL"
+                    if (spo_rs_tracker is not None
+                        and len(_live_adapter_snapshots(
+                            exp_dir, current_policy_adapter_path,
+                            spo_rs_tracker)) > 1)
+                    else Path(adapter_path).name
+                )
+                print(f"[checkpoint] removed {len(removed_adapters)} "
+                      f"superseded adapter snapshot(s); retained {retained}",
+                      flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
     finally:
         if reranker is not None:

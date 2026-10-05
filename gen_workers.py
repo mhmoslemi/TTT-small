@@ -56,6 +56,7 @@ import asyncio
 import importlib.metadata
 import os
 from array import array
+from collections import deque
 from contextlib import nullcontext
 import queue
 import re
@@ -499,8 +500,9 @@ def _hf_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             # non-deterministic default).
             import random
             import numpy as _np
+            seed_rank = int(gen_kwargs.get("seed_rank", rank))
             s = (int(seed) * 1_000_003 + int(step) * 1009
-                 + rank * 7 + 13) % (2**31 - 1)
+                 + seed_rank * 7 + 13) % (2**31 - 1)
             random.seed(s)
             _np.random.seed(s % (2**32 - 1))
             torch.manual_seed(s)
@@ -1146,6 +1148,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 continue
 
             return_logprobs = bool(gen_kwargs.get("return_logprobs", False))
+            seed_rank = int(gen_kwargs.get("seed_rank", rank))
 
             def _rollout_result(candidate):
                 if candidate is None:
@@ -1173,7 +1176,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                             temperature=float(gen_kwargs["temperature"]),
                             top_p=float(gen_kwargs["top_p"]),
                             seed=_vllm_rollout_seed(
-                                seed, step, rank, group_idx, rollout_idx),
+                                seed, step, seed_rank, group_idx, rollout_idx),
                             skip_special_tokens=True,
                             output_kind=RequestOutputKind.FINAL_ONLY,
                         )
@@ -1240,7 +1243,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         max_tokens=int(max_tokens),
                         temperature=float(gen_kwargs["temperature"]),
                         top_p=float(gen_kwargs["top_p"]),
-                        seed=_vllm_job_seed(seed, step, rank, group_idx),
+                        seed=_vllm_job_seed(
+                            seed, step, seed_rank, group_idx),
                         skip_special_tokens=True,
                     )
                     if gen_kwargs.get("top_k") is not None:
@@ -1819,6 +1823,150 @@ class GenerationPool:
         self._vllm_control("wake_up", self._persistent_worker_ids)
         self._start_workers(self._transient_worker_ids)
 
+    def run_sequential_chains(
+            self, *, num_chains, num_stages, prompt_builder, result_handler,
+            adapter_path, max_new_tokens, temperature, top_p, step_idx=0,
+            top_k=None, min_p=None, on_retry=None,
+            progress_desc="strategies"):
+        """Run dependent generation chains without a barrier between stages.
+
+        ``prompt_builder(chain, stage, retry)`` runs in the parent process after
+        the prior stage has been accepted. ``result_handler`` receives
+        ``(chain, stage, text, retry)`` and returns true only when the first
+        answer needs one constrained retry. A retry is always terminal so a
+        malformed model cannot loop forever; the handler can store its normal
+        safe fallback before returning.
+
+        Each engine owns at most one chain request. As soon as an engine
+        finishes, the newly-ready continuation is dispatched immediately,
+        while other chains remain in flight. This removes the old per-depth
+        all-worker barrier without changing chain dependencies.
+        """
+        num_chains = int(num_chains)
+        num_stages = int(num_stages)
+        if num_chains < 0 or num_stages < 0:
+            raise ValueError("chain and stage counts must be non-negative")
+        if not num_chains or not num_stages:
+            return {"completed": 0, "retries": 0}
+        print(f"[pool] dependency-pipelined strategy scheduler: "
+              f"{num_chains} chain(s) x {num_stages} stage(s) across "
+              f"{self.num_workers} engine(s); no per-stage barriers",
+              flush=True)
+
+        base_gen_kwargs = {
+            "max_new_tokens": int(max_new_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "micro_batch": self.gen_micro_batch,
+            "return_logprobs": False,
+            "full_policy_sampling": False,
+        }
+        if top_k is not None:
+            base_gen_kwargs["top_k"] = int(top_k)
+        if min_p is not None:
+            base_gen_kwargs["min_p"] = float(min_p)
+
+        pending = deque(
+            (chain_index, 0, False)
+            for chain_index in range(num_chains)
+        )
+        free_workers = set(range(self.num_workers))
+        inflight = {}
+        completed = 0
+        retries = 0
+        total = num_chains * num_stages
+        bar = make_progress_bar(total, desc=progress_desc)
+
+        def _dispatch(rank, item):
+            chain_index, stage_index, retry = item
+            prompt = prompt_builder(
+                int(chain_index), int(stage_index), bool(retry))
+            task_step = (
+                int(step_idx) + int(stage_index) * 10_000
+                + (5_000 if retry else 0)
+            )
+            gen_kwargs = dict(base_gen_kwargs)
+            # Preserve the old stable chain seed even when a continuation is
+            # picked up by a different physical worker.
+            gen_kwargs["seed_rank"] = int(chain_index) % self.num_workers
+            self.task_queues[rank].put((
+                task_step,
+                adapter_path,
+                [(int(chain_index), prompt, 1)],
+                gen_kwargs,
+            ))
+            inflight[int(rank)] = (
+                int(chain_index), int(stage_index), bool(retry))
+
+        try:
+            while pending or inflight:
+                while pending and free_workers:
+                    rank = min(free_workers)
+                    free_workers.remove(rank)
+                    _dispatch(rank, pending.popleft())
+
+                if not inflight:
+                    raise RuntimeError(
+                        "sequential generation has pending work but no "
+                        "available worker")
+                try:
+                    rank, group_idx, job_results = self.result_queue.get(
+                        timeout=1.0)
+                except queue.Empty:
+                    dead = [
+                        (rank, None if self.procs[rank] is None
+                         else self.procs[rank].exitcode)
+                        for rank in inflight
+                        if (self.procs[rank] is None
+                            or self.procs[rank].exitcode is not None)
+                    ]
+                    if dead:
+                        raise RuntimeError(
+                            "generation worker(s) exited during sequential "
+                            f"strategy generation: {dead}")
+                    continue
+
+                rank = int(rank)
+                if rank not in inflight:
+                    raise RuntimeError(
+                        "unexpected or duplicate generation result from "
+                        f"worker {rank} during sequential strategy generation")
+                chain_index, stage_index, retry = inflight.pop(rank)
+                free_workers.add(rank)
+                if group_idx is None and isinstance(job_results, dict):
+                    detail = job_results.get(
+                        "error", "unknown worker failure")
+                    raise RuntimeError(
+                        f"generation worker {rank} failed during sequential "
+                        f"strategy generation:\n{detail}")
+                if int(group_idx) != chain_index or len(job_results) != 1:
+                    raise RuntimeError(
+                        "sequential strategy generation returned a result "
+                        "for the wrong chain or with the wrong sample count")
+
+                text = job_results[0][0]
+                needs_retry = bool(result_handler(
+                    chain_index, stage_index, text, retry))
+                if needs_retry and not retry:
+                    retries += 1
+                    if on_retry is not None:
+                        on_retry(chain_index, stage_index)
+                    pending.append((chain_index, stage_index, True))
+                    continue
+
+                completed += 1
+                bar.update(1)
+                if stage_index + 1 < num_stages:
+                    pending.append((chain_index, stage_index + 1, False))
+        finally:
+            bar.close()
+
+        if completed != total:
+            raise RuntimeError(
+                f"sequential strategy generation completed {completed}/"
+                f"{total} dependent stages")
+        return {"completed": completed, "retries": retries}
+
     def iter_group_jobs(self, prompts_by_group, group_size, adapter_path,
                         max_new_tokens, temperature, top_p, step_idx=0,
                         show_progress=True, counts_by_group=None,
@@ -2370,6 +2518,9 @@ class PhasedVLLMGenerationPool:
     def iter_group_jobs(self, *args, **kwargs):
         yield from self._ensure_started().iter_group_jobs(*args, **kwargs)
 
+    def run_sequential_chains(self, *args, **kwargs):
+        return self._ensure_started().run_sequential_chains(*args, **kwargs)
+
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)
 
@@ -2459,6 +2610,10 @@ class OnDemandGenerationPool:
     def iter_group_jobs(self, *args, **kwargs):
         pool = self._ensure_started()
         yield from pool.iter_group_jobs(*args, **kwargs)
+
+    def run_sequential_chains(self, *args, **kwargs):
+        pool = self._ensure_started()
+        return pool.run_sequential_chains(*args, **kwargs)
 
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)
