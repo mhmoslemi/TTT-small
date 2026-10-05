@@ -48,7 +48,10 @@ _STRATEGY_FALLBACK = (
     "from the task specification and current parent construction."
 )
 _STRATEGY_BLOCK_RE = re.compile(
-    r"<strategy\b[^>]*>\s*(.*?)\s*</strategy\s*>",
+    # Do not let an earlier malformed opening tag consume the model's actual
+    # final block. With ``<strategy>...<strategy>final</strategy>``, matching
+    # starts at the inner opening tag and only ``final`` reaches the coder.
+    r"<strategy\b[^>]*>\s*((?:(?!<strategy\b).)*?)\s*</strategy\s*>",
     flags=re.IGNORECASE | re.DOTALL,
 )
 _STRATEGY_FINAL_MARKERS = (
@@ -2231,6 +2234,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     (text, gen_token_ids).
     """
     import torch
+    from gen_workers import _canonical_generated_text
+
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
 
@@ -2267,7 +2272,8 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
         gen_ids = out[i, input_len:].tolist()
         if eos_id is not None and eos_id in gen_ids:
             gen_ids = gen_ids[: gen_ids.index(eos_id) + 1]
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        decoded = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        text = _canonical_generated_text(tokenizer, gen_ids, decoded)
         results.append((text, gen_ids))
     return results
 

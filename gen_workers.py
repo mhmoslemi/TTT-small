@@ -204,6 +204,96 @@ def _chosen_token_logprobs(token_ids, position_logprobs):
     return values
 
 
+def _bytelevel_decoder_table():
+    """Return the inverse of the reversible GPT-2/ByteLevel byte alphabet."""
+    byte_values = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    unicode_values = list(byte_values)
+    extra = 0
+    for value in range(256):
+        if value not in byte_values:
+            byte_values.append(value)
+            unicode_values.append(256 + extra)
+            extra += 1
+    return {
+        chr(character): value
+        for value, character in zip(byte_values, unicode_values)
+    }
+
+
+_BYTELEVEL_DECODE = _bytelevel_decoder_table()
+_BYTELEVEL_WHITESPACE_MARKERS = ("\u0120", "\u010a", "\u0109", "\u010d")
+
+
+def _has_bytelevel_surface_artifacts(text):
+    """Detect text that vLLM left in reversible byte-token surface form."""
+    text = str(text or "")
+    marker_count = sum(text.count(marker)
+                       for marker in _BYTELEVEL_WHITESPACE_MARKERS)
+    # A single character could be legitimate prose. Repeated markers, or the
+    # characteristic encoded-space/encoded-newline pair, are tokenizer output.
+    return (marker_count >= 3
+            or ("\u0120" in text and "\u010a" in text))
+
+
+def _decode_bytelevel_surface(text):
+    """Undo a ByteLevel alphabet accidentally exposed as user-facing text."""
+    payload = bytearray()
+    for character in str(text or ""):
+        value = _BYTELEVEL_DECODE.get(character)
+        if value is None:
+            payload.extend(character.encode("utf-8"))
+        else:
+            payload.append(value)
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return str(text or "")
+
+
+def _canonical_generated_text(tokenizer, token_ids, generated_text):
+    """Return clean generated text using the active model's own tokenizer.
+
+    Some tokenizer/vLLM combinations expose the reversible byte alphabet in
+    incremental ``candidate.text`` (for example ``Ġ`` for a space and ``Ċ``
+    for a newline). Healthy Qwen/GPT-OSS/DeepSeek text takes the zero-work fast
+    path. Suspicious text is reconstructed from the generated token IDs with
+    whichever tokenizer belongs to the currently loaded model; the generic
+    ByteLevel inverse is only a fallback for a misdeclared tokenizer backend.
+    """
+    original = str(generated_text or "")
+    if not _has_bytelevel_surface_artifacts(original):
+        return original
+
+    decoded = original
+    try:
+        decoded = tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        try:
+            decoded = tokenizer.decode(
+                list(token_ids), skip_special_tokens=True)
+        except Exception:
+            decoded = original
+    except Exception:
+        decoded = original
+
+    decoded = str(decoded or "")
+    if not _has_bytelevel_surface_artifacts(decoded):
+        return decoded
+
+    repaired = _decode_bytelevel_surface(decoded)
+    if repaired and not _has_bytelevel_surface_artifacts(repaired):
+        return repaired
+    return decoded or original
+
+
 def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
                          max_seq_length, gen_kwargs, cap_state=None,
                          log_prefix="hf"):
@@ -305,8 +395,10 @@ def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
                 gen_ids = out[row, input_width:].tolist()
                 if eos_id is not None and eos_id in gen_ids:
                     gen_ids = gen_ids[:gen_ids.index(eos_id) + 1]
-                item = (tokenizer.decode(gen_ids, skip_special_tokens=True),
-                        gen_ids)
+                decoded = tokenizer.decode(
+                    gen_ids, skip_special_tokens=True)
+                item = (_canonical_generated_text(
+                    tokenizer, gen_ids, decoded), gen_ids)
             by_group.setdefault(group_idx, []).append(item)
         del pending[:n]
         del out, enc
@@ -1059,15 +1151,17 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 if candidate is None:
                     return (("", [], None) if return_logprobs else ("", []))
                 token_ids = list(candidate.token_ids)
+                text = _canonical_generated_text(
+                    tokenizer, token_ids, candidate.text)
                 if return_logprobs:
                     values = _chosen_token_logprobs(
                         token_ids, getattr(candidate, "logprobs", None))
                     return (
-                        candidate.text,
+                        text,
                         token_ids,
                         array("f", values) if values is not None else None,
                     )
-                return candidate.text, token_ids
+                return text, token_ids
 
             if async_engine:
                 async def _generate_all_rollouts():
