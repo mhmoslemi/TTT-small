@@ -50,25 +50,6 @@ program without doing new mathematical or algorithmic research. Spend the
 available answer space on this final deliverable: remove repeated discussion,
 but do not omit the details required to implement it correctly.
 
-Treat the block as the full technical handoff, not as the conclusion or
-summary of your reasoning. Before writing it, mentally review your entire
-analysis and transfer every useful derivation, correction, caveat, rejected
-shortcut, implementation decision, and robustness measure that affects the
-program. Restate those details self-containedly inside the block; do not assume
-that having discussed them during reasoning communicates them. The downstream
-coder is deliberately implementation-only: it should be able to follow the
-block almost mechanically, without inventing missing mathematics, algorithms,
-repair procedures, schedules, or edge-case behavior.
-
-The final block must contain at least 1,500 substantive words, with at least
-600 substantive words in section 3 (Implementation procedure). These are
-minimum completeness requirements, not invitations to pad or repeat text.
-Use the space for exact formulas, language-independent pseudocode, helper
-interfaces, array shapes and indexing, update and acceptance rules, concrete
-defaults, adaptation triggers, stopping conditions, validation, and recovery
-paths. If your reasoning was long but the block is short, the response has
-failed: expand the handoff rather than compressing your work into a recap.
-
 A response without both tags and a complete plan between them is unusable:
 the coder will receive none of your intended plan. Reserve enough output space
 to finish the plan and close the block before ending. Before finishing, read
@@ -295,11 +276,7 @@ Do not shorten the actual plan merely because you already explained something
 in your thinking: that explanation is invisible to the coder. Avoid redundant
 task restatements and pasted input arrays, and do not write Python source or
 include code fences. Reserve enough response space to finish every section
-in detail and close </strategy>; put nothing after that closing tag. Before
-closing, audit the block alone: it must be at least 1,500 substantive words,
-its implementation procedure must be at least 600 substantive words, and
-every nontrivial conclusion from your reasoning that the coder needs must be
-present explicitly inside it.'''
+in detail and close </strategy>; put nothing after that closing tag.'''
             + "\n\n" + STRATEGY_OUTPUT_CONTRACT
         )
         if staged and staged[-1].get("role") == "user":

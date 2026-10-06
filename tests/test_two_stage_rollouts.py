@@ -1,5 +1,10 @@
 from problems.base import ParentContext, Problem, RewardResult, SeedState
-from train_multy_CVaR import _STRATEGY_FALLBACK, _extract_final_strategy
+from train_multy_CVaR import (
+    _STRATEGY_FALLBACK,
+    _apply_qwen3_8b_thinking_sampling,
+    _extract_final_strategy,
+)
+from rollout_allocation import allocate_posterior_expected_best
 
 
 class _DummyProblem(Problem):
@@ -230,3 +235,113 @@ def test_extract_final_strategy_last_resort_caps_to_tail_within_final_channel():
     assert reason == "used unformatted reasoning as a last resort"
     assert tail_marker in body
     assert head_marker not in body
+
+
+def test_bandit_allocation_is_fixed_budget_and_deterministic():
+    rewards = [
+        [0.0, 2.0, 2.1, 0.0, 2.2, 0.0],
+        [0.0, 0.0, 2.0, 0.0, 0.0, 0.0],
+        [1.8, 1.9, 1.85, 1.95, 1.9, 1.88],
+    ]
+    valid = [
+        [False, True, True, False, True, False],
+        [False, False, True, False, False, False],
+        [True, True, True, True, True, True],
+    ]
+    first = allocate_posterior_expected_best(
+        rewards, valid, 27, fail_reward=0.0, seed=1234)
+    second = allocate_posterior_expected_best(
+        rewards, valid, 27, fail_reward=0.0, seed=1234)
+
+    assert first == second
+    assert sum(first[0]) == 27
+    assert all(count >= 0 for count in first[0])
+    assert first[2]["method"] == "posterior-expected-best"
+
+
+def test_bandit_all_invalid_pilots_preserve_symmetry():
+    allocations, diagnostics, summary = allocate_posterior_expected_best(
+        [[0.0] * 6 for _ in range(4)],
+        [[False] * 6 for _ in range(4)],
+        14,
+        fail_reward=0.0,
+        seed=5,
+    )
+
+    assert allocations == [4, 4, 3, 3]
+    assert sum(allocations) == 14
+    assert summary["fallback_equal"] is True
+    assert all(item["valid_count"] == 0 for item in diagnostics)
+
+
+def test_bandit_productive_arm_beats_all_zero_arm():
+    allocations, diagnostics, _summary = allocate_posterior_expected_best(
+        [
+            [2.0, 2.1, 2.2, 2.15, 2.25, 2.18, 2.3, 2.22],
+            [0.0] * 8,
+        ],
+        [
+            [True] * 8,
+            [False] * 8,
+        ],
+        24,
+        fail_reward=0.0,
+        seed=99,
+    )
+
+    assert sum(allocations) == 24
+    assert allocations[0] > allocations[1]
+    assert diagnostics[0]["posterior_valid_probability"] > diagnostics[1][
+        "posterior_valid_probability"]
+
+
+def test_qwen_sampling_profile_does_not_override_explicit_coder_yaml():
+    config = {
+        "model_name": "Qwen/Qwen3-8B",
+        "thinking": True,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "strategies": True,
+        "strategy_model_name": "Qwen/Qwen3-8B",
+        "strategy_thinking": True,
+        "strategy_temperature": 1.0,
+        "strategy_top_p": 1.0,
+        "strategy_top_k": 0,
+        "strategy_min_p": 0.0,
+    }
+    _apply_qwen3_8b_thinking_sampling(
+        config, {
+            "temperature", "top_p", "top_k", "min_p",
+            "strategy_temperature", "strategy_top_p", "strategy_top_k",
+            "strategy_min_p",
+        })
+
+    assert config["temperature"] == 1.0
+    assert config["top_p"] == 1.0
+    assert config["sampling_top_k"] == 0
+    assert config["sampling_min_p"] == 0.0
+    assert config["qwen3_8b_thinking_sampling"] is False
+    assert config["strategy_temperature"] == 1.0
+    assert config["strategy_top_p"] == 1.0
+    assert config["strategy_sampling_top_k"] == 0
+    assert config["strategy_sampling_min_p"] == 0.0
+    assert config["strategy_qwen3_8b_thinking_sampling"] is False
+
+
+def test_qwen_sampling_profile_fills_only_missing_values():
+    config = {
+        "model_name": "Qwen/Qwen3-8B",
+        "thinking": True,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "strategies": False,
+    }
+    _apply_qwen3_8b_thinking_sampling(config, frozenset())
+
+    assert config["temperature"] == 0.6
+    assert config["top_p"] == 0.95
+    assert config["sampling_top_k"] == 0
+    assert config["sampling_min_p"] == 0.0
+    assert config["qwen3_8b_thinking_sampling"] is True

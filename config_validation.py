@@ -35,8 +35,8 @@ growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
-max_new_tokens temperature top_p thinking strategy_max_new_tokens
-strategy_max_seq_length strategy_temperature strategy_top_p
+max_new_tokens temperature top_p top_k thinking strategy_max_new_tokens
+strategy_max_seq_length strategy_temperature strategy_top_p strategy_top_k
 strategy_thinking strategy_reasoning_effort strategy_vllm_quantization
 deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
@@ -52,6 +52,8 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
     "fused_long_attention",
     "training_layout",
+    "phase2_allocation_method",
+    "min_p", "strategy_min_p",
     "strategy_vllm_persistent_workers",
     "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
     "strategy_api_concurrency", "strategy_api_timeout_s",
@@ -217,6 +219,27 @@ def validate_problem_config(
             raise ValueError(
                 f"{_label(source)}: pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
+    if "phase2_allocation_method" in data:
+        allocation_method = str(data["phase2_allocation_method"]).strip().lower()
+        if allocation_method not in {"rule_based", "bandit"}:
+            raise ValueError(
+                f"{_label(source)}: phase2_allocation_method must be "
+                "'rule_based' or 'bandit'")
+    for key in ("top_k", "strategy_top_k"):
+        if key in data:
+            value = data[key]
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value != 0):
+                raise ValueError(
+                    f"{_label(source)}: {key} must be 0 because top-k "
+                    "filtering is disabled project-wide")
+    for key in ("min_p", "strategy_min_p"):
+        if key in data:
+            value = data[key]
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not 0.0 <= float(value) <= 1.0):
+                raise ValueError(
+                    f"{_label(source)}: {key} must be in [0, 1]")
     if "binary_coder_training" in data:
         if not isinstance(data["binary_coder_training"], bool):
             raise ValueError(

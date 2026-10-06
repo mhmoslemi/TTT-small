@@ -138,36 +138,72 @@ def _is_qwen3_8b_sampling_model(model_name):
     return normalized.rsplit("/", 1)[-1].lower() == "qwen3-8b"
 
 
-def _apply_qwen3_8b_thinking_sampling(merged):
-    """Apply Qwen3-8B's recommended sampling only in thinking mode."""
-    merged["sampling_top_k"] = None
-    merged["sampling_min_p"] = None
-    merged["strategy_sampling_top_k"] = None
-    merged["strategy_sampling_min_p"] = None
+def _profile_default(merged, key, value, explicit_keys):
+    """Apply an automatic model default unless configuration set the key."""
+    if key not in explicit_keys:
+        merged[key] = value
+
+
+def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
+    """Default to Qwen3-8B's thinking sampling without overriding YAML."""
+    # Project-wide invariant: never truncate the candidate distribution by a
+    # fixed token count. vLLM translates 0 to its native disabled value (-1),
+    # while Transformers accepts 0 directly.
+    merged["sampling_top_k"] = 0
+    if "min_p" in merged:
+        merged["sampling_min_p"] = float(merged["min_p"])
+    else:
+        merged.setdefault("sampling_min_p", None)
+    merged["strategy_sampling_top_k"] = 0
+    if "strategy_min_p" in merged:
+        merged["strategy_sampling_min_p"] = float(
+            merged["strategy_min_p"])
+    else:
+        merged.setdefault("strategy_sampling_min_p", None)
     merged["qwen3_8b_thinking_sampling"] = False
     merged["strategy_qwen3_8b_thinking_sampling"] = False
 
     if (_is_qwen3_8b_sampling_model(merged.get("model_name"))
             and bool(merged.get("thinking", False))):
-        merged["temperature"] = 0.6
-        merged["top_p"] = 0.95
-        merged["sampling_top_k"] = 20
-        merged["sampling_min_p"] = 0.0
-        merged["qwen3_8b_thinking_sampling"] = True
-        print("[model-profile] Qwen3-8B coder thinking sampling: "
-              "temperature=0.6, top_p=0.95, top_k=20, min_p=0")
+        _profile_default(merged, "temperature", 0.6, explicit_keys)
+        _profile_default(merged, "top_p", 0.95, explicit_keys)
+        if ("min_p" not in explicit_keys
+                and "sampling_min_p" not in explicit_keys):
+            merged["sampling_min_p"] = 0.0
+        merged["qwen3_8b_thinking_sampling"] = bool(
+            float(merged["temperature"]) == 0.6
+            and float(merged["top_p"]) == 0.95
+            and merged.get("sampling_top_k") == 0
+            and merged.get("sampling_min_p") == 0.0)
+        print(
+            "[model-profile] Qwen3-8B coder thinking sampling resolved: "
+            f"temperature={merged['temperature']}, top_p={merged['top_p']}, "
+            f"top_k={merged['sampling_top_k']}, "
+            f"min_p={merged['sampling_min_p']} "
+            "(explicit YAML/config values take precedence)")
 
     if (bool(merged.get("strategies", False))
             and _is_qwen3_8b_sampling_model(
                 merged.get("strategy_model_name"))
             and bool(merged.get("strategy_thinking", False))):
-        merged["strategy_temperature"] = 0.6
-        merged["strategy_top_p"] = 0.95
-        merged["strategy_sampling_top_k"] = 20
-        merged["strategy_sampling_min_p"] = 0.0
-        merged["strategy_qwen3_8b_thinking_sampling"] = True
-        print("[model-profile] Qwen3-8B strategist thinking sampling: "
-              "temperature=0.6, top_p=0.95, top_k=20, min_p=0")
+        _profile_default(
+            merged, "strategy_temperature", 0.6, explicit_keys)
+        _profile_default(merged, "strategy_top_p", 0.95, explicit_keys)
+        if ("strategy_min_p" not in explicit_keys
+                and "strategy_sampling_min_p" not in explicit_keys):
+            merged["strategy_sampling_min_p"] = 0.0
+        merged["strategy_qwen3_8b_thinking_sampling"] = bool(
+            float(merged["strategy_temperature"]) == 0.6
+            and float(merged["strategy_top_p"]) == 0.95
+            and merged.get("strategy_sampling_top_k") == 0
+            and merged.get("strategy_sampling_min_p") == 0.0)
+        print(
+            "[model-profile] Qwen3-8B strategist thinking sampling resolved: "
+            f"temperature={merged['strategy_temperature']}, "
+            f"top_p={merged['strategy_top_p']}, "
+            f"top_k={merged['strategy_sampling_top_k']}, "
+            f"min_p={merged['strategy_sampling_min_p']} "
+            "(explicit YAML/config values take precedence)")
 
 
 def _is_exact_qwen3_30b_a3b(model_name):
@@ -186,8 +222,9 @@ def _model_basename(model_name):
     return normalized.rsplit("/", 1)[-1].lower()
 
 
-def _apply_strategy_model_profile(merged, model_name):
-    """Apply exact, model-native strategist settings where fully specified."""
+def _apply_strategy_model_profile(
+        merged, model_name, explicit_keys=frozenset()):
+    """Apply model-native strategist defaults below explicit configuration."""
     if (_model_basename(model_name)
             != _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME):
         return
@@ -197,25 +234,33 @@ def _apply_strategy_model_profile(merged, model_name):
     # subtracts the actual prompt length, so prompt + completion never exceeds
     # 131072. It is a native reasoning model: thinking stays enabled and
     # `high` is the strongest effort label exposed by this runner.
-    merged["strategy_max_new_tokens"] = 131_072
-    merged["strategy_max_seq_length"] = 131_072
-    merged["strategy_temperature"] = 0.6
-    merged["strategy_top_p"] = 0.95
-    merged["strategy_thinking"] = True
-    merged["strategy_reasoning_effort"] = "high"
-    merged["strategy_vllm_quantization"] = ""
+    _profile_default(
+        merged, "strategy_max_new_tokens", 131_072, explicit_keys)
+    _profile_default(
+        merged, "strategy_max_seq_length", 131_072, explicit_keys)
+    _profile_default(merged, "strategy_temperature", 0.6, explicit_keys)
+    _profile_default(merged, "strategy_top_p", 0.95, explicit_keys)
+    _profile_default(merged, "strategy_thinking", True, explicit_keys)
+    _profile_default(
+        merged, "strategy_reasoning_effort", "high", explicit_keys)
+    _profile_default(
+        merged, "strategy_vllm_quantization", "", explicit_keys)
 
     # At 8B, the exact model fits without quantization. The strategy pool later
     # folds replicas beyond the live parent-chain frontier into TP ranks, so
     # every rollout GPU contributes even when there are fewer parents than
     # cards. Retain every selected engine's level-1 backup between phases.
-    merged["strategy_vllm_sleep_level"] = 1
-    merged["strategy_vllm_staged_loading"] = False
-    merged["strategy_vllm_persistent_workers"] = None
+    _profile_default(merged, "strategy_vllm_sleep_level", 1, explicit_keys)
+    _profile_default(
+        merged, "strategy_vllm_staged_loading", False, explicit_keys)
+    _profile_default(
+        merged, "strategy_vllm_persistent_workers", None, explicit_keys)
     print("[model-profile] DeepSeek-R1-0528-Qwen3-8B strategist: "
-          "native reasoning, max_new=131072, max_seq=131072, "
-          "temperature=0.6, top_p=0.95, exact BF16, frontier-sized engines "
-          "persistent")
+          f"native reasoning, max_new={merged['strategy_max_new_tokens']}, "
+          f"max_seq={merged['strategy_max_seq_length']}, "
+          f"temperature={merged['strategy_temperature']}, "
+          f"top_p={merged['strategy_top_p']}; explicit YAML/config values "
+          "take precedence")
 
 
 def _coder_model_profile(model_name):
@@ -266,18 +311,17 @@ def _coder_model_profile(model_name):
             # prefill chunk, so its transient projection is much larger than
             # the ordinary generation activation. Keep enough actual card
             # headroom instead of assigning that memory to the KV cache.
-            "vllm_runtime_reserve_gib": 16.0,
+            "vllm_runtime_reserve_gib": 15.0,
         }
     return None
 
 
-def _apply_coder_model_profile(merged):
+def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     """Wire reasoning, context, rollout, and exact-training behavior by model.
 
-    These values are intentionally derived from ``coder_model_name`` (which is
-    copied to ``model_name`` by ``--strategies``). The operator therefore only
-    changes the coder checkpoint; no matching collection of token, reasoning,
-    or training-layout knobs is required.
+    These are safe defaults derived from ``coder_model_name`` (which is copied
+    to ``model_name`` by ``--strategies``). Any operator-controlled YAML,
+    resumed-config, or explicit CLI value remains authoritative.
     """
     profile = _coder_model_profile(merged.get("model_name"))
     if profile is None:
@@ -287,34 +331,43 @@ def _apply_coder_model_profile(merged):
     native_context = int(profile["native_context"])
     merged["coder_model_profile"] = str(profile["name"])
     merged["coder_template_kind"] = str(profile["template_kind"])
-    merged["coder_reasoning_effort"] = str(profile["reasoning_effort"])
+    _profile_default(
+        merged, "coder_reasoning_effort",
+        str(profile["reasoning_effort"]), explicit_keys)
     merged["coder_preserve_thinking"] = bool(
         profile["template_kind"] == "qwen3.8")
     merged["model_native_context_length"] = native_context
-    merged["max_seq_length"] = native_context
-    merged["max_new_tokens"] = int(profile["max_output"])
-    merged["thinking"] = True
+    _profile_default(merged, "max_seq_length", native_context, explicit_keys)
+    _profile_default(
+        merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
+    _profile_default(merged, "thinking", True, explicit_keys)
 
     # Native GPT-OSS MXFP4 remains the vLLM checkpoint. Its trainable copy is
     # selected independently by _resolve_training_model_name below.
-    merged["load_in_4bit"] = bool(profile["training_4bit"])
-    merged["training_model_name"] = ""
-    merged["training_layout"] = str(profile["training_layout"])
-    merged["training_memory_fraction"] = float(
-        profile.get("training_memory_fraction", 0.80))
+    _profile_default(
+        merged, "load_in_4bit", bool(profile["training_4bit"]), explicit_keys)
+    _profile_default(merged, "training_model_name", "", explicit_keys)
+    _profile_default(
+        merged, "training_layout", str(profile["training_layout"]),
+        explicit_keys)
+    _profile_default(
+        merged, "training_memory_fraction",
+        float(profile.get("training_memory_fraction", 0.80)), explicit_keys)
 
     # On the 95+ GiB cards used by this project, the exact checkpoint/KV model
     # admits one full-context engine per card. The model profile leaves the
     # measured amount of memory outside vLLM's KV cache for CUDA/NCCL and the
     # bounded exact-token projection. Qwen3.8 needs more than the other
     # profiles because its vocabulary projection is materially larger.
-    merged["vllm_gpu_memory_utilization"] = 0.965
-    merged["vllm_quantization"] = ""
-    merged["gen_micro_batch"] = "auto"
-    merged["vllm_max_num_batched_tokens"] = "auto"
+    _profile_default(
+        merged, "vllm_gpu_memory_utilization", 0.965, explicit_keys)
+    _profile_default(merged, "vllm_quantization", "", explicit_keys)
+    _profile_default(merged, "gen_micro_batch", "auto", explicit_keys)
+    _profile_default(
+        merged, "vllm_max_num_batched_tokens", "auto", explicit_keys)
     merged["vllm_runtime_reserve_override_gib"] = float(
         profile["vllm_runtime_reserve_gib"])
-    merged["vllm_staged_loading"] = True
+    _profile_default(merged, "vllm_staged_loading", True, explicit_keys)
     # Final TP=1 admission is decided after nvidia-smi identifies the cards.
     # Blackwell can consume GPT-OSS's native MXFP4 layout directly; older
     # architectures may need a large transient Marlin repack and must retain
@@ -326,7 +379,7 @@ def _apply_coder_model_profile(merged):
     # before known-failing ordinary attempts and raises if all exact modes are
     # exhausted.
     merged["strict_exact_long_training"] = True
-    merged["fused_long_attention"] = True
+    _profile_default(merged, "fused_long_attention", True, explicit_keys)
     merged["long_training_checkpoint_min_tokens"] = 16_384
     merged["long_training_headroom_min_tokens"] = 32_768
     # CPU activation traffic is much slower than recomputation. Use it only
@@ -336,10 +389,12 @@ def _apply_coder_model_profile(merged):
 
     print(
         f"[model-profile] {profile['name']}: native context="
-        f"{native_context}, max generated tokens={profile['max_output']}, "
-        f"reasoning={profile['reasoning_effort']}, rollout target=one "
+        f"{merged['max_seq_length']}, max generated tokens="
+        f"{merged['max_new_tokens']}, reasoning="
+        f"{merged['coder_reasoning_effort']}, rollout target=one "
         "TP=1 engine/GPU; training layout="
-        f"{profile['training_layout']}; exact long-context training enabled",
+        f"{merged['training_layout']}; explicit YAML/config values take "
+        "precedence; exact long-context training enabled",
         flush=True,
     )
 
@@ -1518,7 +1573,8 @@ def load_config():
              problem_type, budget_s, score_scale, gpu_type, task_yaml, lib_dir),
              which is what the problem registry consumes.
     """
-    args = _build_arg_parser().parse_args()
+    parser = _build_arg_parser()
+    args = parser.parse_args()
 
     # Read the saved run identity early enough to select its YAML. New runs
     # persist the complete merged config; older ones can recover standard
@@ -1565,6 +1621,11 @@ def load_config():
         ),
     )
     merged = dict(ydict)
+    # Automatic model profiles provide defaults only. Track every value that
+    # came from an operator-controlled source so a profile cannot silently
+    # replace it later. Explicit CLI values remain stronger than YAML, and a
+    # resumed run's saved configuration remains stronger than a fresh profile.
+    profile_explicit_keys = set(ydict)
     print(f"[config] loaded {cfg_path}")
 
     # The registry routing key is the YAML's `problem` field when present
@@ -1580,6 +1641,7 @@ def load_config():
             if (key == "memory" or key.startswith("memory_")
                     or key.startswith("reranker_")):
                 saved.pop(key, None)
+        profile_explicit_keys.update(saved)
         merged.update(saved)
         # Runs created before the binary coder phase existed must retain their
         # original adapter rank/objective when resumed, even if the current
@@ -1590,6 +1652,11 @@ def load_config():
         # one-pass rollout schedule even if today's YAML enables pilots.
         if "pilot_programs_per_strategy" not in saved:
             merged["pilot_programs_per_strategy"] = -1
+        # Runs created before selectable phase-2 allocation used the original
+        # median-quadrant rule.  Do not silently switch a resumed run to a new
+        # allocator merely because its current problem YAML selects one.
+        if "phase2_allocation_method" not in saved:
+            merged["phase2_allocation_method"] = "rule_based"
         print(f"[config] resuming original configuration from "
               f"{resume_dir / 'config.json'}")
 
@@ -1600,6 +1667,8 @@ def load_config():
             continue
         key = _CLI_TO_CFG.get(arg_name, arg_name)
         merged[key] = value
+        if value != parser.get_default(arg_name):
+            profile_explicit_keys.add(key)
     if args.rank_clip_epsilon is not None:
         if args.rank_clip_epsilon_low is None:
             merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
@@ -1628,7 +1697,7 @@ def load_config():
 
     # Resolve after the hierarchy chooses its coder and before validating the
     # resulting training layout and precision.
-    _apply_coder_model_profile(merged)
+    _apply_coder_model_profile(merged, profile_explicit_keys)
 
     training_layout = str(
         merged.get("training_layout") or "auto").strip().lower()
@@ -1666,7 +1735,8 @@ def load_config():
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
-        _apply_strategy_model_profile(merged, strategy_model_name)
+        _apply_strategy_model_profile(
+            merged, strategy_model_name, profile_explicit_keys)
         strategy_backend = str(
             merged.get("strategy_backend") or "local"
         ).strip().lower()
@@ -1676,6 +1746,9 @@ def load_config():
         programs_per_strategy = int(merged["programs_per_strategy"])
         pilot_programs_per_strategy = int(
             merged.get("pilot_programs_per_strategy", -1))
+        phase2_allocation_method = str(
+            merged.get("phase2_allocation_method") or "rule_based"
+        ).strip().lower()
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
         strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
         strategy_max_seq_length = int(merged["strategy_max_seq_length"])
@@ -1696,6 +1769,9 @@ def load_config():
             raise ValueError(
                 "pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
+        if phase2_allocation_method not in {"rule_based", "bandit"}:
+            raise ValueError(
+                "phase2_allocation_method must be 'rule_based' or 'bandit'")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
@@ -1715,6 +1791,7 @@ def load_config():
         merged["programs_per_strategy"] = programs_per_strategy
         merged["pilot_programs_per_strategy"] = (
             pilot_programs_per_strategy)
+        merged["phase2_allocation_method"] = phase2_allocation_method
         merged["strategy_archive_top_r"] = strategy_archive_top_r
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
         merged["strategy_max_seq_length"] = strategy_max_seq_length
@@ -1783,7 +1860,7 @@ def load_config():
     # This profile is derived after coder/strategist selection. Clipped-policy
     # resolvers below remain authoritative when they require full-policy
     # sampling for an exact likelihood ratio.
-    _apply_qwen3_8b_thinking_sampling(merged)
+    _apply_qwen3_8b_thinking_sampling(merged, profile_explicit_keys)
     _resolve_binary_coder_options(merged)
     _resolve_rank_options(merged)
     _resolve_x_grpo_options(merged)
@@ -7561,6 +7638,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     pilot_programs_per_strategy = (
         int(getattr(cfg, "pilot_programs_per_strategy", -1))
         if two_stage_rollouts else -1)
+    phase2_allocation_method = str(getattr(
+        cfg, "phase2_allocation_method", "rule_based"
+    )).strip().lower()
+    if phase2_allocation_method not in {"rule_based", "bandit"}:
+        raise RuntimeError(
+            "phase2_allocation_method must be 'rule_based' or 'bandit'")
     adaptive_strategy_pilots = bool(
         two_stage_rollouts and pilot_programs_per_strategy > 0)
     if (two_stage_rollouts
@@ -7934,6 +8017,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "strategy_pilot_variance_threshold"),
             "strategy_pilot_scenario": source_job.get(
                 "strategy_pilot_scenario"),
+            "strategy_phase2_allocation_method": source_job.get(
+                "strategy_phase2_allocation_method"),
+            "strategy_pilot_valid_count": source_job.get(
+                "strategy_pilot_valid_count"),
+            "strategy_posterior_valid_probability": source_job.get(
+                "strategy_posterior_valid_probability"),
+            "strategy_initial_expected_improvement": source_job.get(
+                "strategy_initial_expected_improvement"),
             "strategy_pilot_followup_count": source_job.get(
                 "strategy_pilot_followup_count"),
             "strategy_allocated_programs": source_job.get(
@@ -8001,6 +8092,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             int(source_idx): [] for source_idx in source_job_indices}
         raw_scores_by_source = {
             int(source_idx): [] for source_idx in source_job_indices}
+        valid_flags_by_source = {
+            int(source_idx): [] for source_idx in source_job_indices}
         records_by_source = {
             int(source_idx): [] for source_idx in source_job_indices}
         for record in pilot_records:
@@ -8019,6 +8112,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 raise RuntimeError(
                     f"pilot reward for strategy job {source_idx} is not finite")
             rewards_by_source[source_idx].append(reward)
+            valid_flags_by_source[source_idx].append(bool(
+                getattr(result, "valid", False)))
             raw_score = getattr(result, "raw_score", None)
             if bool(getattr(result, "valid", False)) and raw_score is not None:
                 try:
@@ -8060,110 +8155,148 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 means.append(float(values.mean()))
                 variances.append(float(values.var(ddof=0)))
 
-            mean_threshold = float(np.median(
-                np.asarray(means, dtype=np.float64)))
-            variance_threshold = float(np.median(
-                np.asarray(variances, dtype=np.float64)))
-            scenarios = []
-            weights = []
-            for mean, variance in zip(means, variances):
-                # Exact threshold ties stay on the low side. If every strategy
-                # ties on both statistics, the zero-weight fallback below
-                # restores the original equal per-strategy allocation.
-                high_mean = mean > mean_threshold
-                high_variance = variance > variance_threshold
-                if high_mean and high_variance:
-                    scenario, weight = "high-mean/high-variance", 4.0
-                elif high_mean:
-                    scenario, weight = "high-mean/low-variance", 3.0
-                elif high_variance:
-                    scenario, weight = "low-mean/high-variance", 2.0
-                else:
-                    scenario, weight = "low-mean/low-variance", 0.0
-                scenarios.append(scenario)
-                weights.append(weight)
-
             remaining = (
                 strategies_per_parent
                 * (programs_per_strategy - pilot_programs_per_strategy))
-            tie_values = [
-                (mean, variance,
-                 int(prompt_jobs[source_idx]["strategy_index"]))
-                for source_idx, mean, variance in zip(
-                    chain_indices, means, variances)
-            ]
+            bandit_diagnostics = [None] * len(chain_indices)
+            bandit_summary = None
 
-            # A zero/zero pilot contains no evidence that the strategy itself
-            # is hopeless: all of its few programs may simply have failed.
-            # Give every such strategy a small, fixed-budget exploration floor
-            # before allocating the remainder by the existing four-scenario
-            # rule.  The floor is carved out of ``remaining`` rather than
-            # added to it, so the configured rollout count never changes.
-            zero_signal = [
-                abs(mean) <= 1e-12 and abs(variance) <= 1e-12
-                for mean, variance in zip(means, variances)
-            ]
-            requested_floor = max(
-                0, int(pilot_programs_per_strategy) // 3)
-            floor_allocations = [0] * len(chain_indices)
-            floor_demand = requested_floor * sum(zero_signal)
-            if floor_demand > 0:
-                floor_budget = min(remaining, floor_demand)
-                if floor_budget == floor_demand:
-                    floor_allocations = [
-                        requested_floor if is_zero else 0
-                        for is_zero in zero_signal
-                    ]
-                else:
-                    # This only occurs for configurations whose entire phase-2
-                    # budget is smaller than the requested floors. Share the
-                    # available budget fairly across zero-signal strategies.
-                    floor_allocations = _allocate_largest_remainder(
-                        floor_budget,
-                        [1.0 if is_zero else 0.0
-                         for is_zero in zero_signal],
-                        tie_values,
+            if phase2_allocation_method == "bandit":
+                from rollout_allocation import (
+                    allocate_posterior_expected_best,
+                )
+                allocation_seed = (
+                    int(cfg.seed) * 1_000_003
+                    + (int(step_idx) + 1) * 1009
+                    + (int(parent_group) + 1) * 9176
+                    + (int(fold_index) + 1) * 131
+                ) % (2 ** 32)
+                followups, bandit_diagnostics, bandit_summary = (
+                    allocate_posterior_expected_best(
+                        [rewards_by_source[index]
+                         for index in chain_indices],
+                        [valid_flags_by_source[index]
+                         for index in chain_indices],
+                        remaining,
+                        fail_reward=float(cfg.fail_score),
+                        seed=allocation_seed,
                     )
-            weighted_budget = remaining - sum(floor_allocations)
-            weighted_allocations = _allocate_largest_remainder(
-                weighted_budget, weights, tie_values)
-            followups = [
-                int(floor_count) + int(weighted_count)
-                for floor_count, weighted_count in zip(
-                    floor_allocations, weighted_allocations)
-            ]
-            if sum(followups) != remaining:
-                raise RuntimeError(
-                    "adaptive rollout exploration floor lost budget")
-            fallback_equal = not any(weight > 0.0 for weight in weights)
-            floor_total = sum(floor_allocations)
-            if requested_floor > 0 and any(zero_signal):
-                if floor_total == floor_demand:
-                    floor_label = (
-                        f"; zero-signal exploration floor="
-                        f"{requested_floor} for {sum(zero_signal)} "
-                        "strategy(s)")
-                else:
-                    floor_label = (
-                        f"; zero-signal exploration reserved={floor_total} "
-                        f"across {sum(zero_signal)} strategy(s) "
-                        f"(requested floor={requested_floor} each; "
-                        "phase-2 budget constrained)")
+                )
+                mean_threshold = None
+                variance_threshold = None
+                scenarios = ["bandit-expected-best"] * len(chain_indices)
+                print(
+                    f"[step {step_idx}] rollout pilot parent {parent_group}"
+                    f"/fold {fold_index}: posterior expected-best bandit; "
+                    f"pilot best reward="
+                    f"{float(bandit_summary['pilot_best_reward']):.9f}, "
+                    f"projected phase-2 gain="
+                    f"{float(bandit_summary['projected_expected_gain']):.9f}; "
+                    f"allocating {remaining} phase-2 rollouts"
+                    + (" equally (all pilots invalid)"
+                       if bandit_summary.get("fallback_equal") else ""),
+                    flush=True,
+                )
             else:
-                floor_label = ""
-            print(
-                f"[step {step_idx}] rollout pilot parent {parent_group}"
-                f"/fold {fold_index}: mean threshold={mean_threshold:.9f}, "
-                f"variance threshold={variance_threshold:.9f}; "
-                f"allocating {remaining} phase-2 rollouts"
-                + (" equally (all pilot statistics tied)"
-                   if fallback_equal else "")
-                + floor_label,
-                flush=True,
-            )
+                # Original rule-based allocator. Keep this path byte-for-byte
+                # equivalent in behavior so selecting the new bandit cannot
+                # change or retire existing experiments.
+                mean_threshold = float(np.median(
+                    np.asarray(means, dtype=np.float64)))
+                variance_threshold = float(np.median(
+                    np.asarray(variances, dtype=np.float64)))
+                scenarios = []
+                weights = []
+                for mean, variance in zip(means, variances):
+                    # Exact threshold ties stay on the low side. If every
+                    # strategy ties on both statistics, the zero-weight
+                    # fallback restores equal per-strategy allocation.
+                    high_mean = mean > mean_threshold
+                    high_variance = variance > variance_threshold
+                    if high_mean and high_variance:
+                        scenario, weight = "high-mean/high-variance", 4.0
+                    elif high_mean:
+                        scenario, weight = "high-mean/low-variance", 3.0
+                    elif high_variance:
+                        scenario, weight = "low-mean/high-variance", 2.0
+                    else:
+                        scenario, weight = "low-mean/low-variance", 0.0
+                    scenarios.append(scenario)
+                    weights.append(weight)
 
-            for source_idx, mean, variance, scenario, followup in zip(
-                    chain_indices, means, variances, scenarios, followups):
+                tie_values = [
+                    (mean, variance,
+                     int(prompt_jobs[source_idx]["strategy_index"]))
+                    for source_idx, mean, variance in zip(
+                        chain_indices, means, variances)
+                ]
+
+                # The original rule-based zero-signal exploration floor.
+                zero_signal = [
+                    abs(mean) <= 1e-12 and abs(variance) <= 1e-12
+                    for mean, variance in zip(means, variances)
+                ]
+                requested_floor = max(
+                    0, int(pilot_programs_per_strategy) // 3)
+                floor_allocations = [0] * len(chain_indices)
+                floor_demand = requested_floor * sum(zero_signal)
+                if floor_demand > 0:
+                    floor_budget = min(remaining, floor_demand)
+                    if floor_budget == floor_demand:
+                        floor_allocations = [
+                            requested_floor if is_zero else 0
+                            for is_zero in zero_signal
+                        ]
+                    else:
+                        floor_allocations = _allocate_largest_remainder(
+                            floor_budget,
+                            [1.0 if is_zero else 0.0
+                             for is_zero in zero_signal],
+                            tie_values,
+                        )
+                weighted_budget = remaining - sum(floor_allocations)
+                weighted_allocations = _allocate_largest_remainder(
+                    weighted_budget, weights, tie_values)
+                followups = [
+                    int(floor_count) + int(weighted_count)
+                    for floor_count, weighted_count in zip(
+                        floor_allocations, weighted_allocations)
+                ]
+                if sum(followups) != remaining:
+                    raise RuntimeError(
+                        "adaptive rollout exploration floor lost budget")
+                fallback_equal = not any(weight > 0.0 for weight in weights)
+                floor_total = sum(floor_allocations)
+                if requested_floor > 0 and any(zero_signal):
+                    if floor_total == floor_demand:
+                        floor_label = (
+                            f"; zero-signal exploration floor="
+                            f"{requested_floor} for {sum(zero_signal)} "
+                            "strategy(s)")
+                    else:
+                        floor_label = (
+                            f"; zero-signal exploration reserved="
+                            f"{floor_total} across {sum(zero_signal)} "
+                            f"strategy(s) (requested floor={requested_floor} "
+                            "each; phase-2 budget constrained)")
+                else:
+                    floor_label = ""
+                print(
+                    f"[step {step_idx}] rollout pilot parent {parent_group}"
+                    f"/fold {fold_index}: mean threshold="
+                    f"{mean_threshold:.9f}, variance threshold="
+                    f"{variance_threshold:.9f}; allocating {remaining} "
+                    "phase-2 rollouts"
+                    + (" equally (all pilot statistics tied)"
+                       if fallback_equal else "")
+                    + floor_label,
+                    flush=True,
+                )
+
+            for (source_idx, mean, variance, scenario, followup,
+                 bandit_arm) in zip(
+                    chain_indices, means, variances, scenarios, followups,
+                    bandit_diagnostics):
                 job = prompt_jobs[source_idx]
                 allocated = pilot_programs_per_strategy + int(followup)
                 raw_scores = raw_scores_by_source[source_idx]
@@ -8178,9 +8311,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "pilot_count": int(pilot_programs_per_strategy),
                     "pilot_reward_mean": float(mean),
                     "pilot_reward_variance": float(variance),
-                    "mean_threshold": float(mean_threshold),
-                    "variance_threshold": float(variance_threshold),
+                    "mean_threshold": (
+                        float(mean_threshold)
+                        if mean_threshold is not None else None),
+                    "variance_threshold": (
+                        float(variance_threshold)
+                        if variance_threshold is not None else None),
                     "scenario": str(scenario),
+                    "allocation_method": phase2_allocation_method,
                     "followup_count": int(followup),
                     "allocated_programs": int(allocated),
                     "source_job_idx": int(source_idx),
@@ -8188,14 +8326,42 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         float(best_raw_score)
                         if best_raw_score is not None else None),
                 }
+                if bandit_arm is not None:
+                    diagnostic.update({
+                        "pilot_valid_count": int(
+                            bandit_arm["valid_count"]),
+                        "posterior_valid_probability": float(
+                            bandit_arm[
+                                "posterior_valid_probability"]),
+                        "initial_expected_improvement": float(
+                            bandit_arm[
+                                "initial_expected_improvement"]),
+                        "final_marginal_expected_improvement": float(
+                            bandit_arm[
+                                "final_marginal_expected_improvement"]),
+                        "projected_expected_gain": float(
+                            bandit_summary[
+                                "projected_expected_gain"]),
+                    })
                 strategy_pilot_diagnostics.append(diagnostic)
                 job.update({
                     "strategy_pilot_reward_mean": float(mean),
                     "strategy_pilot_reward_variance": float(variance),
-                    "strategy_pilot_mean_threshold": float(mean_threshold),
-                    "strategy_pilot_variance_threshold": float(
-                        variance_threshold),
+                    "strategy_pilot_mean_threshold": (
+                        float(mean_threshold)
+                        if mean_threshold is not None else None),
+                    "strategy_pilot_variance_threshold": (
+                        float(variance_threshold)
+                        if variance_threshold is not None else None),
                     "strategy_pilot_scenario": str(scenario),
+                    "strategy_phase2_allocation_method": (
+                        phase2_allocation_method),
+                    "strategy_pilot_valid_count": diagnostic.get(
+                        "pilot_valid_count"),
+                    "strategy_posterior_valid_probability": diagnostic.get(
+                        "posterior_valid_probability"),
+                    "strategy_initial_expected_improvement": diagnostic.get(
+                        "initial_expected_improvement"),
                     "strategy_pilot_followup_count": int(followup),
                     "strategy_allocated_programs": int(allocated),
                 })
@@ -8206,10 +8372,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{best_raw_score:.9f}"
                     if best_raw_score is not None else "unavailable"
                 )
+                if bandit_arm is not None:
+                    allocation_text = (
+                        f"valid={int(bandit_arm['valid_count'])}/"
+                        f"{pilot_programs_per_strategy}, posterior-valid="
+                        f"{float(bandit_arm['posterior_valid_probability']):.6f}, "
+                        f"initial-EI="
+                        f"{float(bandit_arm['initial_expected_improvement']):.9f}"
+                    )
+                else:
+                    allocation_text = str(scenario)
                 print(
                     f"[step {step_idx}]   strategy "
                     f"{int(job['strategy_index'])}: mean={mean:.9f}, "
-                    f"variance={variance:.9f}, {scenario}, "
+                    f"variance={variance:.9f}, {allocation_text}, "
                     f"phase2={int(followup)}, total={allocated}, "
                     f"{_ANSI_ORANGE}pilot best raw "
                     f"{problem.metric_name}={best_raw_text}{_ANSI_RESET}",
@@ -8247,19 +8423,30 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         for (parent_group, fold_index), diagnostics in sorted(
                 diagnostics_by_chain.items()):
             diagnostics.sort(key=lambda item: int(item["strategy_index"]))
-            mean_threshold = float(diagnostics[0]["mean_threshold"])
-            variance_threshold = float(
-                diagnostics[0]["variance_threshold"])
+            allocation_method = str(diagnostics[0].get(
+                "allocation_method") or "rule_based")
             phase2_total = sum(
                 int(item["followup_count"]) for item in diagnostics)
-            print(
-                f"[step {step_idx}] rollout phase 2 complete parent "
-                f"{parent_group}/fold {fold_index}: mean threshold="
-                f"{mean_threshold:.9f}, variance threshold="
-                f"{variance_threshold:.9f}; evaluated {phase2_total} "
-                "phase-2 rollouts",
-                flush=True,
-            )
+            if allocation_method == "bandit":
+                print(
+                    f"[step {step_idx}] rollout phase 2 complete parent "
+                    f"{parent_group}/fold {fold_index}: posterior "
+                    f"expected-best bandit; evaluated {phase2_total} "
+                    "phase-2 rollouts",
+                    flush=True,
+                )
+            else:
+                mean_threshold = float(diagnostics[0]["mean_threshold"])
+                variance_threshold = float(
+                    diagnostics[0]["variance_threshold"])
+                print(
+                    f"[step {step_idx}] rollout phase 2 complete parent "
+                    f"{parent_group}/fold {fold_index}: mean threshold="
+                    f"{mean_threshold:.9f}, variance threshold="
+                    f"{variance_threshold:.9f}; evaluated {phase2_total} "
+                    "phase-2 rollouts",
+                    flush=True,
+                )
 
             for diagnostic in diagnostics:
                 source_idx = int(diagnostic["source_job_idx"])
@@ -8269,13 +8456,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{float(pilot_best):.9f}"
                     if pilot_best is not None else "unavailable"
                 )
+                if allocation_method == "bandit":
+                    allocation_text = (
+                        f"valid={int(diagnostic['pilot_valid_count'])}/"
+                        f"{int(diagnostic['pilot_count'])}, posterior-valid="
+                        f"{float(diagnostic['posterior_valid_probability']):.6f}, "
+                        f"initial-EI="
+                        f"{float(diagnostic['initial_expected_improvement']):.9f}"
+                    )
+                else:
+                    allocation_text = str(diagnostic["scenario"])
                 line = (
                     f"[step {step_idx}]   strategy "
                     f"{int(diagnostic['strategy_index'])}: mean="
                     f"{float(diagnostic['pilot_reward_mean']):.9f}, "
                     f"variance="
                     f"{float(diagnostic['pilot_reward_variance']):.9f}, "
-                    f"{diagnostic['scenario']}, phase2={followup_count}, "
+                    f"{allocation_text}, phase2={followup_count}, "
                     f"total={int(diagnostic['allocated_programs'])}, "
                     f"{_ANSI_ORANGE}pilot best raw "
                     f"{problem.metric_name}={pilot_best_text}"
@@ -8322,10 +8519,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             pilot_records, source_job_indices, run_phase):
         """Allocate and generate each parent as soon as its pilots finish.
 
-        Thresholds still use all strategies and every pilot for that same
-        parent/fold. The only change is removal of the global all-parent reward
-        barrier: a ready parent keeps the rollout GPUs occupied while slow CPU
-        sandboxes belonging to other parents continue in parallel.
+        The selected allocator sees all strategies and every pilot for that
+        same parent/fold. There is no global all-parent reward barrier: a ready
+        parent keeps the rollout GPUs occupied while slow CPU sandboxes
+        belonging to other parents continue in parallel.
         """
         source_job_indices = [int(index) for index in source_job_indices]
         source_position = {
@@ -9822,6 +10019,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "strategy_pilot_variance_threshold"),
                     "strategy_pilot_scenario": record.get(
                         "strategy_pilot_scenario"),
+                    "strategy_phase2_allocation_method": record.get(
+                        "strategy_phase2_allocation_method"),
+                    "strategy_pilot_valid_count": record.get(
+                        "strategy_pilot_valid_count"),
+                    "strategy_posterior_valid_probability": record.get(
+                        "strategy_posterior_valid_probability"),
+                    "strategy_initial_expected_improvement": record.get(
+                        "strategy_initial_expected_improvement"),
                     "strategy_pilot_followup_count": record.get(
                         "strategy_pilot_followup_count"),
                     "strategy_allocated_programs": record.get(
@@ -10805,9 +11010,12 @@ def main():
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
-    if getattr(cfg, "qwen3_8b_thinking_sampling", False):
-        print("Coder sampling:     Qwen3-8B thinking profile "
-              "(temperature=0.6, top_p=0.95, top_k=20, min_p=0)")
+    print(
+        f"Coder sampling:     temperature={cfg.temperature}, "
+        f"top_p={cfg.top_p}, "
+        f"top_k={getattr(cfg, 'sampling_top_k', None)}, "
+        f"min_p={getattr(cfg, 'sampling_min_p', None)}, "
+        f"thinking={'on' if cfg.thinking else 'off'}")
     if getattr(problem, "two_stage_rollouts", False):
         print(f"Rollout hierarchy:  {cfg.strategies_per_parent} sequential "
               f"strategies/parent x {cfg.programs_per_strategy} "
@@ -10815,10 +11023,17 @@ def main():
         if int(getattr(cfg, "pilot_programs_per_strategy", -1)) == -1:
             print("Rollout pilot:      off (-1; unchanged one-pass generation)")
         else:
+            allocation_method = str(getattr(
+                cfg, "phase2_allocation_method", "rule_based"))
+            allocation_label = (
+                "posterior expected-best bandit"
+                if allocation_method == "bandit"
+                else "dynamic per-parent median mean/variance rule"
+            )
             print(
                 f"Rollout pilot:      "
                 f"{int(cfg.pilot_programs_per_strategy)}/strategy, then "
-                "dynamic per-parent median mean/variance allocation; fixed "
+                f"{allocation_label}; fixed "
                 f"total={cfg.group_size}/parent")
         print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
               f"then existing top {cfg.topk_children_per_parent}/parent")
@@ -10826,11 +11041,10 @@ def main():
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "
               f"top_p={cfg.strategy_top_p}, "
+              f"top_k={getattr(cfg, 'strategy_sampling_top_k', None)}, "
+              f"min_p={getattr(cfg, 'strategy_sampling_min_p', None)}, "
               f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
               f"reasoning_effort={cfg.strategy_reasoning_effort}")
-        if getattr(cfg, "strategy_qwen3_8b_thinking_sampling", False):
-            print("Strategy sampler:   Qwen3-8B thinking profile "
-                  "(top_k=20, min_p=0)")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         fused_attention_label = (
