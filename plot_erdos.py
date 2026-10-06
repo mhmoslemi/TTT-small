@@ -191,7 +191,7 @@ def plot_step_function(h_values, c5_val, n_points, title, save_path):
     ax.step(x_edges, y_steps, where="post", color="#4A80D0",
             linewidth=1.4, antialiased=True)
     ax.set_xlim(-0.02, 2.02)
-    ax.set_ylim(-0.05, 1.1)
+    ax.set_ylim(-0.05, 1.2)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
