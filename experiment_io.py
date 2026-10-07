@@ -26,6 +26,77 @@ from dataclasses import asdict
 from pathlib import Path
 
 
+class StepPlotter:
+    """Refresh existing plots off the training thread, in step order.
+
+    Use the same Python environment, headless CPU-only subprocesses, and a
+    bounded timeout per script. A single worker avoids competing plot writes;
+    --max-step prevents a queued plot from including a later unfinished step.
+    Diagnostics go to plots.log, and failures never invalidate a checkpoint.
+    """
+
+    def __init__(self, run_dir, problem):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        self.run_dir = Path(run_dir).resolve()
+        self.problem = str(problem).strip().lower()
+        self.stopping = Event()
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="step-plots")
+
+    def submit(self, step):
+        self.executor.submit(self._refresh, int(step))
+
+    def close(self, *, wait=True):
+        # On interruption, cancel queued plots; an already-running plot is
+        # still bounded by the per-script timeout.
+        if not wait:
+            self.stopping.set()
+        self.executor.shutdown(wait=wait, cancel_futures=not wait)
+
+    def _refresh(self, step):
+        import os
+        import subprocess
+        import sys
+
+        scripts = [("plot_erdos_best_curve.py", [])]
+        if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
+            scripts.insert(0, ("plot_erdos.py", ["--saved-only"]))
+        environment = dict(os.environ)
+        environment.update({
+            "MPLBACKEND": "Agg", "CUDA_VISIBLE_DEVICES": "",
+            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+        })
+        script_dir = Path(__file__).resolve().parent
+        try:
+            with (self.run_dir / "plots.log").open("a", encoding="utf-8") as log:
+                for script, options in scripts:
+                    if self.stopping.is_set():
+                        break
+                    log.write(f"\n=== completed step {step}: {script} ===\n")
+                    log.flush()
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, str(script_dir / script),
+                             str(self.run_dir), "--max-step", str(step), *options],
+                            env=environment, stdin=subprocess.DEVNULL,
+                            stdout=log, stderr=subprocess.STDOUT,
+                            timeout=120, check=False,
+                        )
+                        if result.returncode:
+                            raise RuntimeError(f"exit status {result.returncode}")
+                    except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+                        log.write(f"plot refresh failed: {error}\n")
+                        log.flush()
+                        print(f"[plots] step {step}: {script} not updated "
+                              f"({error}); see {self.run_dir / 'plots.log'}",
+                              flush=True)
+        except OSError as error:
+            print(f"[plots] step {step}: cannot write plots.log: {error}", flush=True)
+
+
 def _slugify(s: str) -> str:
     """Make a string safe for use in a directory name."""
     return re.sub(r"[^A-Za-z0-9._\-]", "_", str(s)).strip("_")

@@ -70,7 +70,7 @@ def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
     if not np.isfinite(computed_c5):
         raise ValueError(f"Computed C5 is not finite: {computed_c5}")
 
-    if not np.isclose(computed_c5, c5_achieved, atol=1e-8, rtol=0.0):
+    if not np.isclose(computed_c5, c5_achieved, atol=1e-9, rtol=0.0):
         raise ValueError(
             f"C5 mismatch: reported {c5_achieved:.12f}, "
             f"computed {computed_c5:.12f}")

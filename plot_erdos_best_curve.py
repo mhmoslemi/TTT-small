@@ -97,7 +97,7 @@ def _run_info(run_dir):
     return config, problem, "reward", True
 
 
-def load_best_curve(run_dir):
+def load_best_curve(run_dir, max_step=None):
     """Return (steps, cumulative_best, per_step_best, valid_rollout_count)."""
     # Validate the requested run directory.
     run_dir = Path(run_dir)
@@ -122,6 +122,8 @@ def load_best_curve(run_dir):
         # Skip metadata without a usable, non-negative step number.
         step = _step_number(meta, path)
         if step is None or step < 0:
+            continue
+        if max_step is not None and step > max_step:
             continue
         seen_steps.add(step)
 
@@ -295,7 +297,8 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     # Load the problem settings and score history.
     run_dir = Path(run_dir)
     _, problem, metric_name, maximize = _run_info(run_dir)
-    steps, cumulative, per_step, valid_count = load_best_curve(run_dir)
+    steps, cumulative, per_step, valid_count = load_best_curve(
+        run_dir, max_step=max_step)
 
     # Import plotting dependencies only when a plot is requested.
     try:

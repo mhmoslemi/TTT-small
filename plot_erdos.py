@@ -103,13 +103,19 @@ def seed_construction(seed: int, index: int):
 # ----------------------------------------------------------------------
 # Finding and running a rollout
 # ----------------------------------------------------------------------
-def load_metas(run_dir: Path):
+def load_metas(run_dir: Path, max_step=None):
     out = []
     for meta_path in sorted(run_dir.glob("step*/*.meta.json")):
         try:
             m = json.loads(meta_path.read_text())
         except Exception:
             continue
+        if max_step is not None:
+            try:
+                if int(m["step"]) > max_step:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
         m["_meta_path"] = meta_path
         m["_txt_path"] = meta_path.with_suffix("").with_suffix(".txt")
         out.append(m)
@@ -217,6 +223,8 @@ def main():
     ap = argparse.ArgumentParser(description="Plot h from an Erdos rollout.")
     ap.add_argument("run_dir")
     ap.add_argument("--step", type=int, default=None)
+    ap.add_argument("--max-step", type=int, default=None,
+                    help="select only rollouts at or before this step")
     ap.add_argument("--group", type=int, default=None)
     ap.add_argument("--rollout", type=int, default=None)
     ap.add_argument("--file", default=None,
@@ -230,11 +238,16 @@ def main():
     ap.add_argument("--replay", action="store_true",
                     help="re-execute the program even when the saved "
                          "construction is available")
+    ap.add_argument("--saved-only", action="store_true",
+                    help="never execute a program; skip if no saved "
+                         "construction is available (for automatic plotting)")
     ap.add_argument("--no-initial", action="store_true",
                     help="do not provide initial_h_values at all")
     ap.add_argument("--out", default=None)
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
+    if args.saved_only and (args.replay or args.file):
+        ap.error("--saved-only cannot be combined with --replay or --file")
 
     run_dir = Path(args.run_dir).expanduser()
     if not run_dir.is_dir():
@@ -246,7 +259,7 @@ def main():
 
     # --- route 1: the saved solution, exact ---
     if not args.h_json and not args.file:
-        metas = load_metas(run_dir)
+        metas = load_metas(run_dir, max_step=args.max_step)
         if not metas:
             raise SystemExit(f"no step*/*.meta.json under {run_dir}")
         m = pick(metas, args.step, args.group, args.rollout)
@@ -261,6 +274,10 @@ def main():
             print(f"using the SAVED construction ({len(h_raw)} points): exact, "
                   f"no re-execution")
         else:
+            if args.saved_only:
+                raise SystemExit(
+                    "selected rollout has no saved construction; plot skipped "
+                    "(--saved-only forbids program replay)")
             if not args.replay:
                 print("  this run predates construction saving; falling back to "
                       "replay, which is approximate")

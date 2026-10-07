@@ -38,6 +38,11 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # Skip adapter training completely while keeping rollout, evaluation, search,
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
+# Enabled by default: reuse policy forwards for full-vocabulary entropy and
+# refresh entropy.jsonl / entropy.svg / strategy_diversity.svg each step.
+# No extra model forwards; skipped/unscored examples have missing coverage.
+# Disable measurement for a launch with:
+#   sh run.sh --no-measure-entropy
 # Opt into hierarchical rollouts. The frozen strategist runs first, is fully
 # offloaded, then the LoRA coder generates programs and trains. Without this
 # flag the ordinary one-stage rollout path is unchanged:
@@ -53,3 +58,7 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode entropic \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
     --isolate-eval --strategies --fused-long-attention "$@"
+
+
+
+# --no-measure-entropy

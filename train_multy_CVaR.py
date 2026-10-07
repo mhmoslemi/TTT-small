@@ -42,6 +42,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import yaml
+from entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
 
 
 _STRATEGY_FALLBACK = (
@@ -1118,6 +1119,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "policy produces programs conditioned on those strategies. "
              "Without this flag ordinary one-stage rollouts are unchanged.")
     p.add_argument(
+        "--measure-entropy", action=argparse.BooleanOptionalAction, default=True,
+        help="Enabled by default. Measure detached full-vocabulary coder entropy from existing "
+             "pre-update training forwards, plus code diversity and validity. "
+             "Save entropy.jsonl and simple SVG plots each completed step. "
+             "No extra model forward; unscored rollouts have explicit missing "
+             "coverage (--no-train records diversity only).")
+    p.add_argument(
         "--fused-long-attention", action="store_const", const=True,
         default=None,
         help="Use exact fused causal SDPA for eligible unpadded long training "
@@ -1684,6 +1692,7 @@ def load_config():
     merged["fast"] = bool(args.fast)
     merged["strategies"] = bool(args.strategies)
     merged["fused_long_attention"] = bool(args.fused_long_attention)
+    merged["measure_entropy"] = bool(args.measure_entropy)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
     if merged["strategies"]:
@@ -1769,9 +1778,9 @@ def load_config():
             raise ValueError(
                 "pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
-        if phase2_allocation_method not in {"rule_based", "bandit"}:
+        if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
             raise ValueError(
-                "phase2_allocation_method must be 'rule_based' or 'bandit'")
+                "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
@@ -2564,8 +2573,8 @@ def _score_hidden_token_chunks(hidden_states, targets, output_head, *,
             1, target_chunk.unsqueeze(-1)).squeeze(-1)
         if not return_entropy:
             return chosen
-        safe = log_probs.masked_fill(~torch.isfinite(log_probs), 0.0)
-        entropy = -(log_probs.exp() * safe).sum(dim=-1)
+        entropy = _token_entropy(
+            log_probs, detached=(return_entropy == "measure"))
         return chosen, entropy
 
     chosen_parts = []
@@ -2799,8 +2808,8 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
                 g = lp.gather(2, targets[:, s:e].unsqueeze(-1)).squeeze(-1)
                 parts.append(g)          # keep only (1, e-s); lp freed next iter
                 if return_entropy:
-                    safe_lp = lp.masked_fill(~torch.isfinite(lp), 0.0)
-                    entropies.append(-(lp.exp() * safe_lp).sum(dim=-1))
+                    entropies.append(_token_entropy(
+                        lp, detached=(return_entropy == "measure")))
             gathered = torch.cat(parts, dim=1)  # (1, R)
             if return_entropy:
                 entropy = torch.cat(entropies, dim=1)
@@ -2808,13 +2817,14 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
             log_probs = F.log_softmax(pred_logits.float(), dim=-1)
             gathered = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (1, R)
             if return_entropy:
-                safe_lp = log_probs.masked_fill(~torch.isfinite(log_probs), 0.0)
-                entropy = -(log_probs.exp() * safe_lp).sum(dim=-1)
+                entropy = _token_entropy(
+                    log_probs, detached=(return_entropy == "measure"))
     if return_entropy:
         return gathered.squeeze(0), entropy.squeeze(0)
     return gathered.squeeze(0)
 
 
+@measure_policy_entropy
 def compute_batched_token_logprobs(
         model, examples, with_grad: bool, chunk: int = 0, *,
         pad_token_id: int = 0, return_entropy: bool = False):
@@ -2915,10 +2925,8 @@ def compute_batched_token_logprobs(
                 parts.append(log_probs.gather(
                     1, targets[start:end].unsqueeze(-1)).squeeze(-1))
                 if return_entropy:
-                    safe = log_probs.masked_fill(
-                        ~torch.isfinite(log_probs), 0.0)
-                    entropies.append(
-                        -(log_probs.exp() * safe).sum(dim=-1))
+                    entropies.append(_token_entropy(
+                        log_probs, detached=(return_entropy == "measure")))
             gathered_examples.append(torch.cat(parts, dim=0))
             if return_entropy:
                 entropy_examples.append(torch.cat(entropies, dim=0))
@@ -4265,6 +4273,7 @@ def _prepare_binary_overlap_examples(
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
                 # Filled from the verified RewardResult after the forward.
+                "_entropy_measurement": record.get("_entropy_measurement"),
                 "advantage": None,
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": None,
@@ -4359,6 +4368,7 @@ def _prepare_entropic_overlap_group(
             "prompt_ids": prompt_ids_by_job[job_idx],
             "response_ids": torch.tensor(
                 [token_ids], dtype=torch.long, device="cpu"),
+            "_entropy_measurement": record.get("_entropy_measurement"),
             "advantage": float(advantage),
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": reference_logprobs,
@@ -4698,6 +4708,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                         model, batch, with_grad=True,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id,
+                        measure_entropy=(epoch == 0),
                         return_entropy=gate)
                     if gate:
                         current_logprobs, token_entropies = result
@@ -5648,6 +5659,7 @@ class ReplicatedDataParallelTrainer:
                                 model, batch, with_grad=True,
                                 chunk=cfg.logprob_chunk,
                                 pad_token_id=tokenizer.pad_token_id,
+                                measure_entropy=(epoch == 0),
                                 return_entropy=gate)
                             if gate:
                                 current_logprobs, token_entropies = result
@@ -7434,6 +7446,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                           render_chat, select_balanced)
 
     step_t0 = time.time()
+    entropy_directory = None
+    entropy_observations = []
+    if getattr(cfg, "measure_entropy", False):
+        from entropy_tools import (begin_step, observation_descriptor,
+                                   rollout_observation)
+        entropy_directory = begin_step(exp_dir, step_idx)
     active_advantage_mode = str(
         getattr(cfg, "advantage_mode", "entropic")).lower()
     rank_mode = active_advantage_mode == "rank"
@@ -7641,9 +7659,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     phase2_allocation_method = str(getattr(
         cfg, "phase2_allocation_method", "rule_based"
     )).strip().lower()
-    if phase2_allocation_method not in {"rule_based", "bandit"}:
+    if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
         raise RuntimeError(
-            "phase2_allocation_method must be 'rule_based' or 'bandit'")
+            "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
     adaptive_strategy_pilots = bool(
         two_stage_rollouts and pilot_programs_per_strategy > 0)
     if (two_stage_rollouts
@@ -7968,6 +7986,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
         }
+        if entropy_directory is not None:
+            record["_entropy_measurement"] = observation_descriptor(
+                entropy_directory, int(group_id), rollout_index)
         if rollout_phase is not None:
             record["strategy_rollout_phase"] = str(rollout_phase)
         if strategy_source_job_idx is not None:
@@ -8025,6 +8046,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "strategy_posterior_valid_probability"),
             "strategy_initial_expected_improvement": source_job.get(
                 "strategy_initial_expected_improvement"),
+            "strategy_hurdle": source_job.get("strategy_hurdle"),
             "strategy_pilot_followup_count": source_job.get(
                 "strategy_pilot_followup_count"),
             "strategy_allocated_programs": source_job.get(
@@ -8161,8 +8183,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             bandit_diagnostics = [None] * len(chain_indices)
             bandit_summary = None
 
-            if phase2_allocation_method == "bandit":
+            if phase2_allocation_method in {"bandit", "hurdle"}:
                 from rollout_allocation import (
+                    allocate_hurdle_expected_best,
                     allocate_posterior_expected_best,
                 )
                 allocation_seed = (
@@ -8171,29 +8194,54 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     + (int(parent_group) + 1) * 9176
                     + (int(fold_index) + 1) * 131
                 ) % (2 ** 32)
-                followups, bandit_diagnostics, bandit_summary = (
-                    allocate_posterior_expected_best(
-                        [rewards_by_source[index]
-                         for index in chain_indices],
-                        [valid_flags_by_source[index]
-                         for index in chain_indices],
-                        remaining,
-                        fail_reward=float(cfg.fail_score),
-                        seed=allocation_seed,
+                reward_groups = [rewards_by_source[index]
+                                 for index in chain_indices]
+                valid_groups = [valid_flags_by_source[index]
+                                for index in chain_indices]
+                if phase2_allocation_method == "hurdle":
+                    saved_parent_reward = parents[parent_group].value
+                    if saved_parent_reward is None:
+                        saved_parent_reward = cfg.fail_score
+                    followups, bandit_diagnostics, bandit_summary = (
+                        allocate_hurdle_expected_best(
+                            reward_groups, valid_groups, remaining,
+                            parent_reward=float(saved_parent_reward),
+                        )
                     )
-                )
+                    allocation_label = "hurdle expected-best"
+                    baseline_label = (
+                        f"parent reward={float(saved_parent_reward):.9f}, ")
+                    fallback_label = " equally (no pilot improved the saved parent)"
+                else:
+                    followups, bandit_diagnostics, bandit_summary = (
+                        allocate_posterior_expected_best(
+                            reward_groups, valid_groups, remaining,
+                            fail_reward=float(cfg.fail_score),
+                            seed=allocation_seed,
+                        )
+                    )
+                    allocation_label = "posterior expected-best bandit"
+                    baseline_label = ""
+                    fallback_label = " equally (all pilots invalid)"
                 mean_threshold = None
                 variance_threshold = None
-                scenarios = ["bandit-expected-best"] * len(chain_indices)
+                scenarios = [f"{phase2_allocation_method}-expected-best"] * len(chain_indices)
+                projected_gain = float(bandit_summary['projected_expected_gain'])
+                gain_text = f"{projected_gain:.9f}"
+                if phase2_allocation_method == "hurdle":
+                    gain_text = (
+                        f"{projected_gain:.9g}"
+                        if bandit_summary['gain_estimate_available'] else "unavailable")
                 print(
                     f"[step {step_idx}] rollout pilot parent {parent_group}"
-                    f"/fold {fold_index}: posterior expected-best bandit; "
+                    f"/fold {fold_index}: {allocation_label}; "
+                    f"{baseline_label}"
                     f"pilot best reward="
                     f"{float(bandit_summary['pilot_best_reward']):.9f}, "
                     f"projected phase-2 gain="
-                    f"{float(bandit_summary['projected_expected_gain']):.9f}; "
+                    f"{gain_text}; "
                     f"allocating {remaining} phase-2 rollouts"
-                    + (" equally (all pilots invalid)"
+                    + (fallback_label
                        if bandit_summary.get("fallback_equal") else ""),
                     flush=True,
                 )
@@ -8343,6 +8391,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             bandit_summary[
                                 "projected_expected_gain"]),
                     })
+                    if phase2_allocation_method == "hurdle":
+                        diagnostic["hurdle"] = {
+                            key: bandit_arm[key] for key in (
+                                "parent_reward", "improvement_count",
+                                "posterior_improvement_probability",
+                                "mean_positive_improvement",
+                                "best_positive_improvement",
+                            )
+                        }
+                        diagnostic["hurdle"].update({
+                            key: bandit_summary[key] for key in (
+                                "incumbent_reward", "positive_gain_bandwidth",
+                                "gain_estimate_available", "fallback_equal",
+                            )
+                        })
                 strategy_pilot_diagnostics.append(diagnostic)
                 job.update({
                     "strategy_pilot_reward_mean": float(mean),
@@ -8362,6 +8425,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "posterior_valid_probability"),
                     "strategy_initial_expected_improvement": diagnostic.get(
                         "initial_expected_improvement"),
+                    "strategy_hurdle": diagnostic.get("hurdle"),
                     "strategy_pilot_followup_count": int(followup),
                     "strategy_allocated_programs": int(allocated),
                 })
@@ -8372,7 +8436,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{best_raw_score:.9f}"
                     if best_raw_score is not None else "unavailable"
                 )
-                if bandit_arm is not None:
+                if phase2_allocation_method == "hurdle":
+                    allocation_text = (
+                        f"valid={int(bandit_arm['valid_count'])}/"
+                        f"{pilot_programs_per_strategy}, improved="
+                        f"{int(bandit_arm['improvement_count'])}/"
+                        f"{pilot_programs_per_strategy}, posterior-improve="
+                        f"{float(bandit_arm['posterior_improvement_probability']):.6f}, "
+                        f"initial-EI={float(bandit_arm['initial_expected_improvement']):.9g}"
+                    )
+                elif bandit_arm is not None:
                     allocation_text = (
                         f"valid={int(bandit_arm['valid_count'])}/"
                         f"{pilot_programs_per_strategy}, posterior-valid="
@@ -8427,11 +8500,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "allocation_method") or "rule_based")
             phase2_total = sum(
                 int(item["followup_count"]) for item in diagnostics)
-            if allocation_method == "bandit":
+            if allocation_method in {"bandit", "hurdle"}:
+                allocation_label = (
+                    "hurdle expected-best" if allocation_method == "hurdle"
+                    else "posterior expected-best bandit")
                 print(
                     f"[step {step_idx}] rollout phase 2 complete parent "
-                    f"{parent_group}/fold {fold_index}: posterior "
-                    f"expected-best bandit; evaluated {phase2_total} "
+                    f"{parent_group}/fold {fold_index}: {allocation_label}; "
+                    f"evaluated {phase2_total} "
                     "phase-2 rollouts",
                     flush=True,
                 )
@@ -8456,7 +8532,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{float(pilot_best):.9f}"
                     if pilot_best is not None else "unavailable"
                 )
-                if allocation_method == "bandit":
+                if allocation_method == "hurdle":
+                    hurdle = diagnostic["hurdle"]
+                    allocation_text = (
+                        f"valid={int(diagnostic['pilot_valid_count'])}/"
+                        f"{int(diagnostic['pilot_count'])}, improved="
+                        f"{int(hurdle['improvement_count'])}/"
+                        f"{int(diagnostic['pilot_count'])}, posterior-improve="
+                        f"{float(hurdle['posterior_improvement_probability']):.6f}, "
+                        f"initial-EI={float(diagnostic['initial_expected_improvement']):.9g}"
+                    )
+                elif allocation_method == "bandit":
                     allocation_text = (
                         f"valid={int(diagnostic['pilot_valid_count'])}/"
                         f"{int(diagnostic['pilot_count'])}, posterior-valid="
@@ -10027,6 +10113,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "strategy_posterior_valid_probability"),
                     "strategy_initial_expected_improvement": record.get(
                         "strategy_initial_expected_improvement"),
+                    "strategy_hurdle": record.get("strategy_hurdle"),
                     "strategy_pilot_followup_count": record.get(
                         "strategy_pilot_followup_count"),
                     "strategy_allocated_programs": record.get(
@@ -10048,6 +10135,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             elif binary_coder_mode:
                 meta["binary_coder"] = group_binary_diagnostics[r_idx]
+            if entropy_directory is not None:
+                entropy_observations.append(rollout_observation(
+                    record.get("_entropy_measurement"), meta, res.code))
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
@@ -10137,6 +10227,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             all_examples.append({
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
+                "_entropy_measurement": record.get("_entropy_measurement"),
                 "advantage": float(adv),
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": reference_logprobs,
@@ -10460,6 +10551,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "evaluation_cpu_count": int(isolated_cpu_count),
         "evaluation_processes_per_cpu": int(isolated_processes_per_cpu),
     }
+    if entropy_directory is not None:
+        step_stats["_entropy_observations"] = entropy_observations
     if adaptive_strategy_pilots:
         step_stats["strategy_pilot_allocation"] = (
             strategy_pilot_diagnostics)
@@ -11026,6 +11119,8 @@ def main():
             allocation_method = str(getattr(
                 cfg, "phase2_allocation_method", "rule_based"))
             allocation_label = (
+                "hurdle expected-best allocation"
+                if allocation_method == "hurdle" else
                 "posterior expected-best bandit"
                 if allocation_method == "bandit"
                 else "dynamic per-parent median mean/variance rule"
@@ -11604,6 +11699,8 @@ def main():
           f"forced to max at step {cfg.growth_force_step}")
 
     # ---- main loop ----
+    from experiment_io import StepPlotter
+    step_plotter = StepPlotter(exp_dir, cfg.problem)
     cumulative_training_seconds = 0.0
     for completed_step in range(start_step):
         summary_path = (Path(exp_dir) / f"step{completed_step:02d}"
@@ -11687,6 +11784,7 @@ def main():
                                ensure_trainer_ready=ensure_trainer_ready)
 
             stats = stats or {}
+            entropy_observations = stats.pop("_entropy_observations", [])
             step_training_seconds = float(
                 stats.get("training_seconds",
                           stats.get("rank_train_seconds", 0.0)) or 0.0)
@@ -11743,6 +11841,25 @@ def main():
             }
             save_step_summary(exp_dir, step, step_summary)
             append_step_result(exp_dir, step, step_summary)
+            if getattr(step_cfg, "measure_entropy", False):
+                from entropy_tools import save_step as save_entropy_step
+                try:
+                    entropy_summary = save_entropy_step(
+                        exp_dir, step, entropy_observations, step_cfg, stats)
+                    measured = entropy_summary["all"]
+                    value = measured["entropy_nats"]
+                    label = f"{value:.6f} nats" if value is not None else "unavailable"
+                    print(f"[step {step}] coder entropy: {label}; "
+                          f"measured {measured['measured_rollouts']}/"
+                          f"{measured['rollouts']} rollouts "
+                          f"({measured['measured_tokens']}/"
+                          f"{measured['response_tokens']} response tokens); "
+                          "updated entropy.jsonl, entropy.svg, "
+                          "strategy_diversity.svg", flush=True)
+                except (OSError, ValueError, TypeError) as error:
+                    print(f"[warn] entropy diagnostics could not be saved: "
+                          f"{error}; training checkpoint is already saved",
+                          flush=True)
             current_policy_adapter_path = Path(adapter_path)
             removed_adapters = _prune_adapter_snapshots(
                 exp_dir,
@@ -11762,7 +11879,12 @@ def main():
                       f"superseded adapter snapshot(s); retained {retained}",
                       flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
+            step_plotter.submit(step)
     finally:
+        # Plotting uses no GPUs and never delays generation of the next step.
+        # Finish queued figures on normal completion; cancel pending work when
+        # the training loop exits with an exception or interruption.
+        step_plotter.close(wait=sys.exc_info()[0] is None)
         if strategy_pool is not None and strategy_pool is not gen_pool:
             print("[shutdown] stopping strategy generation pool ...")
             strategy_pool.shutdown()

@@ -221,10 +221,10 @@ def validate_problem_config(
                 "programs_per_strategy")
     if "phase2_allocation_method" in data:
         allocation_method = str(data["phase2_allocation_method"]).strip().lower()
-        if allocation_method not in {"rule_based", "bandit"}:
+        if allocation_method not in {"rule_based", "bandit", "hurdle"}:
             raise ValueError(
                 f"{_label(source)}: phase2_allocation_method must be "
-                "'rule_based' or 'bandit'")
+                "'rule_based', 'bandit', or 'hurdle'")
     for key in ("top_k", "strategy_top_k"):
         if key in data:
             value = data[key]
