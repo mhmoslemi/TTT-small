@@ -1,6 +1,5 @@
 """CPU diagnostics tests; numerical PyTorch checks run when torch is present."""
 
-import argparse
 import ast
 import importlib.util
 import json
@@ -194,25 +193,6 @@ class EntropyToolsTests(unittest.TestCase):
         self.assertIn("measure_entropy=(epoch == 0)", rank)
         parser = ast.get_source_segment(source, functions["_build_arg_parser"])
         self.assertIn('"--measure-entropy"', parser)
-
-    def test_entropy_cli_defaults_on_with_explicit_opt_out(self):
-        source = (Path(__file__).resolve().parents[1]
-                  / "train_multy_CVaR.py").read_text()
-        function = next(node for node in ast.parse(source).body
-                        if isinstance(node, ast.FunctionDef)
-                        and node.name == "_build_arg_parser")
-        statement = next(node for node in function.body
-                         if isinstance(node, ast.Expr)
-                         and isinstance(node.value, ast.Call)
-                         and node.value.args
-                         and isinstance(node.value.args[0], ast.Constant)
-                         and node.value.args[0].value == "--measure-entropy")
-        parser = argparse.ArgumentParser()
-        exec(compile(ast.Module(body=[statement], type_ignores=[]),
-                     "entropy_cli", "exec"), {"argparse": argparse, "p": parser})
-        self.assertTrue(parser.parse_args([]).measure_entropy)
-        self.assertTrue(parser.parse_args(["--measure-entropy"]).measure_entropy)
-        self.assertFalse(parser.parse_args(["--no-measure-entropy"]).measure_entropy)
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch not installed")

@@ -1,4 +1,4 @@
-"""Measurement-only diagnostics, independent of the RL objective and advantages.
+"""Opt-in diagnostics, independent of the RL objective and its advantages.
 
 Entropy is full-vocabulary Shannon entropy (nats, raw logits / temperature 1)
 on the coder's *pre-update training forwards*, at generated response prefixes.

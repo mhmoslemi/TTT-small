@@ -1119,8 +1119,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "policy produces programs conditioned on those strategies. "
              "Without this flag ordinary one-stage rollouts are unchanged.")
     p.add_argument(
-        "--measure-entropy", action=argparse.BooleanOptionalAction, default=True,
-        help="Enabled by default. Measure detached full-vocabulary coder entropy from existing "
+        "--measure-entropy", action="store_const", const=True, default=None,
+        help="Measure detached full-vocabulary coder entropy from existing "
              "pre-update training forwards, plus code diversity and validity. "
              "Save entropy.jsonl and simple SVG plots each completed step. "
              "No extra model forward; unscored rollouts have explicit missing "
