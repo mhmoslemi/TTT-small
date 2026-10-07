@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import torch
+import types
 import weakref
 from terminal_output import terminal_log_only
 
@@ -13,6 +14,12 @@ _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
 _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
 _SHARED_PREFIX_ATTENTION_LAYOUTS = {}
 _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = None
+
+# Bound one dense MLP projection tile to 128 MiB. Long decoder trajectories
+# otherwise ask each gate/up LoRA projection to materialize an output for every
+# token at once (several GiB for Qwen3.8). The MLP is position-wise, so slicing
+# only its token dimension preserves every token and the exact autograd graph.
+_EXACT_MLP_PROJECTION_TILE_BYTES = 128 * 1024 * 1024
 
 
 def register_shared_prefix_attention_mask(mask, prefix_end, branches):
@@ -669,6 +676,147 @@ def _resolve_lora_target_modules(cfg, model_config):
     return targets
 
 
+def _projection_output_width(projection):
+    """Best-effort output width for Linear or PEFT Linear wrappers."""
+    candidates = [projection]
+    get_base_layer = getattr(projection, "get_base_layer", None)
+    if callable(get_base_layer):
+        try:
+            candidates.append(get_base_layer())
+        except (AttributeError, TypeError):
+            pass
+    base_layer = getattr(projection, "base_layer", None)
+    if base_layer is not None:
+        candidates.append(base_layer)
+    for candidate in candidates:
+        width = getattr(candidate, "out_features", None)
+        if width is not None and int(width) > 0:
+            return int(width)
+        weight = getattr(candidate, "weight", None)
+        shape = getattr(weight, "shape", ())
+        if len(shape) >= 2 and int(shape[0]) > 0:
+            return int(shape[0])
+    return None
+
+
+def _projection_output_element_bytes(projection, fallback):
+    """Account for FP32 trainable LoRA outputs on a BF16 base model."""
+    size = max(1, int(fallback))
+    parameters = getattr(projection, "parameters", None)
+    if not callable(parameters):
+        return size
+    for parameter in parameters():
+        element_size = getattr(parameter, "element_size", None)
+        if callable(element_size):
+            size = max(size, int(element_size()))
+    return size
+
+
+def _exact_mlp_token_chunk_size(module, hidden_states):
+    """Choose an automatic token tile from the real dtype and MLP width."""
+    sequence = int(hidden_states.shape[-2])
+    hidden = max(1, int(hidden_states.shape[-1]))
+    leading_rows = max(
+        1, int(hidden_states.numel()) // max(1, sequence * hidden))
+    width = max(
+        filter(None, (
+            _projection_output_width(module.gate_proj),
+            _projection_output_width(module.up_proj),
+        )),
+        default=hidden,
+    )
+    element_bytes = max(
+        _projection_output_element_bytes(
+            module.gate_proj, hidden_states.element_size()),
+        _projection_output_element_bytes(
+            module.up_proj, hidden_states.element_size()),
+    )
+    bytes_per_token = max(1, leading_rows * width * element_bytes)
+    tokens = max(1, _EXACT_MLP_PROJECTION_TILE_BYTES // bytes_per_token)
+    # Multiples of 128 retain efficient GEMM shapes without ever enlarging the
+    # memory-derived tile. Very wide layers may legitimately need fewer.
+    if tokens >= 128:
+        tokens = (tokens // 128) * 128
+    return max(1, min(sequence, int(tokens)))
+
+
+def _exact_chunked_qwen35_mlp_forward(module, hidden_states):
+    """Run Qwen3.8's position-wise MLP in exact checkpointed token tiles.
+
+    No context, token, loss term, or gradient is removed. Each slice executes
+    the checkpoint's original gate/up/activation/down formula, and outputs are
+    concatenated in their original order. Checkpointing each slice prevents a
+    decoder-layer checkpoint recomputation from recreating all wide MLP
+    intermediates simultaneously during backward.
+    """
+    if hidden_states.ndim < 3:
+        return module._ttt_exact_mlp_original_forward(hidden_states)
+    sequence = int(hidden_states.shape[-2])
+    minimum = int(getattr(module, "_ttt_exact_mlp_min_tokens", 0) or 0)
+    original = module._ttt_exact_mlp_original_forward
+    if sequence < minimum:
+        return original(hidden_states)
+
+    chunk = _exact_mlp_token_chunk_size(module, hidden_states)
+    if chunk >= sequence:
+        return original(hidden_states)
+
+    def project(token_slice):
+        return module.down_proj(
+            module.act_fn(module.gate_proj(token_slice))
+            * module.up_proj(token_slice)
+        )
+
+    outputs = []
+    use_checkpoint = bool(
+        torch.is_grad_enabled() and hidden_states.requires_grad)
+    for start in range(0, sequence, chunk):
+        token_slice = hidden_states[..., start:start + chunk, :]
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(project, token_slice, use_reentrant=False)
+        else:
+            output = project(token_slice)
+        outputs.append(output)
+    return torch.cat(outputs, dim=-2)
+
+
+def _install_exact_qwen38_mlp_chunking(model, cfg):
+    """Patch dense Qwen3.8 MLPs after PEFT so base and LoRA paths are tiled."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
+        return 0
+    minimum = int(getattr(
+        cfg, "long_training_headroom_min_tokens", 32_768))
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5MLP":
+            continue
+        if hasattr(module, "_ttt_exact_mlp_original_forward"):
+            installed += 1
+            continue
+        required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+        if not all(hasattr(module, name) for name in required):
+            raise RuntimeError(
+                "Qwen3.8 MLP no longer exposes the position-wise "
+                "gate/up/down contract required for exact token chunking")
+        module._ttt_exact_mlp_original_forward = module.forward
+        module._ttt_exact_mlp_min_tokens = minimum
+        module.forward = types.MethodType(
+            _exact_chunked_qwen35_mlp_forward, module)
+        installed += 1
+    if installed < 1:
+        raise RuntimeError(
+            "Qwen3.8 exact long training found no Qwen3_5MLP modules to "
+            "token-chunk; refusing an unbounded long-sequence MLP path")
+    print(
+        "[memory] Qwen3.8 exact token-chunked MLP training ON "
+        f"({installed} layers; activates from {minimum} tokens; "
+        "all tokens and gradients retained)",
+        flush=True,
+    )
+    return installed
+
+
 def _configure_exact_long_training(model, cfg):
     """Attach the model-profile execution policy used by every trainer path."""
     if not bool(getattr(cfg, "strict_exact_long_training", False)):
@@ -683,6 +831,7 @@ def _configure_exact_long_training(model, cfg):
     model._ttt_activation_offload_min_work = (
         None if cpu_offload_threshold is None
         else int(cpu_offload_threshold))
+    _install_exact_qwen38_mlp_chunking(model, cfg)
     offload_description = (
         "CPU activation offload only after a proven OOM"
         if model._ttt_activation_offload_min_work is None else

@@ -1,4 +1,5 @@
 import io
+import importlib.util
 import logging
 import os
 import sys
@@ -88,6 +89,60 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_qwen38_token_tiles_preserve_forward_and_gradients(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest(
+                "PyTorch is required for exact forward/gradient equivalence")
+        import copy
+        import torch
+        from model_backend import _install_exact_qwen38_mlp_chunking
+
+        class Qwen3_5MLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = torch.nn.Linear(4, 9, bias=False)
+                self.up_proj = torch.nn.Linear(4, 9, bias=False)
+                self.down_proj = torch.nn.Linear(9, 4, bias=False)
+                self.act_fn = torch.nn.SiLU()
+
+            def forward(self, hidden_states):
+                return self.down_proj(
+                    self.act_fn(self.gate_proj(hidden_states))
+                    * self.up_proj(hidden_states)
+                )
+
+        torch.manual_seed(7)
+        reference = Qwen3_5MLP()
+        chunked = copy.deepcopy(reference)
+        cfg = types.SimpleNamespace(
+            coder_model_profile="qwen3.8-27b",
+            long_training_headroom_min_tokens=1,
+        )
+        # Force one-token tiles in this tiny test so it exercises both the
+        # concatenation and nested non-reentrant checkpoint backward paths.
+        with patch("model_backend._EXACT_MLP_PROJECTION_TILE_BYTES", 32):
+            self.assertEqual(
+                _install_exact_qwen38_mlp_chunking(chunked, cfg), 1)
+
+            reference_input = torch.randn(2, 7, 4, requires_grad=True)
+            chunked_input = reference_input.detach().clone().requires_grad_(True)
+            reference_output = reference(reference_input)
+            chunked_output = chunked(chunked_input)
+            torch.testing.assert_close(
+                chunked_output, reference_output, rtol=2e-5, atol=2e-6)
+
+            reference_output.square().sum().backward()
+            chunked_output.square().sum().backward()
+
+        torch.testing.assert_close(
+            chunked_input.grad, reference_input.grad,
+            rtol=2e-5, atol=2e-6)
+        for chunked_parameter, reference_parameter in zip(
+                chunked.parameters(), reference.parameters()):
+            torch.testing.assert_close(
+                chunked_parameter.grad, reference_parameter.grad,
+                rtol=2e-5, atol=2e-6)
+
     def test_progress_bar_uses_declared_progress_stream(self):
         from gen_workers import make_progress_bar
 
