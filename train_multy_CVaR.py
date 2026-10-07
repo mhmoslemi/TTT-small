@@ -275,10 +275,9 @@ def _apply_strategy_model_profile(
     _profile_default(
         merged, "strategy_vllm_quantization", "", explicit_keys)
 
-    # At 8B, the exact model fits without quantization. Keep one independent
-    # TP=1 replica per selected GPU for maximum request throughput; do not turn
-    # spare replicas into communication-heavy tensor-parallel ranks merely to
-    # make every card busy when the live chain frontier is temporarily small.
+    # At 8B, the exact model fits without quantization. The topology planner
+    # keeps independent TP=1 replicas while the live parent-chain frontier can
+    # feed them, and folds otherwise-idle replicas into TP ranks when it cannot.
     # Retain every selected engine's level-1 backup between phases.
     _profile_default(merged, "strategy_vllm_sleep_level", 1, explicit_keys)
     _profile_default(
@@ -2075,7 +2074,8 @@ def load_config():
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
-    from gpu_runtime import (allocate_gpu_roles,
+    from gpu_runtime import (align_vllm_layout_to_concurrency,
+                             allocate_gpu_roles,
                              derive_vllm_parallel_layout,
                              detect_attention_heads, parse_gpu_ids,
                              query_gpu_memory, resolve_memory_settings,
@@ -2350,14 +2350,21 @@ def load_config():
             strategy_heads = detect_attention_heads(strategy_name)
             memory_strategy_layout = derive_vllm_parallel_layout(
                 strategy_layout_cfg, roles, memory, strategy_heads)
-            # Keep the smallest memory-safe TP chosen by the memory planner.
-            # This maximizes independent engines and avoids making a fitting
-            # model slower through unnecessary cross-GPU collectives. The
-            # dependency scheduler dispatches every ready chain immediately;
-            # when there are fewer chains than replicas, the unused replicas
-            # cannot perform useful work without changing the requested
-            # samples or their dependencies.
-            strategy_layout = memory_strategy_layout
+            # Strategies inside one parent are sequential, so the number of
+            # parents/folds—not strategies_per_parent—is the largest live
+            # request frontier. Fold replicas above it into TP/PP ranks rather
+            # than leaving their GPUs idle for every dependent stage.
+            strategy_frontier = int(merged["groups_per_step"])
+            if str(merged.get("advantage_mode", "")).lower() == "x-grpo":
+                strategy_frontier *= int(
+                    merged.get("x_grpo_contexts_per_step", 1))
+            strategy_layout = align_vllm_layout_to_concurrency(
+                strategy_layout_cfg,
+                memory_strategy_layout,
+                len(gpu_ids),
+                strategy_heads,
+                strategy_frontier,
+            )
             strategy_layout_cfg["vllm_tensor_parallel_size"] = (
                 strategy_layout.tensor_parallel_size)
             strategy_layout_cfg["vllm_pipeline_parallel_size"] = (
@@ -2375,6 +2382,7 @@ def load_config():
                 strategy_layout_cfg["vllm_max_num_batched_tokens"])
             merged["strategy_vllm_runtime_reserve_gib"] = float(
                 strategy_layout_cfg["vllm_runtime_reserve_gib"])
+            merged["strategy_generation_frontier"] = strategy_frontier
             merged["separate_strategy_inference_pool"] = bool(
                 strategy_name != str(merged.get("model_name"))
                 or merged["dual_resident_qwen3_8b_strategy_coder_pools"]
@@ -2388,11 +2396,18 @@ def load_config():
                 strategy_layout.tensor_parallel_size,
                 strategy_name,
             )
+            frontier_note = ""
+            if strategy_layout != memory_strategy_layout:
+                frontier_note = (
+                    f"; live frontier={strategy_frontier}, reshaped from "
+                    f"{memory_strategy_layout.replicas}xTP"
+                    f"{memory_strategy_layout.tensor_parallel_size} so every "
+                    "rollout GPU participates")
             print(f"[config] strategy model {strategy_name}: "
                   f"{strategy_layout.replicas} vLLM replica(s), "
                   f"TP={strategy_layout.tensor_parallel_size}, "
-                  f"PP={strategy_layout.pipeline_parallel_size}; maximum "
-                  "memory-safe replica parallelism")
+                  f"PP={strategy_layout.pipeline_parallel_size}"
+                  f"{frontier_note}")
     elif (merged["strategies"]
           and merged.get("strategy_backend", "local") == "local"
           and str(merged.get("strategy_model_name")

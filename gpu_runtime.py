@@ -615,3 +615,62 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
         unsharded_stage_required_gib=required,
         budget_gib=budget,
     )
+
+
+def align_vllm_layout_to_concurrency(
+        cfg: dict, layout: VLLMParallelLayout, num_gpus: int,
+        num_attention_heads: Optional[int], max_concurrency: int,
+        ) -> VLLMParallelLayout:
+    """Fold strategist replicas above the live chain frontier into TP ranks.
+
+    Only one strategy in a dependent parent chain can be ready at once.  A
+    memory-fitting TP=1 engine above that frontier therefore cannot receive
+    useful work.  Turn those otherwise-idle replicas into uniform TP/PP ranks
+    so the full selected GPU inventory contributes to the live requests.
+
+    The model, context, prompts, sampling, output limits, and dependency order
+    are unchanged.  If no memory-safe, head-compatible exact partition exists,
+    retain the memory-derived layout rather than weakening the workload.
+    """
+    num_gpus = int(num_gpus)
+    max_concurrency = int(max_concurrency)
+    if num_gpus < 1:
+        raise ValueError("vLLM generation requires at least one GPU")
+    if max_concurrency < 1:
+        raise ValueError("vLLM request concurrency must be positive")
+    if layout.replicas <= max_concurrency:
+        return layout
+
+    for replicas in range(min(max_concurrency, num_gpus), 0, -1):
+        if num_gpus % replicas:
+            continue
+        world_size = num_gpus // replicas
+        if num_attention_heads:
+            compatible_tp = [
+                factor for factor in range(1, world_size + 1)
+                if world_size % factor == 0
+                and int(num_attention_heads) % factor == 0
+            ]
+        else:
+            compatible_tp = [
+                int(layout.tensor_parallel_size)
+                if world_size % int(layout.tensor_parallel_size) == 0
+                else 0
+            ]
+
+        for tp in reversed(compatible_tp):
+            if tp < 1:
+                continue
+            pp = world_size // tp
+            required = _minimum_vllm_gib_per_gpu(cfg, tp)
+            if required > float(layout.budget_gib):
+                continue
+            return VLLMParallelLayout(
+                tensor_parallel_size=tp,
+                pipeline_parallel_size=pp,
+                replicas=replicas,
+                unsharded_stage_required_gib=required,
+                budget_gib=float(layout.budget_gib),
+            )
+
+    return layout
