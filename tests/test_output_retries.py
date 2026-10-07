@@ -459,7 +459,7 @@ class StrategySchedulerTests(unittest.TestCase):
     def scheduler(self):
         scope = dict(
             deque=deque, queue=queue, make_progress_bar=Bar,
-            terminal_log_only=lambda *args, **kwargs: None,
+            setting_log_only=lambda *args, **kwargs: None,
         )
         functions_from_file("gen_workers.py", {"run_sequential_chains"}, scope)
         results = queue.Queue()

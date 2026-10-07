@@ -189,6 +189,7 @@ class StartupLogTests(unittest.TestCase):
                     Path=Path, os=os, load_config=load_config, _LOG_TIME_OFFSET_SECONDS=0,
                     _install_console_timestamps=lambda: None,
                     _install_terminal_log=lambda: SimpleNamespace(bind=lambda _: None),
+                    bind_setting_log=lambda *args, **kwargs: None,
                     _pin_training_process=lambda _: events.append("pin"),
                     _uses_clipped_policy_loss=lambda m: m in {"spo-rs", "x-grpo", "rank"},
                     _uses_sequence_level_policy_ratio=lambda _: False,

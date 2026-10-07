@@ -5,7 +5,7 @@ import os
 import torch
 import types
 import weakref
-from terminal_output import terminal_log_only
+from terminal_output import setting_log_only
 
 
 _FUSED_LONG_ATTENTION = False
@@ -297,7 +297,7 @@ def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
         return None
 
     if not _FUSED_LONG_ATTENTION_ACTIVE_REPORTED:
-        terminal_log_only(
+        setting_log_only(
             f"[memory] fused exact long attention active: "
             f"sequence={int(query.shape[2])} tokens, "
             f"query_heads={int(query.shape[1])}, "
@@ -1069,7 +1069,7 @@ class HFBackend(_ModelPlacementBackend):
                 "as one replicated trainer on logical GPU "
                 f"{int(replica_device)}"
             )
-        terminal_log_only(
+        setting_log_only(
             f"[backend=hf] loading {training_name} {placement} ...",
             flush=True)
         tokenizer = AutoTokenizer.from_pretrained(

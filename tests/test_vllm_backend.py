@@ -2,6 +2,7 @@ import io
 import importlib.util
 import logging
 import os
+import re
 import sys
 import tempfile
 import types
@@ -208,11 +209,15 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIn("\rrollouts: 10/10", console.getvalue())
 
     def test_terminal_log_only_bypasses_console_and_keeps_timestamp(self):
-        from train_multy_CVaR import (
-            _TerminalLogSink,
-            _TerminalTeeStream,
-            _TimestampedLineStream,
-        )
+        with patch.dict(sys.modules, {
+                "numpy": types.ModuleType("numpy"),
+                "yaml": types.ModuleType("yaml"),
+        }):
+            from train_multy_CVaR import (
+                _TerminalLogSink,
+                _TerminalTeeStream,
+                _TimestampedLineStream,
+            )
         from terminal_output import terminal_log_only
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,12 +236,13 @@ class VLLMBackendTests(unittest.TestCase):
             saved,
             r"^\[\d{2}:\d{2}:\d{2}\] \[step 2\] quiet operational detail\n$")
 
-    def test_rope_notice_is_terminal_log_only(self):
+    def test_rope_notice_is_setting_log_only(self):
         with patch.dict(sys.modules, {
                 "numpy": types.ModuleType("numpy"),
                 "yaml": types.ModuleType("yaml"),
         }):
             from train_multy_CVaR import _NoticeRoutingStream
+            from terminal_output import bind_setting_log
 
         class Visible:
             def __init__(self):
@@ -252,18 +258,27 @@ class VLLMBackendTests(unittest.TestCase):
             def flush(self):
                 return None
 
-        visible = Visible()
-        diagnostic = io.StringIO()
-        stream = _NoticeRoutingStream(
-            visible, diagnostic, "dependency stderr")
-        notice = (
-            "[transformers] Unrecognized keys in `rope_parameters` for "
-            "'rope_type'='yarn': {'attn_factor'}\n")
-        stream.write(notice)
+        with tempfile.TemporaryDirectory() as directory:
+            setting_path = Path(directory) / "setting.log"
+            bind_setting_log(setting_path)
+            try:
+                visible = Visible()
+                diagnostic = io.StringIO()
+                stream = _NoticeRoutingStream(
+                    visible, diagnostic, "dependency stderr")
+                notice = (
+                    "[transformers] Unrecognized keys in `rope_parameters` for "
+                    "'rope_type'='yarn': {'attn_factor'}\n")
+                stream.write(notice)
 
-        self.assertEqual(visible.console.getvalue(), "")
-        self.assertEqual(visible.log_only.getvalue(), notice)
-        self.assertEqual(diagnostic.getvalue(), "")
+                self.assertEqual(visible.console.getvalue(), "")
+                self.assertEqual(visible.log_only.getvalue(), "")
+                self.assertEqual(diagnostic.getvalue(), "")
+                self.assertRegex(
+                    setting_path.read_text(),
+                    r"^\[\d{2}:\d{2}:\d{2}\] " + re.escape(notice) + r"$")
+            finally:
+                bind_setting_log(None)
 
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
         from model_backend import _hf_training_attention_implementation

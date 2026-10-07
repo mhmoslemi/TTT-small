@@ -45,7 +45,7 @@ from entropy_tools import measure_policy_entropy, token_entropy as _token_entrop
 from output_retries import (coder_output_issue, coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
-from terminal_output import terminal_log_only
+from terminal_output import bind_setting_log, setting_log_only
 
 
 _STRATEGY_FALLBACK = (
@@ -882,7 +882,7 @@ _ROUTED_DEPENDENCY_NOTICES = (
     "`torch_dtype` is deprecated! Use `dtype` instead!",
 )
 
-_TERMINAL_LOG_ONLY_NOTICES = (
+_SETTING_LOG_ONLY_NOTICES = (
     "Unrecognized keys in `rope_parameters`",
 )
 
@@ -895,7 +895,7 @@ class _NoticeRoutingStream:
         self.diagnostic = diagnostic
         self.label = label
         self._routing_line = False
-        self._terminal_log_line = False
+        self._setting_log_line = False
 
     def _diagnostic_is_open(self):
         return (self.diagnostic is not None
@@ -903,30 +903,26 @@ class _NoticeRoutingStream:
 
     def write(self, value):
         for piece in str(value).splitlines(keepends=True):
-            terminal_only = (
-                self._terminal_log_line
+            setting_only = (
+                self._setting_log_line
                 or any(marker in piece
-                       for marker in _TERMINAL_LOG_ONLY_NOTICES)
+                       for marker in _SETTING_LOG_ONLY_NOTICES)
             )
             route = (self._diagnostic_is_open()
-                     and not terminal_only
+                     and not setting_only
                      and (self._routing_line
                           or any(marker in piece
                                  for marker in _ROUTED_DEPENDENCY_NOTICES)))
-            if terminal_only:
-                writer = getattr(self.visible, "write_log_only", None)
-                if writer is None:
-                    self.visible.write(piece)
-                else:
-                    writer(piece)
+            if setting_only:
+                setting_log_only(piece, end="")
             elif route:
                 if not self._routing_line:
                     self.diagnostic.write(f"[{self.label}] ")
                 self.diagnostic.write(piece)
             else:
                 self.visible.write(piece)
-            self._terminal_log_line = bool(
-                terminal_only and not piece.endswith(("\n", "\r")))
+            self._setting_log_line = bool(
+                setting_only and not piece.endswith(("\n", "\r")))
             self._routing_line = bool(
                 route and not piece.endswith(("\n", "\r")))
         return len(value)
@@ -945,7 +941,7 @@ class _NoticeRoutingStream:
     def detach_diagnostic(self):
         """Make a handler-retained wrapper safe after its file is closed."""
         self._routing_line = False
-        self._terminal_log_line = False
+        self._setting_log_line = False
         self.diagnostic = None
 
     def __getattr__(self, name):
@@ -3472,7 +3468,7 @@ def _run_oom_resilient_backward(
                     torch.autograd.graph, "save_on_cpu"):
                 activation_offload = True
                 offload_trigger_work = active_work
-                terminal_log_only(
+                setting_log_only(
                     f"[train-oom] {device_label}: singleton still OOM after "
                     "GPU headroom; retrying with saved activations offloaded "
                     "to CPU", flush=True)
@@ -6027,12 +6023,15 @@ class ProcessDistributedTrainer:
         cfg_dict = dict(vars(cfg))
         cfg_dict["_terminal_log_path"] = str(
             Path(exp_dir).resolve() / "temirnal.log")
+        cfg_dict["_setting_log_path"] = str(
+            Path(exp_dir).resolve() / "setting.log")
+        cfg_dict["_log_time_offset_seconds"] = _LOG_TIME_OFFSET_SECONDS
 
-        terminal_log_only(
+        setting_log_only(
             f"[{self._process_label}] starting "
             f"{self._world_size - 1} persistent "
             "worker processes; main process is rank 0", flush=True)
-        terminal_log_only(
+        setting_log_only(
             f"[{self._process_label}] loading trainer replicas one at a time "
             "to cap host/GPU initialization peaks", flush=True)
         try:
@@ -6071,7 +6070,7 @@ class ProcessDistributedTrainer:
             self._abort_workers()
             raise
 
-        terminal_log_only(
+        setting_log_only(
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
@@ -7418,7 +7417,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     else type(sampler).__name__)
     save_parent_selections(
         exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info)
-    terminal_log_only(
+    setting_log_only(
         f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
         f"generation/training", flush=True)
 
@@ -7786,7 +7785,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
         isolated_memory_limit_bytes = (
             _automatic_sandbox_memory_limit_bytes(n_reward_workers))
-        terminal_log_only(
+        setting_log_only(
             f"[step {step_idx}] isolated evaluation pool: "
             f"{n_reward_workers} sandbox process(es) across "
             f"{isolated_cpu_count} CPU(s), up to "
@@ -8782,7 +8781,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
                     planning_pool = strategy_pool or gen_pool
-                    terminal_log_only(f"[step {step_idx}] hierarchical planning: "
+                    setting_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
                           f"{strategies_per_parent} sequential strategies with "
                           f"{cfg.strategy_model_name}; LoRA disabled "
@@ -8909,7 +8908,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             planning_pool.release()
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
-                    terminal_log_only(f"[step {step_idx}] two-stage coding: generating "
+                    setting_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
@@ -8986,7 +8985,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 phase_records, seed_offset=seed_offset)
                         return phase_records
 
-                    terminal_log_only(
+                    setting_log_only(
                         f"[step {step_idx}] rollout pilot: "
                         f"{pilot_programs_per_strategy} programs x "
                         f"{len(source_job_indices)} strategies; CPU evaluation "
@@ -9062,7 +9061,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
-                    terminal_log_only(f"[step {step_idx}] hierarchical planning: "
+                    setting_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
                           f"{strategies_per_parent} sequential strategies with "
                           f"{cfg.strategy_model_name}; LoRA disabled "
@@ -9122,7 +9121,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     break
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
-                    terminal_log_only(f"[step {step_idx}] two-stage coding: generating "
+                    setting_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
@@ -9186,7 +9185,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 phase_records, seed_offset=seed_offset)
                         return phase_records
 
-                    terminal_log_only(
+                    setting_log_only(
                         f"[step {step_idx}] rollout pilot: "
                         f"{pilot_programs_per_strategy} programs x "
                         f"{len(source_job_indices)} strategies; CPU evaluation "
@@ -10762,7 +10761,10 @@ def main():
         exp_dir = make_experiment_dir(
             cfg, resume_dir=resume_dir, config_dict=merged
         )
-        startup_log.bind(Path(exp_dir) / "setting.log")
+        setting_log_path = Path(exp_dir).resolve() / "setting.log"
+        startup_log.bind(setting_log_path)
+        bind_setting_log(
+            setting_log_path, time_offset=_LOG_TIME_OFFSET_SECONDS)
     # Keep the full resolved settings in the file; show their grouped dashboard
     # once below. Restore normal print before loading/training begins.
     print = startup_log.print
@@ -11181,7 +11183,7 @@ def main():
         )
         print(f"[resume] reconstructed {n_states} valid archived candidates "
               f"from {n_rollouts} earlier rollouts")
-    terminal_log_only(
+    setting_log_only(
         f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
@@ -11370,7 +11372,7 @@ def main():
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
-                terminal_log_only(
+                setting_log_only(
                     f"[gpu] offloading {replica_label} to CPU before "
                     "shared-GPU vLLM generation", flush=True)
                 try:
@@ -11459,7 +11461,7 @@ def main():
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
-            terminal_log_only(
+            setting_log_only(
                 f"[init] phase-shared vLLM pool configured across all "
                 f"rollout GPUs {gpu_ids}", flush=True)
             if separate_strategy_pool:
@@ -11496,7 +11498,7 @@ def main():
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )
-                terminal_log_only(
+                setting_log_only(
                     f"[init] separate no-LoRA strategy vLLM pool "
                     f"configured for {cfg.strategy_model_name}", flush=True)
         else:
@@ -11552,12 +11554,12 @@ def main():
                           else "micro-batch")
             limit_scope = ("/engine" if cfg.generation_backend == "vllm"
                            else "/GPU")
-            terminal_log_only(
+            setting_log_only(
                 f"[init] generation pool ready "
                 f"({limit_name} {cfg.gen_micro_batch}{limit_scope})",
                 flush=True)
         else:
-            terminal_log_only("[init] generation pool ready", flush=True)
+            setting_log_only("[init] generation pool ready", flush=True)
     else:
         if cfg.num_training_gpus > 1:
             print(f"[init] model-parallel HF generation across training GPUs "
@@ -11618,20 +11620,20 @@ def main():
                     f"{cfg.strategies_per_parent} strategies x "
                     f"{cfg.programs_per_strategy} programs/group; "
                     if getattr(problem, "two_stage_rollouts", False) else "")
-                terminal_log_only(
+                setting_log_only(
                     f"[step {step}] batch: "
                     f"P={cfg.x_grpo_contexts_per_step} "
                     f"K={cfg.groups_per_step} G={cfg.group_size} "
                     f"({hierarchy}{rollout_count} rollouts)", flush=True)
             elif getattr(problem, "two_stage_rollouts", False):
-                terminal_log_only(
+                setting_log_only(
                     f"[step {step}] batch: parents={cfg.groups_per_step} "
                     f"strategies/parent={cfg.strategies_per_parent} "
                     f"programs/strategy={cfg.programs_per_strategy} "
                     f"({cfg.groups_per_step * cfg.group_size} code rollouts)",
                     flush=True)
             else:
-                terminal_log_only(
+                setting_log_only(
                     f"[step {step}] batch: G={cfg.groups_per_step} "
                     f"K={cfg.group_size} "
                     f"({cfg.groups_per_step * cfg.group_size} rollouts)",

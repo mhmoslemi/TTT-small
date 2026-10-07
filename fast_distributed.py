@@ -1274,6 +1274,13 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         terminal_log_path = cfg_dict.get("_terminal_log_path")
         if terminal_log_path:
             terminal_log.bind(terminal_log_path)
+        from terminal_output import bind_setting_log
+        setting_log_path = cfg_dict.get("_setting_log_path")
+        if setting_log_path:
+            bind_setting_log(
+                setting_log_path,
+                time_offset=cfg_dict.get("_log_time_offset_seconds", 0),
+            )
 
         from loading_logs import quiet_replica_load
 
