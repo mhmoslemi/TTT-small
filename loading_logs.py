@@ -20,6 +20,13 @@ class _LoadingStream:
     def flush(self):
         return self.target.flush()
 
+    def write_log_only(self, value):
+        """Keep explicit run diagnostics in temirnal.log during quiet loads."""
+        writer = getattr(self.visible, "write_log_only", None)
+        if writer is not None:
+            return writer(value)
+        return self.target.write(value)
+
     def detach(self):
         self.target = self.visible
 

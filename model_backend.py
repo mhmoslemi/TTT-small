@@ -4,6 +4,7 @@ import importlib.util
 import os
 import torch
 import weakref
+from terminal_output import terminal_log_only
 
 
 _FUSED_LONG_ATTENTION = False
@@ -289,10 +290,11 @@ def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
         return None
 
     if not _FUSED_LONG_ATTENTION_ACTIVE_REPORTED:
-        print(f"[memory] fused exact long attention active: "
-              f"sequence={int(query.shape[2])} tokens, "
-              f"query_heads={int(query.shape[1])}, "
-              f"kv_heads={int(key.shape[1])}", flush=True)
+        terminal_log_only(
+            f"[memory] fused exact long attention active: "
+            f"sequence={int(query.shape[2])} tokens, "
+            f"query_heads={int(query.shape[1])}, "
+            f"kv_heads={int(key.shape[1])}", flush=True)
         _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = True
     return output
 

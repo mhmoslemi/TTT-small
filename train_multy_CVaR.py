@@ -45,6 +45,7 @@ from entropy_tools import measure_policy_entropy, token_entropy as _token_entrop
 from output_retries import (coder_output_issue, coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
+from terminal_output import terminal_log_only
 
 
 _STRATEGY_FALLBACK = (
@@ -615,6 +616,29 @@ class _TimestampedLineStream:
     def flush(self):
         self.stream.flush()
 
+    def write_log_only(self, value):
+        """Timestamp complete diagnostic lines without touching the TTY."""
+        value = str(value)
+        if not value:
+            return 0
+        writer = getattr(self.stream, "write_log_only", None)
+        if writer is None:
+            return self.write(value)
+        parts = value.split("\n")
+        rendered = []
+        for index, part in enumerate(parts):
+            if part:
+                timestamp = time.strftime(
+                    "[%H:%M:%S] ",
+                    time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS),
+                )
+                rendered.extend((timestamp, part))
+            if index + 1 < len(parts):
+                rendered.append("\n")
+        with self._lock:
+            writer("".join(rendered))
+        return len(value)
+
     def __getattr__(self, name):
         return getattr(self.stream, name)
 
@@ -647,6 +671,15 @@ class _TerminalTeeStream:
         with self.sink.lock:
             self.console.flush()
             self.sink.flush()
+
+    def write_log_only(self, value):
+        """Append to temirnal.log while deliberately bypassing the console."""
+        value = str(value)
+        if not value:
+            return 0
+        with self.sink.lock:
+            self.sink.write(value)
+        return len(value)
 
     @property
     def progress_stream(self):
@@ -847,6 +880,12 @@ class _NoticeRoutingStream:
         self.visible.flush()
         if self._diagnostic_is_open():
             self.diagnostic.flush()
+
+    def write_log_only(self, value):
+        writer = getattr(self.visible, "write_log_only", None)
+        if writer is not None:
+            return writer(value)
+        return self.diagnostic.write(value)
 
     def detach_diagnostic(self):
         """Make a handler-retained wrapper safe after its file is closed."""
@@ -3369,9 +3408,10 @@ def _run_oom_resilient_backward(
                     torch.autograd.graph, "save_on_cpu"):
                 activation_offload = True
                 offload_trigger_work = active_work
-                print(f"[train-oom] {device_label}: singleton still OOM after "
-                      "GPU headroom; retrying with saved activations offloaded "
-                      "to CPU", flush=True)
+                terminal_log_only(
+                    f"[train-oom] {device_label}: singleton still OOM after "
+                    "GPU headroom; retrying with saved activations offloaded "
+                    "to CPU", flush=True)
                 continue
 
             victim_index = max(
@@ -7311,8 +7351,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     else type(sampler).__name__)
     save_parent_selections(
         exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info)
-    print(f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
-          f"generation/training", flush=True)
+    terminal_log_only(
+        f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
+        f"generation/training", flush=True)
 
     # Only problems that declare it get their construction written to disk.
     save_ctor = (bool(getattr(problem, "saves_construction", False))
@@ -7678,15 +7719,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
         isolated_memory_limit_bytes = (
             _automatic_sandbox_memory_limit_bytes(n_reward_workers))
-        print(f"[step {step_idx}] isolated evaluation pool: "
-              f"{n_reward_workers} sandbox process(es) across "
-              f"{isolated_cpu_count} CPU(s), up to "
-              f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
-              "process tree is pinned to one CPU and excess candidates remain "
-              "queued; sandbox launches are FD-safe and do not reduce this "
-              f"parallelism; automatic memory ceiling="
-              f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
-              "stdout+stderr capture is bounded")
+        terminal_log_only(
+            f"[step {step_idx}] isolated evaluation pool: "
+            f"{n_reward_workers} sandbox process(es) across "
+            f"{isolated_cpu_count} CPU(s), up to "
+            f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
+            "process tree is pinned to one CPU and excess candidates remain "
+            "queued; sandbox launches are FD-safe and do not reduce this "
+            f"parallelism; automatic memory ceiling="
+            f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
+            "stdout+stderr capture is bounded")
     else:
         n_reward_workers = _resolve_reward_workers(cfg, problem)
         print(f"[step {step_idx}] evaluation pool: {n_reward_workers} worker(s), "
@@ -8646,7 +8688,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
                     planning_pool = strategy_pool or gen_pool
-                    print(f"[step {step_idx}] hierarchical planning: "
+                    terminal_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
                           f"{strategies_per_parent} sequential strategies with "
                           f"{cfg.strategy_model_name}; LoRA disabled "
@@ -8773,7 +8815,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             planning_pool.release()
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
-                    print(f"[step {step_idx}] two-stage coding: generating "
+                    terminal_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
@@ -8844,7 +8886,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
-                    print(
+                    terminal_log_only(
                         f"[step {step_idx}] rollout pilot: "
                         f"{pilot_programs_per_strategy} programs x "
                         f"{len(source_job_indices)} strategies; CPU evaluation "
@@ -8917,7 +8959,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
                 if two_stage_rollouts:
                     source_prompt_jobs = prompt_jobs
-                    print(f"[step {step_idx}] hierarchical planning: "
+                    terminal_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
                           f"{strategies_per_parent} sequential strategies with "
                           f"{cfg.strategy_model_name}; LoRA disabled "
@@ -8977,7 +9019,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     break
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
-                    print(f"[step {step_idx}] two-stage coding: generating "
+                    terminal_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
                           "strategy-conditioned prompts", flush=True)
@@ -9035,7 +9077,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
-                    print(
+                    terminal_log_only(
                         f"[step {step_idx}] rollout pilot: "
                         f"{pilot_programs_per_strategy} programs x "
                         f"{len(source_job_indices)} strategies; CPU evaluation "

@@ -152,6 +152,30 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIn("\rrollouts: 1/10", console.getvalue())
         self.assertIn("\rrollouts: 10/10", console.getvalue())
 
+    def test_terminal_log_only_bypasses_console_and_keeps_timestamp(self):
+        from train_multy_CVaR import (
+            _TerminalLogSink,
+            _TerminalTeeStream,
+            _TimestampedLineStream,
+        )
+        from terminal_output import terminal_log_only
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "temirnal.log"
+            console = io.StringIO()
+            sink = _TerminalLogSink()
+            stream = _TimestampedLineStream(_TerminalTeeStream(console, sink))
+            sink.bind(log_path)
+            with patch.object(sys, "stdout", stream):
+                terminal_log_only("[step 2] quiet operational detail", flush=True)
+            saved = log_path.read_text()
+            sink.log_file.close()
+
+        self.assertEqual(console.getvalue(), "")
+        self.assertRegex(
+            saved,
+            r"^\[\d{2}:\d{2}:\d{2}\] \[step 2\] quiet operational detail\n$")
+
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
         from model_backend import _hf_training_attention_implementation
 
