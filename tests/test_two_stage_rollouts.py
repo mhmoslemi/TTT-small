@@ -330,7 +330,7 @@ def test_qwen_sampling_profile_does_not_override_explicit_coder_yaml():
     assert config["strategy_qwen3_8b_thinking_sampling"] is False
 
 
-def test_qwen_sampling_profile_fills_only_missing_values():
+def test_qwen_coder_sampling_keeps_yaml_values_and_disables_filters():
     config = {
         "model_name": "Qwen/Qwen3-8B",
         "thinking": True,
@@ -340,8 +340,8 @@ def test_qwen_sampling_profile_fills_only_missing_values():
     }
     _apply_qwen3_8b_thinking_sampling(config, frozenset())
 
-    assert config["temperature"] == 0.6
-    assert config["top_p"] == 0.95
+    assert config["temperature"] == 1.0
+    assert config["top_p"] == 1.0
     assert config["sampling_top_k"] == 0
     assert config["sampling_min_p"] == 0.0
-    assert config["qwen3_8b_thinking_sampling"] is True
+    assert config["qwen3_8b_thinking_sampling"] is False

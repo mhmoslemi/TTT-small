@@ -110,6 +110,7 @@ class EntropyToolsTests(unittest.TestCase):
         self.assertAlmostEqual(summary["all"]["valid_fraction"], 2/3)
         self.assertEqual(summary["all"]["measured_rollouts"], 2)
         self.assertEqual(summary["all"]["measured_tokens"], 10)
+        self.assertAlmostEqual(summary["by_strategy"]["0"]["entropy_nats"], .6)
         self.assertEqual(summary["pilot"], summary["all"])
         samples = [json.loads(line) for line in (
             self.root / "step00/entropy_samples.jsonl").read_text().splitlines()]
@@ -132,8 +133,8 @@ class EntropyToolsTests(unittest.TestCase):
         history = [json.loads(line) for line in
                    (self.root / "entropy.jsonl").read_text().splitlines()]
         self.assertEqual([row["step"] for row in history], [0, 1, 2])
-        for name in ["entropy.svg", "strategy_diversity.svg"]:
-            ET.parse(self.root / name)
+        self.assertTrue((self.root / "entropy.pdf").read_bytes().startswith(b"%PDF"))
+        ET.parse(self.root / "strategy_diversity.svg")
         entropy.save_step(self.root, 1, [], SimpleNamespace(), {})
         history = [json.loads(line) for line in
                    (self.root / "entropy.jsonl").read_text().splitlines()]
@@ -141,10 +142,24 @@ class EntropyToolsTests(unittest.TestCase):
         self.assertIsNone(history[-1]["all"]["entropy_nats"])
 
     def test_missing_entropy_is_a_gap_not_a_zero_curve(self):
-        entropy.save_step(self.root, 0, [], SimpleNamespace(), {})
-        plot = (self.root / "entropy.svg").read_text()
-        self.assertIn("No measured values yet", plot)
-        self.assertNotIn("<circle", plot)
+        summary = entropy.save_step(self.root, 0, [], SimpleNamespace(), {})
+        self.assertIsNone(summary["all"]["entropy_nats"])
+        self.assertTrue((self.root / "entropy.pdf").read_bytes().startswith(b"%PDF"))
+
+    def test_strategy_entropy_is_saved_both_pooled_and_by_parent(self):
+        rows = [self.observation(group=0, rollout=0, strategy=0, tokens=2),
+                self.observation(group=1, rollout=0, strategy=0, tokens=3),
+                self.observation(group=0, rollout=1, strategy=1, tokens=4)]
+        for row, total in zip(rows, (1.0, 3.0, 8.0)):
+            self.measured(row, total)
+        summary = entropy.save_step(
+            self.root, 0, rows, SimpleNamespace(strategies_per_parent=2), {})
+        self.assertAlmostEqual(
+            summary["by_strategy"]["0"]["entropy_nats"], 4.0 / 5.0)
+        self.assertAlmostEqual(
+            summary["by_strategy"]["1"]["entropy_nats"], 2.0)
+        self.assertEqual(
+            sorted(summary["by_parent_strategy"]), ["p0:s0", "p0:s1", "p1:s0"])
 
     def test_pilots_used_for_diversity_and_contexts_not_mixed(self):
         rows = [self.observation(rollout=0, strategy=0),

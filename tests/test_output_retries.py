@@ -125,6 +125,7 @@ class RunnerRetryTests(unittest.TestCase):
             queued_by_parent={0: 0}, queued_by_group={0: 0}, planned_by_group={0: 0},
             group_responses={0: []}, reward_futures={0: []},
             primary_rollout_records=[], coder_retry_records=[],
+            deferred_coder_retry_batches=[],
             phase_prompt_job_cache={}, coder_retry_prompt_cache={},
             entropy_directory=None, rollout_io_futures=[],
             rollout_io_pool=InlinePool(), reward_pool=InlinePool(),
@@ -178,6 +179,8 @@ class RunnerRetryTests(unittest.TestCase):
         functions_from_file("train_multy_CVaR.py", {
             "_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
             "_queue_rollout", "_submit_rollout", "_run_coder_format_retries",
+            "_defer_coder_format_retries",
+            "_drain_deferred_coder_format_retries",
             "_run_vllm_code_phase", "_run_local_code_phase"}, scope)
         return scope, calls, seeds, saved, evaluated
 
@@ -230,6 +233,35 @@ class RunnerRetryTests(unittest.TestCase):
             dict(output_format_issue="missing", retry_attempt=1),
             dict(output_format_issue=None, retry_attempt=0)], seed_offset=0)
         self.assertFalse(calls)
+
+    def test_adaptive_phases_finish_before_deferred_format_retries(self):
+        for backend in ("vllm", "hf"):
+            with self.subTest(backend=backend), redirect_stdout(io.StringIO()):
+                s, calls, seeds, *_ = self.runner(backend)
+                run = s["_run_vllm_code_phase" if backend == "vllm"
+                        else "_run_local_code_phase"]
+                pilots = run(
+                    [2], phase="pilot", seed_offset=0,
+                    progress_desc="pilots", defer_format_retries=True)
+                self.assertEqual(len(pilots), 2)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(s["coder_retry_records"]), 0)
+
+                followups = run(
+                    [1], phase="adaptive", seed_offset=4_000_000,
+                    progress_desc="phase2", defer_format_retries=True)
+                self.assertEqual(len(followups), 1)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(s["coder_retry_records"]), 0)
+                self.assertEqual(len(s["deferred_coder_retry_batches"]), 2)
+
+                s["_drain_deferred_coder_format_retries"]()
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(len(s["coder_retry_records"]), 2)
+                self.assertEqual(s["deferred_coder_retry_batches"], [])
+                self.assertEqual(
+                    seeds,
+                    [0, 4_000_000, 20_000_000, 24_000_000])
 
     def test_one_stage_generation_also_keeps_originals_and_adds_only_one_retry(self):
         tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())

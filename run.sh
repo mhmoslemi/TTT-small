@@ -39,7 +39,7 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
 # Measurement only: reuse policy forwards for full-vocabulary entropy and
-# refresh entropy.jsonl / entropy.svg / strategy_diversity.svg each step.
+# refresh entropy.jsonl / entropy.pdf / strategy_diversity.svg each step.
 # No extra model forwards; skipped/unscored examples have missing coverage.
 #   sh run.sh --measure-entropy
 # Opt into hierarchical rollouts. The frozen strategist runs first, is fully

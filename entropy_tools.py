@@ -336,6 +336,108 @@ def _line_plot(path, rows, series, ylabel, *, upper=None):
     _atomic_text(path, "\n".join(svg))
 
 
+def _finite_entropy(row, field):
+    value = field(row)
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _entropy_pdf(path, rows):
+    """One figure: all coder rollouts left, one strategy slot per right axis."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    strategy_indices = sorted({
+        int(index)
+        for row in rows
+        for index in row.get("by_strategy", {})
+    })
+    right_rows = max(1, len(strategy_indices))
+    figure_height = max(5.6, 1.75 * right_rows)
+    figure = plt.figure(figsize=(13.5, figure_height), constrained_layout=True)
+    layout = figure.add_gridspec(
+        right_rows, 2, width_ratios=(2.45, 1.0), wspace=0.18, hspace=0.62)
+    overall_axis = figure.add_subplot(layout[:, 0])
+    strategy_axes = [figure.add_subplot(layout[index, 1])
+                     for index in range(right_rows)]
+
+    all_values = []
+    for row in rows:
+        value = _finite_entropy(row, lambda item: item["all"]["entropy_nats"])
+        if value is not None:
+            all_values.append(value)
+        for aggregate in row.get("by_strategy", {}).values():
+            value = aggregate.get("entropy_nats")
+            if value is not None and math.isfinite(float(value)):
+                all_values.append(float(value))
+    upper = max([0.1] + [value * 1.08 for value in all_values])
+    steps = [int(row["step"]) for row in rows]
+
+    def draw(axis, values, *, color, title, large=False):
+        points = [(step, value) for step, value in zip(steps, values)
+                  if value is not None]
+        if points:
+            axis.plot([point[0] for point in points],
+                      [point[1] for point in points],
+                      color=color, linewidth=2.5 if large else 1.8,
+                      marker="o", markersize=4.5 if large else 3.5)
+        else:
+            axis.text(0.5, 0.5, "No measurements", ha="center", va="center",
+                      transform=axis.transAxes, color="#777777", fontsize=9)
+        axis.set_title(title, fontsize=13 if large else 10, pad=7)
+        axis.set_ylim(0.0, upper)
+        axis.grid(True, color="#e5e7eb", linewidth=0.8)
+        for side in ("top", "right"):
+            axis.spines[side].set_visible(False)
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+        axis.tick_params(labelsize=10 if large else 8)
+
+    draw(
+        overall_axis,
+        [_finite_entropy(row, lambda item: item["all"]["entropy_nats"])
+         for row in rows],
+        color="#6d28d9", title="All coder rollouts", large=True)
+    overall_axis.set_xlabel("Training step", fontsize=12)
+    overall_axis.set_ylabel("Mean token entropy (nats)", fontsize=12)
+
+    if strategy_indices:
+        palette = plt.get_cmap("tab10")
+        for axis, strategy_index in zip(strategy_axes, strategy_indices):
+            draw(
+                axis,
+                [_finite_entropy(
+                    row,
+                    lambda item, key=str(strategy_index): item.get(
+                        "by_strategy", {}).get(key, {}).get("entropy_nats"))
+                 for row in rows],
+                color=palette(strategy_index % 10),
+                title=f"Strategy {strategy_index} (all parents)")
+            axis.set_ylabel("nats", fontsize=8)
+        strategy_axes[-1].set_xlabel("Training step", fontsize=9)
+    else:
+        draw(strategy_axes[0], [], color="#6b7280",
+             title="Strategy-conditioned rollouts")
+        strategy_axes[0].set_xlabel("Training step", fontsize=9)
+
+    figure.suptitle("Coder output entropy", fontsize=16, fontweight="semibold")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=".entropy-", suffix=".pdf", dir=path.parent)
+    os.close(handle)
+    try:
+        figure.savefig(temporary, format="pdf", bbox_inches="tight")
+        os.replace(temporary, path)
+    finally:
+        plt.close(figure)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def save_step(exp_dir, step, observations, cfg, stats):
     """Join all worker observations; atomically upsert history and refresh plots."""
     samples = []
@@ -351,9 +453,46 @@ def save_step(exp_dir, step, observations, cfg, stats):
                         "token_count": 0,
                         "reason": "no_completed_policy_forward"}
         row.update(measured)
+        row["entropy_nats"] = (
+            float(row["entropy_sum_nats"]) / int(row["token_count"])
+            if row.get("measured") and int(row.get("token_count") or 0) > 0
+            else None)
         samples.append(row)
+    observed_strategy_indices = sorted({
+        int(row["strategy"]) for row in samples
+        if row.get("strategy") is not None
+    })
+    configured_strategy_count = (
+        int(getattr(cfg, "strategies_per_parent", 0) or 0)
+        if bool(getattr(cfg, "strategies", bool(observed_strategy_indices)))
+        else 0)
+    strategy_count = max(
+        configured_strategy_count,
+        (max(observed_strategy_indices) + 1
+         if observed_strategy_indices else 0),
+    )
+    by_strategy = {
+        str(strategy_index): _aggregate([
+            row for row in samples
+            if row.get("strategy") == strategy_index
+        ])
+        for strategy_index in range(strategy_count)
+    }
+    by_parent_strategy = {}
+    for parent, strategy in sorted({
+            (int(row["parent"]), int(row["strategy"]))
+            for row in samples if row.get("strategy") is not None}):
+        by_parent_strategy[f"p{parent}:s{strategy}"] = {
+            "parent": parent,
+            "strategy": strategy,
+            **_aggregate([
+                row for row in samples
+                if row.get("parent") == parent
+                and row.get("strategy") == strategy
+            ]),
+        }
     summary = {
-        "schema_version": 1, "step": int(step),
+        "schema_version": 2, "step": int(step),
         "measurement": "pre_update_training_policy_full_vocabulary_entropy",
         "units": "nats", "logit_temperature": 1.0,
         "includes": "all_response_tokens_including_reasoning_and_failed_outputs",
@@ -367,6 +506,13 @@ def save_step(exp_dir, step, observations, cfg, stats):
                      for key in ("temperature", "top_p", "sampling_top_k",
                                  "sampling_min_p", "thinking")},
         "all": _aggregate(samples),
+        # Strategy indices are the sequential strategy slots within every
+        # selected parent. The plotted value pools the same slot across
+        # parents; the fully disaggregated values remain available below.
+        "by_strategy": by_strategy,
+        "by_parent_strategy": by_parent_strategy,
+        "strategy_entropy_aggregation": (
+            "token_weighted_by_strategy_index_pooled_across_parents_and_phases"),
         "pilot": _aggregate([r for r in samples if r["phase"] == "pilot"
                              and not r.get("retry_attempt", 0)]),
         "retries": _aggregate([r for r in samples if r.get("retry_attempt", 0)]),
@@ -390,10 +536,7 @@ def save_step(exp_dir, step, observations, cfg, stats):
     history[int(step)] = summary
     rows = [history[key] for key in sorted(history)]
     _atomic_text(history_path, "".join(_json(row) + "\n" for row in rows))
-    _line_plot(exp_dir / "entropy.svg", rows, [
-        ("All measured responses", "#702dbd", lambda r: r["all"]["entropy_nats"]),
-        ("Pilot only", "#29a6b6", lambda r: r["pilot"]["entropy_nats"]),
-    ], "Coder conditional entropy (nats)")
+    _entropy_pdf(exp_dir / "entropy.pdf", rows)
     _line_plot(exp_dir / "strategy_diversity.svg", rows, [
         ("Within strategy", "#702dbd", lambda r:
          r["code_diversity"]["within_strategy"]["distance"]),

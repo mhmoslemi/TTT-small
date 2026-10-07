@@ -65,6 +65,7 @@ _STRATEGY_FINAL_MARKERS = (
 )
 _LOG_TIME_OFFSET_SECONDS = -4 * 60 * 60
 _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
+_QWEN3_8B_MODEL_BASENAME = "qwen3-8b"
 _QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
 _GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
 _QWEN3_30B_A3B_THINKING_MODEL_BASENAME = (
@@ -149,7 +150,7 @@ def _profile_default(merged, key, value, explicit_keys):
 
 
 def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
-    """Default to Qwen3-8B's thinking sampling without overriding YAML."""
+    """Resolve unfiltered sampling while leaving coder temperature/p in YAML."""
     # Project-wide invariant: never truncate the candidate distribution by a
     # fixed token count. vLLM translates 0 to its native disabled value (-1),
     # while Transformers accepts 0 directly.
@@ -169,11 +170,11 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
 
     if (_is_qwen3_8b_sampling_model(merged.get("model_name"))
             and bool(merged.get("thinking", False))):
-        _profile_default(merged, "temperature", 0.6, explicit_keys)
-        _profile_default(merged, "top_p", 0.95, explicit_keys)
-        if ("min_p" not in explicit_keys
-                and "sampling_min_p" not in explicit_keys):
-            merged["sampling_min_p"] = 0.0
+        # Coder temperature and nucleus sampling are experiment controls and
+        # therefore come straight from YAML/config.  Qwen3-8B's automatic
+        # runtime contract only enforces the project's deliberately
+        # unfiltered policy: no top-k and no minimum-probability cutoff.
+        merged["sampling_min_p"] = 0.0
         merged["qwen3_8b_thinking_sampling"] = bool(
             float(merged["temperature"]) == 0.6
             and float(merged["top_p"]) == 0.95
@@ -184,7 +185,7 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
             f"temperature={merged['temperature']}, top_p={merged['top_p']}, "
             f"top_k={merged['sampling_top_k']}, "
             f"min_p={merged['sampling_min_p']} "
-            "(explicit YAML/config values take precedence)")
+            "(temperature/top_p from YAML/config; filters disabled)")
 
     if (bool(merged.get("strategies", False))
             and _is_qwen3_8b_sampling_model(
@@ -270,6 +271,23 @@ def _apply_strategy_model_profile(
 def _coder_model_profile(model_name):
     """Return the automatic runtime contract for explicitly supported coders."""
     basename = _model_basename(model_name)
+    if basename == _QWEN3_8B_MODEL_BASENAME:
+        return {
+            "name": "qwen3-8b",
+            # The checkpoint's exact native rotary-position ceiling.  Longer
+            # 131K operation requires YaRN and is intentionally not enabled
+            # implicitly because it changes positional scaling/model behavior.
+            "native_context": 40_960,
+            # Generation code subtracts the actual prompt length, so this
+            # exposes every native token still available to the completion.
+            "max_output": 40_960,
+            "template_kind": "qwen3",
+            "training_4bit": False,
+            "training_layout": "replicated",
+            "training_memory_fraction": 0.88,
+            "vllm_runtime_reserve_gib": 5.0,
+            "force_thinking": True,
+        }
     if basename == _GPT_OSS_120B_MODEL_BASENAME:
         return {
             "name": "gpt-oss-120b",
@@ -417,15 +435,25 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     native_context = int(profile["native_context"])
     merged["coder_model_profile"] = str(profile["name"])
     merged["coder_template_kind"] = str(profile["template_kind"])
-    _profile_default(
-        merged, "coder_reasoning_effort",
-        str(profile["reasoning_effort"]), explicit_keys)
+    if "reasoning_effort" in profile:
+        _profile_default(
+            merged, "coder_reasoning_effort",
+            str(profile["reasoning_effort"]), explicit_keys)
+    else:
+        # Qwen3-8B exposes only the real enable_thinking switch; it has no
+        # native low/medium/high reasoning-effort control.
+        merged.pop("coder_reasoning_effort", None)
     merged["coder_preserve_thinking"] = bool(
         profile["template_kind"] == "qwen3.8")
     _profile_default(merged, "max_seq_length", native_context, explicit_keys)
     _profile_default(
         merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
-    _profile_default(merged, "thinking", True, explicit_keys)
+    if bool(profile.get("force_thinking", False)):
+        # This project uses Qwen3-8B only in its thinking mode.  Unlike
+        # temperature/top-p, this is part of the selected model contract.
+        merged["thinking"] = True
+    else:
+        _profile_default(merged, "thinking", True, explicit_keys)
 
     # Native GPT-OSS MXFP4 remains the vLLM checkpoint. Its trainable copy is
     # selected independently by _resolve_training_model_name below.
@@ -472,14 +500,22 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     # starts comparable later trajectories in that exact fallback directly.
     merged["long_training_cpu_offload_min_tokens"] = None
 
+    precedence_note = (
+        "temperature/top_p remain YAML-controlled; thinking on and "
+        "top-k/min-p off are enforced"
+        if profile["name"] == "qwen3-8b"
+        else "explicit YAML/config values take precedence"
+    )
+    reasoning_label = merged.get(
+        "coder_reasoning_effort", "thinking on/off only")
     print(
         f"[model-profile] {profile['name']}: context limit="
         f"{merged['max_seq_length']}, max generated tokens="
         f"{merged['max_new_tokens']}, reasoning="
-        f"{merged['coder_reasoning_effort']}, rollout target=one "
+        f"{reasoning_label}, rollout target=one "
         "TP=1 engine/GPU; training layout="
-        f"{merged['training_layout']}; explicit YAML/config values take "
-        "precedence; exact long-context training enabled",
+        f"{merged['training_layout']}; {precedence_note}; exact "
+        "long-context training enabled",
         flush=True,
     )
 
@@ -1245,7 +1281,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--measure-entropy", action="store_const", const=True, default=None,
         help="Measure detached full-vocabulary coder entropy from existing "
              "pre-update training forwards, plus code diversity and validity. "
-             "Save entropy.jsonl and simple SVG plots each completed step. "
+             "Save entropy.jsonl and a combined entropy PDF each completed step. "
              "No extra model forward; unscored rollouts have explicit missing "
              "coverage (--no-train records diversity only).")
     p.add_argument(
@@ -7773,6 +7809,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     primary_rollout_records = []
     coder_retry_records = []
     coder_retry_prompt_cache = {}
+    # Adaptive generation must never stop useful planned work to run a small
+    # recovery-only batch. Keep each batch's original seed offset and drain it
+    # after every pilot/phase-2 rollout has been generated. The adapter does
+    # not change inside a step, so this is scheduling-only: prompts, policy,
+    # sampling, token limits, rewards, and training membership stay identical.
+    deferred_coder_retry_batches = []
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
     if adaptive_strategy_pilots and defer_gpu_evaluation:
@@ -7973,6 +8015,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] coder format recovery complete: "
               f"{len(failed) - still_missing}/{len(failed)} complete blocks; "
               f"{still_missing} still missing (failure reward, no further retries)", flush=True)
+
+    def _defer_coder_format_retries(records, *, seed_offset):
+        failed = [record for record in records
+                  if record.get("output_format_issue") is not None
+                  and not record.get("retry_attempt", 0)]
+        if failed:
+            deferred_coder_retry_batches.append(
+                (failed, int(seed_offset)))
+
+    def _drain_deferred_coder_format_retries():
+        while deferred_coder_retry_batches:
+            records, seed_offset = deferred_coder_retry_batches.pop(0)
+            _run_coder_format_retries(
+                records, seed_offset=int(seed_offset))
 
     def _strategy_plan_metadata(source_job_idx):
         source_job = prompt_jobs[int(source_job_idx)]
@@ -8824,7 +8880,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     source_job_indices = list(range(len(prompt_jobs)))
 
                     def _run_vllm_code_phase(
-                            counts, *, phase, seed_offset, progress_desc):
+                            counts, *, phase, seed_offset, progress_desc,
+                            defer_format_retries=False):
                         active = [
                             (source_idx, int(count))
                             for source_idx, count in zip(
@@ -8883,7 +8940,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             raise RuntimeError(
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
-                        _run_coder_format_retries(phase_records, seed_offset=seed_offset)
+                        if defer_format_retries:
+                            _defer_coder_format_retries(
+                                phase_records, seed_offset=seed_offset)
+                        else:
+                            _run_coder_format_retries(
+                                phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     terminal_log_only(
@@ -8897,7 +8959,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         [pilot_programs_per_strategy]
                         * len(source_job_indices),
                         phase="pilot", seed_offset=0,
-                        progress_desc="pilot rollouts")
+                        progress_desc="pilot rollouts",
+                        defer_format_retries=True)
 
                     def _run_ready_vllm_followups(
                             counts, dispatch_index, _batch_total,
@@ -8908,11 +8971,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 4_000_000 + dispatch_index * 100_000),
                             progress_desc=(
                                 "adaptive rollouts "
-                                f"{dispatched_after}/{expected_total}"))
+                                f"{dispatched_after}/{expected_total}"),
+                            defer_format_retries=True)
 
                     _run_adaptive_followups_as_ready(
                         pilot_records, source_job_indices,
                         _run_ready_vllm_followups)
+                    _drain_deferred_coder_format_retries()
                 else:
                     # Keep the disabled path structurally identical to the
                     # original one-pass rollout scheduler.
@@ -9028,7 +9093,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     source_job_indices = list(range(len(prompt_jobs)))
 
                     def _run_local_code_phase(
-                            counts, *, phase, seed_offset, progress_desc):
+                            counts, *, phase, seed_offset, progress_desc,
+                            defer_format_retries=False):
                         active = [
                             (source_idx, int(count))
                             for source_idx, count in zip(
@@ -9074,7 +9140,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             raise RuntimeError(
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
-                        _run_coder_format_retries(phase_records, seed_offset=seed_offset)
+                        if defer_format_retries:
+                            _defer_coder_format_retries(
+                                phase_records, seed_offset=seed_offset)
+                        else:
+                            _run_coder_format_retries(
+                                phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     terminal_log_only(
@@ -9088,7 +9159,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         [pilot_programs_per_strategy]
                         * len(source_job_indices),
                         phase="pilot", seed_offset=0,
-                        progress_desc="pilot rollouts")
+                        progress_desc="pilot rollouts",
+                        defer_format_retries=True)
 
                     def _run_ready_local_followups(
                             counts, dispatch_index, _batch_total,
@@ -9099,11 +9171,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 4_000_000 + dispatch_index * 100_000),
                             progress_desc=(
                                 "adaptive rollouts "
-                                f"{dispatched_after}/{expected_total}"))
+                                f"{dispatched_after}/{expected_total}"),
+                            defer_format_retries=True)
 
                     _run_adaptive_followups_as_ready(
                         pilot_records, source_job_indices,
                         _run_ready_local_followups)
+                    _drain_deferred_coder_format_retries()
                     cfg._local_generation_cap = int(cap_state["value"])
                 else:
                     # Keep the disabled path structurally identical to the
@@ -11586,7 +11660,7 @@ def main():
                           f"{measured['rollouts']} rollouts "
                           f"({measured['measured_tokens']}/"
                           f"{measured['response_tokens']} response tokens); "
-                          "updated entropy.jsonl, entropy.svg, "
+                          "updated entropy.jsonl, entropy.pdf, "
                           "strategy_diversity.svg", flush=True)
                 except (OSError, ValueError, TypeError) as error:
                     print(f"[warn] entropy diagnostics could not be saved: "

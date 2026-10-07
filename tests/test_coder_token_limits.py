@@ -25,6 +25,7 @@ def token_functions():
     names = {"_model_basename", "_coder_model_profile", "_profile_default",
              "_apply_coder_model_profile", "_resolve_coder_token_limits"}
     constants = {"_GPT_OSS_120B_MODEL_BASENAME",
+                 "_QWEN3_8B_MODEL_BASENAME",
                  "_QWEN3_30B_A3B_THINKING_MODEL_BASENAME",
                  "_QWEN38_27B_MODEL_BASENAME"}
     nodes = [node for node in ast.parse(RUNNER.read_text()).body
@@ -51,7 +52,8 @@ class CoderTokenLimitTests(unittest.TestCase):
         return config
 
     def test_profile_defaults_and_strategy_limits_unchanged(self):
-        for name, expected in [("Qwen/Qwen3.8-27B", 262144),
+        for name, expected in [("Qwen/Qwen3-8B", 40960),
+                               ("Qwen/Qwen3.8-27B", 262144),
                                ("Qwen/Qwen3-30B-A3B-Thinking-2507", 262144),
                                ("openai/gpt-oss-120b", 131072)]:
             with self.subTest(model=name):
@@ -62,6 +64,19 @@ class CoderTokenLimitTests(unittest.TestCase):
                 self.assertNotIn("model_native_context_length", config)
                 self.assertEqual(config["strategy_max_seq_length"], 8192)
                 self.assertEqual(config["strategy_max_new_tokens"], 4096)
+
+    def test_qwen3_8b_profile_forces_thinking_without_fake_effort(self):
+        config = self.resolve(dict(
+            model_name="Qwen/Qwen3-8B", thinking=False,
+            temperature=0.73, top_p=0.81,
+        ))
+        self.assertTrue(config["thinking"])
+        self.assertNotIn("coder_reasoning_effort", config)
+        self.assertEqual(config["coder_template_kind"], "qwen3")
+        self.assertEqual(config["temperature"], 0.73)
+        self.assertEqual(config["top_p"], 0.81)
+        self.assertEqual(config["training_layout"], "replicated")
+        self.assertFalse(config["load_in_4bit"])
 
     def test_explicit_limits_still_override_profiles(self):
         config = self.resolve(dict(model_name="Qwen/Qwen3.8-27B",
