@@ -58,6 +58,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
     "strategy_api_concurrency", "strategy_api_timeout_s",
     "strategy_api_max_retries",
+    "strategy_format_max_retries",
     "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
@@ -205,6 +206,12 @@ def validate_problem_config(
                 "strategy_max_seq_length", "binary_coder_lora_rank"):
         if key in data:
             _positive_int(data, key, source)
+    if "strategy_format_max_retries" in data:
+        retries = data["strategy_format_max_retries"]
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError(
+                f"{_label(source)}: strategy_format_max_retries must be a "
+                "non-negative integer")
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

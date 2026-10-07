@@ -43,6 +43,9 @@ from types import SimpleNamespace
 import numpy as np
 import yaml
 from entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
+from output_retries import (coder_output_issue, coder_retry_prompt_job, final_answer_scope,
+                            output_retry_messages, retry_metadata,
+                            strategy_retry_needed)
 
 
 _STRATEGY_FALLBACK = (
@@ -317,6 +320,41 @@ def _coder_model_profile(model_name):
     return None
 
 
+def _coder_effort_for_rollout_phase(cfg, phase=None):
+    """Keep the configured pilot effort; use native xhigh for Qwen3.8 phase 2."""
+    if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
+            and phase == "adaptive"):
+        return "xhigh"
+    return getattr(cfg, "coder_reasoning_effort", None)
+
+
+def _phase_coder_prompt_job(prompt_jobs, source_idx, phase, cfg, render, cache):
+    """Return an immutable phase-specific prompt ID without changing pilots.
+
+    Records must retain the exact prompt used at generation for old/reference
+    logprobs, training, and artifact saving. Appending a prompt variant instead
+    of replacing the source job preserves pilot histories and tensor caches.
+    Allocation still uses the original source ID, so variants add no budget.
+    """
+    effort = _coder_effort_for_rollout_phase(cfg, phase)
+    if effort == _coder_effort_for_rollout_phase(cfg):
+        return int(source_idx)
+    key = (int(source_idx), effort)
+    if key not in cache:
+        source = prompt_jobs[int(source_idx)]
+        variant = {
+            **source,
+            "prompt_text": render(source["messages"], rollout_phase=phase),
+            "coder_reasoning_effort": effort,
+            # This is a prompt alias, not a new allocation. Phase generation
+            # supplies the actual counts explicitly to the existing scheduler.
+            "count": 0,
+        }
+        cache[key] = len(prompt_jobs)
+        prompt_jobs.append(variant)
+    return cache[key]
+
+
 def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     """Wire reasoning, context, rollout, and exact-training behavior by model.
 
@@ -446,9 +484,10 @@ def _extract_final_strategy(response_text):
     the end of the response. An explicit final channel is preferred when the
     template exposes one, but is not required: preceding reasoning is harmless
     because it is never returned. A missing, empty, or unclosed final block is
-    retried by the caller and ultimately becomes the safe fallback.
+    retried by the caller; exhausting the configured limit stops the run.
+    The fallback string is only an extraction-error sentinel, never handed off.
     """
-    raw = str(response_text or "").strip()
+    raw = final_answer_scope(response_text).strip()
     if not raw:
         return _STRATEGY_FALLBACK, "empty response"
 
@@ -1229,6 +1268,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Multiply G and K by this when both signals clear.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--strategy-max-new-tokens", type=int, default=None)
+    p.add_argument("--strategy-format-max-retries", type=int, default=None,
+                   help="Additional attempts for missing strategy blocks; "
+                        "stop if exhausted (default: 3).")
     p.add_argument("--strategy-max-seq-length", type=int, default=None)
     p.add_argument("--strategy-temperature", type=float, default=None)
     p.add_argument("--strategy-top-p", type=float, default=None)
@@ -1740,6 +1782,12 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
+    strategy_format_max_retries = merged.get("strategy_format_max_retries", 3)
+    if (isinstance(strategy_format_max_retries, bool)
+            or not isinstance(strategy_format_max_retries, int)
+            or strategy_format_max_retries < 0):
+        raise ValueError("strategy_format_max_retries must be a non-negative integer")
+    merged["strategy_format_max_retries"] = strategy_format_max_retries
     if merged["strategies"]:
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
@@ -7430,14 +7478,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                ensure_trainer_ready=None):
     import os
     import torch
-    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
     from queue import Queue
 
     from sampler import State
     from experiment_io import (save_parent_selections, save_rollout,
                                save_rollout_artifacts,
                                save_strategy_response)
-    from problems.base import ParentContext, STRATEGY_OUTPUT_CONTRACT
+    from problems.base import ParentContext, RewardResult
     from gen_workers import make_progress_bar
 
     from feedback import (FeedbackStats, bound_feedback_advantage,
@@ -7559,7 +7607,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         adapter_path = _save_adapter(
             model, exp_dir, step_idx, cfg.model_name)
 
-    def _render(messages):
+    def _render(messages, *, rollout_phase=None):
         template_kind = str(
             getattr(cfg, "coder_template_kind", "generic"))
         render_messages = _coder_messages_for_template(
@@ -7571,7 +7619,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         elif template_kind == "qwen3.8":
             template_options.update({
                 "enable_thinking": True,
-                "reasoning_effort": str(cfg.coder_reasoning_effort),
+                "reasoning_effort": str(
+                    _coder_effort_for_rollout_phase(cfg, rollout_phase)),
                 "preserve_thinking": bool(cfg.coder_preserve_thinking),
             })
         elif template_kind == "qwen-thinking":
@@ -7636,6 +7685,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             )
 
     prompt_jobs = []
+    phase_prompt_job_cache = {}
     for g, _parent in enumerate(parents):
         messages = base_messages[g]
         count = (int(cfg.group_size) * x_grpo_groups_per_context
@@ -7644,6 +7694,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "parent_group": g,
             "messages": messages,
             "prompt_text": _render(messages),
+            "coder_reasoning_effort": _coder_effort_for_rollout_phase(cfg),
             "count": count,
         })
 
@@ -7664,6 +7715,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
     adaptive_strategy_pilots = bool(
         two_stage_rollouts and pilot_programs_per_strategy > 0)
+    if (adaptive_strategy_pilots
+            and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
+        print(f"[step {step_idx}] Qwen3.8 coder reasoning: "
+              f"pilot={_coder_effort_for_rollout_phase(cfg, 'pilot')}; "
+              "phase 2=xhigh", flush=True)
     if (two_stage_rollouts
             and int(cfg.group_size)
             != strategies_per_parent * programs_per_strategy):
@@ -7702,6 +7758,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return schedule
 
     strategy_chains = []
+    strategy_prompt_cache = {}
+    strategy_attempt_prompts = {}
+    strategy_format_max_retries = int(getattr(cfg, "strategy_format_max_retries", 3))
     if two_stage_rollouts:
         for parent_group in range(len(parents)):
             schedule = _source_schedule(parent_group)
@@ -7729,62 +7788,58 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             raw_response,
         )
         strategy, extraction_issue = _extract_final_strategy(raw_response)
+        if extraction_issue is not None:
+            raise RuntimeError("cannot admit an invalid strategy into a dependent chain")
         chain["strategies"].append({
             "response": raw_response,
             "strategy": strategy,
             "extraction_issue": extraction_issue,
         })
 
-    def _strategy_prompt(source_jobs, chain, strategy_index, *, retry=False):
-        source_idx = chain["source_indices"][strategy_index]
-        previous = [
-            record["strategy"] for record in chain["strategies"]
-            if record["extraction_issue"] is None
-        ]
-        messages = problem.build_strategy_messages(
-            source_jobs[source_idx]["messages"],
-            previous_strategies=previous,
-        )
+    def _strategy_prompt(source_jobs, chain, strategy_index, *, retry=0):
+        from copy import deepcopy
+        key = (int(chain["chain_id"]), int(strategy_index))
+        if key not in strategy_prompt_cache:
+            source_idx = chain["source_indices"][strategy_index]
+            strategy_prompt_cache[key] = deepcopy(problem.build_strategy_messages(
+                source_jobs[source_idx]["messages"],
+                previous_strategies=[record["strategy"]
+                                     for record in chain["strategies"]]))
+        messages = deepcopy(strategy_prompt_cache[key])
         if retry:
-            retry_instruction = (
-                "Your previous attempt did not contain a complete usable "
-                "final strategy. You may reason as needed, but end with exactly "
-                "one complete <strategy>...</strategy> block containing the "
-                "full structured implementation plan requested above, including "
-                "the mathematical specification, concrete algorithm, budget, "
-                "and validation. Preserve the details needed by the coder; "
-                "remove repetition rather than reducing the plan to a summary. "
-                "Only that block is retained. Put nothing "
-                "after </strategy>, and close it before the token limit."
-            )
-            retry_instruction += "\n\n" + STRATEGY_OUTPUT_CONTRACT
-            if messages and messages[-1].get("role") == "user":
-                messages[-1]["content"] = (
-                    str(messages[-1].get("content", "")).rstrip()
-                    + "\n\n" + retry_instruction + "\n"
-                )
-            else:
-                messages.append({"role": "user", "content": retry_instruction})
-        return _render_strategy(
-            messages,
-            # Effort stays at the configured level (cfg.strategy_reasoning_effort)
-            # on retry too. Repair the output contract while preserving the
-            # complete implementation plan for the coder.
-            reasoning_effort=None,
-        )
+            messages = output_retry_messages(messages, "strategy")
+        prompt = _render_strategy(messages, reasoning_effort=None)
+        strategy_attempt_prompts[(*key, int(retry))] = prompt
+        return prompt
+
+    def _handle_strategy_attempt(chain_index, strategy_index, response, attempt):
+        chain = strategy_chains[int(chain_index)]
+        issue = _extract_final_strategy(response)[1]
+        save_strategy_response(
+            exp_dir, step_idx, int(chain["parent_group"]),
+            int(chain["fold_index"]), int(strategy_index), response,
+            attempt=int(attempt), extraction_issue=issue,
+            prompt_text=strategy_attempt_prompts.pop(
+                (int(chain["chain_id"]), int(strategy_index), int(attempt))))
+        needs_retry = strategy_retry_needed(
+            issue, attempt, strategy_format_max_retries,
+            label=f"strategy {strategy_index + 1}, chain {chain_index + 1}")
+        if needs_retry:
+            print(f"[warn] strategy {strategy_index + 1}, chain {chain_index + 1}: "
+                  f"{issue}; format retry {int(attempt) + 1}/"
+                  f"{strategy_format_max_retries} with unchanged reasoning/sampling",
+                  flush=True)
+        else:
+            _record_strategy_response(chain, strategy_index, response)
+            strategy_prompt_cache.pop((int(chain["chain_id"]), int(strategy_index)), None)
+        return needs_retry
 
     def _code_prompt_jobs(source_jobs, chains):
         extraction_failures = sum(
             record["extraction_issue"] is not None
             for chain in chains for record in chain["strategies"])
         if extraction_failures:
-            print(
-                f"[warn] strategist returned {extraction_failures}/"
-                f"{len(chains) * strategies_per_parent} malformed or "
-                "truncated final answers; coder prompts use the explicit "
-                "safe fallback for those entries",
-                flush=True,
-            )
+            raise RuntimeError("invalid strategies cannot be passed to the coder")
         code_jobs = []
         for chain in chains:
             if len(chain["strategies"]) != strategies_per_parent:
@@ -7906,6 +7961,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     vllm_logprob_records = []
     queued_by_parent = {g: 0 for g in range(len(parents))}
     queued_by_group = {g: 0 for g in range(num_groups)}
+    planned_by_group = {g: 0 for g in range(num_groups)}
+    primary_rollout_records = []
+    coder_retry_records = []
+    coder_retry_prompt_cache = {}
     defer_gpu_evaluation = bool(
         getattr(cfg, "evaluation_shares_generation", False))
     if adaptive_strategy_pilots and defer_gpu_evaluation:
@@ -7929,7 +7988,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         g = int(record["group_id"])
         parent_group = int(job["parent_group"])
         group_responses[g].append(record)
-        if isolated_eval:
+        if record.get("output_format_issue") is not None:
+            # A missing artifact is already a verified format failure. Never
+            # execute an earlier reasoning snippet or evaluate it twice.
+            fut = Future()
+            fut.set_result(RewardResult(
+                reward=float(problem.fail_score), msg=record["output_format_issue"],
+                failure_kind="code"))
+        elif isolated_eval:
             fut = reward_pool.submit(
                 _run_isolated_reward, record["text"],
                 parent_ctxs[parent_group])
@@ -7945,14 +8011,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return fut
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None, *,
-                       rollout_phase=None, strategy_source_job_idx=None):
+                       rollout_phase=None, strategy_source_job_idx=None,
+                       retry_of=None):
         # Admit every sampled code response exactly once. Incomplete or
-        # malformed responses are preserved and the verifier assigns their
-        # failure reward; generation must not replace them with repaired draws.
+        # malformed originals are preserved with their failure reward. Format
+        # retries are separate examples and never count toward allocation.
         job = prompt_jobs[int(job_idx)]
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
-        if x_grpo_mode:
+        if retry_of is not None:
+            fold_index = int(retry_of["fold_index"])
+            group_id = int(retry_of["group_id"])
+        elif x_grpo_mode:
             maximum = x_grpo_groups_per_context * int(cfg.group_size)
             if parent_ordinal >= maximum:
                 raise RuntimeError(
@@ -7964,7 +8034,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             ))
             group_id = (
                 parent_group * x_grpo_groups_per_context + fold_index)
-            if queued_by_group[group_id] >= int(cfg.group_size):
+            if planned_by_group[group_id] >= int(cfg.group_size):
                 raise RuntimeError(
                     "X-GRPO generation returned more than G rollouts for "
                     f"context {parent_group} fold {fold_index}")
@@ -7972,7 +8042,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             fold_index = 0
             group_id = parent_group
         rollout_index = int(queued_by_group[group_id])
-        queued_by_parent[parent_group] = parent_ordinal + 1
+        if retry_of is None:
+            queued_by_parent[parent_group] = parent_ordinal + 1
+            planned_by_group[group_id] += 1
         queued_by_group[group_id] = rollout_index + 1
         record = {
             "job_idx": int(job_idx),
@@ -7985,7 +8057,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "token_ids": list(token_ids),
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
+            "output_format_issue": coder_output_issue(
+                text, require_final_marker=bool(
+                    getattr(problem, "require_final_code_marker", False))),
+            "retry_attempt": 0 if retry_of is None else 1,
+            "retry_of_group": None if retry_of is None else int(retry_of["group_id"]),
+            "retry_of_rollout": None if retry_of is None else int(retry_of["rollout_index"]),
+            "counts_toward_allocation": retry_of is None,
         }
+        (primary_rollout_records if retry_of is None else coder_retry_records).append(record)
         if entropy_directory is not None:
             record["_entropy_measurement"] = observation_descriptor(
                 entropy_directory, int(group_id), rollout_index)
@@ -8001,12 +8081,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             strategy_text=(job.get("strategy_response")
                            if two_stage_rollouts else None),
             pending_meta={
+                **retry_metadata(record),
                 "status": "evaluation_pending",
                 "step": int(step_idx),
                 "group": int(group_id),
                 "parent_group": parent_group,
                 "rollout": rollout_index,
                 "n_response_tokens": len(token_ids),
+                "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "strategy_rollout_phase": (
                     str(rollout_phase) if rollout_phase is not None else None),
                 "strategy_source_job_idx": (
@@ -8024,6 +8106,65 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         else:
             _submit_rollout(record)
         return record
+
+    def _run_coder_format_retries(records, *, seed_offset):
+        """One extra attempt per missing output; never returned to the allocator."""
+        failed = [record for record in records
+                  if record.get("output_format_issue") is not None
+                  and not record.get("retry_attempt", 0)]
+        if not failed:
+            return
+        prompt_indices = [coder_retry_prompt_job(
+            prompt_jobs, record, _render, coder_retry_prompt_cache) for record in failed]
+        prompts = [prompt_jobs[index]["prompt_text"] for index in prompt_indices]
+        with eval_progress_condition:
+            eval_bar.total += len(failed)
+            eval_bar.refresh()
+        print(f"[step {step_idx}] coder format recovery: {len(failed)} extra attempts "
+              "(one per missing output); originals retained, allocation unchanged, "
+              "original phase reasoning/sampling preserved", flush=True)
+        retry_step = int(step_idx) + int(seed_offset) + 20_000_000
+        if gen_pool is not None:
+            options = dict(
+                prompts_by_group=prompts, group_size=1,
+                counts_by_group=[1] * len(prompts), adapter_path=adapter_path,
+                max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature,
+                top_p=cfg.top_p, top_k=getattr(cfg, "sampling_top_k", None),
+                min_p=getattr(cfg, "sampling_min_p", None), step_idx=retry_step,
+                progress_desc="coder format retries",
+                full_policy_sampling=_uses_sequence_level_policy_ratio(cfg))
+            if cfg.generation_backend == "vllm":
+                options["return_logprobs"] = training_enabled
+            stream = gen_pool.iter_group_jobs(**options)
+        else:
+            _seed_local_generation(retry_step)
+            stream = generate_prompt_jobs(
+                model, tokenizer, prompts, [1] * len(prompts), cfg,
+                cap_state=cap_state)
+        seen = set()
+        still_missing = 0
+        for index, results in stream:
+            index = int(index)
+            if index not in range(len(failed)) or index in seen or len(results) != 1:
+                raise RuntimeError("coder format retries returned invalid/duplicate sample IDs")
+            original = failed[index]
+            result = results[0]
+            record = _queue_rollout(
+                prompt_indices[index], result[0], result[1],
+                result[2] if len(result) > 2 else None,
+                rollout_phase=original.get("strategy_rollout_phase"),
+                strategy_source_job_idx=original.get("strategy_source_job_idx"),
+                retry_of=original)
+            source = original.get("strategy_source_job_idx")
+            if source is not None:
+                _attach_strategy_plan(record, source, original["strategy_rollout_phase"])
+            still_missing += record["output_format_issue"] is not None
+            seen.add(index)
+        if len(seen) != len(failed):
+            raise RuntimeError("coder format retries did not return every extra attempt")
+        print(f"[step {step_idx}] coder format recovery complete: "
+              f"{len(failed) - still_missing}/{len(failed)} complete blocks; "
+              f"{still_missing} still missing (failure reward, no further retries)", flush=True)
 
     def _strategy_plan_metadata(source_job_idx):
         source_job = prompt_jobs[int(source_job_idx)]
@@ -8481,6 +8622,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         records_by_source = {}
         for responses in group_responses.values():
             for record in responses:
+                if record.get("retry_attempt", 0):
+                    continue
                 source_idx = record.get("strategy_source_job_idx")
                 if source_idx is None:
                     continue
@@ -8746,7 +8889,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     try:
                         def _generate_strategy_batch(
                                 prompts, chain_indices, strategy_index,
-                                *, retry=False):
+                                *, retry=0):
                             responses = {}
                             completed = set()
                             suffix = " retry" if retry else ""
@@ -8772,7 +8915,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         step_idx=(
                                             int(step_idx) + 2_000_000
                                             + strategy_index * 10_000
-                                            + (5_000 if retry else 0)),
+                                            + int(retry) * 1_000_000),
                                         progress_desc=(
                                             f"strategy "
                                             f"{strategy_index + 1}/"
@@ -8795,7 +8938,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     raise RuntimeError(
                                         "strategy generation returned chain "
                                         f"{chain_index} more than once")
-                                responses[chain_index] = job_results[0][0]
+                                responses[chain_index] = _handle_strategy_attempt(
+                                    chain_index, strategy_index, job_results[0][0], retry)
                                 completed.add(chain_index)
                             if completed != set(chain_indices):
                                 raise RuntimeError(
@@ -8810,42 +8954,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     source_prompt_jobs,
                                     strategy_chains[int(chain_index)],
                                     int(strategy_index),
-                                    retry=bool(retry),
-                                )
-
-                            def _handle_ready_strategy(
-                                    chain_index, strategy_index,
-                                    response, retry):
-                                extraction_issue = _extract_final_strategy(
-                                    response)[1]
-                                if extraction_issue is not None and not retry:
-                                    return True
-                                _record_strategy_response(
-                                    strategy_chains[int(chain_index)],
-                                    int(strategy_index),
-                                    response,
-                                )
-                                return False
-
-                            def _announce_strategy_retry(
-                                    chain_index, strategy_index):
-                                print(
-                                    f"[warn] strategy "
-                                    f"{int(strategy_index) + 1}/"
-                                    f"{strategies_per_parent}, chain "
-                                    f"{int(chain_index) + 1}/"
-                                    f"{len(strategy_chains)}: retrying one "
-                                    "malformed or truncated answer with a "
-                                    "constrained final pass",
-                                    flush=True,
+                                    retry=int(retry),
                                 )
 
                             planning_pool.run_sequential_chains(
                                 num_chains=len(strategy_chains),
                                 num_stages=strategies_per_parent,
                                 prompt_builder=_build_ready_strategy_prompt,
-                                result_handler=_handle_ready_strategy,
-                                on_retry=_announce_strategy_retry,
+                                result_handler=_handle_strategy_attempt,
+                                max_retries=strategy_format_max_retries,
                                 adapter_path=None,
                                 max_new_tokens=int(
                                     cfg.strategy_max_new_tokens),
@@ -8867,50 +8984,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     strategies_per_parent):
                                 chain_indices = list(range(
                                     len(strategy_chains)))
-                                strategy_prompts = [
-                                    _strategy_prompt(
-                                        source_prompt_jobs, chain,
-                                        strategy_index)
-                                    for chain in strategy_chains
-                                ]
-                                responses = _generate_strategy_batch(
-                                    strategy_prompts, chain_indices,
-                                    strategy_index)
-                                malformed = [
-                                    chain_index
-                                    for chain_index, response
-                                    in responses.items()
-                                    if _extract_final_strategy(response)[1]
-                                    is not None
-                                ]
-                                if malformed:
-                                    print(
-                                        f"[warn] strategy "
-                                        f"{strategy_index + 1}/"
-                                        f"{strategies_per_parent}: retrying "
-                                        f"{len(malformed)} malformed or "
-                                        "truncated answer(s) with a "
-                                        "constrained final pass",
-                                        flush=True,
-                                    )
-                                    retry_prompts = [
+                                for attempt in range(strategy_format_max_retries + 1):
+                                    strategy_prompts = [
                                         _strategy_prompt(
                                             source_prompt_jobs,
                                             strategy_chains[chain_index],
-                                            strategy_index,
-                                            retry=True)
-                                        for chain_index in malformed
-                                    ]
-                                    responses.update(
-                                        _generate_strategy_batch(
-                                            retry_prompts, malformed,
-                                            strategy_index, retry=True))
-                                for chain_index in chain_indices:
-                                    _record_strategy_response(
-                                        strategy_chains[chain_index],
-                                        strategy_index,
-                                        responses[chain_index],
-                                    )
+                                            strategy_index, retry=attempt)
+                                        for chain_index in chain_indices]
+                                    needs_retry = _generate_strategy_batch(
+                                        strategy_prompts, chain_indices,
+                                        strategy_index, retry=attempt)
+                                    chain_indices = [index for index in chain_indices
+                                                     if needs_retry[index]]
+                                    if not chain_indices:
+                                        break
                     finally:
                         if (planning_pool is not gen_pool
                                 and not getattr(
@@ -8940,10 +9027,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             return []
                         active_indices = [item[0] for item in active]
                         active_counts = [item[1] for item in active]
+                        active_prompt_indices = [
+                            _phase_coder_prompt_job(
+                                prompt_jobs, index, phase, cfg, _render,
+                                phase_prompt_job_cache)
+                            for index in active_indices]
                         options = {
                             "prompts_by_group": [
                                 prompt_jobs[index]["prompt_text"]
-                                for index in active_indices],
+                                for index in active_prompt_indices],
                             "group_size": max(active_counts),
                             "counts_by_group": active_counts,
                             "adapter_path": adapter_path,
@@ -8970,7 +9062,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 behavior_logprobs = (
                                     result[2] if len(result) > 2 else None)
                                 record = _queue_rollout(
-                                    source_idx, text, token_ids,
+                                    active_prompt_indices[int(local_idx)],
+                                    text, token_ids,
                                     behavior_logprobs,
                                     rollout_phase=phase,
                                     strategy_source_job_idx=source_idx)
@@ -8982,6 +9075,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             raise RuntimeError(
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
+                        _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     print(
@@ -9040,6 +9134,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 result[2] if len(result) > 2 else None)
                             _queue_rollout(
                                 job_idx, text, token_ids, behavior_logprobs)
+                    _run_coder_format_retries(primary_rollout_records, seed_offset=0)
             else:
                 # In-process generation uses cross-prompt micro-batches rather
                 # than draining one parent at a time. Ordinary CPU verification
@@ -9073,63 +9168,47 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         cfg, "strategy_sampling_min_p", None)
                     with backend.disable_adapter():
                         for strategy_index in range(strategies_per_parent):
-                            strategy_prompts = [
-                                _strategy_prompt(
-                                    source_prompt_jobs, chain, strategy_index)
-                                for chain in strategy_chains
-                            ]
-                            _seed_local_generation(
-                                int(step_idx) + 2_000_000
-                                + strategy_index * 10_000)
-                            completed_chains = set()
-                            strategy_bar = make_progress_bar(
-                                len(strategy_chains),
-                                desc=(f"strategy {strategy_index + 1}/"
-                                      f"{strategies_per_parent}"))
-                            try:
-                                for chain_index, responses in (
-                                        generate_prompt_jobs(
-                                            model, tokenizer,
-                                            strategy_prompts,
-                                            [1] * len(strategy_prompts),
-                                            strategy_cfg,
-                                            max_new_tokens=int(
-                                                cfg.strategy_max_new_tokens),
-                                            temperature=float(
-                                                cfg.strategy_temperature),
+                            pending_chains = list(range(len(strategy_chains)))
+                            for attempt in range(strategy_format_max_retries + 1):
+                                strategy_prompts = [
+                                    _strategy_prompt(source_prompt_jobs,
+                                                     strategy_chains[index],
+                                                     strategy_index, retry=attempt)
+                                    for index in pending_chains]
+                                _seed_local_generation(
+                                    int(step_idx) + 2_000_000
+                                    + strategy_index * 10_000 + attempt * 1_000_000)
+                                completed_chains = set()
+                                retry_chains = []
+                                strategy_bar = make_progress_bar(
+                                    len(pending_chains),
+                                    desc=f"strategy {strategy_index + 1} attempt {attempt}")
+                                try:
+                                    for local_index, responses in generate_prompt_jobs(
+                                            model, tokenizer, strategy_prompts,
+                                            [1] * len(strategy_prompts), strategy_cfg,
+                                            max_new_tokens=int(cfg.strategy_max_new_tokens),
+                                            temperature=float(cfg.strategy_temperature),
                                             top_p=float(cfg.strategy_top_p),
-                                            top_k=getattr(
-                                                cfg,
-                                                "strategy_sampling_top_k",
-                                                None),
-                                            min_p=getattr(
-                                                cfg,
-                                                "strategy_sampling_min_p",
-                                                None),
-                                            cap_state=cap_state)):
-                                    if len(responses) != 1:
-                                        raise RuntimeError(
-                                            "strategy generation must return "
-                                            "exactly one response per chain")
-                                    chain_index = int(chain_index)
-                                    if chain_index in completed_chains:
-                                        raise RuntimeError(
-                                            "strategy generation returned "
-                                            f"chain {chain_index} more than "
-                                            "once")
-                                    _record_strategy_response(
-                                        strategy_chains[chain_index],
-                                        strategy_index,
-                                        responses[0][0],
-                                    )
-                                    completed_chains.add(chain_index)
-                                    strategy_bar.update(1)
-                            finally:
-                                strategy_bar.close()
-                            if len(completed_chains) != len(strategy_chains):
-                                raise RuntimeError(
-                                    "strategy generation did not return every "
-                                    "parent/fold chain")
+                                            top_k=getattr(cfg, "strategy_sampling_top_k", None),
+                                            min_p=getattr(cfg, "strategy_sampling_min_p", None),
+                                            cap_state=cap_state):
+                                        chain_index = pending_chains[int(local_index)]
+                                        if len(responses) != 1 or chain_index in completed_chains:
+                                            raise RuntimeError("invalid strategy generation result count")
+                                        if _handle_strategy_attempt(
+                                                chain_index, strategy_index,
+                                                responses[0][0], attempt):
+                                            retry_chains.append(chain_index)
+                                        completed_chains.add(chain_index)
+                                        strategy_bar.update(1)
+                                finally:
+                                    strategy_bar.close()
+                                if completed_chains != set(pending_chains):
+                                    raise RuntimeError("strategy generation omitted a parent/fold chain")
+                                pending_chains = sorted(retry_chains)
+                                if not pending_chains:
+                                    break
                     prompt_jobs = _code_prompt_jobs(
                         source_prompt_jobs, strategy_chains)
                     print(f"[step {step_idx}] two-stage coding: generating "
@@ -9152,6 +9231,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             return []
                         active_indices = [item[0] for item in active]
                         active_counts = [item[1] for item in active]
+                        active_prompt_indices = [
+                            _phase_coder_prompt_job(
+                                prompt_jobs, index, phase, cfg, _render,
+                                phase_prompt_job_cache)
+                            for index in active_indices]
                         _seed_local_generation(
                             int(step_idx) + int(seed_offset))
                         phase_records = []
@@ -9161,13 +9245,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             for local_idx, responses in generate_prompt_jobs(
                                     model, tokenizer,
                                     [prompt_jobs[index]["prompt_text"]
-                                     for index in active_indices],
+                                     for index in active_prompt_indices],
                                     active_counts, cfg,
                                     cap_state=cap_state):
                                 source_idx = active_indices[int(local_idx)]
                                 for text, token_ids in responses:
                                     record = _queue_rollout(
-                                        source_idx, text, token_ids,
+                                        active_prompt_indices[int(local_idx)],
+                                        text, token_ids,
                                         rollout_phase=phase,
                                         strategy_source_job_idx=source_idx)
                                     _attach_strategy_plan(
@@ -9181,6 +9266,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             raise RuntimeError(
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
+                        _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     print(
@@ -9229,6 +9315,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         cfg._local_generation_cap = int(cap_state["value"])
                     finally:
                         gen_bar.close()
+
+                    _run_coder_format_retries(primary_rollout_records, seed_offset=0)
+                    cfg._local_generation_cap = int(cap_state["value"])
 
             if x_grpo_mode:
                 expected_per_context = (
@@ -9881,10 +9970,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if rewards_np.size == 0:
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
-        if x_grpo_mode and len(responses) != int(cfg.group_size):
+        if x_grpo_mode and planned_by_group[g] != int(cfg.group_size):
             raise RuntimeError(
                 f"X-GRPO context {context_id} fold {fold_index} returned "
-                f"{len(responses)} rollouts; expected G={int(cfg.group_size)}")
+                f"{planned_by_group[g]} planned rollouts; expected G={int(cfg.group_size)}")
         adv_mode = active_advantage_mode
         x_trial_advantages = None
         x_trial_info = None
@@ -9966,14 +10055,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             })
 
         # growth signals for this group
-        if len(valids):
-            best_valid_yield = max(best_valid_yield, sum(valids) / len(valids))
+        planned_valids = [valid for record, valid in zip(responses, valids)
+                         if not record.get("retry_attempt", 0)]
+        if planned_valids:
+            best_valid_yield = max(best_valid_yield, sum(planned_valids) / len(planned_valids))
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
         parent_val = float(parent.value) if parent.value is not None else 0.0
         for r_idx in range(len(responses)):
-            if valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val:
+            if (not responses[r_idx].get("retry_attempt", 0)
+                    and valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val):
                 distinct_good_hashes.add(hash(codes[r_idx].strip()))
 
         group_label = (f"context {context_id} fold {fold_index}"
@@ -10026,6 +10118,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             pick_info = (sampler.last_picks_info[parent_group]
                          if parent_group < len(sampler.last_picks_info) else {})
             meta = {
+                **retry_metadata(record),
                 "step": step_idx,
                 "group": g,
                 "parent_group": parent_group,
@@ -10048,6 +10141,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "advantage_scale": (float(adv_scale)
                                     if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
+                "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": (res.stdout or "")[:2000],
                 "parent_value": float(parent.value) if parent.value is not None else None,
                 "parent_raw_score": (float(parent.raw_score)
@@ -10518,6 +10612,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"\033[93m{message}\033[0m", flush=True)
 
     step_stats = {
+        "planned_rollouts": len(primary_rollout_records),
+        "coder_format_retries": len(coder_retry_records),
+        "coder_format_retries_still_missing": sum(
+            record["output_format_issue"] is not None for record in coder_retry_records),
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
         "step_best_raw_score": step_best_raw_score,
@@ -11132,6 +11230,8 @@ def main():
                 f"total={cfg.group_size}/parent")
         print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
               f"then existing top {cfg.topk_children_per_parent}/parent")
+        print(f"Output retries:     strategy up to {cfg.strategy_format_max_retries} "
+              "(stop on exhaustion); coder once (extra training example)")
         print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "

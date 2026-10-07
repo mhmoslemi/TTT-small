@@ -1832,15 +1832,15 @@ class GenerationPool:
             self, *, num_chains, num_stages, prompt_builder, result_handler,
             adapter_path, max_new_tokens, temperature, top_p, step_idx=0,
             top_k=None, min_p=None, on_retry=None,
-            progress_desc="strategies"):
+            progress_desc="strategies", max_retries=1):
         """Run dependent generation chains without a barrier between stages.
 
         ``prompt_builder(chain, stage, retry)`` runs in the parent process after
         the prior stage has been accepted. ``result_handler`` receives
-        ``(chain, stage, text, retry)`` and returns true only when the first
-        answer needs one constrained retry. A retry is always terminal so a
-        malformed model cannot loop forever; the handler can store its normal
-        safe fallback before returning.
+        ``(chain, stage, text, attempt)`` and returns true when an output-format
+        retry is needed. Attempt zero is the original; at most ``max_retries``
+        additional attempts are allowed. Exhaustion raises, never advances the
+        dependent chain with a malformed answer.
 
         Each engine owns at most one chain request. As soon as an engine
         finishes, the newly-ready continuation is dispatched immediately,
@@ -1849,6 +1849,9 @@ class GenerationPool:
         """
         num_chains = int(num_chains)
         num_stages = int(num_stages)
+        max_retries = int(max_retries)
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
         if num_chains < 0 or num_stages < 0:
             raise ValueError("chain and stage counts must be non-negative")
         if not num_chains or not num_stages:
@@ -1879,7 +1882,7 @@ class GenerationPool:
             base_gen_kwargs["min_p"] = float(min_p)
 
         pending = deque(
-            (chain_index, 0, False)
+            (chain_index, 0, 0)
             for chain_index in range(num_chains)
         )
         free_workers = set(range(self.num_workers))
@@ -1892,10 +1895,10 @@ class GenerationPool:
         def _dispatch(rank, item):
             chain_index, stage_index, retry = item
             prompt = prompt_builder(
-                int(chain_index), int(stage_index), bool(retry))
+                int(chain_index), int(stage_index), int(retry))
             task_step = (
                 int(step_idx) + int(stage_index) * 10_000
-                + (5_000 if retry else 0)
+                + int(retry) * 1_000_000
             )
             gen_kwargs = dict(base_gen_kwargs)
             # Preserve the old stable chain seed even when a continuation is
@@ -1908,7 +1911,7 @@ class GenerationPool:
                 gen_kwargs,
             ))
             inflight[int(rank)] = (
-                int(chain_index), int(stage_index), bool(retry))
+                int(chain_index), int(stage_index), int(retry))
 
         try:
             while pending or inflight:
@@ -1959,17 +1962,21 @@ class GenerationPool:
                 text = job_results[0][0]
                 needs_retry = bool(result_handler(
                     chain_index, stage_index, text, retry))
-                if needs_retry and not retry:
+                if needs_retry:
+                    if retry >= max_retries:
+                        raise RuntimeError(
+                            f"strategy chain {chain_index} stage {stage_index} "
+                            f"exhausted {max_retries} format retries")
                     retries += 1
                     if on_retry is not None:
                         on_retry(chain_index, stage_index)
-                    pending.append((chain_index, stage_index, True))
+                    pending.append((chain_index, stage_index, retry + 1))
                     continue
 
                 completed += 1
                 bar.update(1)
                 if stage_index + 1 < num_stages:
-                    pending.append((chain_index, stage_index + 1, False))
+                    pending.append((chain_index, stage_index + 1, 0))
         finally:
             bar.close()
 
@@ -2529,7 +2536,21 @@ class PhasedVLLMGenerationPool:
         yield from self._ensure_started().iter_group_jobs(*args, **kwargs)
 
     def run_sequential_chains(self, *args, **kwargs):
-        return self._ensure_started().run_sequential_chains(*args, **kwargs)
+        pool = self._ensure_started()
+        try:
+            return pool.run_sequential_chains(*args, **kwargs)
+        except BaseException:
+            # A format-retry exhaustion can leave other chains in flight.
+            # Stop those workers directly; sending sleep commands into their
+            # unfinished generation stream can block or consume stale replies.
+            self._pool = None
+            self._awake = False
+            self._persistent = False
+            try:
+                pool.shutdown()
+            finally:
+                self._after_stop()
+            raise
 
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)
@@ -2623,7 +2644,11 @@ class OnDemandGenerationPool:
 
     def run_sequential_chains(self, *args, **kwargs):
         pool = self._ensure_started()
-        return pool.run_sequential_chains(*args, **kwargs)
+        try:
+            return pool.run_sequential_chains(*args, **kwargs)
+        except BaseException:
+            self.release()
+            raise
 
     def generate_groups(self, *args, **kwargs):
         return self._ensure_started().generate_groups(*args, **kwargs)

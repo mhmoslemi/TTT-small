@@ -235,16 +235,26 @@ def save_rollout_artifacts(
 
 def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
                            fold: int, strategy: int,
-                           response_text: str) -> Path:
+                           response_text: str, *, attempt=None,
+                           prompt_text=None, extraction_issue=None) -> Path:
     """Persist one planning response immediately after generation returns."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
     step_dir.mkdir(exist_ok=True)
+    suffix = "" if attempt is None else f"_attempt{int(attempt):02d}"
     base = (f"step{step:02d}_group{parent_group:02d}_fold{fold:02d}_"
-            f"strategy{strategy:02d}.txt")
+            f"strategy{strategy:02d}{suffix}.txt")
     path = step_dir / base
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(str(response_text or ""), errors="replace")
     tmp.replace(path)
+    if attempt is not None:
+        prompt = (prompt_text if isinstance(prompt_text, str)
+                  else json.dumps(prompt_text, ensure_ascii=False, indent=2))
+        path.with_suffix(".prompt.txt").write_text(prompt, errors="replace")
+        path.with_suffix(".meta.json").write_text(json.dumps({
+            "attempt": int(attempt), "extraction_issue": extraction_issue,
+            "accepted": extraction_issue is None,
+        }, indent=2))
     return path
 
 

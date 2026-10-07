@@ -198,6 +198,7 @@ def rollout_observation(descriptor, meta, code):
         "parent": int(meta.get("parent_group", meta["group"])),
         "strategy": meta.get("strategy_index"),
         "phase": meta.get("strategy_rollout_phase") or "ordinary",
+        "retry_attempt": int(meta.get("retry_attempt") or 0),
         "valid": bool(meta["valid"]), "reward": float(meta["reward"]),
         "raw_score": meta.get("raw_score"),
         "response_tokens": int(meta["n_response_tokens"]),
@@ -233,6 +234,7 @@ def _sketch_distance(a, b, size=128):
 
 def code_diversity(rows, max_pairs_per_parent=256):
     """Balanced-pilot, same-parent comparisons with bounded CPU-only work."""
+    rows = [row for row in rows if not row.get("retry_attempt", 0)]
     pilot = [row for row in rows if row["phase"] == "pilot"]
     selected = pilot or rows
     usable = [row for row in selected if row["valid"] and row.get("_code")]
@@ -365,7 +367,9 @@ def save_step(exp_dir, step, observations, cfg, stats):
                      for key in ("temperature", "top_p", "sampling_top_k",
                                  "sampling_min_p", "thinking")},
         "all": _aggregate(samples),
-        "pilot": _aggregate([r for r in samples if r["phase"] == "pilot"]),
+        "pilot": _aggregate([r for r in samples if r["phase"] == "pilot"
+                             and not r.get("retry_attempt", 0)]),
+        "retries": _aggregate([r for r in samples if r.get("retry_attempt", 0)]),
         "code_diversity": code_diversity(samples),
         "step_best_raw_score": stats.get("step_best_raw_score"),
         "best_seen_raw_score": stats.get("best_seen_raw_score"),
