@@ -1596,7 +1596,8 @@ class GenerationPool:
             and self.num_workers > 1)
         mode = " one at a time" if staged else ""
         print(f"[pool] loading {self.num_workers} {self.backend} engine(s){mode} "
-              f"on {requested_num_gpus} GPU(s) ...", flush=True)
+              f"for {self.model_name} (TP={tp}, PP={pp}) on "
+              f"{requested_num_gpus} GPU(s) ...", flush=True)
         self._staged_loading = staged
         self._start_workers(range(self.num_workers), initial=True)
         self.sleep_supported = bool(

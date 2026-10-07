@@ -29,7 +29,6 @@ from gen_workers import (
 )
 from gpu_runtime import (
     GPUMemory,
-    align_vllm_layout_to_concurrency,
     allocate_gpu_roles,
     derive_vllm_parallel_layout,
     derive_vllm_tensor_parallel_size,
@@ -962,7 +961,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(layout.pipeline_parallel_size, 1)
         self.assertEqual(layout.replicas, 3)
 
-    def test_strategy_frontier_folds_idle_replicas_into_tensor_parallelism(self):
+    def test_small_strategist_keeps_maximum_safe_replica_parallelism(self):
         roles = allocate_gpu_roles(list(range(8)), "erdos")
         memory = {
             gpu_id: GPUMemory(
@@ -980,47 +979,15 @@ class VLLMBackendTests(unittest.TestCase):
         heads = detect_attention_heads(cfg["model_name"])
         memory_layout = derive_vllm_parallel_layout(
             cfg, roles, memory, heads)
-        frontier_layout = align_vllm_layout_to_concurrency(
-            cfg, memory_layout, len(roles.generation), heads,
-            max_concurrency=4,
-        )
-
         self.assertEqual(memory_layout.replicas, 8)
         self.assertEqual(memory_layout.tensor_parallel_size, 1)
-        self.assertEqual(frontier_layout.replicas, 4)
-        self.assertEqual(frontier_layout.tensor_parallel_size, 2)
-        self.assertEqual(frontier_layout.pipeline_parallel_size, 1)
+        self.assertEqual(memory_layout.pipeline_parallel_size, 1)
         self.assertEqual(
-            frontier_layout.replicas
-            * frontier_layout.tensor_parallel_size
-            * frontier_layout.pipeline_parallel_size,
+            memory_layout.replicas
+            * memory_layout.tensor_parallel_size
+            * memory_layout.pipeline_parallel_size,
             8,
         )
-
-    def test_strategy_frontier_leaves_full_replica_parallelism_when_busy(self):
-        roles = allocate_gpu_roles(list(range(8)), "erdos")
-        memory = {
-            gpu_id: GPUMemory(gpu_id, "RTX PRO 6000", 95.59, 95.0)
-            for gpu_id in roles.generation
-        }
-        cfg = {
-            "model_name": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-            "generation_backend": "vllm",
-            "max_seq_length": 131072,
-            "vllm_gpu_memory_utilization": "auto",
-            "vllm_quantization": "",
-            "vllm_runtime_reserve_gib": 16.0,
-        }
-        heads = detect_attention_heads(cfg["model_name"])
-        memory_layout = derive_vllm_parallel_layout(
-            cfg, roles, memory, heads)
-
-        frontier_layout = align_vllm_layout_to_concurrency(
-            cfg, memory_layout, len(roles.generation), heads,
-            max_concurrency=100,
-        )
-
-        self.assertEqual(frontier_layout, memory_layout)
 
     def test_qwen32_scoring_reserve_selects_four_tp2_engines(self):
         """The rollout layout must use GenerationPool's effective budget.
