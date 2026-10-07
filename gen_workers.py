@@ -68,7 +68,11 @@ import multiprocessing as mp
 from gpu_runtime import (
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
-from terminal_output import setting_log_only
+import terminal_output as _terminal_output
+
+
+setting_log_only = getattr(
+    _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
 
 # Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
 # process still owns CUDA contexts, NCCL state, compiled graphs, and allocator

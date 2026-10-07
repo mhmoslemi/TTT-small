@@ -20,6 +20,49 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class StartupLogTests(unittest.TestCase):
+    def test_trainer_import_tolerates_legacy_terminal_output_module(self):
+        """A stale logging helper must not abort a distributed update."""
+        tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+        compatibility_names = {
+            "setting_log_only", "_native_bind_setting_log",
+        }
+        selected = []
+        for node in tree.body:
+            if (isinstance(node, ast.Import)
+                    and any(alias.name == "terminal_output"
+                            for alias in node.names)):
+                selected.append(node)
+            elif isinstance(node, ast.Assign):
+                targets = {
+                    target.id for target in node.targets
+                    if isinstance(target, ast.Name)
+                }
+                if targets & compatibility_names:
+                    selected.append(node)
+            elif (isinstance(node, ast.FunctionDef)
+                  and node.name == "bind_setting_log"):
+                selected.append(node)
+            elif (isinstance(node, ast.If)
+                  and "hasattr(_terminal_output" in ast.unparse(node)):
+                selected.append(node)
+
+        legacy = ModuleType("terminal_output")
+        legacy_calls = []
+        legacy.terminal_log_only = lambda *args, **kwargs: legacy_calls.append(
+            (args, kwargs))
+        scope = {}
+        code = compile(
+            ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+            "trainer logging compatibility", "exec")
+        with patch.dict(sys.modules, {"terminal_output": legacy}):
+            exec(code, scope)
+
+        scope["setting_log_only"]("legacy diagnostic")
+        self.assertEqual(legacy_calls[0][0], ("legacy diagnostic",))
+        self.assertIs(legacy.setting_log_only, scope["setting_log_only"])
+        self.assertIs(legacy.bind_setting_log, scope["bind_setting_log"])
+        self.assertIsNone(scope["bind_setting_log"]("/tmp/unused-setting.log"))
+
     def test_pre_directory_output_saved_and_resume_appends(self):
         console = io.StringIO()
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(console):

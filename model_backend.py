@@ -5,7 +5,11 @@ import os
 import torch
 import types
 import weakref
-from terminal_output import setting_log_only
+import terminal_output as _terminal_output
+
+
+setting_log_only = getattr(
+    _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
 
 
 _FUSED_LONG_ATTENTION = False

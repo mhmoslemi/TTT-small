@@ -45,7 +45,31 @@ from entropy_tools import measure_policy_entropy, token_entropy as _token_entrop
 from output_retries import (coder_output_issue, coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
-from terminal_output import bind_setting_log, setting_log_only
+import terminal_output as _terminal_output
+
+
+# Logging is diagnostic and must never make an otherwise valid trainer update
+# fail.  Accept the pre-setting.log helper module during a rolling/mixed
+# deployment; a complete deployment still uses the direct setting.log sink.
+setting_log_only = getattr(
+    _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
+_native_bind_setting_log = getattr(
+    _terminal_output, "bind_setting_log", None)
+
+
+def bind_setting_log(path, *, time_offset=0):
+    if callable(_native_bind_setting_log):
+        return _native_bind_setting_log(path, time_offset=time_offset)
+    return None
+
+
+# Downstream modules in an older deployment may still import these names
+# directly after importing this module. Publish the compatibility aliases so
+# those imports remain non-fatal as well.
+if not hasattr(_terminal_output, "setting_log_only"):
+    _terminal_output.setting_log_only = setting_log_only
+if not hasattr(_terminal_output, "bind_setting_log"):
+    _terminal_output.bind_setting_log = bind_setting_log
 
 
 _STRATEGY_FALLBACK = (
