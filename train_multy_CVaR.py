@@ -367,10 +367,10 @@ def _resolve_coder_token_limits(merged):
 
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
-    """Keep the configured pilot effort; use native xhigh for Qwen3.8 phase 2."""
+    """Keep the configured pilot effort; use medium for Qwen3.8 phase 2."""
     if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
             and phase == "adaptive"):
-        return "xhigh"
+        return "medium"
     return getattr(cfg, "coder_reasoning_effort", None)
 
 
@@ -4795,6 +4795,7 @@ class ReplicatedDataParallelTrainer:
                  optimizer, cfg, dependency_log_path=None):
         import torch
         from model_backend import load_backend
+        from loading_logs import quiet_replica_load
 
         self.cfg = cfg
         self.optimizer = optimizer
@@ -4815,7 +4816,9 @@ class ReplicatedDataParallelTrainer:
             # The explicit replica device controls placement. Keep the complete
             # budget vector so model_backend can select this device's budget.
             replica_cfg.num_training_gpus = 1
-            with _route_dependency_notices(dependency_log_path):
+            replica_log = (f"{dependency_log_path}.trainer-rank{logical_id}"
+                           if dependency_log_path else None)
+            with quiet_replica_load(replica_log):
                 replica_backend = load_backend(cfg.backend, replica_cfg)
                 replica_model, replica_tokenizer = replica_backend.load()
             self.replicas.append(
@@ -7481,7 +7484,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
         print(f"[step {step_idx}] Qwen3.8 coder reasoning: "
               f"pilot={_coder_effort_for_rollout_phase(cfg, 'pilot')}; "
-              "phase 2=xhigh", flush=True)
+              f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}",
+              flush=True)
     if (two_stage_rollouts
             and int(cfg.group_size)
             != strategies_per_parent * programs_per_strategy):
@@ -10582,25 +10586,31 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 def main():
     _install_console_timestamps()
     terminal_log = _install_terminal_log()
-    cfg, merged = load_config()
-    from problems.binary_coder import (
-        BINARY_CODER_MODE, BinaryCoderConfig)
-    binary_coder_cfg = BinaryCoderConfig.from_mapping(merged)
-    # This must precede every import path that can initialize CUDA. Worker and
-    # evaluation children replace CUDA_VISIBLE_DEVICES with their own physical
-    # groups before importing their CUDA stacks.
-    _pin_training_process(cfg.training_gpu_ids)
-    if cfg.evaluation_gpu_id is not None:
-        os.environ["TTT_EVALUATION_GPU_ID"] = str(cfg.evaluation_gpu_id)
+    from builtins import print as console_print
+    from startup_logs import StartupLog, print_dashboard
+    startup_log = StartupLog(time_offset=_LOG_TIME_OFFSET_SECONDS)
+    with startup_log.capture():
+        cfg, merged = load_config()
+        from problems.binary_coder import (
+            BINARY_CODER_MODE, BinaryCoderConfig)
+        binary_coder_cfg = BinaryCoderConfig.from_mapping(merged)
+        # This must precede every import path that can initialize CUDA. Worker
+        # and evaluation children set their own physical groups before import.
+        _pin_training_process(cfg.training_gpu_ids)
+        if cfg.evaluation_gpu_id is not None:
+            os.environ["TTT_EVALUATION_GPU_ID"] = str(cfg.evaluation_gpu_id)
 
-    # Select the run directory before runtime-only context adjustments so a
-    # fresh config.json stores the reusable base configuration.
-    from experiment_io import (append_step_result, make_experiment_dir,
-                               save_final_summary, save_step_summary)
-    resume_dir = merged.pop("_resume_dir", None)
-    exp_dir = make_experiment_dir(
-        cfg, resume_dir=resume_dir, config_dict=merged
-    )
+        # Save the reusable base configuration before runtime-only adjustments.
+        from experiment_io import (append_step_result, make_experiment_dir,
+                                   save_final_summary, save_step_summary)
+        resume_dir = merged.pop("_resume_dir", None)
+        exp_dir = make_experiment_dir(
+            cfg, resume_dir=resume_dir, config_dict=merged
+        )
+        startup_log.bind(Path(exp_dir) / "setting.log")
+    # Keep the full resolved settings in the file; show their grouped dashboard
+    # once below. Restore normal print before loading/training begins.
+    print = startup_log.print
     terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
     terminal_log.bind(terminal_log_path)
     print(f"[logs] terminal output: {terminal_log_path}", flush=True)
@@ -10700,8 +10710,9 @@ def main():
     # one-stage policy rollout path.
     problem.two_stage_rollouts = bool(cfg.strategies)
 
+    startup_log.begin_summary()
     print("=" * 70)
-    print("TTT-Discover — local multi-problem implementation")
+    print("Strategist Bandit")
     print("=" * 70)
     problem_type = getattr(cfg, "problem_type", "")
     print(f"Problem:            {cfg.problem}"
@@ -10815,6 +10826,8 @@ def main():
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
+    print(f"Coder reasoning:    pilot/base={_coder_effort_for_rollout_phase(cfg)}, "
+          f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
     print(
         f"Coder sampling:     temperature={cfg.temperature}, "
         f"top_p={cfg.top_p}, "
@@ -10871,6 +10884,9 @@ def main():
     print(f"Fused long attention: {fused_attention_label}")
     print(f"Train microbatch:   up to "
           f"{cfg.train_examples_per_microbatch} examples/GPU")
+    print(f"LoRA:               rank={cfg.lora_rank}, alpha={cfg.lora_alpha}, "
+          f"dropout={cfg.lora_dropout}")
+    print(f"Deterministic:      {cfg.deterministic}")
     if use_process_distributed_training:
         print(f"Training memory cap: {100.0 * float(cfg.training_memory_fraction):g}% "
               "per GPU (96% exact long-rollout rescue)")
@@ -10880,16 +10896,19 @@ def main():
     print("=" * 70)
 
     # ---- experiment dir ----
+    startup_log.end_summary()
     action = "resuming in" if resume_dir else "writing all rollouts to"
     print(f"[init] {action}: {exp_dir}")
 
     # ---- seed states (problem-defined) ----
     seeds = problem.seed_states()
     print(f"[init] problem produced {len(seeds)} seed state(s)")
+    print = console_print
+    print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
     # ---- backend + model ----
     # Load backend FIRST so Unsloth can patch transformers if used.
-    with _route_dependency_notices(dependency_log_path):
+    with startup_log.capture(loading=True), _route_dependency_notices(dependency_log_path):
         from model_backend import load_backend
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()

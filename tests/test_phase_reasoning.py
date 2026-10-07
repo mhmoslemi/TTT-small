@@ -34,11 +34,11 @@ def _runtime_scope(kind="qwen3.8", backend="vllm"):
 
 
 class PhaseReasoningTests(unittest.TestCase):
-    def test_native_template_receives_medium_for_pilot_xhigh_for_phase2(self):
+    def test_native_template_receives_medium_for_both_phases(self):
         scope, calls = _runtime_scope()
         messages = [{"role": "user", "content": "task and strategy"}]
         for phase, effort in [(None, "medium"), ("pilot", "medium"),
-                              ("adaptive", "xhigh")]:
+                              ("adaptive", "medium")]:
             scope["_render"](messages, rollout_phase=phase)
             self.assertEqual(calls[-1]["reasoning_effort"], effort)
             self.assertTrue(calls[-1]["enable_thinking"])
@@ -61,17 +61,18 @@ class PhaseReasoningTests(unittest.TestCase):
 
     def test_variants_keep_pilot_prompts_intact_and_are_cached(self):
         scope, calls = _runtime_scope()
+        scope["cfg"].coder_reasoning_effort = "low"
         messages = [{"role": "user", "content": "plan"}]
         jobs = [dict(messages=messages, prompt_text=scope["_render"](messages),
                      parent_group=2, strategy_index=1, assigned_fold_index=3,
-                     count=14, coder_reasoning_effort="medium")]
+                     count=14, coder_reasoning_effort="low")]
         original = copy.deepcopy(jobs[0])
         cache = {}
         index = scope["_phase_coder_prompt_job"](
             jobs, 0, "adaptive", scope["cfg"], scope["_render"], cache)
         self.assertEqual(index, 1)
         self.assertEqual(jobs[0], original)
-        self.assertEqual(jobs[index]["coder_reasoning_effort"], "xhigh")
+        self.assertEqual(jobs[index]["coder_reasoning_effort"], "medium")
         self.assertEqual(jobs[index]["count"], 0)
         self.assertEqual(jobs[index]["parent_group"], 2)
         self.assertEqual(jobs[index]["strategy_index"], 1)
@@ -83,14 +84,14 @@ class PhaseReasoningTests(unittest.TestCase):
         self.assertEqual(scope["_phase_coder_prompt_job"](
             jobs, 0, "pilot", scope["cfg"], scope["_render"], cache), 0)
 
-    def test_explicit_base_effort_is_preserved_and_xhigh_needs_no_alias(self):
+    def test_explicit_base_effort_is_preserved_and_medium_needs_no_alias(self):
         scope, _ = _runtime_scope()
         effort = scope["_coder_effort_for_rollout_phase"]
         scope["cfg"].coder_reasoning_effort = "low"
         self.assertEqual(effort(scope["cfg"], "pilot"), "low")
-        self.assertEqual(effort(scope["cfg"], "adaptive"), "xhigh")
-        scope["cfg"].coder_reasoning_effort = "xhigh"
-        jobs = [dict(prompt_text="already xhigh")]
+        self.assertEqual(effort(scope["cfg"], "adaptive"), "medium")
+        scope["cfg"].coder_reasoning_effort = "medium"
+        jobs = [dict(prompt_text="already medium")]
         self.assertEqual(scope["_phase_coder_prompt_job"](
             jobs, 0, "adaptive", scope["cfg"], scope["_render"], {}), 0)
 
@@ -152,20 +153,20 @@ class PhaseReasoningTests(unittest.TestCase):
                 self.assertEqual(len(pilots) + len(followups), 7)
                 self.assertEqual(jobs[:2], originals)
                 self.assertEqual(batches[1][1], [3])
-                self.assertEqual(len(jobs), 3)
+                self.assertEqual(len(jobs), 2)
                 for record in pilots:
                     self.assertTrue(jobs[record["job_idx"]]["prompt_text"].startswith("medium:"))
                     self.assertEqual(record["job_idx"], record["strategy_source_job_idx"])
                 for record in followups:
-                    self.assertTrue(jobs[record["job_idx"]]["prompt_text"].startswith("xhigh:"))
-                    self.assertEqual(record["job_idx"], 2)
+                    self.assertTrue(jobs[record["job_idx"]]["prompt_text"].startswith("medium:"))
+                    self.assertEqual(record["job_idx"], 1)
                     self.assertEqual(record["strategy_source_job_idx"], 1)
                     if backend == "vllm":
                         self.assertEqual(record["behavior_logprobs"], [-.4, -.5])
                 again = run([0, 1], phase="adaptive", seed_offset=4100000,
                             progress_desc="adaptive")
-                self.assertEqual(again[0]["job_idx"], 2)
-                self.assertEqual(len(jobs), 3)
+                self.assertEqual(again[0]["job_idx"], 1)
+                self.assertEqual(len(jobs), 2)
 
 
 if __name__ == "__main__":

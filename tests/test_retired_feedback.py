@@ -25,21 +25,24 @@ def previous_source(path):
     lines = (ROOT / path).read_text().splitlines(True)
     restored = []
     cursor = 0
-    for line in patch[start:end]:
-        if line.startswith("@@"):
-            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-            position = int(match.group(1)) - 1
-            restored.extend(lines[cursor:position])
-            cursor = position
-        elif line.startswith(" "):
-            assert lines[cursor] == line[1:]
-            restored.append(line[1:])
-            cursor += 1
-        elif line.startswith("+"):
-            assert lines[cursor] == line[1:]
-            cursor += 1
-        elif line.startswith("-"):
-            restored.append(line[1:])
+    offset = 0
+    # Locate exact hunk contents, not obsolete line numbers: unrelated edits
+    # (such as replica logging) may shift the code without changing the losses.
+    boundaries = [i for i in range(start, end) if patch[i].startswith("@@")]
+    for first, last in zip(boundaries, boundaries[1:] + [end]):
+        hunk = patch[first + 1:last]
+        after = [line[1:] for line in hunk if line.startswith((" ", "+"))]
+        before = [line[1:] for line in hunk if line.startswith((" ", "-"))]
+        matches = [i for i in range(cursor, len(lines) - len(after) + 1)
+                   if lines[i:i + len(after)] == after]
+        assert matches, f"Cannot locate archived hunk in {path}: {patch[first]}"
+        match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", patch[first])
+        expected = int(match.group(1)) - 1
+        position = min(matches, key=lambda i: abs(i - expected - offset))
+        offset = position - expected
+        restored.extend(lines[cursor:position])
+        restored.extend(before)
+        cursor = position + len(after)
     restored.extend(lines[cursor:])
     return "".join(restored)
 

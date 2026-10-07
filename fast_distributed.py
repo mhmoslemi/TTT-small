@@ -1275,22 +1275,24 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         if terminal_log_path:
             terminal_log.bind(terminal_log_path)
 
-        import torch
-        import torch.distributed as dist
-        from model_backend import load_backend
+        from loading_logs import quiet_replica_load
 
-        torch.set_num_threads(max(
-            1, int(os.cpu_count() or world_size) // int(world_size)))
-        torch.cuda.set_device(int(rank))
-        memory_fraction = float(
-            cfg_dict.get("training_memory_fraction", 0.80))
-        set_total_memory_ceiling(int(rank), memory_fraction)
-        cfg = SimpleNamespace(**dict(cfg_dict))
-        cfg.training_replica_device = int(rank)
-        cfg.num_training_gpus = 1
         rank_log = (f"{dependency_log_path}.trainer-rank{rank}"
                     if dependency_log_path else None)
-        with training._route_dependency_notices(rank_log):
+        with quiet_replica_load(rank_log):
+            import torch
+            import torch.distributed as dist
+            from model_backend import load_backend
+
+            torch.set_num_threads(max(
+                1, int(os.cpu_count() or world_size) // int(world_size)))
+            torch.cuda.set_device(int(rank))
+            memory_fraction = float(
+                cfg_dict.get("training_memory_fraction", 0.80))
+            set_total_memory_ceiling(int(rank), memory_fraction)
+            cfg = SimpleNamespace(**dict(cfg_dict))
+            cfg.training_replica_device = int(rank)
+            cfg.num_training_gpus = 1
             backend = load_backend(cfg.backend, cfg)
             model, tokenizer = backend.load()
         validate_model_device(model, int(rank))

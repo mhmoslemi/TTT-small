@@ -146,7 +146,7 @@ class RunnerRetryTests(unittest.TestCase):
         saved = []
         scope["save_rollout_artifacts"] = lambda *args, **kw: saved.append((args, kw))
         scope["_render"] = lambda messages, rollout_phase=None: (
-            ("xhigh" if rollout_phase == "adaptive" else "medium") + repr(messages))
+            "medium" + repr(messages))
         messages = [{"role": "user", "content": "original parent plus strategy"}]
         scope["prompt_jobs"] = [dict(
             parent_group=0, messages=messages, count=3, assigned_fold_index=0,
@@ -208,7 +208,7 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(len(calls), 4)  # still-missing retry is NOT retried
                     self.assertEqual(len(set(seeds)), 4)
                     for index, expected in [(0, "medium"), (1, "medium"),
-                                            (2, "xhigh"), (3, "xhigh")]:
+                                            (2, "medium"), (3, "medium")]:
                         self.assertTrue(calls[index][0][0].startswith(expected))
                     for rec in s["coder_retry_records"]:
                         parent = records[rec["retry_of_rollout"]]
