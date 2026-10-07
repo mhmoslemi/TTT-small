@@ -1069,7 +1069,9 @@ class HFBackend(_ModelPlacementBackend):
                 "as one replicated trainer on logical GPU "
                 f"{int(replica_device)}"
             )
-        print(f"[backend=hf] loading {training_name} {placement} ...")
+        terminal_log_only(
+            f"[backend=hf] loading {training_name} {placement} ...",
+            flush=True)
         tokenizer = AutoTokenizer.from_pretrained(
             training_name, trust_remote_code=True)
         hf_config = AutoConfig.from_pretrained(

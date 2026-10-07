@@ -231,6 +231,40 @@ class VLLMBackendTests(unittest.TestCase):
             saved,
             r"^\[\d{2}:\d{2}:\d{2}\] \[step 2\] quiet operational detail\n$")
 
+    def test_rope_notice_is_terminal_log_only(self):
+        with patch.dict(sys.modules, {
+                "numpy": types.ModuleType("numpy"),
+                "yaml": types.ModuleType("yaml"),
+        }):
+            from train_multy_CVaR import _NoticeRoutingStream
+
+        class Visible:
+            def __init__(self):
+                self.console = io.StringIO()
+                self.log_only = io.StringIO()
+
+            def write(self, value):
+                return self.console.write(value)
+
+            def write_log_only(self, value):
+                return self.log_only.write(value)
+
+            def flush(self):
+                return None
+
+        visible = Visible()
+        diagnostic = io.StringIO()
+        stream = _NoticeRoutingStream(
+            visible, diagnostic, "dependency stderr")
+        notice = (
+            "[transformers] Unrecognized keys in `rope_parameters` for "
+            "'rope_type'='yarn': {'attn_factor'}\n")
+        stream.write(notice)
+
+        self.assertEqual(visible.console.getvalue(), "")
+        self.assertEqual(visible.log_only.getvalue(), notice)
+        self.assertEqual(diagnostic.getvalue(), "")
+
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
         from model_backend import _hf_training_attention_implementation
 

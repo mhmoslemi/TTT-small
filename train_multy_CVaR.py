@@ -882,6 +882,10 @@ _ROUTED_DEPENDENCY_NOTICES = (
     "`torch_dtype` is deprecated! Use `dtype` instead!",
 )
 
+_TERMINAL_LOG_ONLY_NOTICES = (
+    "Unrecognized keys in `rope_parameters`",
+)
+
 
 class _NoticeRoutingStream:
     """Keep ordinary model-loading output visible and route known noise."""
@@ -891,6 +895,7 @@ class _NoticeRoutingStream:
         self.diagnostic = diagnostic
         self.label = label
         self._routing_line = False
+        self._terminal_log_line = False
 
     def _diagnostic_is_open(self):
         return (self.diagnostic is not None
@@ -898,16 +903,30 @@ class _NoticeRoutingStream:
 
     def write(self, value):
         for piece in str(value).splitlines(keepends=True):
+            terminal_only = (
+                self._terminal_log_line
+                or any(marker in piece
+                       for marker in _TERMINAL_LOG_ONLY_NOTICES)
+            )
             route = (self._diagnostic_is_open()
+                     and not terminal_only
                      and (self._routing_line
                           or any(marker in piece
                                  for marker in _ROUTED_DEPENDENCY_NOTICES)))
-            if route:
+            if terminal_only:
+                writer = getattr(self.visible, "write_log_only", None)
+                if writer is None:
+                    self.visible.write(piece)
+                else:
+                    writer(piece)
+            elif route:
                 if not self._routing_line:
                     self.diagnostic.write(f"[{self.label}] ")
                 self.diagnostic.write(piece)
             else:
                 self.visible.write(piece)
+            self._terminal_log_line = bool(
+                terminal_only and not piece.endswith(("\n", "\r")))
             self._routing_line = bool(
                 route and not piece.endswith(("\n", "\r")))
         return len(value)
@@ -926,6 +945,7 @@ class _NoticeRoutingStream:
     def detach_diagnostic(self):
         """Make a handler-retained wrapper safe after its file is closed."""
         self._routing_line = False
+        self._terminal_log_line = False
         self.diagnostic = None
 
     def __getattr__(self, name):
@@ -1374,6 +1394,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Use UCT parent selection instead of PUCT. Both use "
                         "the same puct_c configuration value as c.")
     p.add_argument("--max-new-tokens", type=int, default=None)
+    p.add_argument(
+        "--coder-retry", action="store_const", const=True, default=None,
+        help="Retry each coder response missing its required final code block "
+             "once. Disabled unless this flag is passed; the original failed "
+             "rollout is retained and the retry is an extra training example.")
     p.add_argument("--strategy-max-new-tokens", type=int, default=None)
     p.add_argument("--strategy-format-max-retries", type=int, default=None,
                    help="Additional attempts for missing strategy blocks; "
@@ -1811,6 +1836,9 @@ def load_config():
     merged["measure_entropy"] = bool(args.measure_entropy)
     merged["no_train"] = bool(args.no_train)
     merged["isolate_eval"] = bool(args.isolate_eval)
+    # Coder recovery is deliberately launch-scoped. A saved run or external
+    # YAML must not silently turn it back on when --coder-retry is absent.
+    merged["coder_retry"] = bool(args.coder_retry)
     if merged["strategies"]:
         # Keep the ordinary policy checkpoint untouched unless the opt-in
         # hierarchy is requested. Explicit CLI model choices remain strongest.
@@ -6000,11 +6028,13 @@ class ProcessDistributedTrainer:
         cfg_dict["_terminal_log_path"] = str(
             Path(exp_dir).resolve() / "temirnal.log")
 
-        print(f"[{self._process_label}] starting "
-              f"{self._world_size - 1} persistent "
-              "worker processes; main process is rank 0", flush=True)
-        print(f"[{self._process_label}] loading trainer replicas one at a time to cap "
-              "host/GPU initialization peaks", flush=True)
+        terminal_log_only(
+            f"[{self._process_label}] starting "
+            f"{self._world_size - 1} persistent "
+            "worker processes; main process is rank 0", flush=True)
+        terminal_log_only(
+            f"[{self._process_label}] loading trainer replicas one at a time "
+            "to cap host/GPU initialization peaks", flush=True)
         try:
             for rank in range(1, self._world_size):
                 command_queue = self._context.Queue(maxsize=2)
@@ -6041,11 +6071,12 @@ class ProcessDistributedTrainer:
             self._abort_workers()
             raise
 
-        print(f"[{self._process_label}] process-distributed trainer active on physical "
-              f"GPUs {self._physical_ids}; adaptive memory ceiling="
-              f"{self._memory_percentage:g}%, "
-              "exact long-rollout rescue up to 96%",
-              flush=True)
+        terminal_log_only(
+            f"[{self._process_label}] process-distributed trainer active on "
+            f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
+            f"{self._memory_percentage:g}%, "
+            "exact long-rollout rescue up to 96%",
+            flush=True)
 
     @property
     def world_size(self):
@@ -7959,6 +7990,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     def _run_coder_format_retries(records, *, seed_offset):
         """One extra attempt per missing output; never returned to the allocator."""
+        if not bool(getattr(cfg, "coder_retry", False)):
+            return
         failed = [record for record in records
                   if record.get("output_format_issue") is not None
                   and not record.get("retry_attempt", 0)]
@@ -8017,6 +8050,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{still_missing} still missing (failure reward, no further retries)", flush=True)
 
     def _defer_coder_format_retries(records, *, seed_offset):
+        if not bool(getattr(cfg, "coder_retry", False)):
+            return
         failed = [record for record in records
                   if record.get("output_format_issue") is not None
                   and not record.get("retry_attempt", 0)]
@@ -8025,6 +8060,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 (failed, int(seed_offset)))
 
     def _drain_deferred_coder_format_retries():
+        if not bool(getattr(cfg, "coder_retry", False)):
+            deferred_coder_retry_batches.clear()
+            return
         while deferred_coder_retry_batches:
             records, seed_offset = deferred_coder_retry_batches.pop(0)
             _run_coder_format_retries(
@@ -10400,6 +10438,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_stats = {
         "planned_rollouts": len(primary_rollout_records),
         "coder_format_retries": len(coder_retry_records),
+        "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
         "coder_format_retries_still_missing": sum(
             record["output_format_issue"] is not None for record in coder_retry_records),
         "result_metric_name": str(problem.metric_name),
@@ -10973,8 +11012,13 @@ def main():
                 f"total={cfg.group_size}/parent")
         print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
               f"then existing top {cfg.topk_children_per_parent}/parent")
+        coder_retry_label = (
+            "once (extra training example)"
+            if bool(getattr(cfg, "coder_retry", False)) else
+            "off (enable with --coder-retry)"
+        )
         print(f"Output retries:     strategy up to {cfg.strategy_format_max_retries} "
-              "(stop on exhaustion); coder once (extra training example)")
+              f"(stop on exhaustion); coder {coder_retry_label}")
         print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "
@@ -11137,7 +11181,8 @@ def main():
         )
         print(f"[resume] reconstructed {n_states} valid archived candidates "
               f"from {n_rollouts} earlier rollouts")
-    print(f"[init] sampler archive size = {sampler.archive_size()}")
+    terminal_log_only(
+        f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
     if configured_advantage_mode == "spo-rs" and not binary_coder_cfg.enabled:
@@ -11325,8 +11370,9 @@ def main():
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
-                print(f"[gpu] offloading {replica_label} to CPU before "
-                      "shared-GPU vLLM generation", flush=True)
+                terminal_log_only(
+                    f"[gpu] offloading {replica_label} to CPU before "
+                    "shared-GPU vLLM generation", flush=True)
                 try:
                     if parallel_trainer is not None:
                         parallel_trainer.offload_for_generation()
@@ -11413,8 +11459,9 @@ def main():
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
-            print(f"[init] phase-shared vLLM pool configured across all "
-                  f"rollout GPUs {gpu_ids}")
+            terminal_log_only(
+                f"[init] phase-shared vLLM pool configured across all "
+                f"rollout GPUs {gpu_ids}", flush=True)
             if separate_strategy_pool:
                 strategy_pool_options = dict(pool_options)
                 strategy_pool_options.update({
@@ -11449,8 +11496,9 @@ def main():
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )
-                print(f"[init] separate no-LoRA strategy vLLM pool "
-                      f"configured for {cfg.strategy_model_name}")
+                terminal_log_only(
+                    f"[init] separate no-LoRA strategy vLLM pool "
+                    f"configured for {cfg.strategy_model_name}", flush=True)
         else:
             # Do not load a duplicate base model beside the trainer. Rank zero
             # is the live HF/Unsloth training model; only the remaining cards
@@ -11504,10 +11552,12 @@ def main():
                           else "micro-batch")
             limit_scope = ("/engine" if cfg.generation_backend == "vllm"
                            else "/GPU")
-            print(f"[init] generation pool ready "
-                  f"({limit_name} {cfg.gen_micro_batch}{limit_scope})")
+            terminal_log_only(
+                f"[init] generation pool ready "
+                f"({limit_name} {cfg.gen_micro_batch}{limit_scope})",
+                flush=True)
         else:
-            print("[init] generation pool ready")
+            terminal_log_only("[init] generation pool ready", flush=True)
     else:
         if cfg.num_training_gpus > 1:
             print(f"[init] model-parallel HF generation across training GPUs "
@@ -11568,19 +11618,24 @@ def main():
                     f"{cfg.strategies_per_parent} strategies x "
                     f"{cfg.programs_per_strategy} programs/group; "
                     if getattr(problem, "two_stage_rollouts", False) else "")
-                print(f"[step {step}] batch: "
-                      f"P={cfg.x_grpo_contexts_per_step} "
-                      f"K={cfg.groups_per_step} G={cfg.group_size} "
-                      f"({hierarchy}{rollout_count} rollouts)")
+                terminal_log_only(
+                    f"[step {step}] batch: "
+                    f"P={cfg.x_grpo_contexts_per_step} "
+                    f"K={cfg.groups_per_step} G={cfg.group_size} "
+                    f"({hierarchy}{rollout_count} rollouts)", flush=True)
             elif getattr(problem, "two_stage_rollouts", False):
-                print(f"[step {step}] batch: parents={cfg.groups_per_step} "
-                      f"strategies/parent={cfg.strategies_per_parent} "
-                      f"programs/strategy={cfg.programs_per_strategy} "
-                      f"({cfg.groups_per_step * cfg.group_size} code rollouts)")
+                terminal_log_only(
+                    f"[step {step}] batch: parents={cfg.groups_per_step} "
+                    f"strategies/parent={cfg.strategies_per_parent} "
+                    f"programs/strategy={cfg.programs_per_strategy} "
+                    f"({cfg.groups_per_step * cfg.group_size} code rollouts)",
+                    flush=True)
             else:
-                print(f"[step {step}] batch: G={cfg.groups_per_step} "
-                      f"K={cfg.group_size} "
-                      f"({cfg.groups_per_step * cfg.group_size} rollouts)")
+                terminal_log_only(
+                    f"[step {step}] batch: G={cfg.groups_per_step} "
+                    f"K={cfg.group_size} "
+                    f"({cfg.groups_per_step * cfg.group_size} rollouts)",
+                    flush=True)
 
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
                                step_cfg, exp_dir, problem, gen_pool,

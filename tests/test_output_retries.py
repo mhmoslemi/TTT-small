@@ -103,11 +103,14 @@ class OutputContractTests(unittest.TestCase):
             self.assertFalse(json.loads(first.with_suffix(".meta.json").read_text())["accepted"])
             self.assertTrue(json.loads(second.with_suffix(".meta.json").read_text())["accepted"])
 
-    def test_all_yaml_presets_have_three_retries_and_cli_is_wired(self):
+    def test_strategy_retries_remain_configured_and_coder_retry_is_opt_in(self):
         for path in (ROOT / "configs").glob("*.yaml"):
             self.assertRegex(path.read_text(), r"(?m)^strategy_format_max_retries: 3$")
         source = (ROOT / "train_multy_CVaR.py").read_text()
         self.assertIn('"--strategy-format-max-retries"', source)
+        self.assertIn('"--coder-retry"', source)
+        launcher = (ROOT / "run.sh").read_text()
+        self.assertIn("sh run.sh --coder-retry", launcher)
 
 
 class RunnerRetryTests(unittest.TestCase):
@@ -116,7 +119,8 @@ class RunnerRetryTests(unittest.TestCase):
             coder_template_kind="qwen3.8", coder_reasoning_effort="medium",
             group_size=3, seed=12, max_new_tokens=32000, temperature=.9,
             top_p=.92, sampling_top_k=0, sampling_min_p=0,
-            generation_backend=backend, sandbox_timeout_s=600)
+            generation_backend=backend, sandbox_timeout_s=600,
+            coder_retry=True)
         scope = dict(
             cfg=cfg, Future=Future, coder_output_issue=coder_output_issue,
             coder_retry_prompt_job=coder_retry_prompt_job, retry_metadata=retry_metadata,
@@ -233,6 +237,23 @@ class RunnerRetryTests(unittest.TestCase):
             dict(output_format_issue="missing", retry_attempt=1),
             dict(output_format_issue=None, retry_attempt=0)], seed_offset=0)
         self.assertFalse(calls)
+
+    def test_coder_retry_disabled_keeps_failures_without_extra_generation(self):
+        with redirect_stdout(io.StringIO()):
+            s, calls, _, saved, evaluated = self.runner("vllm")
+            s["cfg"].coder_retry = False
+            records = s["_run_vllm_code_phase"](
+                [3], phase="pilot", seed_offset=0, progress_desc="pilots")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(records), 3)
+        self.assertEqual(len(s["primary_rollout_records"]), 3)
+        self.assertEqual(s["coder_retry_records"], [])
+        self.assertEqual(s["deferred_coder_retry_batches"], [])
+        self.assertEqual(len(saved), 3)
+        self.assertEqual(len(evaluated), 1)
+        self.assertEqual(
+            [future.result().reward for future in s["reward_futures"][0]],
+            [1, 0, 0])
 
     def test_adaptive_phases_finish_before_deferred_format_retries(self):
         for backend in ("vllm", "hf"):
@@ -436,7 +457,10 @@ class StrategyAttemptTests(unittest.TestCase):
 
 class StrategySchedulerTests(unittest.TestCase):
     def scheduler(self):
-        scope = dict(deque=deque, queue=queue, make_progress_bar=Bar)
+        scope = dict(
+            deque=deque, queue=queue, make_progress_bar=Bar,
+            terminal_log_only=lambda *args, **kwargs: None,
+        )
         functions_from_file("gen_workers.py", {"run_sequential_chains"}, scope)
         results = queue.Queue()
         dispatched = []

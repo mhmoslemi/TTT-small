@@ -68,6 +68,7 @@ import multiprocessing as mp
 from gpu_runtime import (
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
+from terminal_output import terminal_log_only
 
 # Level-1 vLLM sleep releases tagged weights and KV blocks, but the sleeping
 # process still owns CUDA contexts, NCCL state, compiled graphs, and allocator
@@ -1465,7 +1466,7 @@ class GenerationPool:
                 ))
             if (self.vllm_gpu_memory_utilization
                     < requested_vllm_utilization - 1e-9):
-                print(
+                terminal_log_only(
                     f"[pool] {' + '.join(reserve_reasons)}: reserving at "
                     f"least {reserve_gib:.1f} GiB/GPU; "
                     "vLLM utilization "
@@ -1859,14 +1860,15 @@ class GenerationPool:
         assigned_ranks = (
             self.num_workers * self.tensor_parallel_size
             * self.pipeline_parallel_size)
-        print(f"[pool] dependency-pipelined strategy scheduler: "
-              f"{num_chains} chain(s) x {num_stages} stage(s) across "
-              f"{self.num_workers} engine(s), "
-              f"TP={self.tensor_parallel_size}, "
-              f"PP={self.pipeline_parallel_size} "
-              f"({assigned_ranks} GPU rank(s) assigned); no per-stage "
-              "barriers",
-              flush=True)
+        terminal_log_only(
+            f"[pool] dependency-pipelined strategy scheduler: "
+            f"{num_chains} chain(s) x {num_stages} stage(s) across "
+            f"{self.num_workers} engine(s), "
+            f"TP={self.tensor_parallel_size}, "
+            f"PP={self.pipeline_parallel_size} "
+            f"({assigned_ranks} GPU rank(s) assigned); no per-stage "
+            "barriers",
+            flush=True)
 
         base_gen_kwargs = {
             "max_new_tokens": int(max_new_tokens),
@@ -2492,7 +2494,8 @@ class PhasedVLLMGenerationPool:
                             "vLLM sleep level 1"
                             if self._level_one_override_model is not None else
                             f"vLLM sleep level {self._sleep_level}")
-                        print(f"[pool] {prefix} ready; {detail}", flush=True)
+                        terminal_log_only(
+                            f"[pool] {prefix} ready; {detail}", flush=True)
                     else:
                         print("[pool] installed vLLM lacks safe deep sleep; "
                               "using transient engines for phase sharing",

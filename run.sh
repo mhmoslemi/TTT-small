@@ -46,6 +46,9 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # offloaded, then the LoRA coder generates programs and trains. Without this
 # flag the ordinary one-stage rollout path is unchanged:
 #   sh run.sh --strategies
+# Retry a coder response missing its required final code block once. Coder
+# retries are off unless this flag is passed; strategy retries are unchanged:
+#   sh run.sh --coder-retry
 # An OpenAI-compatible remote strategist can be selected without loading its
 # tokenizer or weights locally:
 #   export DEEPSEEK_API_KEY='...'
@@ -57,3 +60,4 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode entropic --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
     --isolate-eval --strategies --fused-long-attention "$@"
+    # --coder-retry
