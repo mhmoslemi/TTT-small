@@ -25,7 +25,6 @@ from gen_workers import (
     _vllm_utilization_with_reserve,
     _vllm_worker_loop,
 )
-from feedback import FeedbackConfig, is_code_failure, render_chat
 from gpu_runtime import (
     GPUMemory,
     align_vllm_layout_to_concurrency,
@@ -54,6 +53,8 @@ def _fake_complete_yaml(stream):
     values = {
         "problem": "circle_packing",
         "model_name": "Qwen/Qwen3-8B",
+        "max_seq_length": 32768,
+        "max_new_tokens": 32768,
         "backend": "auto",
         "load_in_4bit": True,
         "generation_backend": "hf",
@@ -62,8 +63,6 @@ def _fake_complete_yaml(stream):
         "vllm_pipeline_parallel_size": 1,
         "groups_per_step": 8,
         "group_size": 64,
-        "max_groups_per_step": None,
-        "max_group_size": None,
         "training_gpu_id": 0,
         "available_gpu_ids": "",
         "evaluation_gpu_id": None,
@@ -1167,23 +1166,6 @@ class VLLMBackendTests(unittest.TestCase):
             if data.get("problem_type") == "mla_decode_nvidia":
                 self.assertIn("mla_seed_runtime_us", data, path.name)
 
-    def test_feedback_dataclass_matches_yaml_contract(self):
-        from dataclasses import fields
-
-        from config_validation import COMMON_REQUIRED_KEYS
-        from feedback import FeedbackConfig
-        feedback_keys = {
-            ("feedback" if field.name == "enabled" else
-             "feedback_lambda" if field.name == "lambda_f" else
-             f"feedback_{field.name}")
-            for field in fields(FeedbackConfig)
-        }
-
-        self.assertEqual(
-            {key for key in COMMON_REQUIRED_KEYS
-             if key == "feedback" or key.startswith("feedback_")},
-            feedback_keys,
-        )
 
     def test_complete_yaml_rejects_retired_feature_keys(self):
         import yaml
@@ -1312,54 +1294,9 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertFalse(any("vLLM" in note for note in notes))
         self.assertTrue(any("generation max sequences" in note for note in notes))
 
-    def test_feedback_only_accepts_code_failures(self):
-        result = types.SimpleNamespace
-        self.assertTrue(is_code_failure(result(
-            failure_kind="code", parsed=True, ran=False, msg="SyntaxError")))
-        self.assertFalse(is_code_failure(result(
-            failure_kind="constraint", parsed=True, ran=True,
-            msg="Invalid solution")))
-        self.assertFalse(is_code_failure(result(
-            failure_kind="timeout", parsed=True, ran=False,
-            msg="Timeout after 120s")))
-        self.assertFalse(is_code_failure(result(
-            failure_kind="infrastructure", parsed=True, ran=False,
-            msg="task files missing")))
-        self.assertTrue(is_code_failure(result(
-            failure_kind="", parsed=False, ran=False, msg="no_code_block")))
-        self.assertFalse(is_code_failure(result(
-            failure_kind="", parsed=True, ran=False,
-            msg="run_failed: Timeout after 120s")))
 
-    def test_feedback_reprompt_uses_rollout_thinking_mode(self):
-        class Tokenizer:
-            def __init__(self):
-                self.enable_thinking = None
 
-            def apply_chat_template(self, _messages, **kwargs):
-                self.enable_thinking = kwargs["enable_thinking"]
-                return "rendered"
 
-        tokenizer = Tokenizer()
-        self.assertEqual(
-            render_chat(tokenizer, [{"role": "user", "content": "x"}],
-                        enable_thinking=True),
-            "rendered",
-        )
-        self.assertIs(tokenizer.enable_thinking, True)
-
-    def test_feedback_caps_scale_from_current_batch(self):
-        cfg = FeedbackConfig(enabled=True)
-        self.assertEqual(cfg.resolve_caps(5, 16), (16, 4))
-        self.assertEqual(cfg.resolve_caps(8, 64), (103, 26))
-
-    def test_feedback_caps_keep_explicit_and_unlimited_modes(self):
-        fixed = FeedbackConfig(
-            enabled=True, max_per_step=12, max_per_signature=3)
-        self.assertEqual(fixed.resolve_caps(20, 100), (12, 3))
-        unlimited = FeedbackConfig(
-            enabled=True, max_per_step=-1, max_per_signature=-1)
-        self.assertEqual(unlimited.resolve_caps(5, 16), (0, 0))
 
     def test_vllm_engine_kwargs_map_runtime_controls(self):
         kwargs = _vllm_engine_kwargs(
@@ -2400,7 +2337,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(merged["backend"], "hf")
         self.assertEqual(merged["generation_backend"], "vllm")
 
-    def test_batch_maxima_and_gpu_count_are_derived(self):
+    def test_fixed_batch_sizes_and_gpu_count_are_resolved(self):
         fake_numpy = types.ModuleType("numpy")
         fake_numpy.integer = int
         fake_yaml = types.ModuleType("yaml")
@@ -2423,8 +2360,10 @@ class VLLMBackendTests(unittest.TestCase):
                         os.environ, {"AVAILABLE_GPUS": "1,0,2,4,6,7"}):
                     cfg, merged = load_config()
 
-        self.assertEqual(cfg.max_groups_per_step, 5)
-        self.assertEqual(cfg.max_group_size, 16)
+        self.assertEqual(cfg.groups_per_step, 5)
+        self.assertEqual(cfg.group_size, 16)
+        self.assertFalse(hasattr(cfg, "max_groups_per_step"))
+        self.assertFalse(hasattr(cfg, "max_group_size"))
         self.assertEqual(cfg.num_gpus, 6)
         self.assertEqual(cfg.gpu_ids, "1,0,2,4,6,7")
         self.assertIs(cfg.thinking, True)

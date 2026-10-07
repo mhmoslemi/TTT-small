@@ -1,5 +1,9 @@
 """
-Feedback-based program-repair signal (Sec. 2.3, Eq. 9).
+RETIRED: feedback-based program-repair signal (Sec. 2.3, Eq. 9).
+
+Reference archive only; active training does not import this module. The
+companion feedback_integration.patch records the removal from the trainers
+and tests (git apply -R can reconstruct that wiring for review).
 
 A scalar reward says a rollout failed. It does not say which tokens caused the
 failure. Eq. 9 recovers that by reusing the rollout policy as a

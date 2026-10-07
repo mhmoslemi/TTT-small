@@ -8,13 +8,13 @@ from pathlib import Path
 
 
 # These settings are consumed by the shared training, generation, search,
-# and feedback runtimes. Every checked-in preset carries them so a
+# runtimes. Every checked-in preset carries them so a
 # selected YAML is self-contained, but that does not make problem-specific
 # fields interchangeable.
 COMMON_REQUIRED_KEYS = frozenset("""
 problem target
 fail_score model_name training_model_name coder_model_name
-coder_training_model_name strategy_model_name backend max_seq_length load_in_4bit
+coder_training_model_name strategy_model_name backend load_in_4bit
 lora_rank lora_alpha
 lora_dropout target_modules
 binary_coder_training binary_coder_init_steps binary_coder_lora_rank
@@ -29,26 +29,19 @@ vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
 vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
 num_steps groups_per_step group_size strategies_per_parent
 programs_per_strategy pilot_programs_per_strategy strategy_archive_top_r
-num_seed_states max_groups_per_step
-max_group_size growth_force_step growth_valid_yield growth_distinct_min
-growth_factor learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
+num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
-max_new_tokens temperature top_p top_k thinking strategy_max_new_tokens
+temperature top_p top_k thinking strategy_max_new_tokens
 strategy_max_seq_length strategy_temperature strategy_top_p strategy_top_k
 strategy_thinking strategy_reasoning_effort strategy_vllm_quantization
 deterministic seed
 sandbox_timeout_s reward_workers print_responses max_saved_construction
-feedback feedback_lambda feedback_anneal_steps feedback_anneal_shape
-feedback_lambda_final feedback_clip feedback_chars feedback_max_per_step
-feedback_auto_fraction feedback_include_constant_groups feedback_inject_mode
-feedback_normalize feedback_adaptive feedback_validity_floor
-feedback_validity_target feedback_max_reward_ratio feedback_reward_scale_floor
-feedback_max_per_signature feedback_auto_signature_fraction
 """.split())
 
 COMMON_OPTIONAL_KEYS = frozenset({
+    "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
     "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
     "fused_long_attention",
     "training_layout",
@@ -65,6 +58,13 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "spo_rs_beta", "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
+})
+
+# Compatibility filter only: these keys cannot activate any runtime behavior.
+# Archived configs may still contain them; fresh presets no longer do.
+RETIRED_BATCH_GROWTH_KEYS = frozenset({
+    "max_groups_per_step", "max_group_size", "growth_force_step",
+    "growth_valid_yield", "growth_distinct_min", "growth_factor",
 })
 
 CPU_PROBLEMS = frozenset({

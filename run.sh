@@ -9,7 +9,7 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 
 
 
-# Runtime-only environment belongs here. Models, GPU roles, feedback,
+# Runtime-only environment belongs here. Models, GPU roles,
 # sampling, and optimization hyperparameters belong in the selected YAML.
 # Authoritative ordered physical GPU inventory. Edit this one list (or export
 # it before invoking the script); Python derives every role from it. Every
@@ -57,4 +57,3 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode entropic --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
     --isolate-eval --strategies --fused-long-attention "$@"
-

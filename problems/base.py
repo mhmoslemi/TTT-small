@@ -92,11 +92,28 @@ class RewardResult:
     stdout: str = ""
     code: str = ""
     construction: Optional[list] = None  
-    # Failure stage used only to decide whether token-level feedback applies.
+    # Failure stage preserved in rollout diagnostics.
     # code = malformed source/runtime/interface bug; constraint = a runnable
     # program rejected by the scientific verifier; timeout/infrastructure are
-    # explicitly excluded from feedback.
+    # distinct from code failures.
     failure_kind: str = ""
+
+
+def is_code_failure(res) -> bool:
+    """Classify code failures separately from verifier, timeout and infra failures.
+
+    Explicit failure kinds are authoritative. The fallback supports older
+    RewardResult-like objects without losing their original classification.
+    """
+    kind = str(getattr(res, "failure_kind", "") or "").strip().lower()
+    if kind:
+        return kind == "code"
+    if not bool(getattr(res, "parsed", False)):
+        return True
+    if bool(getattr(res, "ran", False)):
+        return False
+    msg = str(getattr(res, "msg", "") or "").lower()
+    return "timeout" not in msg
 
 
 # ----------------------------------------------------------------------

@@ -10,13 +10,10 @@ Needs:
   * the examples/gpu_mode/lib tree present (task.yml, reference.py, eval.py, utils.py)
   * run from the repo root so `examples` and `libkernelbot` resolve
 
-Changes from the original for the feedback component:
+Evaluation diagnostics and isolation:
 
-  compute_reward captures compiler and test output into res.stdout. The
-  original discarded it and returned only a one-line msg, which meant the
-  feedback signal's f_i was "Failed to pass test cases." with nothing in it.
-  Triton compile errors and correctness mismatches are the richest textual
-  feedback this problem produces, and they were being thrown away.
+  compute_reward captures compiler and test output into res.stdout so saved
+  rollouts retain Triton compile errors and correctness mismatches.
 
   compute_reward now also honours a timeout. The original ignored
   sandbox_timeout_s entirely and called run_config inline, so a kernel that hung
@@ -146,10 +143,10 @@ def _clip(s: str, n: int) -> str:
 
 def collect_logs(result, limit: int = 4000) -> str:
     """
-    Everything the runner said as f_i for the feedback signal.
+    Collect compiler, correctness and benchmark diagnostics for saved rollouts.
 
     Ordered worst-first on purpose: a compile error explains a failure and a
-    benchmark log does not, and the feedback reprompt keeps the tail.
+    benchmark log does not.
     """
     parts = []
     err = getattr(result, "error", "") or ""

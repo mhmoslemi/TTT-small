@@ -128,7 +128,7 @@ def measure_policy_entropy(function):
     """Instrument successful policy forwards without changing their API result.
 
     Descriptors travel with examples through existing queues and device moves.
-    Only with_grad policy calls participate; reference/feedback scoring cannot
+    Only with_grad policy calls participate; reference scoring cannot
     contaminate the metric. Multi-epoch callers disable this after epoch zero.
     The first completed forward is counted once, even if backward subsequently
     OOMs. Such a forward is still a valid pre-update policy observation.

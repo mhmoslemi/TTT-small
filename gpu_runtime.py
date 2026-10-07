@@ -457,9 +457,9 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
 
     if _auto(cfg.get("logprob_chunk", "auto")):
         # Caps the float32 (tokens x vocabulary) log_softmax spike.  The model
-        # forward remains exact and the feedback teacher uses the same cap.
+        # forward remains exact.
         cfg["logprob_chunk"] = 256 if min_total >= 60 else 128
-        notes.append(f"training/feedback logprob chunk={cfg['logprob_chunk']}")
+        notes.append(f"training logprob chunk={cfg['logprob_chunk']}")
     else:
         cfg["logprob_chunk"] = int(cfg.get("logprob_chunk") or 0)
 

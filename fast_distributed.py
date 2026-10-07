@@ -238,29 +238,8 @@ def reduce_trainable_gradients(model, destination_rank=0):
     del flat
 
 
-def _feedback_stats_dict(stats):
-    return {
-        "n": int(stats.n),
-        "skipped": int(stats.skipped),
-        "sum_abs": float(stats.sum_abs),
-        "sum_pos": float(stats.sum_pos),
-        "max_abs": float(stats.max_abs),
-    }
 
 
-def _merge_feedback_stats(parts):
-    from feedback import FeedbackStats
-
-    merged = FeedbackStats()
-    for part in parts:
-        if part is None:
-            continue
-        merged.n += int(part.n)
-        merged.skipped += int(part.skipped)
-        merged.sum_abs += float(part.sum_abs)
-        merged.sum_pos += float(part.sum_pos)
-        merged.max_abs = max(merged.max_abs, float(part.max_abs))
-    return merged
 
 
 def _padded_token_count(batch):
@@ -480,13 +459,10 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
 
 
 def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
-                      token_budget, *, memory_fraction=0.80, fb_cfg=None,
-                      fb_on=False, fb_lambda=0.0, work_queue=None):
+                      token_budget, *, memory_fraction=0.80, work_queue=None):
     """Accumulate one rank's gradients and leave them attached to the model."""
     import torch
     import train_multy_CVaR as training
-    from feedback import (FeedbackStats, bound_feedback_advantage,
-                          feedback_advantage)
 
     if not 0.0 < float(memory_fraction) <= (
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
@@ -513,7 +489,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     backward_batches = 0
     trained_examples = 0
     peak_memory_fraction = 0.0
-    feedback_parts = []
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
 
@@ -649,7 +624,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 attempt_ratio_values = []
                 attempt_prefix_ratio_values = []
                 attempt_entropy_examples = 0
-                attempt_feedback = FeedbackStats()
 
                 with training._rank_dropout_disabled(model):
                     for batch in active_batches:
@@ -693,28 +667,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                                             "rank_reference_logprob"
                                         ] = reference_lp.detach()
 
-                        if fb_on:
-                            for example in batch:
-                                if not example.get("reprompt_text"):
-                                    continue
-                                old_lp = example["rank_old_logprobs"].to(
-                                    example["response_ids"].device)
-                                fb_advantage = feedback_advantage(
-                                    training.compute_token_logprobs, model,
-                                    tokenizer, example["reprompt_text"],
-                                    example["response_ids"], old_lp, fb_cfg,
-                                    lam=fb_lambda, chunk=cfg.logprob_chunk)
-                                if fb_advantage is None:
-                                    attempt_feedback.skipped += 1
-                                else:
-                                    fb_advantage, _ = bound_feedback_advantage(
-                                        fb_advantage,
-                                        reward_advantage=example["advantage"],
-                                        cfg=fb_cfg)
-                                    attempt_feedback.add(fb_advantage)
-                                    example[
-                                        "rank_feedback_advantage"
-                                    ] = fb_advantage.detach().cpu()
 
                         gate = bool(
                             batch[0]["rank_entropy_gate"]
@@ -745,16 +697,10 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 entropy_coef=(entropy_coef if gate else 0.0),
                                 token_entropies=token_entropy,
                                 return_tensor_metrics=True)
-                            fb_advantage = example[
-                                "rank_feedback_advantage"]
-                            if fb_advantage is not None:
-                                loss = loss - (
-                                    fb_advantage.to(current_lp.device)
-                                    * current_lp).mean()
                             weight = float(example["sample_weight"])
                             if not torch.isfinite(loss).all():
                                 raise FloatingPointError(
-                                    "nonfinite rank/feedback loss")
+                                    "nonfinite rank loss")
                             weighted_losses.append(weight * loss)
                             attempt_values["loss"].append(
                                 weight * loss.detach())
@@ -793,7 +739,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 return (
                     dict(zip(metric_keys, packed[:len(metric_keys)])),
                     packed[len(metric_keys)], packed[len(metric_keys) + 1],
-                    attempt_entropy_examples, attempt_feedback,
+                    attempt_entropy_examples,
                 )
 
             result, effective_batches, quarantined = (
@@ -827,7 +773,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 max_ratio = max(max_ratio, result[1])
                 max_prefix_ratio = max(max_prefix_ratio, result[2])
                 entropy_examples += result[3]
-                feedback_parts.append(result[4])
 
             model.zero_grad(set_to_none=True)
             quarantined_examples += len(quarantined)
@@ -880,7 +825,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
             parameter.grad = accumulator
         torch.cuda.synchronize(logical_id)
 
-    merged_feedback = _merge_feedback_stats(feedback_parts)
     return {
         "totals": totals,
         "max_ratio": max_ratio,
@@ -894,14 +838,12 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         "long_rollout_memory_rescue": (
             emergency_allocator_fraction is not None),
         "token_budget": budget,
-        "feedback_stats": _feedback_stats_dict(merged_feedback),
     }
 
 
 def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         token_budget, total_examples, *,
-                        memory_fraction=0.80, fb_cfg=None, fb_on=False,
-                        fb_lambda=0.0, work_queue=None,
+                        memory_fraction=0.80, work_queue=None,
                         adaptive_batches=True):
     """Accumulate one rank's exact entropic/GRPO/CVaR gradients.
 
@@ -914,8 +856,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     import torch
     import train_multy_CVaR as training
     from model_backend import fused_long_attention_is_active
-    from feedback import (FeedbackStats, bound_feedback_advantage,
-                          feedback_advantage)
 
     if not 0.0 < float(memory_fraction) <= (
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
@@ -940,7 +880,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     backward_batches = 0
     trained_examples = 0
     peak_memory_fraction = 0.0
-    feedback_parts = []
     kl_errors = []
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
@@ -1101,7 +1040,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 attempt_ratio_means = []
                 attempt_ratio_maxima = []
                 attempt_ratio_count = 0
-                attempt_feedback = FeedbackStats()
                 attempt_kl_error = None
 
                 # Match the existing standard-policy trainer exactly. Unlike
@@ -1151,27 +1089,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 average_difference
                                 - (current_lp - base_lp))
                             effective_advantage = advantage + kl_advantage
-                            feedback_policy_advantage = None
-                            if fb_on and example.get("reprompt_text"):
-                                fb_advantage = feedback_advantage(
-                                    training.compute_token_logprobs, model,
-                                    tokenizer, example["reprompt_text"],
-                                    example["response_ids"],
-                                    current_lp.detach(), fb_cfg,
-                                    lam=fb_lambda,
-                                    chunk=cfg.logprob_chunk)
-                                if fb_advantage is None:
-                                    attempt_feedback.skipped += 1
-                                else:
-                                    fb_advantage, _ = (
-                                        bound_feedback_advantage(
-                                            fb_advantage,
-                                            reward_advantage=advantage,
-                                            cfg=fb_cfg))
-                                    attempt_feedback.add(fb_advantage)
-                                    feedback_policy_advantage = fb_advantage
-                                    effective_advantage = (
-                                        effective_advantage + fb_advantage)
 
                             has_behavior = (
                                 training._valid_example_token_logprobs(
@@ -1185,9 +1102,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                     training.
                                     _a3b_sequence_clipped_standard_loss(
                                         cfg, current_lp, behavior_lp,
-                                        base_lp, advantage,
-                                        feedback_advantage=(
-                                            feedback_policy_advantage)))
+                                        base_lp, advantage))
                                 importance_ratio = policy_metrics["ratio"]
                             elif has_behavior:
                                 importance_ratio = (
@@ -1211,7 +1126,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 attempt_ratio_count += 1
                             if not torch.isfinite(loss).all():
                                 raise FloatingPointError(
-                                    "nonfinite policy/feedback loss")
+                                    "nonfinite policy loss")
                             batch_losses.append(loss / total_examples)
                             attempt_losses.append(loss.detach())
                             attempt_logp_deltas.append(
@@ -1235,7 +1150,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 ]).detach().cpu().tolist()
                 return (
                     packed[0], packed[1], packed[2], packed[3],
-                    attempt_ratio_count, attempt_feedback,
+                    attempt_ratio_count,
                     attempt_kl_error,
                 )
 
@@ -1272,9 +1187,8 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 ratio_sum += result[2]
                 ratio_max = max(ratio_max, result[3])
                 ratio_count += result[4]
-                feedback_parts.append(result[5])
-                if result[6] is not None:
-                    kl_errors.append(result[6])
+                if result[5] is not None:
+                    kl_errors.append(result[5])
 
             model.zero_grad(set_to_none=True)
             quarantined_examples += len(quarantined)
@@ -1327,7 +1241,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
             parameter.grad = accumulator
         torch.cuda.synchronize(logical_id)
 
-    merged_feedback = _merge_feedback_stats(feedback_parts)
     return {
         "total_loss": total_loss,
         "total_logp_delta": total_logp_delta,
@@ -1342,7 +1255,6 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
         "long_rollout_memory_rescue": (
             emergency_allocator_fraction is not None),
         "token_budget": budget,
-        "feedback_stats": _feedback_stats_dict(merged_feedback),
         "kl_errors": kl_errors,
     }
 
@@ -1433,9 +1345,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
                     memory_fraction=command.get("memory_fraction", 0.80),
-                    fb_cfg=command.get("fb_cfg"),
-                    fb_on=bool(command.get("fb_on", False)),
-                    fb_lambda=float(command.get("fb_lambda", 0.0)),
                     work_queue=work_queue)
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
@@ -1452,9 +1361,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     int(rank), command["token_budget"],
                     command["total_examples"],
                     memory_fraction=command.get("memory_fraction", 0.80),
-                    fb_cfg=command.get("fb_cfg"),
-                    fb_on=bool(command.get("fb_on", False)),
-                    fb_lambda=float(command.get("fb_lambda", 0.0)),
                     work_queue=work_queue,
                     adaptive_batches=bool(command.get(
                         "adaptive_batches", True)))

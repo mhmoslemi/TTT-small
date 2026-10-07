@@ -4,7 +4,7 @@ TTT-Discover — multi-problem local runner.
 Configuration: self-contained problem YAML < resumed config < CLI flags
 
 Rank-selection mode (the proposed local surrogate):
-    python train_multy_CVaR.py --problem erdos --advantage-mode rank --no-feedback
+    python train_multy_CVaR.py --problem erdos --advantage-mode rank
 
 It uses exact reward midranks, KL-budgeted selection weights, A_i = G*q_i - 1,
 token-level clipped ratios, a separate sampled reference KL, and sampled
@@ -17,8 +17,7 @@ the synchronized policy with no additional top-k/repetition/logit filtering;
 vLLM workers return sampled-token behavior probabilities with the rollout.
 Missing values retain a compatibility fallback through the trainer.
 The built-in local generation path explicitly disables top-k sampling.
---feedback remains an optional auxiliary repair loss; --no-feedback implements
-the standalone rank objective. Existing advantage modes retain their losses.
+Existing advantage modes retain their losses.
 """
 
 import warnings
@@ -320,6 +319,53 @@ def _coder_model_profile(model_name):
     return None
 
 
+def _resolve_coder_token_limits(merged):
+    """Fill missing coder limits without changing explicit limits or model behavior.
+
+    Known coder profiles run first. Other checkpoints supply their context
+    through config.json; reading that small file does not load any weights or
+    initialize CUDA. No RoPE scaling or context extension is enabled here.
+    """
+    keys = ("max_seq_length", "max_new_tokens")
+    if all(key in merged for key in keys):
+        return
+    if "max_seq_length" not in merged:
+        model_name = str(merged["model_name"])
+        try:
+            model_path = Path(model_name).expanduser()
+            if model_path.is_dir():
+                config_path = model_path / "config.json"
+            else:
+                from huggingface_hub import hf_hub_download
+                config_path = Path(hf_hub_download(model_name, "config.json"))
+            metadata = json.loads(config_path.read_text())
+            context = None
+            for candidate in (metadata.get("text_config"), metadata):
+                if not isinstance(candidate, dict):
+                    continue
+                for key in ("max_position_embeddings", "n_positions", "max_seq_len"):
+                    value = candidate.get(key)
+                    if (isinstance(value, int) and not isinstance(value, bool)
+                            and value > 0):
+                        context = value
+                        break
+                if context is not None:
+                    break
+            if context is None:
+                raise ValueError("checkpoint config has no positive context length")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resolve the coder context limit for {model_name!r}; "
+                "make its config.json available or explicitly set max_seq_length. "
+                f"Details: {exc}") from exc
+        merged["max_seq_length"] = context
+    # With no separate output cap, allow all context remaining after the prompt.
+    merged.setdefault("max_new_tokens", int(merged["max_seq_length"]))
+    print(f"[config] coder token limits: max_seq={merged['max_seq_length']}, "
+          f"max_new={merged['max_new_tokens']}; output is capped by the "
+          "remaining context after the prompt")
+
+
 def _coder_effort_for_rollout_phase(cfg, phase=None):
     """Keep the configured pilot effort; use native xhigh for Qwen3.8 phase 2."""
     if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
@@ -375,7 +421,6 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
         str(profile["reasoning_effort"]), explicit_keys)
     merged["coder_preserve_thinking"] = bool(
         profile["template_kind"] == "qwen3.8")
-    merged["model_native_context_length"] = native_context
     _profile_default(merged, "max_seq_length", native_context, explicit_keys)
     _profile_default(
         merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
@@ -427,7 +472,7 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     merged["long_training_cpu_offload_min_tokens"] = None
 
     print(
-        f"[model-profile] {profile['name']}: native context="
+        f"[model-profile] {profile['name']}: context limit="
         f"{merged['max_seq_length']}, max generated tokens="
         f"{merged['max_new_tokens']}, reasoning="
         f"{merged['coder_reasoning_effort']}, rollout target=one "
@@ -1253,19 +1298,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--uct", action="store_const", const=True, default=None,
                    help="Use UCT parent selection instead of PUCT. Both use "
                         "the same puct_c configuration value as c.")
-    # ---- adaptive batch growth (groups-per-step / group-size are the START) --
-    p.add_argument("--max-groups-per-step", type=int, default=None,
-                   help="Cap for groups_per_step; in X-GRPO this is max K.")
-    p.add_argument("--max-group-size", type=int, default=None,
-                   help="Cap for group_size; in X-GRPO this is max G.")
-    p.add_argument("--growth-force-step", type=int, default=None,
-                   help="From this step on, run at (max G, max K) no matter what.")
-    p.add_argument("--growth-valid-yield", type=float, default=None,
-                   help="Best group's valid fraction must reach this to grow.")
-    p.add_argument("--growth-distinct-min", type=int, default=None,
-                   help="Distinct improved children needed to grow.")
-    p.add_argument("--growth-factor", type=float, default=None,
-                   help="Multiply G and K by this when both signals clear.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--strategy-max-new-tokens", type=int, default=None)
     p.add_argument("--strategy-format-max-retries", type=int, default=None,
@@ -1368,8 +1400,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Slice compute_token_logprobs over response positions "
                         "into chunks of at most this many tokens, bounding the "
                         "float32 log_softmax spike. Exact (no precision loss). "
-                        "0 = single shot. Use when the feedback teacher forward "
-                        "OOMs on a large-vocab model.")
+                        "0 = single shot. Bounds projection memory on "
+                        "large-vocabulary models.")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--thinking", dest="thinking",
@@ -1452,49 +1484,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    dest="vllm_enable_expert_parallel",
                    action="store_const", const=False)
 
-    # ---- feedback signal (Sec. 2.3) ----
-    p.add_argument("--feedback", dest="feedback", action="store_const",
-                   const=True, default=None,
-                   help="Master switch for the feedback-based failure signal. "
-                        "Every other --feedback-* flag is ignored unless this is set.")
-    p.add_argument("--no-feedback", dest="feedback", action="store_const",
-                   const=False,
-                   help="Force the feedback signal off, overriding the YAML.")
-    p.add_argument("--feedback-lambda", type=float, default=None)
-    p.add_argument("--feedback-anneal-steps", type=int, default=None,
-                   help="Anneal lambda_f to feedback_lambda_final over this many "
-                        "steps. 0 keeps it constant. Once the coefficient hits "
-                        "zero the teacher forward is skipped entirely.")
-    p.add_argument("--feedback-anneal-shape",
-                   choices=["linear", "cosine"], default=None)
-    p.add_argument("--feedback-lambda-final", type=float, default=None)
-    p.add_argument("--feedback-clip", type=float, default=None)
-    p.add_argument("--feedback-chars", type=int, default=None)
-    p.add_argument("--feedback-max-per-step", type=int, default=None,
-                   help="Code-failure teacher cap: 0 = auto from G*K, "
-                        "-1 = all, >0 = fixed override.")
-    p.add_argument("--feedback-auto-fraction", type=float, default=None,
-                   help="Automatic teacher budget as a fraction of current G*K "
-                        "(default: 0.20).")
-    p.add_argument("--feedback-inject-mode",
-                   choices=["append", "user_turn"], default=None)
-    p.add_argument("--feedback-normalize", action="store_const",
-                   const=True, default=None)
-    p.add_argument("--feedback-adaptive", action="store_const",
-                   const=True, default=None,
-                   help="Gate feedback by the observed code-valid rate.")
-    p.add_argument("--feedback-validity-floor", type=float, default=None)
-    p.add_argument("--feedback-validity-target", type=float, default=None)
-    p.add_argument("--feedback-max-reward-ratio", type=float, default=None,
-                   help="Bound mean feedback advantage relative to reward advantage.")
-    p.add_argument("--feedback-reward-scale-floor", type=float, default=None,
-                   help="Nonzero reward scale used to repair constant-failure groups.")
-    p.add_argument("--feedback-max-per-signature", type=int, default=None,
-                   help="Per-failure-class cap: 0 = auto from the step cap, "
-                        "-1 = unlimited, >0 = fixed override.")
-    p.add_argument("--feedback-auto-signature-fraction", type=float, default=None,
-                   help="Automatic per-signature cap as a fraction of the step "
-                        "cap (default: 0.25).")
 
     return p
 
@@ -1662,7 +1651,14 @@ def load_config():
         ydict = yaml.safe_load(f) or {}
     if not isinstance(ydict, dict) or not ydict:
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
-    from config_validation import validate_problem_config
+    from config_validation import (RETIRED_BATCH_GROWTH_KEYS,
+                                   validate_problem_config)
+    for key in RETIRED_BATCH_GROWTH_KEYS:
+        ydict.pop(key, None)
+    # Old external configs may retain the retired repair-feature settings.
+    for key in list(ydict):
+        if key == "feedback" or key.startswith("feedback_"):
+            ydict.pop(key)
     validate_problem_config(
         ydict,
         source=cfg_path,
@@ -1687,9 +1683,12 @@ def load_config():
     # can resume checkpoints written before those optional systems were removed.
     if saved:
         saved.pop("_max_seq_length_includes_memory_topup", None)
+        saved.pop("model_native_context_length", None)  # Retired diagnostic metadata.
         for key in list(saved):
             if (key == "memory" or key.startswith("memory_")
-                    or key.startswith("reranker_")):
+                    or key == "feedback" or key.startswith("feedback_")
+                    or key.startswith("reranker_")
+                    or key in RETIRED_BATCH_GROWTH_KEYS):
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
@@ -1749,6 +1748,7 @@ def load_config():
     # Resolve after the hierarchy chooses its coder and before validating the
     # resulting training layout and precision.
     _apply_coder_model_profile(merged, profile_explicit_keys)
+    _resolve_coder_token_limits(merged)
 
     training_layout = str(
         merged.get("training_layout") or "auto").strip().lower()
@@ -1893,10 +1893,6 @@ def load_config():
                 "strategy API mode requires environment variable "
                 f"{merged['strategy_api_key_env']} to be set")
         merged["group_size"] = effective_group_size
-        # Strategy multiplicity is the authoritative rollout budget. Adaptive
-        # growth may still change the parent count, but cannot silently break
-        # the S*C hierarchy by changing the derived per-parent group size.
-        merged["max_group_size"] = effective_group_size
     # This ablation intentionally keeps two independent Qwen3-8B engines per
     # card resident together: a permanently base/no-LoRA strategist and a
     # coder that receives the current LoRA adapter. Keep the switch derived
@@ -1950,22 +1946,6 @@ def load_config():
                 "strategy_vllm_persistent_workers must be nonnegative")
     merged["strategy_vllm_persistent_workers"] = (
         strategy_persistent_workers)
-
-    # Omitted growth caps mean fixed batch size. Resolve after YAML and CLI so
-    # `--groups-per-step 5 --group-size 16` becomes max G=5, max K=16 even if
-    # the selected problem YAML has different starting values.
-    if args.groups_per_step is not None and args.max_groups_per_step is None:
-        merged["max_groups_per_step"] = int(merged["groups_per_step"])
-    if args.group_size is not None and args.max_group_size is None:
-        merged["max_group_size"] = int(merged["group_size"])
-    if merged["max_groups_per_step"] is None:
-        merged["max_groups_per_step"] = int(merged["groups_per_step"])
-    if merged["max_group_size"] is None:
-        merged["max_group_size"] = int(merged["group_size"])
-    if int(merged["max_groups_per_step"]) < int(merged["groups_per_step"]):
-        raise ValueError("max_groups_per_step cannot be below groups_per_step")
-    if int(merged["max_group_size"]) < int(merged["group_size"]):
-        raise ValueError("max_group_size cannot be below group_size")
 
     # Resolve every physical role from one ordered inventory. run.sh exports
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
@@ -3470,7 +3450,6 @@ def _initialize_rank_logprob_caches(examples):
         else:
             example["rank_reference_logprob"] = None
             missing_reference.append(example)
-        example["rank_feedback_advantage"] = None
     return missing_old, missing_reference
 
 
@@ -3700,17 +3679,15 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
 
 def _a3b_sequence_clipped_standard_loss(
         cfg, current_logprobs, behavior_logprobs, reference_logprobs,
-        advantage, *, feedback_advantage=None):
+        advantage):
     """Apply the A3B sequence surrogate inside standard advantage modes.
 
     Entropic, GRPO, and CVaR retain their existing advantages, centered
-    current/reference correction, sample normalization, and optional feedback
-    term. Only the reward-policy importance ratio and clipping unit become one
+    current/reference correction and sample normalization. Only the
+    reward-policy importance ratio and clipping unit become one
     length-normalized response ratio. The helper is deliberately unavailable
     to every other coder model.
     """
-    import torch
-
     if not _uses_sequence_level_policy_ratio(cfg):
         raise ValueError(
             "the sequence-clipped standard loss is Qwen3-30B-A3B only")
@@ -3725,16 +3702,6 @@ def _a3b_sequence_clipped_standard_loss(
         clip_epsilon_high=epsilon_high,
         kl_coef=kl_coef,
         return_tensor_metrics=True)
-    if feedback_advantage is not None:
-        feedback = torch.as_tensor(
-            feedback_advantage, dtype=current_logprobs.dtype,
-            device=current_logprobs.device).detach()
-        # Feedback remains the same auxiliary score-function term. Weight it
-        # with the detached trajectory ratio so no token-level MoE ratio is
-        # reintroduced outside the GSPO-style reward surrogate.
-        loss = loss - (
-            metrics["ratio"] * feedback * current_logprobs
-        ).mean()
     return loss, metrics
 
 
@@ -4325,8 +4292,6 @@ def _prepare_binary_overlap_examples(
                 "advantage": None,
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": None,
-                "reprompt_text": None,
-                "failure_signature": "",
                 "reward_constant": False,
                 "rank_entropy_gate": False,
                 "group_id": int(group_id),
@@ -4420,8 +4385,6 @@ def _prepare_entropic_overlap_group(
             "advantage": float(advantage),
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": reference_logprobs,
-            "reprompt_text": None,
-            "failure_signature": "",
             "reward_constant": False,
             "rank_entropy_gate": False,
             "group_id": int(group_id),
@@ -4639,7 +4602,7 @@ def _finish_binary_coder_overlap_update(
     for example in state["examples"]:
         for key in (
                 "rank_old_logprobs", "rank_reference_logprob",
-                "rank_feedback_advantage", "_overlap_reward_future",
+                "_overlap_reward_future",
                 "_overlap_parent"):
             example.pop(key, None)
     return {
@@ -4654,8 +4617,7 @@ def _finish_binary_coder_overlap_update(
 
 
 def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
-                         cfg, step_idx, *, fb_cfg=None, fb_on=False,
-                         fb_lambda=0.0):
+                         cfg, step_idx):
     """Cache the old/reference policies, then update the rank surrogate."""
     import torch
 
@@ -4663,11 +4625,6 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
     epsilon, epsilon_low, epsilon_high, kl_coef = (
         _clipped_policy_options(cfg))
     entropy_coef = _rank_entropy_coefficient(cfg)
-    fb_stats = None
-    if fb_on:
-        from feedback import (FeedbackStats, bound_feedback_advantage,
-                              feedback_advantage)
-        fb_stats = FeedbackStats()
     backend.set_training_mode()
     started = time.time()
     update_batches = _training_microbatches(
@@ -4722,22 +4679,6 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                             "nonfinite reference-policy logprobs")
                     for ex, ref_lp in zip(batch, reference_logprobs):
                         ex["rank_reference_logprob"] = ref_lp.detach()
-        if fb_on:
-            for ex in examples:
-                if not ex.get("reprompt_text"):
-                    continue
-                old_lp = ex["rank_old_logprobs"].to(ex["response_ids"].device)
-                fb_adv = feedback_advantage(
-                    compute_token_logprobs, model, tokenizer,
-                    ex["reprompt_text"], ex["response_ids"], old_lp,
-                    fb_cfg, lam=fb_lambda, chunk=cfg.logprob_chunk)
-                if fb_adv is None:
-                    fb_stats.skipped += 1
-                else:
-                    fb_adv, _ = bound_feedback_advantage(
-                        fb_adv, reward_advantage=ex["advantage"], cfg=fb_cfg)
-                    fb_stats.add(fb_adv)
-                    ex["rank_feedback_advantage"] = fb_adv.detach().cpu()
 
         history = []
         for epoch in range(epochs):
@@ -4775,14 +4716,10 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                             kl_coef=kl_coef,
                             entropy_coef=(entropy_coef if gate else 0.0),
                             token_entropies=token_entropy)
-                        fb_adv = ex["rank_feedback_advantage"]
-                        if fb_adv is not None:
-                            loss = loss - (
-                                fb_adv.to(cur_lp.device) * cur_lp).mean()
                         weight = float(ex["sample_weight"])
                         if not torch.isfinite(loss).all():
                             raise FloatingPointError(
-                                "nonfinite rank/feedback loss")
+                                "nonfinite rank loss")
                         weighted_losses.append(weight * loss)
                         totals["loss"] += (
                             weight * float(loss.detach().item()))
@@ -4832,10 +4769,8 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
                   f"OOM-quarantined={len(quarantined)}", flush=True)
-    if fb_stats is not None:
-        print(fb_stats.line(step_idx, fb_lambda))
     for ex in examples:
-        for key in ("rank_old_logprobs", "rank_reference_logprob", "rank_feedback_advantage"):
+        for key in ("rank_old_logprobs", "rank_reference_logprob"):
             ex.pop(key, None)
     return {
         "rank_updates": history,
@@ -5060,19 +4995,6 @@ class ReplicatedDataParallelTrainer:
                             destination.device, non_blocking=True))
             torch.cuda.synchronize(0)
 
-    @staticmethod
-    def _merge_feedback_stats(stats):
-        from feedback import FeedbackStats
-        merged = FeedbackStats()
-        for item in stats:
-            if item is None:
-                continue
-            merged.n += item.n
-            merged.skipped += item.skipped
-            merged.sum_abs += item.sum_abs
-            merged.sum_pos += item.sum_pos
-            merged.max_abs = max(merged.max_abs, item.max_abs)
-        return merged
 
     def _clip_step_and_sync(self, cfg):
         import torch
@@ -5098,8 +5020,7 @@ class ReplicatedDataParallelTrainer:
             for example in batch
         ) * len(batch)
 
-    def _train_rank_fast(self, examples, cfg, step_idx, *, fb_cfg=None,
-                         fb_on=False, fb_lambda=0.0):
+    def _train_rank_fast(self, examples, cfg, step_idx):
         """Adaptive, work-stealing rank update selected only by --fast.
 
         Each replica repeatedly claims a length-bucketed batch from one shared
@@ -5110,8 +5031,6 @@ class ReplicatedDataParallelTrainer:
         """
         import threading
         import torch
-        from feedback import (FeedbackStats, bound_feedback_advantage,
-                              feedback_advantage)
 
         started = time.time()
         if self._offloaded:
@@ -5220,7 +5139,6 @@ class ReplicatedDataParallelTrainer:
             backward_batches = 0
             trained_examples = 0
             peak_memory_fraction = 0.0
-            feedback_parts = []
             budget = max(1, int(budgets[replica_index]))
 
             while True:
@@ -5244,7 +5162,6 @@ class ReplicatedDataParallelTrainer:
                         attempt_ratio_values = []
                         attempt_prefix_ratio_values = []
                         attempt_entropy_examples = 0
-                        attempt_feedback = FeedbackStats()
 
                         with _rank_dropout_disabled(model):
                             for batch in active_batches:
@@ -5294,33 +5211,6 @@ class ReplicatedDataParallelTrainer:
                                                     "rank_reference_logprob"
                                                 ] = reference_lp.detach()
 
-                                if fb_on:
-                                    for example in batch:
-                                        if not example.get("reprompt_text"):
-                                            continue
-                                        old_lp = example[
-                                            "rank_old_logprobs"].to(
-                                                example["response_ids"].device)
-                                        fb_advantage = feedback_advantage(
-                                            compute_token_logprobs, model,
-                                            tokenizer,
-                                            example["reprompt_text"],
-                                            example["response_ids"], old_lp,
-                                            fb_cfg, lam=fb_lambda,
-                                            chunk=cfg.logprob_chunk)
-                                        if fb_advantage is None:
-                                            attempt_feedback.skipped += 1
-                                        else:
-                                            fb_advantage, _ = (
-                                                bound_feedback_advantage(
-                                                    fb_advantage,
-                                                    reward_advantage=example[
-                                                        "advantage"],
-                                                    cfg=fb_cfg))
-                                            attempt_feedback.add(fb_advantage)
-                                            example[
-                                                "rank_feedback_advantage"
-                                            ] = fb_advantage.detach().cpu()
 
                                 gate = bool(
                                     batch[0]["rank_entropy_gate"]
@@ -5353,16 +5243,10 @@ class ReplicatedDataParallelTrainer:
                                                       if gate else 0.0),
                                         token_entropies=token_entropy,
                                         return_tensor_metrics=True)
-                                    fb_advantage = example[
-                                        "rank_feedback_advantage"]
-                                    if fb_advantage is not None:
-                                        loss = loss - (
-                                            fb_advantage.to(current_lp.device)
-                                            * current_lp).mean()
                                     weight = float(example["sample_weight"])
                                     if not torch.isfinite(loss).all():
                                         raise FloatingPointError(
-                                            "nonfinite rank/feedback loss")
+                                            "nonfinite rank loss")
                                     weighted_losses.append(weight * loss)
                                     attempt_values["loss"].append(
                                         weight * loss.detach())
@@ -5409,7 +5293,7 @@ class ReplicatedDataParallelTrainer:
                         return (
                             attempt_totals, attempt_max_ratio,
                             attempt_max_prefix_ratio,
-                            attempt_entropy_examples, attempt_feedback,
+                            attempt_entropy_examples,
                         )
 
                     result, effective_batches, quarantined = (
@@ -5447,7 +5331,6 @@ class ReplicatedDataParallelTrainer:
                         max_prefix_ratio = max(
                             max_prefix_ratio, result[2])
                         entropy_examples += result[3]
-                        feedback_parts.append(result[4])
 
                     model.zero_grad(set_to_none=True)
                     quarantined_examples += len(quarantined)
@@ -5513,7 +5396,6 @@ class ReplicatedDataParallelTrainer:
                 "backward_batches": backward_batches,
                 "trained_examples": trained_examples,
                 "peak_memory_fraction": peak_memory_fraction,
-                "feedback_stats": self._merge_feedback_stats(feedback_parts),
             }
 
         results = self._run_replicas(work, range(self.world_size))
@@ -5528,8 +5410,6 @@ class ReplicatedDataParallelTrainer:
             result["entropy_examples"] for result in results)
         quarantined_examples = sum(
             result["quarantined_examples"] for result in results)
-        feedback_stats = self._merge_feedback_stats(
-            [result["feedback_stats"] for result in results])
         grad_norm = self._clip_step_and_sync(cfg)
         history = [{
             "epoch": 1, **totals, "ratio_max": max_ratio,
@@ -5556,8 +5436,6 @@ class ReplicatedDataParallelTrainer:
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
               f"OOM-quarantined={quarantined_examples}", flush=True)
-        if fb_on:
-            print(feedback_stats.line(step_idx, fb_lambda))
         return {
             "rank_updates": history,
             "rank_train_seconds": time.time() - started,
@@ -5571,16 +5449,12 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
-                   fb_on=False, fb_lambda=0.0):
+    def train_rank(self, examples, cfg, step_idx):
         if bool(getattr(cfg, "fast", False)):
             return self._train_rank_fast(
-                examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda)
+                examples, cfg, step_idx)
 
         import torch
-        from feedback import (FeedbackStats, bound_feedback_advantage,
-                              feedback_advantage)
 
         started = time.time()
         if self._offloaded:
@@ -5624,7 +5498,6 @@ class ReplicatedDataParallelTrainer:
         def cache(item):
             replica_index, shard = item
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
-            stats = FeedbackStats() if fb_on else None
             backend.set_training_mode()
             with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
                 missing_old, missing_reference = (
@@ -5658,33 +5531,10 @@ class ReplicatedDataParallelTrainer:
                                     batch, reference_logprobs):
                                 example["rank_reference_logprob"] = (
                                     reference_lp.detach())
-                if fb_on:
-                    for example in shard:
-                        if example.get("reprompt_text"):
-                            old_lp = example["rank_old_logprobs"].to(
-                                example["response_ids"].device)
-                            fb_advantage = feedback_advantage(
-                                compute_token_logprobs, model, tokenizer,
-                                example["reprompt_text"],
-                                example["response_ids"], old_lp, fb_cfg,
-                                lam=fb_lambda,
-                                chunk=cfg.logprob_chunk)
-                            if fb_advantage is None:
-                                stats.skipped += 1
-                            else:
-                                fb_advantage, _ = bound_feedback_advantage(
-                                    fb_advantage,
-                                    reward_advantage=example["advantage"],
-                                    cfg=fb_cfg)
-                                stats.add(fb_advantage)
-                                example["rank_feedback_advantage"] = (
-                                    fb_advantage.detach().cpu())
                 torch.cuda.synchronize(logical_id)
-            return stats
 
-        cache_stats = self._run_replicas(
+        self._run_replicas(
             cache, list(enumerate(local_shards)))
-        feedback_stats = self._merge_feedback_stats(cache_stats)
         history = []
         for epoch in range(epochs):
             self._zero_gradients()
@@ -5730,16 +5580,10 @@ class ReplicatedDataParallelTrainer:
                                     entropy_coef=(entropy_coef
                                                   if gate else 0.0),
                                     token_entropies=token_entropy)
-                                fb_advantage = example[
-                                    "rank_feedback_advantage"]
-                                if fb_advantage is not None:
-                                    loss = loss - (
-                                        fb_advantage.to(current_lp.device)
-                                        * current_lp).mean()
                                 weight = float(example["sample_weight"])
                                 if not torch.isfinite(loss).all():
                                     raise FloatingPointError(
-                                        "nonfinite rank/feedback loss")
+                                        "nonfinite rank loss")
                                 weighted_losses.append(weight * loss)
                                 totals["loss"] += (
                                     weight * float(loss.detach().item()))
@@ -5801,8 +5645,6 @@ class ReplicatedDataParallelTrainer:
                   f"entropy examples={entropy_examples} "
                   f"OOM-quarantined={quarantined_examples}", flush=True)
 
-        if fb_on:
-            print(feedback_stats.line(step_idx, fb_lambda))
         return {
             "rank_updates": history,
             "rank_train_seconds": time.time() - started,
@@ -5811,11 +5653,8 @@ class ReplicatedDataParallelTrainer:
                 item["oom_quarantined_examples"] for item in history),
         }
 
-    def train_policy(self, examples, cfg, step_idx, *, fb_cfg=None,
-                     fb_on=False, fb_lambda=0.0):
+    def train_policy(self, examples, cfg, step_idx):
         import torch
-        from feedback import (FeedbackStats, bound_feedback_advantage,
-                              feedback_advantage)
 
         started = time.time()
         if self._offloaded:
@@ -5848,7 +5687,6 @@ class ReplicatedDataParallelTrainer:
                 ratio_sum = 0.0
                 ratio_max = 0.0
                 ratio_count = 0
-                stats = FeedbackStats()
                 kl_error = None
                 for batch in active_batches:
                     base_logprobs = [
@@ -5879,30 +5717,12 @@ class ReplicatedDataParallelTrainer:
                     for example, current_lp, base_lp in zip(
                             batch, current_logprobs, base_logprobs):
                         base_lp = base_lp.to(current_lp.device)
-                        response_ids = example["response_ids"]
                         advantage = example["advantage"]
                         logp_difference = (current_lp - base_lp).detach()
                         average_difference = logp_difference.mean()
                         kl_advantage = cfg.kl_penalty_coef * (
                             average_difference - (current_lp - base_lp))
                         effective_advantage = advantage + kl_advantage
-                        feedback_policy_advantage = None
-                        if fb_on and example.get("reprompt_text"):
-                            fb_advantage = feedback_advantage(
-                                compute_token_logprobs, model, tokenizer,
-                                example["reprompt_text"], response_ids,
-                                current_lp.detach(), fb_cfg, lam=fb_lambda,
-                                chunk=cfg.logprob_chunk)
-                            if fb_advantage is None:
-                                stats.skipped += 1
-                            else:
-                                fb_advantage, _ = bound_feedback_advantage(
-                                    fb_advantage,
-                                    reward_advantage=advantage, cfg=fb_cfg)
-                                stats.add(fb_advantage)
-                                feedback_policy_advantage = fb_advantage
-                                effective_advantage = (
-                                    effective_advantage + fb_advantage)
                         behavior_lp = example.get("behavior_logprobs")
                         has_behavior = _valid_example_token_logprobs(
                             example, "behavior_logprobs")
@@ -5911,9 +5731,7 @@ class ReplicatedDataParallelTrainer:
                                 _a3b_sequence_clipped_standard_loss(
                                     cfg, current_lp,
                                     behavior_lp if has_behavior else None,
-                                    base_lp, advantage,
-                                    feedback_advantage=(
-                                        feedback_policy_advantage)))
+                                    base_lp, advantage))
                             importance_ratio = policy_metrics["ratio"]
                         elif has_behavior:
                             importance_ratio = (
@@ -5943,7 +5761,7 @@ class ReplicatedDataParallelTrainer:
                         sum(batch_losses[1:], batch_losses[0]).backward()
                 torch.cuda.synchronize(logical_id)
                 return (total_loss, total_logp_delta, ratio_sum, ratio_max,
-                        ratio_count, stats, kl_error)
+                        ratio_count, kl_error)
 
             with torch.cuda.device(logical_id):
                 result, _effective, quarantined = (
@@ -5951,7 +5769,7 @@ class ReplicatedDataParallelTrainer:
                         model, batches, attempt,
                         device_label=f"cuda:{logical_id}"))
             if result is None:
-                result = (0.0, 0.0, 0.0, 0.0, 0, FeedbackStats(), None)
+                result = (0.0, 0.0, 0.0, 0.0, 0, None)
             return (*result, len(quarantined))
 
         results = self._run_replicas(
@@ -5962,10 +5780,8 @@ class ReplicatedDataParallelTrainer:
         ratio_sum = sum(result[2] for result in results)
         ratio_max = max(result[3] for result in results)
         ratio_count = sum(result[4] for result in results)
-        feedback_stats = self._merge_feedback_stats(
-            [result[5] for result in results])
-        kl_errors = [result[6] for result in results if result[6] is not None]
-        quarantined_examples = sum(result[7] for result in results)
+        kl_errors = [result[5] for result in results if result[5] is not None]
+        quarantined_examples = sum(result[6] for result in results)
         if kl_errors:
             print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
                   "training without KL penalty on affected examples")
@@ -5979,8 +5795,6 @@ class ReplicatedDataParallelTrainer:
               f"avg logpi_theta - logpi_base: "
               f"{total_logp_delta / n_examples:.9f}{ratio_message}  "
               f"OOM-quarantined={quarantined_examples}")
-        if fb_on:
-            print(feedback_stats.line(step_idx, fb_lambda))
         return {
             "training_seconds": elapsed,
             "training_parallel_gpus": self.world_size,
@@ -6309,19 +6123,6 @@ class ProcessDistributedTrainer:
                 self._work_queue.put(None)
         return ordered
 
-    @staticmethod
-    def _merge_feedback_dicts(items):
-        from feedback import FeedbackStats
-
-        merged = FeedbackStats()
-        for item in items:
-            merged.n += int(item.get("n", 0))
-            merged.skipped += int(item.get("skipped", 0))
-            merged.sum_abs += float(item.get("sum_abs", 0.0))
-            merged.sum_pos += float(item.get("sum_pos", 0.0))
-            merged.max_abs = max(
-                merged.max_abs, float(item.get("max_abs", 0.0)))
-        return merged
 
     def calibrate_x_grpo(self, examples, cfg, step_idx, *,
                          context_group_ids=None, group_ids=None):
@@ -6435,8 +6236,7 @@ class ProcessDistributedTrainer:
             "distributed": True,
         }
 
-    def train_rank(self, examples, cfg, step_idx, *, fb_cfg=None,
-                   fb_on=False, fb_lambda=0.0):
+    def train_rank(self, examples, cfg, step_idx):
         import torch
         from fast_distributed import (broadcast_trainable_parameters,
                                       local_rank_update,
@@ -6478,16 +6278,12 @@ class ProcessDistributedTrainer:
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": self._memory_fraction,
-                "fb_cfg": fb_cfg,
-                "fb_on": bool(fb_on),
-                "fb_lambda": float(fb_lambda),
             })
 
         local_stats = local_rank_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
-            fb_cfg=fb_cfg, fb_on=fb_on, fb_lambda=fb_lambda,
             work_queue=self._work_queue)
         child_messages = self._collect_event(
             "computed", range(1, self._world_size))
@@ -6558,8 +6354,6 @@ class ProcessDistributedTrainer:
             round(100.0 * fraction, 1) for fraction in peak_fractions]
         allocator_percentages = [
             round(100.0 * fraction, 1) for fraction in allocator_fractions]
-        feedback_stats = self._merge_feedback_dicts([
-            stats["feedback_stats"] for stats in rank_stats])
         history = [{
             "epoch": 1, **totals, "ratio_max": max_ratio,
             "prefix_ratio_max": max_prefix_ratio,
@@ -6579,8 +6373,6 @@ class ProcessDistributedTrainer:
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
               f"OOM-quarantined={quarantined_examples}", flush=True)
-        if fb_on:
-            print(feedback_stats.line(step_idx, fb_lambda))
         return {
             "rank_updates": history,
             "rank_train_seconds": time.time() - started,
@@ -6632,9 +6424,6 @@ class ProcessDistributedTrainer:
                 # the small exact correction on every rank before reduction.
                 "total_examples": normalization_examples,
                 "memory_fraction": self._memory_fraction,
-                "fb_cfg": None,
-                "fb_on": False,
-                "fb_lambda": 0.0,
                 "adaptive_batches": adaptive_batches,
             })
 
@@ -6659,8 +6448,7 @@ class ProcessDistributedTrainer:
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0], normalization_examples,
             memory_fraction=self._memory_fraction,
-            fb_cfg=None, fb_on=False,
-            fb_lambda=0.0, work_queue=self._work_queue,
+            work_queue=self._work_queue,
             adaptive_batches=adaptive_batches)
         state["future"] = future
 
@@ -6854,8 +6642,7 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def train_policy(self, examples, cfg, step_idx, *, fb_cfg=None,
-                     fb_on=False, fb_lambda=0.0):
+    def train_policy(self, examples, cfg, step_idx):
         """Run the exact standard policy loss on the process-per-GPU path."""
         import torch
         from fast_distributed import (broadcast_trainable_parameters,
@@ -6908,9 +6695,6 @@ class ProcessDistributedTrainer:
                 "token_budget": self._token_budgets[rank],
                 "total_examples": total_examples,
                 "memory_fraction": self._memory_fraction,
-                "fb_cfg": fb_cfg,
-                "fb_on": bool(fb_on),
-                "fb_lambda": float(fb_lambda),
                 "adaptive_batches": adaptive_batches,
             })
 
@@ -6918,8 +6702,7 @@ class ProcessDistributedTrainer:
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0], total_examples,
             memory_fraction=self._memory_fraction,
-            fb_cfg=fb_cfg, fb_on=fb_on,
-            fb_lambda=fb_lambda, work_queue=self._work_queue,
+            work_queue=self._work_queue,
             adaptive_batches=adaptive_batches)
         child_messages = self._collect_event(
             "computed", range(1, self._world_size))
@@ -6984,8 +6767,6 @@ class ProcessDistributedTrainer:
         allocator_fractions = [
             float(stats["allocator_memory_fraction"])
             for stats in rank_stats]
-        feedback_stats = self._merge_feedback_dicts([
-            stats["feedback_stats"] for stats in rank_stats])
         kl_errors = [
             error for stats in rank_stats for error in stats["kl_errors"]
         ]
@@ -7014,8 +6795,6 @@ class ProcessDistributedTrainer:
               "avg logpi_theta - logpi_base: "
               f"{total_logp_delta / total_examples:.9f}{ratio_message}  "
               f"OOM-quarantined={quarantined_examples}", flush=True)
-        if fb_on:
-            print(feedback_stats.line(step_idx, fb_lambda))
         return {
             "training_seconds": elapsed,
             "training_parallel_gpus": self._world_size,
@@ -7292,21 +7071,18 @@ def _load_adapter(model, adapter_dir, *, announce=True):
 
 
 def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
-                              optimizer, next_g, next_k,
-                              spo_rs_tracker=None):
+                              optimizer, spo_rs_tracker=None):
     """Atomically save the state required for an exact next-step resume."""
     import torch
 
     target = Path(exp_dir) / "training_state.pt"
     tmp = target.with_suffix(target.suffix + ".tmp")
     payload = {
-        "version": 1,
+        "version": 2,
         "next_step": int(next_step),
         "adapter_dir": Path(adapter_path).name,
         "sampler": sampler.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "next_groups_per_step": int(next_g),
-        "next_group_size": int(next_k),
         "spo_rs_tracker": (spo_rs_tracker.state_dict()
                            if spo_rs_tracker is not None else None),
     }
@@ -7325,10 +7101,11 @@ def _load_training_checkpoint(exp_dir):
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
         raise ValueError(f"unsupported training checkpoint: {path}")
-    required = ("next_step", "adapter_dir", "sampler", "optimizer",
-                "next_groups_per_step", "next_group_size")
+    # Version 1's next-batch fields are no longer required or consumed.
+    # Fixed batch sizes come from the resolved saved config / CLI overrides.
+    required = ("next_step", "adapter_dir", "sampler", "optimizer")
     for key in required:
         if key not in payload:
             raise ValueError(f"training checkpoint is missing {key!r}: {path}")
@@ -7473,7 +7250,7 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
-               fb_cfg=None, parallel_trainer=None,
+               parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
                ensure_trainer_ready=None):
     import os
@@ -7485,13 +7262,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from experiment_io import (save_parent_selections, save_rollout,
                                save_rollout_artifacts,
                                save_strategy_response)
-    from problems.base import ParentContext, RewardResult
+    from problems.base import ParentContext, RewardResult, is_code_failure
     from gen_workers import make_progress_bar
 
-    from feedback import (FeedbackStats, bound_feedback_advantage,
-                          build_reprompt, failure_signature,
-                          feedback_advantage, format_feedback, is_code_failure,
-                          render_chat, select_balanced)
 
     step_t0 = time.time()
     entropy_directory = None
@@ -7543,17 +7316,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
     training_enabled = not bool(getattr(cfg, "no_train", False))
-    fb_base_lambda = (
-        fb_cfg.lambda_at(step_idx)
-        if training_enabled and fb_cfg is not None else 0.0
-    )
-    fb_candidate_on = bool(
-        training_enabled and fb_cfg is not None
-        and fb_cfg.enabled and fb_base_lambda > 0.0)
-    if (training_enabled and fb_cfg is not None
-            and fb_cfg.enabled and not fb_candidate_on):
-        print(f"[step {step_idx}] feedback: lambda annealed to 0, term disabled")
-    reprompt_by_key = {}    # (group, rollout) -> reprompt for a code failure
 
     all_examples = []
     rank_group_stats = []
@@ -9539,7 +9301,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and parallel_trainer is not None
                 and hasattr(parallel_trainer, "begin_entropic_overlap")
                 and cfg.generation_backend == "vllm"
-                and not fb_candidate_on
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
@@ -9649,7 +9410,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     )
 
             # Binary usability is a per-rollout label and the fast objective
-            # has one update epoch, no KL, no entropy, and no feedback. On the
+            # has one update epoch, no KL, and no entropy regularizer. On the
             # sharded trainer we can therefore launch each policy forward while
             # CPU rewards are outstanding, attach the +/-1 label when that
             # microbatch's future resolves, and backpropagate without changing
@@ -9662,7 +9423,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and ensure_trainer_ready is not None
                 and cfg.generation_backend == "vllm"
                 and int(getattr(cfg, "rank_update_epochs", 1)) == 1
-                and not fb_candidate_on
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
@@ -9866,12 +9626,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"{time.time() - drift_t0:.1f}s", flush=True)
 
     # ----- SCORE + ADVANTAGE + SAVE + COLLECT TRAINING EXAMPLES -----
-    # ---- signals for adaptive batch growth ----
-    # best_valid_yield: the single best group's valid fraction this step.
-    # distinct_good: how many UNIQUE valid children beat their parent, deduped
-    # by code so a collapsed group (same program N times) counts once.
-    best_valid_yield = 0.0
-    distinct_good_hashes = set()
     step_valid_count = 0
     step_rollout_count = 0
     step_code_failure_count = 0
@@ -10054,19 +9808,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "entropy_gate": rank_entropy_gate,
             })
 
-        # growth signals for this group
-        planned_valids = [valid for record, valid in zip(responses, valids)
-                         if not record.get("retry_attempt", 0)]
-        if planned_valids:
-            best_valid_yield = max(best_valid_yield, sum(planned_valids) / len(planned_valids))
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
-        parent_val = float(parent.value) if parent.value is not None else 0.0
-        for r_idx in range(len(responses)):
-            if (not responses[r_idx].get("retry_attempt", 0)
-                    and valids[r_idx] and codes[r_idx] and rewards[r_idx] > parent_val):
-                distinct_good_hashes.add(hash(codes[r_idx].strip()))
 
         group_label = (f"context {context_id} fold {fold_index}"
                        if x_grpo_mode else f"group {g}")
@@ -10240,35 +9984,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                          artifacts_already_saved=True)
             saved_rollouts += 1
 
-        # ---- reprompt(x_p, f_i) for code failures only (Sec. 2.3) --------
-        # Built here, while the RewardResult is in hand. The teacher forward
-        # itself happens in the train loop, where log pi_thetabar is already
-        # available from the existing forward pass.
-        if fb_candidate_on:
-            for r_idx, record in enumerate(responses):
-                job_idx = record["job_idx"]
-                res = outs[r_idx]
-                if not is_code_failure(res):
-                    continue
-                f_i = format_feedback(res.msg or "", res.stdout or "",
-                                      int(fb_cfg.chars))
-                rp_messages = build_reprompt(prompt_jobs[job_idx]["messages"], f_i,
-                                             mode=fb_cfg.inject_mode)
-                reprompt_by_key[(g, r_idx)] = render_chat(
-                    tokenizer, rp_messages,
-                    enable_thinking=bool(cfg.thinking),
-                )
-
-        # If reward is constant in this group there is no A^rew signal. With
-        # the feedback signal on, those rollouts are still worth training on:
-        # A^rew_i = 0 but A^fb is not, which is the whole point of Eq. 9. This
-        # is where it pays most, since an all-failed group is exactly the case
-        # the reward channel cannot score at all.
+        # Standard group-centered objectives skip constant-reward groups.
         # Rank mode uses exact equality and retains fully tied groups for
         # reference updates. Entropy is gated separately above: an all-failure
         # tie at fail_score must not receive an entropy update.
-        if (constant and not clipped_policy_mode
-                and not (fb_candidate_on and fb_cfg.include_constant_groups)):
+        if constant and not clipped_policy_mode:
             continue
 
         for r_idx, (record, adv) in enumerate(
@@ -10292,8 +10012,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     prepared["_overlap_label_mismatch"] = True
                 prepared.update({
                     "advantage": float(adv),
-                    "reprompt_text": reprompt_by_key.get((g, r_idx)),
-                    "failure_signature": failure_signature(res.msg or ""),
                     "reward_constant": constant,
                     "rank_entropy_gate": rank_entropy_gate,
                     "x_grpo_group_size": len(responses),
@@ -10325,8 +10043,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "advantage": float(adv),
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": reference_logprobs,
-                "reprompt_text": reprompt_by_key.get((g, r_idx)),
-                "failure_signature": failure_signature(res.msg or ""),
                 "reward_constant": constant,
                 "rank_entropy_gate": rank_entropy_gate,
                 "group_id": g,
@@ -10358,60 +10074,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       if step_rollout_count else 0.0)
     code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count
                            if step_rollout_count else 1.0)
-    fb_lambda = (
-        fb_cfg.effective_lambda(step_idx, code_valid_fraction)
-        if training_enabled and fb_cfg is not None and fb_cfg.enabled else 0.0
-    )
-    fb_on = bool(fb_candidate_on and fb_lambda > 0.0)
-    if fb_candidate_on:
-        print(f"[step {step_idx}] feedback: code-validity="
-              f"{code_valid_fraction:.1%} "
-              f"({step_code_failure_count} code failures), "
-              f"scheduled lambda={fb_base_lambda:.4f}, "
-              f"effective lambda={fb_lambda:.4f}")
 
-    # Constant groups only carry a feedback signal. Drop them when the adaptive
-    # controller turns feedback off after seeing this step's code validity.
-    if not fb_on and not clipped_policy_mode:
+    # Preserve the standard objectives' constant-reward-group filtering.
+    if not clipped_policy_mode:
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
-
-    # Cap the teacher forwards. Applied to all_examples rather than to
-    # reprompt_by_key, because the examples were built during the scoring loop
-    # above and already hold their reprompt text; shrinking the dict now would
-    # change nothing. Selection is balanced across failure signatures and
-    # spread across the batch rather than restricted to the first groups.
-    feedback_teacher_rollouts = 0
-    feedback_step_cap = 0
-    feedback_signature_cap = 0
-    if fb_on:
-        feedback_step_cap, feedback_signature_cap = fb_cfg.resolve_caps(
-            num_groups, cfg.group_size)
-        total_label = feedback_step_cap or "all"
-        signature_label = feedback_signature_cap or "all"
-        print(f"[step {step_idx}] feedback budget: total={total_label}, "
-              f"per-signature={signature_label} for "
-              f"{num_groups} groups x {cfg.group_size} rollouts")
-        with_fb = [i for i, ex in enumerate(all_examples) if ex.get("reprompt_text")]
-        signatures = [ex.get("failure_signature", "unknown") for ex in all_examples]
-        keep = set(select_balanced(
-            with_fb, signatures, total_cap=feedback_step_cap,
-            per_signature_cap=feedback_signature_cap))
-        if len(keep) < len(with_fb):
-            for i in with_fb:
-                if i not in keep:
-                    all_examples[i]["reprompt_text"] = None
-            print(f"[step {step_idx}] feedback: balanced/capped to {len(keep)} "
-                  f"of {len(with_fb)} code-failed rollouts")
-        feedback_teacher_rollouts = len(keep)
-
-        # A constant-reward example with no retained repair prompt has neither
-        # a reward nor a feedback signal. Keeping it would only run the policy
-        # and reference forwards for a KL-only update and dilute the batch.
-        all_examples = [
-            ex for ex in all_examples
-            if (clipped_policy_mode
-                or not (ex["reward_constant"] and not ex.get("reprompt_text")))
-        ]
 
     if clipped_policy_mode and cfg.generation_backend == "vllm":
         # Rank/PPO requires the frozen behavior probability. A malformed vLLM
@@ -10636,14 +10302,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "best_seen_step": (
             int(best_seen_result.timestep)
             if best_seen_result is not None else None),
-        "best_valid_yield": float(best_valid_yield),
-        "distinct_good": int(len(distinct_good_hashes)),
         "valid_fraction": float(valid_fraction),
-        "feedback_code_valid_fraction": float(code_valid_fraction),
-        "feedback_lambda_effective": float(fb_lambda),
-        "feedback_teacher_rollouts": int(feedback_teacher_rollouts),
-        "feedback_step_cap": int(feedback_step_cap),
-        "feedback_signature_cap": int(feedback_signature_cap),
+        "code_valid_fraction": float(code_valid_fraction),
         "evaluation_isolated": isolated_eval,
         "evaluation_workers": int(n_reward_workers),
         "evaluation_cpu_count": int(isolated_cpu_count),
@@ -10761,13 +10421,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 model, optimizer, cfg, step_idx, binary_overlap_state))
         elif parallel_trainer is not None:
             step_stats.update(parallel_trainer.train_rank(
-                all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda))
+                all_examples, cfg, step_idx))
         else:
             step_stats.update(_train_rank_examples(
                 backend, model, tokenizer, optimizer, all_examples, cfg,
-                step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda))
+                step_idx))
         if spo_rs_mode:
             step_stats["spo_rs_policy_updated"] = True
         return step_stats
@@ -10782,8 +10440,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             entropic_overlap_state = None
         else:
             step_stats.update(parallel_trainer.train_policy(
-                all_examples, cfg, step_idx, fb_cfg=fb_cfg, fb_on=fb_on,
-                fb_lambda=fb_lambda))
+                all_examples, cfg, step_idx))
         best = sampler.best_state()
         if best is not None:
             raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
@@ -10811,7 +10468,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         is_ratio_sum = 0.0
         is_ratio_max = 0.0
         is_ratio_count = 0
-        fb_stats = FeedbackStats()
         for batch in active_batches:
             base_logprobs = [
                 example.get("reference_logprobs") for example in batch]
@@ -10839,28 +10495,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             for ex, cur_lp, base_lp in zip(
                     batch, current_logprobs, base_logprobs):
                 base_lp = base_lp.to(cur_lp.device)
-                rid = ex["response_ids"]
                 adv = ex["advantage"]
                 logp_diff = (cur_lp - base_lp).detach()
                 avg_logp_diff = logp_diff.mean()
                 kl_adv = cfg.kl_penalty_coef * (
                     avg_logp_diff - (cur_lp - base_lp))
                 eff_adv = adv + kl_adv
-                feedback_policy_advantage = None
 
-                if fb_on and ex.get("reprompt_text"):
-                    fb_adv = feedback_advantage(
-                        compute_token_logprobs, model, tokenizer,
-                        ex["reprompt_text"], rid, cur_lp.detach(), fb_cfg,
-                        lam=fb_lambda, chunk=cfg.logprob_chunk)
-                    if fb_adv is None:
-                        fb_stats.skipped += 1
-                    else:
-                        fb_adv, _fb_scale = bound_feedback_advantage(
-                            fb_adv, reward_advantage=adv, cfg=fb_cfg)
-                        fb_stats.add(fb_adv)
-                        feedback_policy_advantage = fb_adv
-                        eff_adv = eff_adv + fb_adv
 
                 behavior_lp = ex.get("behavior_logprobs")
                 has_behavior = _valid_example_token_logprobs(
@@ -10870,9 +10511,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         _a3b_sequence_clipped_standard_loss(
                             cfg, cur_lp,
                             behavior_lp if has_behavior else None,
-                            base_lp, adv,
-                            feedback_advantage=(
-                                feedback_policy_advantage)))
+                            base_lp, adv))
                     is_ratio = policy_metrics["ratio"]
                 elif has_behavior:
                     is_ratio = _detached_behavior_importance_ratio(
@@ -10898,14 +10537,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if batch_losses:
                 sum(batch_losses[1:], batch_losses[0]).backward()
         return (total_loss, total_logp_delta, is_ratio_sum,
-                is_ratio_max, is_ratio_count, fb_stats)
+                is_ratio_max, is_ratio_count)
 
     result, _effective, quarantined = _run_oom_resilient_backward(
         model, microbatches, attempt, device_label=str(model.device))
     if result is None:
-        result = (0.0, 0.0, 0.0, 0.0, 0, FeedbackStats())
+        result = (0.0, 0.0, 0.0, 0.0, 0)
     (total_loss, total_logp_delta, is_ratio_sum, is_ratio_max,
-     is_ratio_count, fb_stats) = result
+     is_ratio_count) = result
 
     import torch as _torch
     _torch.nn.utils.clip_grad_norm_(
@@ -10927,8 +10566,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
           f"avg logpi_theta - logpi_base: "
           f"{total_logp_delta / n_examples:.9f}{is_msg}  "
           f"OOM-quarantined={len(quarantined)}")
-    if fb_on:
-        print(fb_stats.line(step_idx, fb_lambda))
 
     best = sampler.best_state()
     if best is not None:
@@ -10937,29 +10574,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               f"(step total {time.time() - step_t0:.1f}s, archive={sampler.archive_size()})")
 
     return step_stats
-
-
-# ======================================================================
-# Batch-size growth controller
-# ======================================================================
-def grow_batch(cur_g, cur_k, stats, cfg):
-    """
-    Monotonic ratchet. Grow (G, K) toward (max_groups_per_step, max_group_size)
-    only when BOTH signals from the step just finished clear their thresholds:
-      - best_valid_yield: the best group's valid fraction, and
-      - distinct_good: the count of unique children that beat their parent.
-    Otherwise hold. Never shrinks. The step >= growth_force_step override lives
-    in the caller, not here.
-    """
-    g_max = int(cfg.max_groups_per_step)
-    k_max = int(cfg.max_group_size)
-    stats = stats or {}
-    grow = (float(stats.get("best_valid_yield", 0.0)) >= cfg.growth_valid_yield
-            and int(stats.get("distinct_good", 0)) >= cfg.growth_distinct_min)
-    if grow:
-        cur_g = min(g_max, int(round(cur_g * cfg.growth_factor)))
-        cur_k = min(k_max, int(round(cur_k * cfg.growth_factor)))
-    return cur_g, cur_k
 
 
 # ======================================================================
@@ -11263,11 +10877,6 @@ def main():
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
-    feedback_label = (
-        "disabled (--no-train)" if cfg.no_train else
-        "off during binary coder phase" if binary_coder_cfg.enabled else
-        "on" if bool(merged["feedback"]) else "off")
-    print(f"Feedback signal:    {feedback_label}")
     print("=" * 70)
 
     # ---- experiment dir ----
@@ -11328,7 +10937,10 @@ def main():
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
             _load_adapter(model, adapter_path)
             current_policy_adapter_path = adapter_path
-            print(f"[resume] exact checkpoint found; next step is {start_step}")
+            print(f"[resume] training checkpoint found; next step is {start_step}")
+            if resume_payload["version"] == 1:
+                print("[resume] legacy batch-growth state ignored; "
+                      "using fixed configured batch sizes")
         else:
             legacy_resume = _legacy_resume_info(exp_dir)
             start_step, adapter_path = legacy_resume
@@ -11337,7 +10949,7 @@ def main():
             print(
                 f"[resume] legacy run (no training_state.pt): restarting step "
                 f"{start_step} from {adapter_path.name}. The archive will be "
-                "reconstructed, but old PUCT/optimizer/growth statistics are "
+                "reconstructed, but old PUCT/optimizer statistics are "
                 "unavailable."
             )
 
@@ -11768,35 +11380,6 @@ def main():
         else:
             print("[init] single-GPU generation (no worker pool)")
 
-    # ---- feedback-based program-repair signal (Sec. 2.3) ----
-    from feedback import FeedbackConfig
-    fb_cfg = FeedbackConfig.from_dict(merged)
-    print(f"[init] {fb_cfg.describe()}")
-    if not cfg.no_train and fb_cfg.enabled and fb_cfg.anneal_steps > 0:
-        print(f"[init] lambda schedule: {fb_cfg.schedule_preview()}")
-
-    # ---- adaptive batch growth: start from the configured (G, K) ----
-    if resume_payload is not None:
-        cur_g = int(resume_payload["next_groups_per_step"])
-        cur_k = int(resume_payload["next_group_size"])
-    else:
-        cur_g = int(cfg.groups_per_step)
-        cur_k = int(cfg.group_size)
-    if getattr(problem, "two_stage_rollouts", False):
-        cur_k = int(cfg.strategies_per_parent) * int(
-            cfg.programs_per_strategy)
-    if configured_advantage_mode == "x-grpo":
-        growth_shape = (
-            f"P={cfg.x_grpo_contexts_per_step}, K={cur_g}, G={cur_k} -> "
-            f"max K={cfg.max_groups_per_step}, G={cfg.max_group_size}")
-    else:
-        growth_shape = (
-            f"G={cur_g} K={cur_k} -> max G={cfg.max_groups_per_step} "
-            f"K={cfg.max_group_size}")
-    print(f"[init] batch growth: start {growth_shape}; "
-          f"grow when best-valid-yield>={cfg.growth_valid_yield} and "
-          f"distinct-good>={cfg.growth_distinct_min} (x{cfg.growth_factor}); "
-          f"forced to max at step {cfg.growth_force_step}")
 
     # ---- main loop ----
     from experiment_io import StepPlotter
@@ -11824,18 +11407,10 @@ def main():
         if start_step >= cfg.num_steps:
             print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
         for step in range(start_step, cfg.num_steps):
-            # Hard convergence: from growth_force_step on, run at the cap no
-            # matter what the signals say.
-            if step >= cfg.growth_force_step:
-                cur_g, cur_k = int(cfg.max_groups_per_step), int(cfg.max_group_size)
-            cfg.groups_per_step = cur_g
-            cfg.group_size = cur_k
             step_cfg = cfg
-            step_fb_cfg = fb_cfg
             if binary_coder_cfg.enabled:
                 step_cfg = SimpleNamespace(**vars(cfg))
                 step_cfg.advantage_mode = BINARY_CODER_MODE
-                step_fb_cfg = None
                 if binary_coder_cfg.active(step):
                     step_cfg.no_train = bool(cfg.no_train)
                     print(f"[step {step}] binary coder initialization "
@@ -11852,28 +11427,30 @@ def main():
             runtime_training_active["value"] = not bool(step_cfg.no_train)
             if configured_advantage_mode == "x-grpo":
                 rollout_count = (
-                    int(cfg.x_grpo_contexts_per_step) * cur_g * cur_k)
+                    int(cfg.x_grpo_contexts_per_step)
+                    * cfg.groups_per_step * cfg.group_size)
                 hierarchy = (
                     f"{cfg.strategies_per_parent} strategies x "
                     f"{cfg.programs_per_strategy} programs/group; "
                     if getattr(problem, "two_stage_rollouts", False) else "")
                 print(f"[step {step}] batch: "
-                      f"P={cfg.x_grpo_contexts_per_step} K={cur_g} G={cur_k} "
+                      f"P={cfg.x_grpo_contexts_per_step} "
+                      f"K={cfg.groups_per_step} G={cfg.group_size} "
                       f"({hierarchy}{rollout_count} rollouts)")
             elif getattr(problem, "two_stage_rollouts", False):
-                print(f"[step {step}] batch: parents={cur_g} "
+                print(f"[step {step}] batch: parents={cfg.groups_per_step} "
                       f"strategies/parent={cfg.strategies_per_parent} "
                       f"programs/strategy={cfg.programs_per_strategy} "
-                      f"({cur_g * cur_k} code rollouts)")
+                      f"({cfg.groups_per_step * cfg.group_size} code rollouts)")
             else:
-                print(f"[step {step}] batch: G={cur_g} K={cur_k} "
-                      f"({cur_g * cur_k} rollouts)")
+                print(f"[step {step}] batch: G={cfg.groups_per_step} "
+                      f"K={cfg.group_size} "
+                      f"({cfg.groups_per_step * cfg.group_size} rollouts)")
 
             stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
                                step_cfg, exp_dir, problem, gen_pool,
                                strategy_pool=strategy_pool,
                                strategy_tokenizer=strategy_tokenizer,
-                               fb_cfg=step_fb_cfg,
                                parallel_trainer=parallel_trainer,
                                spo_rs_tracker=spo_rs_tracker,
                                sampling_adapter_path=(
@@ -11895,11 +11472,6 @@ def main():
                   f"{step_training_seconds:.1f}s  "
                   f"(run cumulative {cumulative_training_seconds:.1f}s)",
                   flush=True)
-
-            # Ratchet up for the next step (skipped once we are in the forced
-            # region, since we are already pinned to the max there).
-            if step < cfg.growth_force_step:
-                cur_g, cur_k = grow_batch(cur_g, cur_k, stats, cfg)
 
             # Version the adapter first, then atomically advance the state
             # pointer. A crash during either write leaves the previous pair
@@ -11925,7 +11497,6 @@ def main():
                     model, exp_dir, step, cfg.model_name)
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
-                next_g=cur_g, next_k=cur_k,
                 spo_rs_tracker=spo_rs_tracker,
             )
             step_summary = {
@@ -11935,8 +11506,8 @@ def main():
                 "adapter_dir": Path(adapter_path).name,
                 "checkpoint": Path(checkpoint_path).name,
                 "archive_size": sampler.archive_size(),
-                "next_groups_per_step": cur_g,
-                "next_group_size": cur_k,
+                "groups_per_step": int(cfg.groups_per_step),
+                "group_size": int(cfg.group_size),
                 **(stats or {}),
             }
             save_step_summary(exp_dir, step, step_summary)
