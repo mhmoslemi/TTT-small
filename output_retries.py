@@ -80,13 +80,10 @@ def coder_retry_prompt_job(prompt_jobs, record, render, cache):
     if key not in cache:
         source = prompt_jobs[source_idx]
         messages = output_retry_messages(source["messages"], "coder")
-        # A mixed-effort pilot is still an allocation-phase "pilot", but its
-        # immutable prompt alias may require xhigh rather than medium.
-        prompt_phase = source.get("coder_prompt_phase", phase)
         cache[key] = len(prompt_jobs)
         prompt_jobs.append({
             **source, "messages": messages,
-            "prompt_text": render(messages, rollout_phase=prompt_phase), "count": 0,
+            "prompt_text": render(messages, rollout_phase=phase), "count": 0,
         })
     return cache[key]
 

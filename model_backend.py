@@ -25,6 +25,14 @@ _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = None
 # only its token dimension preserves every token and the exact autograd graph.
 _EXACT_MLP_PROJECTION_TILE_BYTES = 128 * 1024 * 1024
 
+# Qwen3.8 flattens every token/value-head pair before its gated RMSNorm.  The
+# stock fallback casts that entire matrix and its SiLU gate to FP32 at once.
+# At 100K+ tokens that single elementwise operation needs several additional
+# GiB even though the surrounding Gated DeltaNet and MLP are already bounded.
+# Tile the flattened row dimension so each exact FP32 norm/gate call stays
+# bounded as well.
+_EXACT_GATED_NORM_TILE_BYTES = 128 * 1024 * 1024
+
 
 def register_shared_prefix_attention_mask(mask, prefix_end, branches):
     """Associate a compact packed-branch mask with its contiguous layout.
@@ -821,6 +829,97 @@ def _install_exact_qwen38_mlp_chunking(model, cfg):
     return installed
 
 
+def _exact_gated_norm_row_chunk_size(hidden_states, gate):
+    """Bound one FP32 gated-normalization tile using its actual row width."""
+    width = max(1, int(hidden_states.shape[-1]), int(gate.shape[-1]))
+    # Both operands are explicitly promoted to FP32 by the checkpoint's
+    # original implementation, regardless of their input dtype.
+    rows = max(1, _EXACT_GATED_NORM_TILE_BYTES // (width * 4))
+    if rows >= 128:
+        rows = (rows // 128) * 128
+    return max(1, min(int(hidden_states.shape[-2]), int(rows)))
+
+
+def _exact_chunked_qwen35_gated_norm_forward(module, hidden_states, gate):
+    """Run Qwen3.8's gated RMSNorm in exact checkpointed row tiles.
+
+    Qwen3.8 passes a two-dimensional ``(tokens * value_heads, head_dim)``
+    matrix here.  RMS normalization and SiLU gating are independent per row,
+    so slicing only that row dimension changes neither values nor gradients.
+    Per-tile checkpointing prevents backward recomputation from materializing
+    the original multi-GiB FP32 gate for the complete trajectory.
+    """
+    original = module._ttt_exact_gated_norm_original_forward
+    if hidden_states.ndim < 2 or gate.ndim != hidden_states.ndim:
+        return original(hidden_states, gate)
+    if tuple(hidden_states.shape) != tuple(gate.shape):
+        return original(hidden_states, gate)
+    rows = int(hidden_states.shape[-2])
+    minimum = int(getattr(
+        module, "_ttt_exact_gated_norm_min_rows", 0) or 0)
+    if rows < minimum:
+        return original(hidden_states, gate)
+
+    chunk = _exact_gated_norm_row_chunk_size(hidden_states, gate)
+    if chunk >= rows:
+        return original(hidden_states, gate)
+
+    def normalize(hidden_slice, gate_slice):
+        return original(hidden_slice, gate_slice)
+
+    outputs = []
+    use_checkpoint = bool(
+        torch.is_grad_enabled()
+        and (hidden_states.requires_grad or gate.requires_grad))
+    for start in range(0, rows, chunk):
+        hidden_slice = hidden_states[..., start:start + chunk, :]
+        gate_slice = gate[..., start:start + chunk, :]
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(
+                normalize, hidden_slice, gate_slice, use_reentrant=False)
+        else:
+            output = normalize(hidden_slice, gate_slice)
+        outputs.append(output)
+    return torch.cat(outputs, dim=-2)
+
+
+def _install_exact_qwen38_gated_norm_chunking(model, cfg):
+    """Patch Qwen3.8's FP32 gated-norm fallback with exact bounded tiles."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
+        return 0
+    # The module receives value-head rows rather than decoder-token rows.  Use
+    # the memory-derived tile for every nontrivial matrix; short calls remain a
+    # single original forward when they already fit under the tile bound.
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5RMSNormGated":
+            continue
+        if hasattr(module, "_ttt_exact_gated_norm_original_forward"):
+            installed += 1
+            continue
+        required = ("weight", "variance_epsilon", "activation")
+        if not all(hasattr(module, name) for name in required):
+            raise RuntimeError(
+                "Qwen3.8 gated RMSNorm no longer exposes the exact "
+                "normalization/gating contract required for row chunking")
+        module._ttt_exact_gated_norm_original_forward = module.forward
+        module._ttt_exact_gated_norm_min_rows = 1
+        module.forward = types.MethodType(
+            _exact_chunked_qwen35_gated_norm_forward, module)
+        installed += 1
+    if installed < 1:
+        raise RuntimeError(
+            "Qwen3.8 exact long training found no Qwen3_5RMSNormGated "
+            "modules to row-chunk; refusing an unbounded FP32 gate path")
+    print(
+        "[memory] Qwen3.8 exact token-chunked gated RMSNorm training ON "
+        f"({installed} layers; all tokens and gradients retained)",
+        flush=True,
+    )
+    return installed
+
+
 def _configure_exact_long_training(model, cfg):
     """Attach the model-profile execution policy used by every trainer path."""
     if not bool(getattr(cfg, "strict_exact_long_training", False)):
@@ -836,6 +935,7 @@ def _configure_exact_long_training(model, cfg):
         None if cpu_offload_threshold is None
         else int(cpu_offload_threshold))
     _install_exact_qwen38_mlp_chunking(model, cfg)
+    _install_exact_qwen38_gated_norm_chunking(model, cfg)
     offload_description = (
         "CPU activation offload only after a proven OOM"
         if model._ttt_activation_offload_min_work is None else

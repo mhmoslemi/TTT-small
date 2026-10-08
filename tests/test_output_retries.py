@@ -151,7 +151,7 @@ class RunnerRetryTests(unittest.TestCase):
         saved = []
         scope["save_rollout_artifacts"] = lambda *args, **kw: saved.append((args, kw))
         scope["_render"] = lambda messages, rollout_phase=None: (
-            ("xhigh" if rollout_phase == "pilot_xhigh" else "medium") + repr(messages))
+            "medium" + repr(messages))
         messages = [{"role": "user", "content": "original parent plus strategy"}]
         scope["prompt_jobs"] = [dict(
             parent_group=0, messages=messages, count=3, assigned_fold_index=0,
@@ -184,7 +184,6 @@ class RunnerRetryTests(unittest.TestCase):
         scope["generate_prompt_jobs"] = lambda m, t, p, c, cfg, **kw: generate(p, c, False)
         functions_from_file("train_multy_CVaR.py", {
             "_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
-            "_coder_phase_generation_jobs",
             "_queue_rollout", "_submit_rollout", "_run_coder_format_retries",
             "_defer_coder_format_retries",
             "_drain_deferred_coder_format_retries",
@@ -217,7 +216,7 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(len(saved), 5)
                     self.assertEqual(len(calls), 4)  # still-missing retry is NOT retried
                     self.assertEqual(len(set(seeds)), 4)
-                    for index, expected in [(0, "xhigh"), (1, "xhigh"),
+                    for index, expected in [(0, "medium"), (1, "medium"),
                                             (2, "medium"), (3, "medium")]:
                         self.assertTrue(calls[index][0][0].startswith(expected))
                     for rec in s["coder_retry_records"]:

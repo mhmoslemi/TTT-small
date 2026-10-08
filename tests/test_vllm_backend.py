@@ -90,6 +90,63 @@ def _fake_complete_yaml(stream):
 
 
 class VLLMBackendTests(unittest.TestCase):
+    def test_qwen38_gated_norm_tiles_preserve_forward_and_gradients(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest(
+                "PyTorch is required for exact forward/gradient equivalence")
+        import copy
+        import torch
+        from model_backend import _install_exact_qwen38_gated_norm_chunking
+
+        class Qwen3_5RMSNormGated(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(4))
+                self.variance_epsilon = 1e-6
+                self.activation = "silu"
+
+            def forward(self, hidden_states, gate):
+                input_dtype = hidden_states.dtype
+                hidden_states = hidden_states.to(torch.float32)
+                variance = hidden_states.pow(2).mean(-1, keepdim=True)
+                hidden_states = hidden_states * torch.rsqrt(
+                    variance + self.variance_epsilon)
+                hidden_states = self.weight * hidden_states.to(input_dtype)
+                hidden_states = hidden_states * torch.nn.functional.silu(
+                    gate.to(torch.float32))
+                return hidden_states.to(input_dtype)
+
+        torch.manual_seed(11)
+        reference = Qwen3_5RMSNormGated()
+        chunked = copy.deepcopy(reference)
+        cfg = types.SimpleNamespace(coder_model_profile="qwen3.8-27b")
+        # Two rows per tile exercises concatenation and nested checkpointing.
+        with patch("model_backend._EXACT_GATED_NORM_TILE_BYTES", 32):
+            self.assertEqual(
+                _install_exact_qwen38_gated_norm_chunking(chunked, cfg), 1)
+
+            reference_hidden = torch.randn(11, 4, requires_grad=True)
+            reference_gate = torch.randn(11, 4, requires_grad=True)
+            chunked_hidden = reference_hidden.detach().clone().requires_grad_(True)
+            chunked_gate = reference_gate.detach().clone().requires_grad_(True)
+            reference_output = reference(reference_hidden, reference_gate)
+            chunked_output = chunked(chunked_hidden, chunked_gate)
+            torch.testing.assert_close(
+                chunked_output, reference_output, rtol=2e-5, atol=2e-6)
+
+            reference_output.square().sum().backward()
+            chunked_output.square().sum().backward()
+
+        torch.testing.assert_close(
+            chunked_hidden.grad, reference_hidden.grad,
+            rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(
+            chunked_gate.grad, reference_gate.grad,
+            rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(
+            chunked.weight.grad, reference.weight.grad,
+            rtol=2e-5, atol=2e-6)
+
     def test_qwen38_token_tiles_preserve_forward_and_gradients(self):
         if importlib.util.find_spec("torch") is None:
             self.skipTest(
