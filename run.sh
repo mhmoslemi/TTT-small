@@ -59,7 +59,7 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 # exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank entropic spo-rs --fast
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode entropic --measure-entropy \
-    --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
+    --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
     --isolate-eval --fused-long-attention "$@"
-    # --strategies
-    # --coder-retry
+    # 
+    # 
