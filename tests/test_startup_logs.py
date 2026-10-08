@@ -80,6 +80,15 @@ class StartupLogTests(unittest.TestCase):
             self.assertIn(f"after bind {index}", saved)
         self.assertEqual(saved.count("startup settings"), 2)
 
+    def test_direct_run_setting_header_is_not_strategist_labeled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "setting.log"
+            log = StartupLog(title="Single-Model Discovery")
+            log.bind(path)
+            saved = path.read_text()
+        self.assertIn("Single-Model Discovery | startup settings", saved)
+        self.assertNotIn("Strategist Bandit", saved)
+
     def test_warnings_errors_and_cached_stream_stay_visible(self):
         console = io.StringIO()
         with redirect_stdout(console):
@@ -147,6 +156,7 @@ class StartupLogTests(unittest.TestCase):
 
     def test_box_alignment_wrapping_and_color(self):
         fields = {"Problem": "erdos", "Model": "Qwen/" + "long-model-" * 14,
+                  "Strategy model": "deepseek/strategist",
                   "Strategy sampling": "temperature=1, top_p=1, thinking=on, " * 4,
                   "Total rollouts/step": "108", "Advantage mode": "spo-rs"}
         for width in (44, 80, 112):
@@ -160,6 +170,14 @@ class StartupLogTests(unittest.TestCase):
                     self.assertIn("STRATEGIST BANDIT", plain)
                     self.assertIn("RESUMING", plain)
                     self.assertIn("108", plain)
+
+    def test_direct_dashboard_has_no_strategist_label(self):
+        output = render_dashboard(
+            {"Problem": "erdos", "Model": "Qwen/Qwen3-8B",
+             "Total rollouts/step": "192"},
+            "/tmp/direct-run", color=False)
+        self.assertIn("SINGLE-MODEL DISCOVERY", output)
+        self.assertNotIn("STRATEGIST BANDIT", output)
 
     def test_real_main_startup_uses_resolved_values_without_changing_behavior(self):
         tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
@@ -200,10 +218,16 @@ class StartupLogTests(unittest.TestCase):
             x_grpo_relative_error=.99, x_grpo_entropy_coef=.001,
             rank_clip_epsilon_low=.2, rank_clip_epsilon_high=.38)
 
-        for mode in ("entropic", "spo-rs", "x-grpo", "binary", "no-train"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+        cases = [
+            (mode, True)
+            for mode in ("entropic", "spo-rs", "x-grpo", "binary", "no-train")
+        ] + [("entropic", False)]
+        for mode, strategies in cases:
+            with self.subTest(mode=mode, strategies=strategies), \
+                    tempfile.TemporaryDirectory() as directory:
                 cfg = SimpleNamespace(**dict(base, advantage_mode=mode,
-                                             no_train=mode == "no-train"))
+                                             no_train=mode == "no-train",
+                                             strategies=strategies))
                 events = []
                 binary = SimpleNamespace(enabled=mode == "binary", init_steps=4,
                                          lora_rank=16, clip_epsilon_low=.2, clip_epsilon_high=.38)
@@ -244,9 +268,20 @@ class StartupLogTests(unittest.TestCase):
                 saved = (Path(directory) / "setting.log").read_text()
                 output = console.getvalue()
                 self.assertEqual(events, ["config", "pin", "load"])
-                self.assertIn("STRATEGIST BANDIT", output)
+                expected_title = ("STRATEGIST BANDIT" if strategies
+                                  else "SINGLE-MODEL DISCOVERY")
+                self.assertIn(expected_title, output)
+                self.assertIn(
+                    "Strategist Bandit | startup settings" if strategies
+                    else "Single-Model Discovery | startup settings",
+                    saved)
                 self.assertIn("normal runtime output", output)
-                self.assertIn("phase 2=medium", output)
+                if strategies:
+                    self.assertIn("phase 2=medium", output)
+                else:
+                    self.assertIn("Coder reasoning: direct=medium", output)
+                    self.assertNotIn("phase 2=", output)
+                    self.assertNotIn("Strategy model:", output)
                 self.assertIn("262144", output)
                 self.assertNotIn("detailed profile", output)
                 self.assertNotIn("detailed kernel setup", output)

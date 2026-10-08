@@ -356,6 +356,57 @@ def _entropy_pdf(path, rows):
         for row in rows
         for index in row.get("by_strategy", {})
     })
+
+    # A direct, one-stage run has no meaningful strategy dimension.  Give its
+    # aggregate the full figure instead of manufacturing an empty strategy
+    # subplot.  Keep the existing two-column strategist layout below unchanged.
+    if not strategy_indices:
+        values = [
+            _finite_entropy(row, lambda item: item["all"]["entropy_nats"])
+            for row in rows
+        ]
+        finite = [value for value in values if value is not None]
+        upper = max([0.1] + [value * 1.08 for value in finite])
+        points = [
+            (int(row["step"]), value)
+            for row, value in zip(rows, values)
+            if value is not None
+        ]
+        figure, axis = plt.subplots(
+            figsize=(9.5, 5.6), constrained_layout=True)
+        if points:
+            axis.plot(
+                [point[0] for point in points],
+                [point[1] for point in points],
+                color="#6d28d9", linewidth=2.5, marker="o", markersize=4.5)
+        else:
+            axis.text(0.5, 0.5, "No measurements", ha="center", va="center",
+                      transform=axis.transAxes, color="#777777", fontsize=9)
+        axis.set_title("All coder rollouts", fontsize=13, pad=7)
+        axis.set_xlabel("Training step", fontsize=12)
+        axis.set_ylabel("Mean token entropy (nats)", fontsize=12)
+        axis.set_ylim(0.0, upper)
+        axis.grid(True, color="#e5e7eb", linewidth=0.8)
+        for side in ("top", "right"):
+            axis.spines[side].set_visible(False)
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+        axis.tick_params(labelsize=10)
+        figure.suptitle(
+            "Coder output entropy", fontsize=16, fontweight="semibold")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(
+            prefix=".entropy-", suffix=".pdf", dir=path.parent)
+        os.close(handle)
+        try:
+            figure.savefig(temporary, format="pdf", bbox_inches="tight")
+            os.replace(temporary, path)
+        finally:
+            plt.close(figure)
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return
+
     right_rows = max(1, len(strategy_indices))
     figure_height = max(5.6, 1.75 * right_rows)
     figure = plt.figure(figsize=(13.5, figure_height), constrained_layout=True)
@@ -462,14 +513,18 @@ def save_step(exp_dir, step, observations, cfg, stats):
         int(row["strategy"]) for row in samples
         if row.get("strategy") is not None
     })
+    strategies_enabled = bool(getattr(
+        cfg, "strategies", bool(observed_strategy_indices)))
     configured_strategy_count = (
         int(getattr(cfg, "strategies_per_parent", 0) or 0)
-        if bool(getattr(cfg, "strategies", bool(observed_strategy_indices)))
-        else 0)
-    strategy_count = max(
-        configured_strategy_count,
-        (max(observed_strategy_indices) + 1
-         if observed_strategy_indices else 0),
+        if strategies_enabled else 0)
+    strategy_count = (
+        max(
+            configured_strategy_count,
+            (max(observed_strategy_indices) + 1
+             if observed_strategy_indices else 0),
+        )
+        if strategies_enabled else 0
     )
     by_strategy = {
         str(strategy_index): _aggregate([
@@ -479,9 +534,14 @@ def save_step(exp_dir, step, observations, cfg, stats):
         for strategy_index in range(strategy_count)
     }
     by_parent_strategy = {}
-    for parent, strategy in sorted({
+    parent_strategy_pairs = (
+        sorted({
             (int(row["parent"]), int(row["strategy"]))
-            for row in samples if row.get("strategy") is not None}):
+            for row in samples if row.get("strategy") is not None
+        })
+        if strategies_enabled else []
+    )
+    for parent, strategy in parent_strategy_pairs:
         by_parent_strategy[f"p{parent}:s{strategy}"] = {
             "parent": parent,
             "strategy": strategy,
@@ -498,8 +558,10 @@ def save_step(exp_dir, step, observations, cfg, stats):
         "includes": "all_response_tokens_including_reasoning_and_failed_outputs",
         "excludes": "prompt_padding_and_unscored_rollouts",
         "coder_model": getattr(cfg, "model_name", None),
-        "strategy_model": getattr(cfg, "strategy_model_name", None),
-        "strategies_enabled": bool(getattr(cfg, "strategies", False)),
+        "strategy_model": (
+            getattr(cfg, "strategy_model_name", None)
+            if strategies_enabled else None),
+        "strategies_enabled": strategies_enabled,
         "training_disabled": bool(getattr(cfg, "no_train", False)),
         "lora_dropout": getattr(cfg, "lora_dropout", None),
         "sampling": {key: getattr(cfg, key, None)
@@ -512,11 +574,15 @@ def save_step(exp_dir, step, observations, cfg, stats):
         "by_strategy": by_strategy,
         "by_parent_strategy": by_parent_strategy,
         "strategy_entropy_aggregation": (
-            "token_weighted_by_strategy_index_pooled_across_parents_and_phases"),
-        "pilot": _aggregate([r for r in samples if r["phase"] == "pilot"
-                             and not r.get("retry_attempt", 0)]),
+            "token_weighted_by_strategy_index_pooled_across_parents_and_phases"
+            if strategies_enabled else None),
+        "pilot": (
+            _aggregate([r for r in samples if r["phase"] == "pilot"
+                        and not r.get("retry_attempt", 0)])
+            if strategies_enabled else None),
         "retries": _aggregate([r for r in samples if r.get("retry_attempt", 0)]),
-        "code_diversity": code_diversity(samples),
+        "code_diversity": (
+            code_diversity(samples) if strategies_enabled else None),
         "step_best_raw_score": stats.get("step_best_raw_score"),
         "best_seen_raw_score": stats.get("best_seen_raw_score"),
         "metric_name": stats.get("result_metric_name"),
@@ -537,10 +603,11 @@ def save_step(exp_dir, step, observations, cfg, stats):
     rows = [history[key] for key in sorted(history)]
     _atomic_text(history_path, "".join(_json(row) + "\n" for row in rows))
     _entropy_pdf(exp_dir / "entropy.pdf", rows)
-    _line_plot(exp_dir / "strategy_diversity.svg", rows, [
-        ("Within strategy", "#702dbd", lambda r:
-         r["code_diversity"]["within_strategy"]["distance"]),
-        ("Across strategies", "#29a6b6", lambda r:
-         r["code_diversity"]["across_strategies"]["distance"]),
-    ], "Valid-code diversity (lexical distance)", upper=1.0)
+    if strategies_enabled:
+        _line_plot(exp_dir / "strategy_diversity.svg", rows, [
+            ("Within strategy", "#702dbd", lambda r:
+             r["code_diversity"]["within_strategy"]["distance"]),
+            ("Across strategies", "#29a6b6", lambda r:
+             r["code_diversity"]["across_strategies"]["distance"]),
+        ], "Valid-code diversity (lexical distance)", upper=1.0)
     return summary

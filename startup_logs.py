@@ -52,9 +52,11 @@ class StartupLog:
     on scope exit, so later training and progress output cannot be captured.
     """
 
-    def __init__(self, *, time_offset=0, console=None):
+    def __init__(self, *, time_offset=0, console=None,
+                 title="Strategist Bandit"):
         self.console = sys.stdout if console is None else console
         self.time_offset = time_offset
+        self.title = str(title)
         self.path = None
         self.pending = io.StringIO()
         self.partial = ""
@@ -65,7 +67,7 @@ class StartupLog:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as log:
-            log.write("\n=== Strategist Bandit | startup settings ===\n")
+            log.write(f"\n=== {self.title} | startup settings ===\n")
             log.write(self.pending.getvalue())
         self.pending = io.StringIO()
 
@@ -204,8 +206,10 @@ def render_dashboard(fields, run_dir, *, width=104, color=False, resuming=False)
     def content(text):
         return "│ " + text.ljust(inner) + " │"
 
+    title = ("STRATEGIST BANDIT" if "Strategy model" in fields
+             else "SINGLE-MODEL DISCOVERY")
     lines = [paint("╭" + "─" * (width - 2) + "╮", 90),
-             content(paint("STRATEGIST BANDIT".ljust(inner), "1;96"))]
+             content(paint(title.ljust(inner), "1;96"))]
     for title, code, rows in dashboard_sections(fields, run_dir, resuming=resuming):
         header = f" {title} "
         lines.append(paint("├" + header + "─" * (width - 2 - len(header)) + "┤", code))

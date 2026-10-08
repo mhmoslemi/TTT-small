@@ -10786,6 +10786,9 @@ def main():
             cfg, resume_dir=resume_dir, config_dict=merged
         )
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
+        startup_log.title = (
+            "Strategist Bandit" if cfg.strategies
+            else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
         bind_setting_log(
             setting_log_path, time_offset=_LOG_TIME_OFFSET_SECONDS)
@@ -10887,13 +10890,14 @@ def main():
         problem_config["eval_cpus"] = 1
     problem = get_problem(cfg.problem, problem_config)
     # Strategy generation is a launch mode, not a permanent property of a
-    # problem class. Without --strategies every problem follows its original
+    # problem class. Without --strategies every problem follows its direct
     # one-stage policy rollout path.
     problem.two_stage_rollouts = bool(cfg.strategies)
 
     startup_log.begin_summary()
     print("=" * 70)
-    print("Strategist Bandit")
+    print("Strategist Bandit" if cfg.strategies
+          else "Single-Model Discovery")
     print("=" * 70)
     problem_type = getattr(cfg, "problem_type", "")
     print(f"Problem:            {cfg.problem}"
@@ -11007,8 +11011,13 @@ def main():
         print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
-    print(f"Coder reasoning:    pilot/base={_coder_effort_for_rollout_phase(cfg)}, "
-          f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
+    if getattr(problem, "two_stage_rollouts", False):
+        print(f"Coder reasoning:    pilot/base={_coder_effort_for_rollout_phase(cfg)}, "
+              f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
+    else:
+        direct_effort = _coder_effort_for_rollout_phase(cfg)
+        if direct_effort is not None:
+            print(f"Coder reasoning:    direct={direct_effort}")
     print(
         f"Coder sampling:     temperature={cfg.temperature}, "
         f"top_p={cfg.top_p}, "
@@ -11741,8 +11750,11 @@ def main():
                           f"{measured['rollouts']} rollouts "
                           f"({measured['measured_tokens']}/"
                           f"{measured['response_tokens']} response tokens); "
-                          "updated entropy.jsonl, entropy.pdf, "
-                          "strategy_diversity.svg", flush=True)
+                          + ("updated entropy.jsonl, entropy.pdf, "
+                             "strategy_diversity.svg"
+                             if bool(getattr(step_cfg, "strategies", False))
+                             else "updated entropy.jsonl, entropy.pdf"),
+                          flush=True)
                 except (OSError, ValueError, TypeError) as error:
                     print(f"[warn] entropy diagnostics could not be saved: "
                           f"{error}; training checkpoint is already saved",

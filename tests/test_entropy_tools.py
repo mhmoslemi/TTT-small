@@ -104,7 +104,7 @@ class EntropyToolsTests(unittest.TestCase):
         self.measured(first, 2.0)
         self.measured(failed, 4.0)
         summary = entropy.save_step(self.root, 0, [first, failed, missing],
-                                    SimpleNamespace(), {})
+                                    SimpleNamespace(strategies=True), {})
         self.assertAlmostEqual(summary["all"]["entropy_nats"], .6)
         self.assertAlmostEqual(summary["all"]["token_coverage"], .5)
         self.assertAlmostEqual(summary["all"]["valid_fraction"], 2/3)
@@ -121,30 +121,71 @@ class EntropyToolsTests(unittest.TestCase):
         row = self.observation(tokens=4)
         self.measured(row, 4.0)
         row["response_tokens"] = 5
-        summary = entropy.save_step(self.root, 0, [row], SimpleNamespace(), {})
+        summary = entropy.save_step(
+            self.root, 0, [row], SimpleNamespace(strategies=True), {})
         self.assertIsNone(summary["all"]["entropy_nats"])
         self.assertEqual(summary["all"]["measured_rollouts"], 0)
 
     def test_json_history_resume_upsert_and_svg(self):
+        cfg = SimpleNamespace(strategies=True, strategies_per_parent=1)
         for step in [0, 1, 1, 2]:
             row = self.observation()
             self.measured(row, float(step + 1))
-            entropy.save_step(self.root, step, [row], SimpleNamespace(), {})
+            entropy.save_step(self.root, step, [row], cfg, {})
         history = [json.loads(line) for line in
                    (self.root / "entropy.jsonl").read_text().splitlines()]
         self.assertEqual([row["step"] for row in history], [0, 1, 2])
         self.assertTrue((self.root / "entropy.pdf").read_bytes().startswith(b"%PDF"))
         ET.parse(self.root / "strategy_diversity.svg")
-        entropy.save_step(self.root, 1, [], SimpleNamespace(), {})
+        entropy.save_step(self.root, 1, [], cfg, {})
         history = [json.loads(line) for line in
                    (self.root / "entropy.jsonl").read_text().splitlines()]
         self.assertEqual([row["step"] for row in history], [0, 1])
         self.assertIsNone(history[-1]["all"]["entropy_nats"])
 
     def test_missing_entropy_is_a_gap_not_a_zero_curve(self):
-        summary = entropy.save_step(self.root, 0, [], SimpleNamespace(), {})
+        summary = entropy.save_step(
+            self.root, 0, [], SimpleNamespace(strategies=False), {})
         self.assertIsNone(summary["all"]["entropy_nats"])
         self.assertTrue((self.root / "entropy.pdf").read_bytes().startswith(b"%PDF"))
+
+    def test_direct_run_has_no_strategy_only_metadata_or_artifact(self):
+        row = self.observation(strategy=None, phase="ordinary")
+        self.measured(row, 1.5)
+        cfg = SimpleNamespace(
+            strategies=False,
+            strategy_model_name="must-not-leak-into-direct-run",
+            model_name="Qwen/Qwen3-8B",
+        )
+        with patch.object(entropy, "_entropy_pdf") as entropy_pdf, \
+                patch.object(entropy, "_line_plot") as strategy_plot:
+            summary = entropy.save_step(self.root, 0, [row], cfg, {})
+        entropy_pdf.assert_called_once()
+        strategy_plot.assert_not_called()
+        self.assertFalse((self.root / "strategy_diversity.svg").exists())
+        self.assertFalse(summary["strategies_enabled"])
+        self.assertIsNone(summary["strategy_model"])
+        self.assertEqual(summary["by_strategy"], {})
+        self.assertEqual(summary["by_parent_strategy"], {})
+        self.assertIsNone(summary["strategy_entropy_aggregation"])
+        self.assertIsNone(summary["pilot"])
+        self.assertIsNone(summary["code_diversity"])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("matplotlib"), "matplotlib not installed")
+    def test_direct_entropy_pdf_uses_one_full_width_axis(self):
+        import matplotlib.pyplot as plt
+
+        closed = []
+        real_close = plt.close
+        rows = [{"step": 0, "all": {"entropy_nats": 0.7},
+                 "by_strategy": {}}]
+        with patch.object(plt, "close", side_effect=closed.append):
+            entropy._entropy_pdf(self.root / "entropy.pdf", rows)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(len(closed[0].axes), 1)
+        self.assertTrue((self.root / "entropy.pdf").read_bytes().startswith(b"%PDF"))
+        real_close(closed[0])
 
     def test_strategy_entropy_is_saved_both_pooled_and_by_parent(self):
         rows = [self.observation(group=0, rollout=0, strategy=0, tokens=2),
@@ -153,7 +194,8 @@ class EntropyToolsTests(unittest.TestCase):
         for row, total in zip(rows, (1.0, 3.0, 8.0)):
             self.measured(row, total)
         summary = entropy.save_step(
-            self.root, 0, rows, SimpleNamespace(strategies_per_parent=2), {})
+            self.root, 0, rows,
+            SimpleNamespace(strategies=True, strategies_per_parent=2), {})
         self.assertAlmostEqual(
             summary["by_strategy"]["0"]["entropy_nats"], 4.0 / 5.0)
         self.assertAlmostEqual(

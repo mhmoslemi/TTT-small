@@ -218,7 +218,24 @@ Return exactly one complete fenced Python code block, beginning with
 ```python and ending with ```, and nothing else. Do not output a strategy,
 analysis, prose, notes, example usage, a second code block, or a partial
 snippet. Finish the program and close the fence well before the response-token
-limit.'''
+limit.
+
+## Mandatory compact-source contract
+
+- `initial_h_values` is runtime input when a parent construction exists.
+  Reference it directly; NEVER assign to it, paste its values, serialize it,
+  or reconstruct it as a literal. If no parent construction was announced,
+  create a starting vector under a different name.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- Keep the complete source concise: at most 300 lines and about 12,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
+
+These are hard output constraints.'''
 
         user = f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
 Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.

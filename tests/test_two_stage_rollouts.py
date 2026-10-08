@@ -1,4 +1,5 @@
 from problems.base import ParentContext, Problem, RewardResult, SeedState
+from problems.erdos import ErdosMinOverlap
 from train_multy_CVaR import (
     _STRATEGY_FALLBACK,
     _apply_qwen3_8b_thinking_sampling,
@@ -77,6 +78,28 @@ def test_build_code_messages_embeds_strategy_and_requires_code_only():
     assert "<strategy>\nuse approach A\n</strategy>" in content
     assert "```python" in content
     assert "Do not output analysis, reasoning, a strategy" in content
+
+
+def test_erdos_direct_prompt_and_strategy_coder_share_compact_contract():
+    problem = ErdosMinOverlap({"budget_s": 60})
+    parent = ParentContext()
+
+    problem.two_stage_rollouts = True
+    strategist_base = _content(problem.build_prompt(parent))
+    assert "## Mandatory compact-source contract" not in strategist_base
+    staged = _content(problem.build_code_messages(
+        [{"role": "user", "content": strategist_base}], "detailed plan"))
+
+    problem.two_stage_rollouts = False
+    direct = _content(problem.build_prompt(parent))
+    for required in (
+            "## Mandatory compact-source contract",
+            "A list/tuple/array literal may contain at most 32 scalar",
+            "at most 300 lines and about 12,000"):
+        assert required in direct
+        assert required in staged
+    assert "Return exactly one complete fenced Python code block" in direct
+    assert "Return only exactly one fenced Python code block" in staged
 
 
 def test_extract_final_strategy_selects_last_complete_block():

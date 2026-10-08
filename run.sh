@@ -39,12 +39,13 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # search and result/checkpoint persistence:
 #   sh run.sh --no-train
 # Measurement only: reuse policy forwards for full-vocabulary entropy and
-# refresh entropy.jsonl / entropy.pdf / strategy_diversity.svg each step.
+# refresh entropy.jsonl / entropy.pdf each step. Strategy runs additionally
+# refresh strategy_diversity.svg.
 # No extra model forwards; skipped/unscored examples have missing coverage.
 #   sh run.sh --measure-entropy
 # Opt into hierarchical rollouts. The frozen strategist runs first, is fully
 # offloaded, then the LoRA coder generates programs and trains. Without this
-# flag the ordinary one-stage rollout path is unchanged:
+# flag the coder uses the direct one-stage rollout path:
 #   sh run.sh --strategies
 # Retry a coder response missing its required final code block once. Coder
 # retries are off unless this flag is passed; strategy retries are unchanged:
@@ -59,5 +60,6 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 # exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank entropic spo-rs --fast
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode entropic --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 \
-    --isolate-eval --strategies --fused-long-attention "$@"
+    --isolate-eval --fused-long-attention "$@"
+    # --strategies
     # --coder-retry
