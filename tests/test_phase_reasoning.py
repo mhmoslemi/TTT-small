@@ -5,12 +5,14 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from output_retries import coder_retry_prompt_job
 
 
 def _runtime_scope(kind="qwen3.8", backend="vllm"):
     source = (Path(__file__).resolve().parents[1] / "train_multy_CVaR.py").read_text()
     tree = ast.parse(source)
     names = {"_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
+             "_coder_phase_generation_jobs",
              "_render", "_run_vllm_code_phase", "_run_local_code_phase"}
     nodes = [node for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -34,10 +36,11 @@ def _runtime_scope(kind="qwen3.8", backend="vllm"):
 
 
 class PhaseReasoningTests(unittest.TestCase):
-    def test_native_template_receives_medium_for_both_phases(self):
+    def test_native_template_receives_mixed_pilot_and_medium_phase2(self):
         scope, calls = _runtime_scope()
         messages = [{"role": "user", "content": "task and strategy"}]
         for phase, effort in [(None, "medium"), ("pilot", "medium"),
+                              ("pilot_xhigh", "xhigh"),
                               ("adaptive", "medium")]:
             scope["_render"](messages, rollout_phase=phase)
             self.assertEqual(calls[-1]["reasoning_effort"], effort)
@@ -46,7 +49,7 @@ class PhaseReasoningTests(unittest.TestCase):
         self.assertEqual(scope["cfg"].coder_reasoning_effort, "medium")
 
     def test_other_coders_keep_original_template_controls(self):
-        for kind in ["generic", "qwen-thinking", "gpt-oss"]:
+        for kind in ["generic", "qwen3", "qwen-thinking", "gpt-oss"]:
             with self.subTest(kind=kind):
                 scope, calls = _runtime_scope(kind)
                 messages = [{"role": "user", "content": "task"}]
@@ -58,6 +61,23 @@ class PhaseReasoningTests(unittest.TestCase):
                 self.assertEqual(scope["_phase_coder_prompt_job"](
                     jobs, 0, "adaptive", scope["cfg"], scope["_render"], {}), 0)
                 self.assertEqual(len(jobs), 1)
+                self.assertEqual(scope["_coder_phase_generation_jobs"](
+                    [0, 1, 2], [10, 1, 0], "pilot", scope["cfg"]),
+                    [(0, 10, "pilot"), (1, 1, "pilot")])
+
+    def test_pilot_split_preserves_budgets_including_singletons(self):
+        scope, _ = _runtime_scope()
+        split = scope["_coder_phase_generation_jobs"]
+        self.assertEqual(split([2, 5, 8], [10, 1, 0], "pilot", scope["cfg"]), [
+            (2, 1, "pilot_xhigh"), (5, 1, "pilot_xhigh"), (2, 9, "pilot")])
+        for phase in (None, "adaptive"):
+            self.assertEqual(split([2, 5, 8], [10, 1, 0], phase, scope["cfg"]),
+                             [(2, 10, phase), (5, 1, phase)])
+        # The scheduler rotates prompt-group IDs across workers. Keeping all
+        # high-effort IDs contiguous avoids loading only even-numbered GPUs.
+        jobs = split(range(8), [10] * 8, "pilot", scope["cfg"])
+        self.assertEqual(jobs[:8], [(i, 1, "pilot_xhigh") for i in range(8)])
+        self.assertEqual(sum(count for _, count, _ in jobs), 80)
 
     def test_variants_keep_pilot_prompts_intact_and_are_cached(self):
         scope, calls = _runtime_scope()
@@ -82,13 +102,15 @@ class PhaseReasoningTests(unittest.TestCase):
             jobs, 0, "adaptive", scope["cfg"], scope["_render"], cache), index)
         self.assertEqual(len(calls), count)
         self.assertEqual(scope["_phase_coder_prompt_job"](
-            jobs, 0, "pilot", scope["cfg"], scope["_render"], cache), 0)
+            jobs, 0, "pilot", scope["cfg"], scope["_render"], cache), index)
 
-    def test_explicit_base_effort_is_preserved_and_medium_needs_no_alias(self):
+    def test_base_effort_is_preserved_outside_pilots_and_phase2(self):
         scope, _ = _runtime_scope()
         effort = scope["_coder_effort_for_rollout_phase"]
         scope["cfg"].coder_reasoning_effort = "low"
-        self.assertEqual(effort(scope["cfg"], "pilot"), "low")
+        self.assertEqual(effort(scope["cfg"]), "low")
+        self.assertEqual(effort(scope["cfg"], "pilot"), "medium")
+        self.assertEqual(effort(scope["cfg"], "pilot_xhigh"), "xhigh")
         self.assertEqual(effort(scope["cfg"], "adaptive"), "medium")
         scope["cfg"].coder_reasoning_effort = "medium"
         jobs = [dict(prompt_text="already medium")]
@@ -147,16 +169,25 @@ class PhaseReasoningTests(unittest.TestCase):
                 })
                 run = scope["_run_vllm_code_phase" if backend == "vllm"
                             else "_run_local_code_phase"]
-                pilots = run([2, 2], phase="pilot", seed_offset=0, progress_desc="pilot")
+                pilots = run([10, 10], phase="pilot", seed_offset=0, progress_desc="pilot")
                 followups = run([0, 3], phase="adaptive", seed_offset=4000000,
                                 progress_desc="adaptive")
-                self.assertEqual(len(pilots) + len(followups), 7)
+                self.assertEqual(len(pilots) + len(followups), 23)
                 self.assertEqual(jobs[:2], originals)
+                self.assertEqual(batches[0][1], [1, 1, 9, 9])
                 self.assertEqual(batches[1][1], [3])
-                self.assertEqual(len(jobs), 2)
-                for record in pilots:
-                    self.assertTrue(jobs[record["job_idx"]]["prompt_text"].startswith("medium:"))
-                    self.assertEqual(record["job_idx"], record["strategy_source_job_idx"])
+                self.assertEqual(len(jobs), 4)
+                for source_idx in (0, 1):
+                    records = [r for r in pilots if r["strategy_source_job_idx"] == source_idx]
+                    efforts = [jobs[r["job_idx"]]["coder_reasoning_effort"] for r in records]
+                    self.assertEqual(efforts.count("medium"), 9)
+                    self.assertEqual(efforts.count("xhigh"), 1)
+                    self.assertTrue(all(r["rollout_phase"] == "pilot" for r in records))
+                    for record in records:
+                        job = jobs[record["job_idx"]]
+                        self.assertTrue(job["prompt_text"].startswith(job["coder_reasoning_effort"] + ":"))
+                        if backend == "vllm":
+                            self.assertEqual(record["behavior_logprobs"], [-.4, -.5])
                 for record in followups:
                     self.assertTrue(jobs[record["job_idx"]]["prompt_text"].startswith("medium:"))
                     self.assertEqual(record["job_idx"], 1)
@@ -166,7 +197,35 @@ class PhaseReasoningTests(unittest.TestCase):
                 again = run([0, 1], phase="adaptive", seed_offset=4100000,
                             progress_desc="adaptive")
                 self.assertEqual(again[0]["job_idx"], 1)
-                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len(jobs), 4)
+
+    def test_retry_retains_high_effort_but_remains_in_pilot_allocation(self):
+        for base_effort in ("medium", "xhigh"):
+            with self.subTest(base_effort=base_effort):
+                self._check_high_effort_retry(base_effort)
+
+    def _check_high_effort_retry(self, base_effort):
+        scope, calls = _runtime_scope()
+        scope["cfg"].coder_reasoning_effort = base_effort
+        messages = [{"role": "user", "content": "parent and strategy"}]
+        jobs = [dict(messages=messages, prompt_text=scope["_render"](messages),
+                     coder_reasoning_effort=base_effort, count=10,
+                     parent_group=3, strategy_index=2, assigned_fold_index=1)]
+        index = scope["_phase_coder_prompt_job"](
+            jobs, 0, "pilot_xhigh", scope["cfg"], scope["_render"], {})
+        record = dict(job_idx=index, strategy_rollout_phase="pilot", strategy_source_job_idx=0)
+        frozen = copy.deepcopy(jobs)
+        cache = {}
+        retry = coder_retry_prompt_job(jobs, record, scope["_render"], cache)
+        self.assertEqual(calls[-1]["reasoning_effort"], "xhigh")
+        self.assertEqual(jobs[retry]["coder_reasoning_effort"], "xhigh")
+        self.assertEqual(jobs[retry]["count"], 0)
+        self.assertEqual(jobs[retry]["parent_group"], 3)
+        self.assertEqual(jobs[retry]["strategy_index"], 2)
+        self.assertEqual(jobs[retry]["assigned_fold_index"], 1)
+        self.assertEqual(jobs[:2], frozen)
+        self.assertIn("Your previous attempt", jobs[retry]["prompt_text"])
+        self.assertEqual(coder_retry_prompt_job(jobs, record, scope["_render"], cache), retry)
 
 
 if __name__ == "__main__":

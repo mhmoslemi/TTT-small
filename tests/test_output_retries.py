@@ -151,7 +151,7 @@ class RunnerRetryTests(unittest.TestCase):
         saved = []
         scope["save_rollout_artifacts"] = lambda *args, **kw: saved.append((args, kw))
         scope["_render"] = lambda messages, rollout_phase=None: (
-            "medium" + repr(messages))
+            ("xhigh" if rollout_phase == "pilot_xhigh" else "medium") + repr(messages))
         messages = [{"role": "user", "content": "original parent plus strategy"}]
         scope["prompt_jobs"] = [dict(
             parent_group=0, messages=messages, count=3, assigned_fold_index=0,
@@ -162,12 +162,14 @@ class RunnerRetryTests(unittest.TestCase):
         def generate(prompts, counts, logprobs):
             calls.append((prompts, counts))
             call = len(calls)
+            produced = 0
             for index in reversed(range(len(prompts))):
                 outputs = []
                 for ordinal in range(counts[index]):
                     # Pilot: one valid + one missing. Its retry also fails.
                     # Phase2: missing original, successful retry.
-                    text = VALID if (call == 1 and ordinal == 0) or call == 4 else "no final output"
+                    text = VALID if (call == 1 and produced == 0) or call == 4 else "no final output"
+                    produced += 1
                     outputs.append((text, [101, 102], [-.1, -.2]) if logprobs
                                    else (text, [101, 102]))
                 yield index, outputs
@@ -182,6 +184,7 @@ class RunnerRetryTests(unittest.TestCase):
         scope["generate_prompt_jobs"] = lambda m, t, p, c, cfg, **kw: generate(p, c, False)
         functions_from_file("train_multy_CVaR.py", {
             "_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
+            "_coder_phase_generation_jobs",
             "_queue_rollout", "_submit_rollout", "_run_coder_format_retries",
             "_defer_coder_format_retries",
             "_drain_deferred_coder_format_retries",
@@ -214,7 +217,7 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(len(saved), 5)
                     self.assertEqual(len(calls), 4)  # still-missing retry is NOT retried
                     self.assertEqual(len(set(seeds)), 4)
-                    for index, expected in [(0, "medium"), (1, "medium"),
+                    for index, expected in [(0, "xhigh"), (1, "xhigh"),
                                             (2, "medium"), (3, "medium")]:
                         self.assertTrue(calls[index][0][0].startswith(expected))
                     for rec in s["coder_retry_records"]:
@@ -224,6 +227,11 @@ class RunnerRetryTests(unittest.TestCase):
                         self.assertEqual(rec["strategy_rollout_phase"], parent["strategy_rollout_phase"])
                         self.assertEqual(rec["strategy_source_job_idx"], 0)
                         job = s["prompt_jobs"][rec["job_idx"]]
+                        original = s["prompt_jobs"][parent["job_idx"]]
+                        self.assertEqual(job["coder_reasoning_effort"], original["coder_reasoning_effort"])
+                        self.assertTrue(job["prompt_text"].startswith(job["coder_reasoning_effort"]))
+                        self.assertEqual(saved[rec["rollout_index"]][1]["pending_meta"]["coder_reasoning_effort"],
+                                         job["coder_reasoning_effort"])
                         self.assertIn("Your previous attempt", job["prompt_text"])
                         self.assertNotIn("no final output", job["prompt_text"])
                         self.assertEqual(saved[rec["rollout_index"]][1]["prompt_text"], job["prompt_text"])

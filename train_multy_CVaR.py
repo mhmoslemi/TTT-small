@@ -410,11 +410,39 @@ def _resolve_coder_token_limits(merged):
 
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
-    """Keep the configured pilot effort; use medium for Qwen3.8 phase 2."""
-    if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-            and phase == "adaptive"):
-        return "medium"
+    """Apply Qwen3.8's mixed pilot efforts without changing other coders."""
+    if getattr(cfg, "coder_template_kind", "generic") == "qwen3.8":
+        if phase == "pilot_xhigh":
+            return "xhigh"
+        if phase in {"pilot", "adaptive"}:
+            return "medium"
     return getattr(cfg, "coder_reasoning_effort", None)
+
+
+def _coder_phase_generation_jobs(source_job_indices, counts, phase, cfg):
+    """Split Qwen3.8 pilots into one xhigh and N-1 medium samples per source.
+
+    Both prompt variants enter the same scheduler call, retaining the original
+    parent/strategy/fold allocation ID. The internal pilot_xhigh phase controls
+    rendering only; all these records remain pilots for evaluation/allocation.
+    """
+    high_effort = []
+    active = []
+    for source_idx, count in zip(source_job_indices, counts):
+        count = int(count)
+        if count <= 0:
+            continue
+        if (phase == "pilot"
+                and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
+            # Put all xhigh prompt groups first in the SAME scheduler call.
+            # Consecutive IDs let the existing round-robin dispatcher spread
+            # them across every worker instead of only the even-numbered ones.
+            high_effort.append((int(source_idx), 1, "pilot_xhigh"))
+            if count > 1:
+                active.append((int(source_idx), count - 1, "pilot"))
+        else:
+            active.append((int(source_idx), count, phase))
+    return high_effort + active
 
 
 def _phase_coder_prompt_job(prompt_jobs, source_idx, phase, cfg, render, cache):
@@ -426,7 +454,11 @@ def _phase_coder_prompt_job(prompt_jobs, source_idx, phase, cfg, render, cache):
     Allocation still uses the original source ID, so variants add no budget.
     """
     effort = _coder_effort_for_rollout_phase(cfg, phase)
-    if effort == _coder_effort_for_rollout_phase(cfg):
+    # The xhigh pilot needs an alias even when xhigh is the configured base:
+    # a retry is tagged "pilot" for allocation, so its render phase must be
+    # retained explicitly to avoid silently retrying it at medium effort.
+    if (effort == _coder_effort_for_rollout_phase(cfg)
+            and phase != "pilot_xhigh"):
         return int(source_idx)
     key = (int(source_idx), effort)
     if key not in cache:
@@ -435,6 +467,7 @@ def _phase_coder_prompt_job(prompt_jobs, source_idx, phase, cfg, render, cache):
             **source,
             "prompt_text": render(source["messages"], rollout_phase=phase),
             "coder_reasoning_effort": effort,
+            "coder_prompt_phase": phase,
             # This is a prompt alias, not a new allocation. Phase generation
             # supplies the actual counts explicitly to the existing scheduler.
             "count": 0,
@@ -7614,7 +7647,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if (adaptive_strategy_pilots
             and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
         print(f"[step {step_idx}] Qwen3.8 coder reasoning: "
-              f"pilot={_coder_effort_for_rollout_phase(cfg, 'pilot')}; "
+              f"pilot per parent/strategy={pilot_programs_per_strategy - 1} medium "
+              "+ 1 xhigh; "
               f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}",
               flush=True)
     if (two_stage_rollouts
@@ -8943,21 +8977,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     def _run_vllm_code_phase(
                             counts, *, phase, seed_offset, progress_desc,
                             defer_format_retries=False):
-                        active = [
-                            (source_idx, int(count))
-                            for source_idx, count in zip(
-                                source_job_indices, counts)
-                            if int(count) > 0
-                        ]
+                        active = _coder_phase_generation_jobs(
+                            source_job_indices, counts, phase, cfg)
                         if not active:
                             return []
                         active_indices = [item[0] for item in active]
                         active_counts = [item[1] for item in active]
                         active_prompt_indices = [
                             _phase_coder_prompt_job(
-                                prompt_jobs, index, phase, cfg, _render,
+                                prompt_jobs, index, prompt_phase, cfg, _render,
                                 phase_prompt_job_cache)
-                            for index in active_indices]
+                            for index, _count, prompt_phase in active]
                         options = {
                             "prompts_by_group": [
                                 prompt_jobs[index]["prompt_text"]
@@ -9156,21 +9186,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     def _run_local_code_phase(
                             counts, *, phase, seed_offset, progress_desc,
                             defer_format_retries=False):
-                        active = [
-                            (source_idx, int(count))
-                            for source_idx, count in zip(
-                                source_job_indices, counts)
-                            if int(count) > 0
-                        ]
+                        active = _coder_phase_generation_jobs(
+                            source_job_indices, counts, phase, cfg)
                         if not active:
                             return []
                         active_indices = [item[0] for item in active]
                         active_counts = [item[1] for item in active]
                         active_prompt_indices = [
                             _phase_coder_prompt_job(
-                                prompt_jobs, index, phase, cfg, _render,
+                                prompt_jobs, index, prompt_phase, cfg, _render,
                                 phase_prompt_job_cache)
-                            for index in active_indices]
+                            for index, _count, prompt_phase in active]
                         _seed_local_generation(
                             int(step_idx) + int(seed_offset))
                         phase_records = []
@@ -11012,8 +11038,14 @@ def main():
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
-        print(f"Coder reasoning:    pilot/base={_coder_effort_for_rollout_phase(cfg)}, "
-              f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
+        pilot_count = int(getattr(cfg, "pilot_programs_per_strategy", -1))
+        if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
+                and pilot_count > 0):
+            print(f"Coder reasoning:    pilot={pilot_count - 1} medium + 1 xhigh "
+                  "per parent/strategy; phase 2=medium")
+        else:
+            print(f"Coder reasoning:    pilot/base={_coder_effort_for_rollout_phase(cfg)}, "
+                  f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
     else:
         direct_effort = _coder_effort_for_rollout_phase(cfg)
         if direct_effort is not None:
