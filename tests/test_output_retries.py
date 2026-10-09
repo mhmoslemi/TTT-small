@@ -17,7 +17,8 @@ from unittest.mock import patch
 from contextlib import nullcontext, redirect_stdout
 
 from experiment_io import save_strategy_response
-from output_retries import (coder_output_issue, coder_retry_prompt_job,
+from output_retries import (coder_output_issue, coder_retry_gate,
+                            coder_retry_prompt_job,
                             final_answer_scope, output_retry_messages,
                             retry_metadata, strategy_retry_needed)
 
@@ -57,6 +58,20 @@ class InlinePool:
 
 
 class OutputContractTests(unittest.TestCase):
+    def test_coder_retry_gate_triggers_only_below_half_valid(self):
+        valid = {"output_format_issue": None, "retry_attempt": 0}
+        missing = {"output_format_issue": "missing", "retry_attempt": 0}
+        retried = {"output_format_issue": "missing", "retry_attempt": 1}
+        self.assertEqual(
+            coder_retry_gate([valid, missing, retried]),
+            (False, 2, 1, 1, 0))
+        self.assertEqual(
+            coder_retry_gate([valid, missing, missing, retried]),
+            (True, 3, 1, 2, 1))
+        self.assertEqual(
+            coder_retry_gate([valid, valid, missing]),
+            (False, 3, 2, 1, 0))
+
     def test_only_complete_final_python_blocks_pass(self):
         self.assertIsNone(coder_output_issue(VALID, require_final_marker=True))
         self.assertIsNone(coder_output_issue("```python\nthis is not valid Python\n```"))
@@ -123,6 +138,7 @@ class RunnerRetryTests(unittest.TestCase):
             coder_retry=True)
         scope = dict(
             cfg=cfg, Future=Future, coder_output_issue=coder_output_issue,
+            coder_retry_gate=coder_retry_gate,
             coder_retry_prompt_job=coder_retry_prompt_job, retry_metadata=retry_metadata,
             parent_ctxs=[object()], step_idx=0, exp_dir=Path("unused"),
             x_grpo_mode=x_grpo, x_grpo_groups_per_context=1,
@@ -204,20 +220,20 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(s["queued_by_parent"], {0: 3})
                     self.assertEqual(s["planned_by_group"], {0: 3})
                     records = s["group_responses"][0]
-                    self.assertEqual(len(records), 5)
-                    self.assertEqual(len(s["coder_retry_records"]), 2)
+                    self.assertEqual(len(records), 4)
+                    self.assertEqual(len(s["coder_retry_records"]), 1)
                     self.assertEqual(len(s["primary_rollout_records"]), 3)
                     self.assertEqual(s["prompt_jobs"][0], original_job)
-                    self.assertEqual([r["rollout_index"] for r in records], list(range(5)))
-                    self.assertEqual([f.result().reward for f in s["reward_futures"][0]], [1, 0, 0, 0, 1])
-                    self.assertEqual(len(evaluated), 2)  # missing artifacts never hit sandbox
-                    self.assertEqual(s["eval_bar"].n, 5)
-                    self.assertEqual(s["eval_bar"].total, 5)
-                    self.assertEqual(len(saved), 5)
-                    self.assertEqual(len(calls), 4)  # still-missing retry is NOT retried
-                    self.assertEqual(len(set(seeds)), 4)
+                    self.assertEqual([r["rollout_index"] for r in records], list(range(4)))
+                    self.assertEqual([f.result().reward for f in s["reward_futures"][0]], [1, 0, 0, 0])
+                    self.assertEqual(len(evaluated), 1)  # missing artifacts never hit sandbox
+                    self.assertEqual(s["eval_bar"].n, 4)
+                    self.assertEqual(s["eval_bar"].total, 4)
+                    self.assertEqual(len(saved), 4)
+                    self.assertEqual(len(calls), 3)  # the 50%-valid pilot is not retried
+                    self.assertEqual(len(set(seeds)), 3)
                     for index, expected in [(0, "medium"), (1, "medium"),
-                                            (2, "medium"), (3, "medium")]:
+                                            (2, "medium")]:
                         self.assertTrue(calls[index][0][0].startswith(expected))
                     for rec in s["coder_retry_records"]:
                         parent = records[rec["retry_of_rollout"]]
@@ -235,7 +251,7 @@ class RunnerRetryTests(unittest.TestCase):
                         self.assertNotIn("no final output", job["prompt_text"])
                         self.assertEqual(saved[rec["rollout_index"]][1]["prompt_text"], job["prompt_text"])
                     if backend == "vllm":
-                        self.assertEqual(len(s["vllm_logprob_records"]), 5)
+                        self.assertEqual(len(s["vllm_logprob_records"]), 4)
                         self.assertTrue(all(r["behavior_logprobs"] == [-.1, -.2] for r in records))
 
     def test_already_retried_or_valid_records_never_generate_more(self):
@@ -284,12 +300,12 @@ class RunnerRetryTests(unittest.TestCase):
                 self.assertEqual(len(s["deferred_coder_retry_batches"]), 2)
 
                 s["_drain_deferred_coder_format_retries"]()
-                self.assertEqual(len(calls), 4)
-                self.assertEqual(len(s["coder_retry_records"]), 2)
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(len(s["coder_retry_records"]), 1)
                 self.assertEqual(s["deferred_coder_retry_batches"], [])
                 self.assertEqual(
                     seeds,
-                    [0, 4_000_000, 20_000_000, 24_000_000])
+                    [0, 4_000_000, 20_000_000])
 
     def test_one_stage_generation_also_keeps_originals_and_adds_only_one_retry(self):
         tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
@@ -305,7 +321,7 @@ class RunnerRetryTests(unittest.TestCase):
                 exec(compile(ast.Module(body=branch.orelse, type_ignores=[]),
                              "ordinary_rollouts", "exec"), scope)
                 self.assertEqual(len(scope["primary_rollout_records"]), 3)
-                self.assertEqual(len(scope["coder_retry_records"]), 2)
+                self.assertEqual(len(scope["coder_retry_records"]), 1)
                 self.assertEqual(len(calls), 2)
                 self.assertEqual(scope["queued_by_parent"], {0: 3})
                 self.assertTrue(all(p.startswith("medium") for prompts, _ in calls for p in prompts))
@@ -337,13 +353,12 @@ class RunnerRetryTests(unittest.TestCase):
         with patch.dict("sys.modules", {"torch": fake_torch}):
             examples = s["_prepare_entropic_overlap_group"](
                 tokenize, 0, records, s["reward_futures"][0], s["prompt_jobs"], {}, 1)
-        self.assertEqual(len(examples), 3)
-        self.assertEqual([ex["sample_weight"] for ex in examples], [1 / 3] * 3)
+        self.assertEqual(len(examples), 2)
+        self.assertEqual([ex["sample_weight"] for ex in examples], [1 / 2] * 2)
         for record, ex in zip(records, examples):
             self.assertIs(record["_entropic_overlap_example"], ex)
             self.assertEqual(ex["prompt_ids"].value, s["prompt_jobs"][record["job_idx"]]["prompt_text"])
         self.assertLess(examples[1]["advantage"], 0)  # original failure retained
-        self.assertLess(examples[2]["advantage"], 0)  # failed retry retained too
 
 
 class StrategyAttemptTests(unittest.TestCase):

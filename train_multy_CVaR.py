@@ -42,7 +42,8 @@ from types import SimpleNamespace
 import numpy as np
 import yaml
 from entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
-from output_retries import (coder_output_issue, coder_retry_prompt_job, final_answer_scope,
+from output_retries import (coder_output_issue, coder_retry_gate,
+                            coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
 import terminal_output as _terminal_output
@@ -1416,9 +1417,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument(
         "--coder-retry", action="store_const", const=True, default=None,
-        help="Retry each coder response missing its required final code block "
-             "once. Disabled unless this flag is passed; the original failed "
-             "rollout is retained and the retry is an extra training example.")
+        help="If fewer than 50%% of a coder rollout batch contain complete "
+             "final code blocks, retry only enough incomplete responses once "
+             "to target 60%% valid output. "
+             "Disabled unless this flag is passed; originals are retained "
+             "and retries are extra training examples.")
     p.add_argument("--strategy-max-new-tokens", type=int, default=None)
     p.add_argument("--strategy-format-max-retries", type=int, default=None,
                    help="Additional attempts for missing strategy blocks; "
@@ -8006,22 +8009,42 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         return record
 
     def _run_coder_format_retries(records, *, seed_offset):
-        """One extra attempt per missing output; never returned to the allocator."""
+        """Recover a low-validity batch; never return retries to the allocator."""
         if not bool(getattr(cfg, "coder_retry", False)):
+            return
+        triggered, total, valid, missing, retry_budget = coder_retry_gate(
+            records)
+        if not triggered:
+            if missing:
+                print(
+                    f"[step {step_idx}] coder format recovery skipped: "
+                    f"{valid}/{total} complete blocks (at least 50%); "
+                    f"{missing} incomplete original(s) retain failure reward",
+                    flush=True,
+                )
             return
         failed = [record for record in records
                   if record.get("output_format_issue") is not None
                   and not record.get("retry_attempt", 0)]
         if not failed:
             return
+        # Spread a limited recovery budget across the streamed failure order
+        # instead of always favoring the first strategy/worker group.
+        if retry_budget < len(failed):
+            failed = [
+                failed[(index * len(failed)) // retry_budget]
+                for index in range(retry_budget)
+            ]
         prompt_indices = [coder_retry_prompt_job(
             prompt_jobs, record, _render, coder_retry_prompt_cache) for record in failed]
         prompts = [prompt_jobs[index]["prompt_text"] for index in prompt_indices]
         with eval_progress_condition:
             eval_bar.total += len(failed)
             eval_bar.refresh()
-        print(f"[step {step_idx}] coder format recovery: {len(failed)} extra attempts "
-              "(one per missing output); originals retained, allocation unchanged, "
+        print(f"[step {step_idx}] coder format recovery: "
+              f"{valid}/{total} complete blocks (below 50%); "
+              f"{len(failed)} extra attempts "
+              "to target at least 60% valid; originals retained, allocation unchanged, "
               "original phase reasoning/sampling preserved", flush=True)
         retry_step = int(step_idx) + int(seed_offset) + 20_000_000
         if gen_pool is not None:
@@ -8069,21 +8092,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     def _defer_coder_format_retries(records, *, seed_offset):
         if not bool(getattr(cfg, "coder_retry", False)):
             return
-        failed = [record for record in records
-                  if record.get("output_format_issue") is not None
-                  and not record.get("retry_attempt", 0)]
-        if failed:
+        # Retain every planned record, including fully valid batches, because
+        # the 50% trigger is defined over the complete pilot + phase-2 set.
+        if records:
             deferred_coder_retry_batches.append(
-                (failed, int(seed_offset)))
+                (list(records), int(seed_offset)))
 
     def _drain_deferred_coder_format_retries():
         if not bool(getattr(cfg, "coder_retry", False)):
             deferred_coder_retry_batches.clear()
             return
-        while deferred_coder_retry_batches:
-            records, seed_offset = deferred_coder_retry_batches.pop(0)
-            _run_coder_format_retries(
-                records, seed_offset=int(seed_offset))
+        batches = list(deferred_coder_retry_batches)
+        deferred_coder_retry_batches.clear()
+        all_records = [record for records, _seed_offset in batches
+                       for record in records]
+        _run_coder_format_retries(all_records, seed_offset=0)
 
     def _strategy_plan_metadata(source_job_idx):
         source_job = prompt_jobs[int(source_job_idx)]
@@ -11043,7 +11066,7 @@ def main():
         print(f"Strategy archive:   top {cfg.strategy_archive_top_r}/strategy "
               f"then existing top {cfg.topk_children_per_parent}/parent")
         coder_retry_label = (
-            "once (extra training example)"
+            "only enough to target 60% when planned validity is below 50%"
             if bool(getattr(cfg, "coder_retry", False)) else
             "off (enable with --coder-retry)"
         )

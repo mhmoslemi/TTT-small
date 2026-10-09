@@ -72,6 +72,30 @@ def retry_metadata(record):
         "output_format_issue", "counts_toward_allocation")}
 
 
+def coder_retry_gate(records):
+    """Return whether incomplete coder outputs need format recovery.
+
+    Recovery is intentionally a batch-level safety net, not a requirement that
+    every sample end in a complete block.  A batch triggers only when fewer
+    than half of its original rollouts contain complete final code blocks.
+    """
+    originals = [record for record in records
+                 if not record.get("retry_attempt", 0)]
+    total = len(originals)
+    missing = sum(
+        record.get("output_format_issue") is not None
+        for record in originals)
+    valid = total - missing
+    triggered = bool(total and missing and valid * 2 < total)
+    # Once recovery is necessary, aim ten percentage points above the trigger
+    # instead of trying to repair every malformed rollout.  ceil(0.60 * N) is
+    # computed exactly with integers.
+    target_valid = (3 * total + 4) // 5 if total else 0
+    retry_budget = (
+        min(missing, max(0, target_valid - valid)) if triggered else 0)
+    return triggered, total, valid, missing, retry_budget
+
+
 def coder_retry_prompt_job(prompt_jobs, record, render, cache):
     """Separate prompt ID so generation, reference scoring and training agree."""
     source_idx = int(record["job_idx"])
