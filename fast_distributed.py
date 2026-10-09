@@ -463,6 +463,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     """Accumulate one rank's gradients and leave them attached to the model."""
     import torch
     import train_multy_CVaR as training
+    from host_memory import reclaim_unused_host_memory
 
     if not 0.0 < float(memory_fraction) <= (
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
@@ -824,6 +825,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 parameters, gradient_accumulators):
             parameter.grad = accumulator
         torch.cuda.synchronize(logical_id)
+    reclaim_unused_host_memory(
+        torch, cuda_devices=(logical_id,), force=True)
 
     return {
         "totals": totals,
@@ -855,6 +858,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     from contextlib import nullcontext
     import torch
     import train_multy_CVaR as training
+    from host_memory import reclaim_unused_host_memory
     from model_backend import fused_long_attention_is_active
 
     if not 0.0 < float(memory_fraction) <= (
@@ -1240,6 +1244,8 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                 parameters, gradient_accumulators):
             parameter.grad = accumulator
         torch.cuda.synchronize(logical_id)
+    reclaim_unused_host_memory(
+        torch, cuda_devices=(logical_id,), force=True)
 
     return {
         "total_loss": total_loss,
@@ -1325,7 +1331,19 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         while True:
             command = command_queue.get()
             kind = command.get("kind")
-            if kind == "offload":
+            if kind == "purge_host_memory":
+                from host_memory import reclaim_unused_host_memory
+
+                with torch.cuda.device(int(rank)):
+                    torch.cuda.synchronize(int(rank))
+                cleanup = reclaim_unused_host_memory(
+                    torch, cuda_devices=(int(rank),), force=True)
+                result_queue.put({
+                    "event": "host_memory_purged",
+                    "rank": int(rank),
+                    "cleanup": cleanup,
+                })
+            elif kind == "offload":
                 if not offloaded:
                     backend.offload_for_generation()
                     gc.collect()
@@ -1335,6 +1353,8 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 result_queue.put({"event": "offloaded", "rank": int(rank)})
             elif kind == "restore":
                 if offloaded:
+                    from host_memory import reclaim_unused_host_memory
+
                     gc.collect()
                     with torch.cuda.device(int(rank)):
                         torch.cuda.empty_cache()
@@ -1344,6 +1364,11 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                         backend.set_training_mode()
                         torch.cuda.synchronize(int(rank))
                     validate_model_device(model, int(rank))
+                    # ``Module.to(cuda)`` releases its former CPU storages,
+                    # but glibc and the pinned allocator can retain those
+                    # arenas. Return them before long-sequence training starts.
+                    reclaim_unused_host_memory(
+                        torch, cuda_devices=(int(rank),), force=True)
                     offloaded = False
                 result_queue.put({"event": "restored", "rank": int(rank)})
             elif kind == "train_rank":

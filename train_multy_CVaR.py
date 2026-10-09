@@ -3309,6 +3309,8 @@ def _run_oom_resilient_backward(
     """
     import gc
     import torch
+    from host_memory import (host_cache_reclaim_supported,
+                             reclaim_unused_host_memory)
     from model_backend import set_gradient_checkpointing
 
     active = [list(batch) for batch in batches if batch]
@@ -3412,14 +3414,22 @@ def _run_oom_resilient_backward(
     while active:
         model.zero_grad(set_to_none=True)
         try:
+            # Pinned saved tensors make the GPU<->CPU replay substantially
+            # faster, but PyTorch caches the released host blocks separately
+            # from the CUDA device allocator.  Use pinned storage only when
+            # this runtime exposes a way to return that cache to the OS.
             offload_context = (
-                torch.autograd.graph.save_on_cpu(pin_memory=True)
+                torch.autograd.graph.save_on_cpu(
+                    pin_memory=host_cache_reclaim_supported(torch))
                 if activation_offload
                 and hasattr(torch.autograd.graph, "save_on_cpu")
                 else nullcontext()
             )
             with offload_context:
                 result = attempt(active)
+            if activation_offload:
+                reclaim_unused_host_memory(
+                    torch, cuda_devices=cuda_devices, force=False)
             if split_backoff and active:
                 successful_work = _gradient_checkpointing_work_units(active)
                 _remember_oom_profile_minimum(
@@ -4970,6 +4980,33 @@ class ReplicatedDataParallelTrainer:
     def is_offloaded(self):
         return self._offloaded
 
+    def estimated_host_offload_bytes(self):
+        """RAM required to move every live trainer replica off its GPU."""
+        from host_memory import (GIB, estimated_module_bytes,
+                                 estimated_optimizer_bytes)
+
+        model_bytes = sum(
+            estimated_module_bytes(model)
+            for _, model, _, _ in self.replicas
+        )
+        optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
+        # The model estimate is storage-exact.  The small margin covers Python
+        # tensor metadata, allocator alignment, and one GiB of workspace per
+        # process without pretending that an additional model copy is needed.
+        return int(
+            1.05 * (model_bytes + optimizer_bytes)
+            + self.world_size * GIB
+        )
+
+    def reclaim_host_memory(self):
+        """Synchronize all replicas, then drop unused host allocations."""
+        import torch
+        from host_memory import reclaim_unused_host_memory
+
+        devices = tuple(range(self.world_size))
+        return [reclaim_unused_host_memory(
+            torch, cuda_devices=devices, force=True)]
+
     @staticmethod
     def _trainable_parameters(model):
         return [(name, parameter) for name, parameter in model.named_parameters()
@@ -5932,12 +5969,14 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self):
+    def offload_for_generation(self, *, purge_host_cache=True):
         """Release every replica before an all-GPU vLLM phase."""
         if self._offloaded:
             return
         import gc
         import torch
+        if purge_host_cache:
+            self.reclaim_host_memory()
         # Mark first so a partially completed move is recoverable if any one
         # quantized replica raises while transferring to host memory.
         self._offloaded = True
@@ -5961,6 +6000,7 @@ class ReplicatedDataParallelTrainer:
             return
         import gc
         import torch
+        from host_memory import reclaim_unused_host_memory
         gc.collect()
 
         def restore(replica):
@@ -5974,6 +6014,8 @@ class ReplicatedDataParallelTrainer:
         self._run_replicas(restore, self.replicas)
         self._validate_replica_devices()
         _restore_optimizer_state_to_parameters(self.optimizer)
+        reclaim_unused_host_memory(
+            torch, cuda_devices=tuple(range(self.world_size)), force=True)
         self._offloaded = False
 
 
@@ -6111,6 +6153,42 @@ class ProcessDistributedTrainer:
     @property
     def is_offloaded(self):
         return self._offloaded
+
+    def estimated_host_offload_bytes(self):
+        """RAM required to move every live trainer replica off its GPU."""
+        from host_memory import (GIB, estimated_module_bytes,
+                                 estimated_optimizer_bytes)
+
+        model_bytes = estimated_module_bytes(self.model)
+        optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
+        # All worker models have the same storage layout as rank zero.  The
+        # optimizer exists only on rank zero; workers retain gradients/model
+        # state but do not construct duplicate Adam state.
+        return int(
+            1.05 * (model_bytes * self._world_size + optimizer_bytes)
+            + self._world_size * GIB
+        )
+
+    def reclaim_host_memory(self):
+        """Synchronize every trainer process and free unused host caches."""
+        import torch
+        from host_memory import reclaim_unused_host_memory
+
+        if not self._workers_idle:
+            raise RuntimeError(
+                "cannot reclaim trainer host caches while an update is active")
+        for command_queue in self._command_queues.values():
+            command_queue.put({"kind": "purge_host_memory"})
+        with torch.cuda.device(0):
+            torch.cuda.synchronize(0)
+        local_cleanup = reclaim_unused_host_memory(
+            torch, cuda_devices=(0,), force=True)
+        child_messages = self._collect_event(
+            "host_memory_purged", range(1, self._world_size))
+        return [local_cleanup] + [
+            child_messages[rank]["cleanup"]
+            for rank in range(1, self._world_size)
+        ]
 
     def _dead_workers(self, pending):
         return [
@@ -6945,12 +7023,19 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self):
+    def offload_for_generation(self, *, purge_host_cache=True):
         if self._offloaded:
             return
         import gc
         import torch
 
+        # Long-context saved tensors use PyTorch's *host* pinned allocator.
+        # CUDA empty_cache() cannot release that cache.  Clear it on every
+        # replica before allocating eight complete CPU model copies; doing so
+        # at this phase boundary does not change the update and avoids the
+        # step-over-step host-RAM growth that can OOM-kill the whole VM.
+        if purge_host_cache:
+            self.reclaim_host_memory()
         self._offloaded = True
         try:
             for command_queue in self._command_queues.values():
@@ -6980,6 +7065,7 @@ class ProcessDistributedTrainer:
         import torch
         from fast_distributed import (set_total_memory_ceiling,
                                       validate_model_device)
+        from host_memory import reclaim_unused_host_memory
 
         try:
             for command_queue in self._command_queues.values():
@@ -6993,6 +7079,8 @@ class ProcessDistributedTrainer:
                 torch.cuda.synchronize(0)
             validate_model_device(self.model, 0)
             _restore_optimizer_state_to_parameters(self.optimizer)
+            reclaim_unused_host_memory(
+                torch, cuda_devices=(0,), force=True)
             self._collect_event("restored", range(1, self._world_size))
             self._offloaded = False
         except BaseException:
@@ -11410,13 +11498,96 @@ def main():
         if cfg.generation_backend == "vllm":
             trainer_offloaded = False
 
-            def _offload_trainer_for_generation():
+            def _offload_trainer_for_generation(phase="coder"):
                 nonlocal trainer_offloaded
                 if (parallel_trainer is not None
                         and parallel_trainer.is_offloaded):
                     return
                 if parallel_trainer is None and trainer_offloaded:
                     return
+                from host_memory import (
+                    GIB, estimated_module_bytes, estimated_optimizer_bytes,
+                    host_memory_info, reclaim_unused_host_memory,
+                )
+
+                # Reclaim cached activation-offload blocks on *every* trainer
+                # process before allocating complete CPU model replicas. This
+                # is a phase-boundary operation: it leaves live tensors and
+                # gradients untouched and runs only once per rollout step.
+                if parallel_trainer is not None:
+                    cleanups = parallel_trainer.reclaim_host_memory()
+                    required_bytes = (
+                        parallel_trainer.estimated_host_offload_bytes())
+                else:
+                    torch.cuda.synchronize()
+                    cleanups = [reclaim_unused_host_memory(
+                        torch,
+                        cuda_devices=tuple(range(torch.cuda.device_count())),
+                        force=True,
+                    )]
+                    required_bytes = int(
+                        1.05 * (
+                            estimated_module_bytes(model)
+                            + estimated_optimizer_bytes(optimizer))
+                        + GIB
+                    )
+
+                reclaimed_bytes = sum(max(
+                    0,
+                    int(cleanup.get("pinned_cached_before", 0))
+                    - int(cleanup.get("pinned_cached_after", 0)),
+                ) for cleanup in cleanups)
+                memory = host_memory_info()
+                if reclaimed_bytes >= GIB:
+                    available = (
+                        "unknown" if memory is None else
+                        f"{memory['available'] / GIB:.1f} GiB")
+                    setting_log_only(
+                        f"[host-memory] released "
+                        f"{reclaimed_bytes / GIB:.1f} GiB of inactive pinned "
+                        f"trainer cache; available RAM={available}",
+                        flush=True,
+                    )
+
+                # Normally the cache purge above is sufficient and both vLLM
+                # pools remain RAM-resident.  Under genuine pressure, discard
+                # only sleeping level-1 backups, largest/unused peer first.
+                # This trades one later checkpoint reload for survival instead
+                # of permanently choosing a slower level-2/transient policy.
+                if memory is not None:
+                    reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
+                    target_available = required_bytes + reserve_bytes
+                    if phase == "strategy":
+                        pressure_candidates = (
+                            ("coder", gen_pool),
+                            ("strategist", strategy_pool),
+                        )
+                    else:
+                        pressure_candidates = (
+                            ("strategist", strategy_pool),
+                            ("coder", gen_pool),
+                        )
+                    for pool_label, pool in pressure_candidates:
+                        if memory["available"] >= target_available:
+                            break
+                        discard = getattr(
+                            pool, "discard_sleeping_host_residency", None)
+                        if pool is None or not callable(discard) or not discard():
+                            continue
+                        memory = host_memory_info() or memory
+                        print(
+                            f"[host-memory] low-RAM guard discarded the "
+                            f"sleeping {pool_label} vLLM weight backup; it "
+                            "will reload on its next use",
+                            flush=True,
+                        )
+                    if memory["available"] < target_available:
+                        raise MemoryError(
+                            "insufficient host RAM for exact trainer offload "
+                            f"after cache reclamation: available="
+                            f"{memory['available'] / GIB:.1f} GiB, estimated "
+                            f"offload={required_bytes / GIB:.1f} GiB, safety "
+                            f"reserve={reserve_bytes / GIB:.1f} GiB")
                 replica_label = (
                     "inactive training model"
                     if not runtime_training_active["value"]
@@ -11428,9 +11599,9 @@ def main():
                     "shared-GPU vLLM generation", flush=True)
                 try:
                     if parallel_trainer is not None:
-                        parallel_trainer.offload_for_generation()
+                        parallel_trainer.offload_for_generation(
+                            purge_host_cache=False)
                     else:
-                        torch.cuda.synchronize()
                         _move_optimizer_state(optimizer, "cpu")
                         backend.offload_for_generation()
                         import gc
@@ -11485,6 +11656,12 @@ def main():
                 backend.restore_after_generation()
                 _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
+                from host_memory import reclaim_unused_host_memory
+                reclaim_unused_host_memory(
+                    torch,
+                    cuda_devices=tuple(range(torch.cuda.device_count())),
+                    force=True,
+                )
                 trainer_offloaded = False
 
             def _ensure_sharded_trainer_ready():
@@ -11502,13 +11679,20 @@ def main():
                 backend.restore_after_generation()
                 _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
+                from host_memory import reclaim_unused_host_memory
+                reclaim_unused_host_memory(
+                    torch,
+                    cuda_devices=tuple(range(torch.cuda.device_count())),
+                    force=True,
+                )
                 trainer_offloaded = False
 
             if cfg.training_layout == "sharded":
                 ensure_trainer_ready = _ensure_sharded_trainer_ready
 
             gen_pool = PhasedVLLMGenerationPool(
-                before_start=_offload_trainer_for_generation,
+                before_start=lambda: _offload_trainer_for_generation(
+                    "coder"),
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
@@ -11545,7 +11729,8 @@ def main():
                     "vllm_log_path": strategy_vllm_log_path,
                 })
                 strategy_pool = PhasedVLLMGenerationPool(
-                    before_start=_offload_trainer_for_generation,
+                    before_start=lambda: _offload_trainer_for_generation(
+                        "strategy"),
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )

@@ -2451,6 +2451,24 @@ class PhasedVLLMGenerationPool:
     def active(self):
         return self._awake
 
+    def discard_sleeping_host_residency(self):
+        """Drop an inactive level-1 pool so Linux can reclaim its RAM.
+
+        This is a pressure valve, not the normal phase path.  It is safe only
+        while the pool is asleep; the next use recreates the identical engines
+        from the same checkpoint and adapter.
+        """
+        if self._awake or self._pool is None or self._sleep_level != 1:
+            return False
+        pool, self._pool = self._pool, None
+        self._persistent = False
+        try:
+            pool.shutdown()
+        finally:
+            self.num_workers = int(
+                self._pool_kwargs.get("num_workers", 1) or 1)
+        return True
+
     def _ensure_started(self):
         if self._awake:
             return self._pool
