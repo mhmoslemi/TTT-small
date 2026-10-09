@@ -71,6 +71,12 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(
             coder_retry_gate([valid, valid, missing]),
             (False, 3, 2, 1, 0))
+        self.assertEqual(
+            coder_retry_gate([valid] * 3 + [missing] * 7),
+            (True, 10, 3, 7, 3))
+        self.assertEqual(
+            coder_retry_gate([missing] * 10),
+            (True, 10, 0, 10, 6))
 
     def test_only_complete_final_python_blocks_pass(self):
         self.assertIsNone(coder_output_issue(VALID, require_final_marker=True))
