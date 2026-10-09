@@ -64,3 +64,7 @@ exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantag
     # 
     # 
     # 
+
+
+
+    # sh run.sh --resume runs/erdos_Qwen3.8-27B_1009-0116
