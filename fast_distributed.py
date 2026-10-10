@@ -14,6 +14,8 @@ import traceback
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
 LONG_ROLLOUT_MEMORY_FRACTION = 0.96
+LONG_ROLLOUT_MEMORY_FRACTIONS = (0.96, 0.98)
+MAX_LONG_ROLLOUT_MEMORY_FRACTION = max(LONG_ROLLOUT_MEMORY_FRACTIONS)
 SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
 
 
@@ -173,12 +175,13 @@ def set_long_rollout_memory_ceiling(
 
     This is used after the batch has been reduced to one rollout and before
     resorting to saved-activation CPU offload. External allocations (including
-    sleeping vLLM processes and NCCL) remain part of the total, so the final
-    four percent of the card is still left untouched.
+    sleeping vLLM processes and NCCL) remain part of the total. Callers first
+    use the 96% ceiling and may explicitly escalate to 98% after a proven OOM;
+    the last two percent of the card always remains outside the total ceiling.
     """
     return _set_total_memory_ceiling(
         logical_id, fraction,
-        maximum=LONG_ROLLOUT_MEMORY_FRACTION,
+        maximum=MAX_LONG_ROLLOUT_MEMORY_FRACTION,
         label="long-rollout rescue")
 
 
@@ -492,21 +495,31 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     peak_memory_fraction = 0.0
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
+    emergency_allocator_stage = 0
 
     def expand_for_long_rollout():
         nonlocal allocator_fraction, emergency_allocator_fraction
-        if emergency_allocator_fraction is not None:
-            return emergency_allocator_fraction
-        try:
-            emergency_allocator_fraction = (
-                set_long_rollout_memory_ceiling(logical_id))
-        except RuntimeError as error:
-            print(f"[train-oom] cuda:{logical_id}: reserved GPU headroom is "
-                  f"unavailable ({error})", flush=True)
-            return None
-        allocator_fraction = max(
-            allocator_fraction, emergency_allocator_fraction)
-        return emergency_allocator_fraction
+        nonlocal emergency_allocator_stage
+        while emergency_allocator_stage < len(
+                LONG_ROLLOUT_MEMORY_FRACTIONS):
+            requested_fraction = LONG_ROLLOUT_MEMORY_FRACTIONS[
+                emergency_allocator_stage]
+            emergency_allocator_stage += 1
+            try:
+                expanded = set_long_rollout_memory_ceiling(
+                    logical_id, requested_fraction)
+            except RuntimeError as error:
+                print(f"[train-oom] cuda:{logical_id}: "
+                      f"{100.0 * requested_fraction:.0f}% reserved GPU "
+                      f"headroom is unavailable ({error})", flush=True)
+                continue
+            if (emergency_allocator_fraction is not None
+                    and expanded <= emergency_allocator_fraction):
+                continue
+            emergency_allocator_fraction = expanded
+            allocator_fraction = max(allocator_fraction, expanded)
+            return expanded
+        return None
 
     examples = list(examples or ())
     if work_queue is not None and examples:
@@ -887,21 +900,31 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     kl_errors = []
     budget = max(1, int(token_budget or cfg.max_seq_length))
     emergency_allocator_fraction = None
+    emergency_allocator_stage = 0
 
     def expand_for_long_rollout():
         nonlocal allocator_fraction, emergency_allocator_fraction
-        if emergency_allocator_fraction is not None:
-            return emergency_allocator_fraction
-        try:
-            emergency_allocator_fraction = (
-                set_long_rollout_memory_ceiling(logical_id))
-        except RuntimeError as error:
-            print(f"[train-oom] cuda:{logical_id}: reserved GPU headroom is "
-                  f"unavailable ({error})", flush=True)
-            return None
-        allocator_fraction = max(
-            allocator_fraction, emergency_allocator_fraction)
-        return emergency_allocator_fraction
+        nonlocal emergency_allocator_stage
+        while emergency_allocator_stage < len(
+                LONG_ROLLOUT_MEMORY_FRACTIONS):
+            requested_fraction = LONG_ROLLOUT_MEMORY_FRACTIONS[
+                emergency_allocator_stage]
+            emergency_allocator_stage += 1
+            try:
+                expanded = set_long_rollout_memory_ceiling(
+                    logical_id, requested_fraction)
+            except RuntimeError as error:
+                print(f"[train-oom] cuda:{logical_id}: "
+                      f"{100.0 * requested_fraction:.0f}% reserved GPU "
+                      f"headroom is unavailable ({error})", flush=True)
+                continue
+            if (emergency_allocator_fraction is not None
+                    and expanded <= emergency_allocator_fraction):
+                continue
+            emergency_allocator_fraction = expanded
+            allocator_fraction = max(allocator_fraction, expanded)
+            return expanded
+        return None
 
     examples = list(examples or ())
     if work_queue is not None and examples:

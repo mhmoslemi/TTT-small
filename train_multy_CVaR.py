@@ -3389,6 +3389,7 @@ def _run_oom_resilient_backward(
         getattr(model, "_ttt_strict_exact_long_training", False))
     activation_offload = False
     memory_expanded = False
+    expanded_fraction = None
     split_backoff = False
     offload_trigger_work = None
     headroom_trigger_work = None
@@ -3396,6 +3397,21 @@ def _run_oom_resilient_backward(
         model, "_ttt_gradient_checkpointing_min_work", None)
     checkpointing_available = set_gradient_checkpointing(model, False)
     checkpointing = False
+
+    def expand_to_next_memory_ceiling():
+        """Request one strictly larger exact-training allocator ceiling."""
+        nonlocal expanded_fraction
+        if expand_memory is None:
+            return None
+        candidate = expand_memory()
+        if candidate is None:
+            return None
+        candidate = float(candidate)
+        if (expanded_fraction is not None
+                and candidate <= float(expanded_fraction) + 1e-9):
+            return None
+        expanded_fraction = candidate
+        return candidate
 
     def select_checkpointing():
         nonlocal checkpointing, checkpointing_available
@@ -3424,8 +3440,7 @@ def _run_oom_resilient_backward(
          or (headroom_min_work is not None
              and active_work >= int(headroom_min_work)))
             and expand_memory is not None):
-        expanded_fraction = expand_memory()
-        memory_expanded = expanded_fraction is not None
+        memory_expanded = expand_to_next_memory_ceiling() is not None
     configured_offload_min_work = getattr(
         model, "_ttt_activation_offload_min_work", None)
     offload_min_work = profile.get(
@@ -3546,17 +3561,22 @@ def _run_oom_resilient_backward(
                       f"microbatch {max(len(batch) for batch in active)}",
                       flush=True)
                 continue
-            if (cuda_oom and not memory_expanded
-                    and expand_memory is not None):
-                expanded_fraction = expand_memory()
-                if expanded_fraction is not None:
+            if cuda_oom and expand_memory is not None:
+                previous_fraction = expanded_fraction
+                next_fraction = expand_to_next_memory_ceiling()
+                if next_fraction is not None:
                     memory_expanded = True
                     headroom_trigger_work = active_work
+                    retry_label = (
+                        "singleton OOM"
+                        if previous_fraction is None else
+                        "singleton still OOM"
+                    )
                     print(
-                        f"[train-oom] {device_label}: singleton OOM; retrying "
+                        f"[train-oom] {device_label}: {retry_label}; retrying "
                         "the exact update with "
                         f"reserved GPU headroom (allocator cap "
-                        f"{100.0 * float(expanded_fraction):.1f}%)",
+                        f"{100.0 * next_fraction:.1f}%)",
                         flush=True,
                     )
                     continue
@@ -6202,7 +6222,7 @@ class ProcessDistributedTrainer:
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
-            "exact long-rollout rescue up to 96%",
+            "exact long-rollout rescue staged at 96% then 98%",
             flush=True)
 
     @property
@@ -6540,7 +6560,7 @@ class ProcessDistributedTrainer:
               flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling="
               f"{self._memory_percentage:g}%; "
-              "exact singleton rescue=96%; "
+              "exact singleton rescue=96%->98%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -6956,7 +6976,7 @@ class ProcessDistributedTrainer:
             f"{int(cfg.train_examples_per_microbatch)} examples")
         print(f"[{process_label}] one process/GPU; {scheduler_label}; "
               f"memory ceiling={self._memory_percentage:g}%; "
-              "exact singleton rescue=96%; "
+              "exact singleton rescue=96%->98%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -11255,7 +11275,7 @@ def main():
     print(f"Deterministic:      {cfg.deterministic}")
     if use_process_distributed_training:
         print(f"Training memory cap: {100.0 * float(cfg.training_memory_fraction):g}% "
-              "per GPU (96% exact long-rollout rescue)")
+              "per GPU (96%->98% staged exact long-rollout rescue)")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")

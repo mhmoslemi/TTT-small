@@ -567,9 +567,12 @@ class VLLMBackendTests(unittest.TestCase):
             model(torch.ones((1, 2))).sum().backward()
             return "trained"
 
+        expansion_stages = iter((0.96, 0.98))
+
         def expand_memory():
-            expansions.append(True)
-            return 0.96
+            value = next(expansion_stages, None)
+            expansions.append(value)
+            return value
 
         with (patch("torch.cuda.empty_cache"),
               patch("torch.autograd.graph.save_on_cpu",
@@ -580,7 +583,7 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertEqual(result, "trained")
         self.assertEqual(attempts, [1, 2, 3])
-        self.assertEqual(expansions, [True])
+        self.assertEqual(expansions, [0.96, 0.98])
         self.assertEqual(effective, [[example]])
         self.assertEqual(quarantined, [])
 
@@ -637,9 +640,10 @@ class VLLMBackendTests(unittest.TestCase):
             "prompt_ids": torch.zeros((1, 1), dtype=torch.long),
             "response_ids": torch.zeros((1, 1), dtype=torch.long),
         }
-        state = {"offload": False, "expanded": False}
+        state = {"offload": False, "expanded": None}
         attempts = []
         expansions = []
+        expansion_stages = iter((0.96, 0.98))
 
         class OffloadContext:
             def __enter__(self):
@@ -656,9 +660,11 @@ class VLLMBackendTests(unittest.TestCase):
             return "trained"
 
         def expand_memory():
-            expansions.append(True)
-            state["expanded"] = True
-            return 0.96
+            value = next(expansion_stages, None)
+            expansions.append(value)
+            if value is not None:
+                state["expanded"] = value
+            return value
 
         with (patch("torch.cuda.empty_cache"),
               patch("torch.autograd.graph.save_on_cpu",
@@ -669,13 +675,17 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertEqual(result, "trained")
         self.assertEqual(
-            attempts, [(False, False), (True, False), (True, True)])
-        self.assertEqual(expansions, [True])
+            attempts,
+            [(False, None), (False, 0.96), (False, 0.98),
+             (True, 0.98)],
+        )
+        self.assertEqual(expansions, [0.96, 0.98, None])
         self.assertEqual(effective, [[example]])
         self.assertEqual(quarantined, [])
 
-        state["expanded"] = False
+        state["expanded"] = None
         attempts.clear()
+        expansion_stages = iter((0.96, 0.98))
         with (patch("torch.cuda.empty_cache"),
               patch("torch.autograd.graph.save_on_cpu",
                     side_effect=lambda **_kwargs: OffloadContext())):
@@ -684,8 +694,8 @@ class VLLMBackendTests(unittest.TestCase):
                 expand_memory=expand_memory)
 
         self.assertEqual(result, "trained")
-        self.assertEqual(attempts, [(True, True)])
-        self.assertEqual(expansions, [True, True])
+        self.assertEqual(attempts, [(True, 0.96)])
+        self.assertEqual(expansions, [0.96, 0.98, None, 0.96])
         self.assertEqual(effective, [[example]])
         self.assertEqual(quarantined, [])
 
@@ -702,6 +712,20 @@ class VLLMBackendTests(unittest.TestCase):
 
         self.assertAlmostEqual(actual, 0.86)
         setter.assert_called_once_with(0.86, device=2)
+
+    def test_long_rollout_ceiling_can_escalate_to_98_percent(self):
+        from fast_distributed import set_long_rollout_memory_ceiling
+
+        with (patch("torch.cuda.device", return_value=nullcontext()),
+              patch("torch.cuda.empty_cache"),
+              patch("torch.cuda.memory_allocated", return_value=200),
+              patch("torch.cuda.memory_reserved", return_value=100),
+              patch("torch.cuda.mem_get_info", return_value=(800, 1000)),
+              patch("torch.cuda.set_per_process_memory_fraction") as setter):
+            actual = set_long_rollout_memory_ceiling(2, 0.98)
+
+        self.assertAlmostEqual(actual, 0.88)
+        setter.assert_called_once_with(0.88, device=2)
 
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
         from train_multy_CVaR import (_resolve_training_backend,
