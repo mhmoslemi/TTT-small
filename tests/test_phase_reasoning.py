@@ -3,6 +3,7 @@
 import ast
 import copy
 from pathlib import Path
+import random
 from types import SimpleNamespace
 import unittest
 from output_retries import coder_retry_prompt_job
@@ -11,7 +12,8 @@ from output_retries import coder_retry_prompt_job
 def _runtime_scope(kind="qwen3.8", backend="vllm"):
     source = (Path(__file__).resolve().parents[1] / "train_multy_CVaR.py").read_text()
     tree = ast.parse(source)
-    names = {"_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
+    names = {"_coder_effort_for_rollout_phase",
+             "_qwen38_pilot_effort_entries", "_phase_coder_prompt_job",
              "_render", "_run_vllm_code_phase", "_run_local_code_phase"}
     nodes = [node for node in ast.walk(tree)
              if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -27,6 +29,7 @@ def _runtime_scope(kind="qwen3.8", backend="vllm"):
             return f"{options.get('reasoning_effort', 'generic')}:{messages!r}"
     scope = {
         "cfg": cfg, "tokenizer": Tokenizer(),
+        "random": random,
         "_coder_messages_for_template": lambda messages, _kind: messages,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "phase_functions", "exec"),
@@ -106,7 +109,9 @@ class PhaseReasoningTests(unittest.TestCase):
                     messages = [{"role": "user", "content": f"strategy {index}"}]
                     jobs.append(dict(messages=messages,
                                      prompt_text=scope["_render"](messages),
-                                     coder_reasoning_effort="medium", count=4))
+                                     coder_reasoning_effort="medium", count=4,
+                                     parent_group=0, strategy_index=index,
+                                     assigned_fold_index=0))
                 originals = copy.deepcopy(jobs)
                 batches = []
                 def generate(prompts, counts, with_logprobs=False):
@@ -154,13 +159,14 @@ class PhaseReasoningTests(unittest.TestCase):
                                 progress_desc="adaptive")
                 self.assertEqual(len(pilots) + len(followups), 23)
                 self.assertEqual(jobs[:2], originals)
-                self.assertEqual(batches[0][1], [10, 10])
+                self.assertEqual(batches[0][1], [1, 1, 9, 9])
                 self.assertEqual(batches[1][1], [3])
-                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len(jobs), 4)
                 for source_idx in (0, 1):
                     records = [r for r in pilots if r["strategy_source_job_idx"] == source_idx]
                     efforts = [jobs[r["job_idx"]]["coder_reasoning_effort"] for r in records]
-                    self.assertEqual(efforts.count("medium"), 10)
+                    self.assertEqual(efforts.count("medium"), 9)
+                    self.assertEqual(efforts.count("xhigh"), 1)
                     self.assertTrue(all(r["rollout_phase"] == "pilot" for r in records))
                     for record in records:
                         job = jobs[record["job_idx"]]
@@ -176,7 +182,35 @@ class PhaseReasoningTests(unittest.TestCase):
                 again = run([0, 1], phase="adaptive", seed_offset=4100000,
                             progress_desc="adaptive")
                 self.assertEqual(again[0]["job_idx"], 1)
-                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len(jobs), 4)
+
+    def test_xhigh_selection_is_stable_per_step_and_changes_no_budget(self):
+        scope, _ = _runtime_scope()
+        jobs = []
+        for parent in range(3):
+            for strategy in range(5):
+                jobs.append(dict(parent_group=parent, strategy_index=strategy))
+        indices = list(range(len(jobs)))
+        counts = [10] * len(jobs)
+        split = scope["_qwen38_pilot_effort_entries"](
+            jobs, indices, counts, scope["cfg"], 7, "pilot")
+        self.assertEqual(sum(count for _, count, _ in split), sum(counts))
+        self.assertEqual(sum(effort == "xhigh" for _, _, effort in split), 6)
+        self.assertEqual(
+            split,
+            scope["_qwen38_pilot_effort_entries"](
+                jobs, indices, counts, scope["cfg"], 7, "pilot"))
+        for parent in range(3):
+            selected = {
+                jobs[source]["strategy_index"]
+                for source, count, effort in split
+                if jobs[source]["parent_group"] == parent
+                and effort == "xhigh" and count == 1
+            }
+            self.assertEqual(len(selected), 2)
+        adaptive = scope["_qwen38_pilot_effort_entries"](
+            jobs, indices, counts, scope["cfg"], 7, "adaptive")
+        self.assertTrue(all(effort is None for _, _, effort in adaptive))
 
     def test_retry_remains_medium_and_in_pilot_allocation(self):
         scope, calls = _runtime_scope()
@@ -185,11 +219,15 @@ class PhaseReasoningTests(unittest.TestCase):
                      coder_reasoning_effort="medium", count=10,
                      parent_group=3, strategy_index=2, assigned_fold_index=1)]
         index = scope["_phase_coder_prompt_job"](
-            jobs, 0, "pilot", scope["cfg"], scope["_render"], {})
+            jobs, 0, "pilot", scope["cfg"], scope["_render"], {},
+            effort="xhigh")
+        self.assertEqual(jobs[index]["coder_reasoning_effort"], "xhigh")
         record = dict(job_idx=index, strategy_rollout_phase="pilot", strategy_source_job_idx=0)
         frozen = copy.deepcopy(jobs)
         cache = {}
-        retry = coder_retry_prompt_job(jobs, record, scope["_render"], cache)
+        retry = coder_retry_prompt_job(
+            jobs, record, scope["_render"], cache,
+            reasoning_effort="medium")
         self.assertEqual(calls[-1]["reasoning_effort"], "medium")
         self.assertEqual(jobs[retry]["coder_reasoning_effort"], "medium")
         self.assertEqual(jobs[retry]["count"], 0)
@@ -198,7 +236,9 @@ class PhaseReasoningTests(unittest.TestCase):
         self.assertEqual(jobs[retry]["assigned_fold_index"], 1)
         self.assertEqual(jobs[0], frozen[0])
         self.assertIn("Your previous attempt", jobs[retry]["prompt_text"])
-        self.assertEqual(coder_retry_prompt_job(jobs, record, scope["_render"], cache), retry)
+        self.assertEqual(coder_retry_prompt_job(
+            jobs, record, scope["_render"], cache,
+            reasoning_effort="medium"), retry)
 
 
 if __name__ == "__main__":

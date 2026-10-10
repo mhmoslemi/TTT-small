@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import queue
+import random
 import re
 from tempfile import TemporaryDirectory
 import threading
@@ -172,12 +173,13 @@ class RunnerRetryTests(unittest.TestCase):
             fail_score=0, require_final_code_marker=True, compute_reward=evaluate)
         saved = []
         scope["save_rollout_artifacts"] = lambda *args, **kw: saved.append((args, kw))
-        scope["_render"] = lambda messages, rollout_phase=None: (
-            "medium" + repr(messages))
+        scope["_render"] = lambda messages, rollout_phase=None, reasoning_effort=None: (
+            str(reasoning_effort or "medium") + repr(messages))
         messages = [{"role": "user", "content": "original parent plus strategy"}]
         scope["prompt_jobs"] = [dict(
             parent_group=0, messages=messages, count=3, assigned_fold_index=0,
-            prompt_text=scope["_render"](messages), coder_reasoning_effort="medium")]
+            strategy_index=0, prompt_text=scope["_render"](messages),
+            coder_reasoning_effort="medium")]
         calls = []
         seeds = []
         scope["_seed_local_generation"] = seeds.append
@@ -205,11 +207,13 @@ class RunnerRetryTests(unittest.TestCase):
         scope["gen_pool"] = (SimpleNamespace(iter_group_jobs=remote) if backend == "vllm" else None)
         scope["generate_prompt_jobs"] = lambda m, t, p, c, cfg, **kw: generate(p, c, False)
         functions_from_file("train_multy_CVaR.py", {
-            "_coder_effort_for_rollout_phase", "_phase_coder_prompt_job",
+            "_coder_effort_for_rollout_phase",
+            "_qwen38_pilot_effort_entries", "_phase_coder_prompt_job",
             "_queue_rollout", "_submit_rollout", "_run_coder_format_retries",
             "_defer_coder_format_retries",
             "_drain_deferred_coder_format_retries",
             "_run_vllm_code_phase", "_run_local_code_phase"}, scope)
+        scope["random"] = random
         return scope, calls, seeds, saved, evaluated
 
     def test_extra_attempts_preserve_prompts_phases_failures_and_budget(self):
@@ -238,9 +242,11 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(len(saved), 4)
                     self.assertEqual(len(calls), 3)  # the 50%-valid pilot is not retried
                     self.assertEqual(len(set(seeds)), 3)
-                    for index, expected in [(0, "medium"), (1, "medium"),
-                                            (2, "medium")]:
-                        self.assertTrue(calls[index][0][0].startswith(expected))
+                    self.assertEqual(
+                        {prompt.split("[", 1)[0] for prompt in calls[0][0]},
+                        {"medium", "xhigh"})
+                    self.assertTrue(calls[1][0][0].startswith("medium"))
+                    self.assertTrue(calls[2][0][0].startswith("medium"))
                     for rec in s["coder_retry_records"]:
                         parent = records[rec["retry_of_rollout"]]
                         self.assertEqual(rec["retry_attempt"], 1)
@@ -249,7 +255,11 @@ class RunnerRetryTests(unittest.TestCase):
                         self.assertEqual(rec["strategy_source_job_idx"], 0)
                         job = s["prompt_jobs"][rec["job_idx"]]
                         original = s["prompt_jobs"][parent["job_idx"]]
-                        self.assertEqual(job["coder_reasoning_effort"], original["coder_reasoning_effort"])
+                        self.assertEqual(job["coder_reasoning_effort"], "medium")
+                        if original["coder_reasoning_effort"] == "xhigh":
+                            self.assertNotEqual(
+                                job["coder_reasoning_effort"],
+                                original["coder_reasoning_effort"])
                         self.assertTrue(job["prompt_text"].startswith(job["coder_reasoning_effort"]))
                         self.assertEqual(saved[rec["rollout_index"]][1]["pending_meta"]["coder_reasoning_effort"],
                                          job["coder_reasoning_effort"])

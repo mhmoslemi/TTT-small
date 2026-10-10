@@ -96,19 +96,26 @@ def coder_retry_gate(records):
     return triggered, total, valid, missing, retry_budget
 
 
-def coder_retry_prompt_job(prompt_jobs, record, render, cache):
+def coder_retry_prompt_job(
+        prompt_jobs, record, render, cache, *, reasoning_effort=None):
     """Separate prompt ID so generation, reference scoring and training agree."""
     source_idx = int(record["job_idx"])
     phase = record.get("strategy_rollout_phase")
-    key = (source_idx, phase)
+    key = (source_idx, phase, reasoning_effort)
     if key not in cache:
         source = prompt_jobs[source_idx]
         messages = output_retry_messages(source["messages"], "coder")
-        cache[key] = len(prompt_jobs)
-        prompt_jobs.append({
+        render_options = {"rollout_phase": phase}
+        if reasoning_effort is not None:
+            render_options["reasoning_effort"] = reasoning_effort
+        retry_job = {
             **source, "messages": messages,
-            "prompt_text": render(messages, rollout_phase=phase), "count": 0,
-        })
+            "prompt_text": render(messages, **render_options), "count": 0,
+        }
+        if reasoning_effort is not None:
+            retry_job["coder_reasoning_effort"] = reasoning_effort
+        cache[key] = len(prompt_jobs)
+        prompt_jobs.append(retry_job)
     return cache[key]
 
 
