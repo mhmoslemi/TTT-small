@@ -19,6 +19,7 @@ from pathlib import Path
 GIB = 1024 ** 3
 DEFAULT_PINNED_CACHE_LIMIT_BYTES = 16 * GIB
 DEFAULT_LOW_AVAILABLE_FRACTION = 0.18
+DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES = 384 * GIB
 
 
 def host_memory_info(meminfo_path="/proc/meminfo"):
@@ -46,6 +47,26 @@ def host_memory_info(meminfo_path="/proc/meminfo"):
     except (AttributeError, OSError, TypeError, ValueError):
         return None
     return None
+
+
+def automatic_activation_offload_slots(
+        worker_count, *, memory_info=None,
+        bytes_per_slot=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES):
+    """Bound concurrent saved-activation CPU offloads by physical RAM.
+
+    Ordinary GPU-resident forwards remain fully parallel.  This limit applies
+    only after an exact long sequence has exhausted both GPU-headroom stages
+    and falls back to ``save_on_cpu``.  A 384-GiB admission unit leaves room
+    for resident trainer state and sleeping vLLM weight backups while still
+    allowing several long rollouts to train concurrently on large hosts.
+    """
+    worker_count = max(1, int(worker_count))
+    bytes_per_slot = max(1, int(bytes_per_slot))
+    info = host_memory_info() if memory_info is None else memory_info
+    if not info:
+        return 1
+    total = max(1, int(info.get("total", 0)))
+    return min(worker_count, max(1, total // bytes_per_slot))
 
 
 def process_rss_bytes(statm_path="/proc/self/statm"):

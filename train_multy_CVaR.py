@@ -3350,7 +3350,8 @@ def _gradient_checkpointing_work_units(batches):
 
 def _run_oom_resilient_backward(
         model, batches, attempt, *, device_label, expand_memory=None,
-        start_checkpointed=False, start_with_headroom=False):
+        start_checkpointed=False, start_with_headroom=False,
+        activation_offload_semaphore=None):
     """Retry with checkpointing, smaller batches, and memory fallbacks.
 
     Each attempt starts the local replica's gradients from zero, so an OOM
@@ -3492,18 +3493,45 @@ def _run_oom_resilient_backward(
             # faster, but PyTorch caches the released host blocks separately
             # from the CUDA device allocator.  Use pinned storage only when
             # this runtime exposes a way to return that cache to the OS.
-            offload_context = (
-                torch.autograd.graph.save_on_cpu(
-                    pin_memory=host_cache_reclaim_supported(torch))
+            admission = (
+                activation_offload_semaphore
                 if activation_offload
-                and hasattr(torch.autograd.graph, "save_on_cpu")
+                and activation_offload_semaphore is not None
                 else nullcontext()
             )
-            with offload_context:
-                result = attempt(active)
-            if activation_offload:
-                reclaim_unused_host_memory(
-                    torch, cuda_devices=cuda_devices, force=False)
+            # Keep the admission token until inactive pinned blocks and libc
+            # arenas have been returned. Otherwise the next trainer can begin
+            # a large offload while this process still owns the prior batch's
+            # host cache, recreating the node-wide RAM spike.
+            with admission:
+                offload_context = (
+                    torch.autograd.graph.save_on_cpu(
+                        pin_memory=host_cache_reclaim_supported(torch))
+                    if activation_offload
+                    and hasattr(torch.autograd.graph, "save_on_cpu")
+                    else nullcontext()
+                )
+                try:
+                    with offload_context:
+                        result = attempt(active)
+                except BaseException:
+                    # Clean the failed graph before releasing the shared
+                    # admission slot. Otherwise another rank can begin a CPU
+                    # offload while this exception still retains saved
+                    # tensors, recreating the node-wide host-RAM spike.
+                    if activation_offload:
+                        model.zero_grad(set_to_none=True)
+                        gc.collect()
+                        for cuda_device in cuda_devices:
+                            with torch.cuda.device(cuda_device):
+                                torch.cuda.empty_cache()
+                        reclaim_unused_host_memory(
+                            torch, cuda_devices=cuda_devices, force=True)
+                    raise
+                else:
+                    if activation_offload:
+                        reclaim_unused_host_memory(
+                            torch, cuda_devices=cuda_devices, force=True)
             if split_backoff and active:
                 successful_work = _gradient_checkpointing_work_units(active)
                 _remember_oom_profile_minimum(
@@ -6152,6 +6180,12 @@ class ProcessDistributedTrainer:
         if self._world_size < 2:
             raise ValueError("process-distributed training requires two GPUs")
 
+        from host_memory import automatic_activation_offload_slots
+        self._activation_offload_slots = (
+            automatic_activation_offload_slots(self._world_size))
+        self._activation_offload_semaphore = self._context.BoundedSemaphore(
+            self._activation_offload_slots)
+
         # Eight independent Python processes must not each create a full-sized
         # host thread pool. GPU 0 was loaded before this class is constructed;
         # the allocator limit still constrains every subsequent allocation.
@@ -6191,6 +6225,7 @@ class ProcessDistributedTrainer:
                         rank, self._world_size, cfg_dict,
                         self._init_method, self._work_queue, command_queue,
                         self._result_queue, dependency_log_path,
+                        self._activation_offload_semaphore,
                     ),
                     name=f"ttt-fast-trainer-rank-{rank}",
                 )
@@ -6222,7 +6257,9 @@ class ProcessDistributedTrainer:
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
-            "exact long-rollout rescue staged at 96% then 98%",
+            "exact long-rollout rescue staged at 96% then 98%; "
+            f"CPU activation offload admitted on at most "
+            f"{self._activation_offload_slots}/{self._world_size} ranks",
             flush=True)
 
     @property
@@ -6577,7 +6614,9 @@ class ProcessDistributedTrainer:
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
-            work_queue=self._work_queue)
+            work_queue=self._work_queue,
+            activation_offload_semaphore=(
+                self._activation_offload_semaphore))
         child_messages = self._collect_event(
             "computed", range(1, self._world_size))
         rank_stats = [local_stats] + [
@@ -6742,7 +6781,9 @@ class ProcessDistributedTrainer:
             self._token_budgets[0], normalization_examples,
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
-            adaptive_batches=adaptive_batches)
+            adaptive_batches=adaptive_batches,
+            activation_offload_semaphore=(
+                self._activation_offload_semaphore))
         state["future"] = future
 
         def _record_completion(_future):
@@ -6996,7 +7037,9 @@ class ProcessDistributedTrainer:
             self._token_budgets[0], total_examples,
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
-            adaptive_batches=adaptive_batches)
+            adaptive_batches=adaptive_batches,
+            activation_offload_semaphore=(
+                self._activation_offload_semaphore))
         child_messages = self._collect_event(
             "computed", range(1, self._world_size))
         rank_stats = [local_stats] + [
@@ -7490,6 +7533,432 @@ def _logged_step_rewards(exp_dir, step_idx):
         if math.isfinite(reward):
             rewards.append(reward)
     return rewards
+
+
+def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
+    """Return a complete evaluated-but-uncheckpointed SPO-RS step.
+
+    Rollout metadata is written only after reward evaluation, while the step
+    summary is written only after the adapter and training checkpoint.  Their
+    combination therefore forms a crash-safe boundary for replaying only the
+    interrupted optimizer update without regenerating or reevaluating code.
+    """
+    step_idx = int(step_idx)
+    step_dir = Path(exp_dir) / f"step{step_idx:02d}"
+    summary_path = step_dir / f"step{step_idx:02d}.summary.json"
+    if summary_path.is_file() or not step_dir.is_dir():
+        return None
+    paths = sorted(step_dir.glob(
+        f"step{step_idx:02d}_group*_rollout*.meta.json"))
+    expected_primary = int(cfg.groups_per_step) * int(cfg.group_size)
+    if len(paths) < expected_primary:
+        return None
+
+    artifacts = []
+    for meta_path in paths:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        required = (
+            "step", "group", "rollout", "reward", "valid", "advantage",
+            "advantage_mode", "n_response_tokens",
+        )
+        if any(name not in meta for name in required):
+            return None
+        if (int(meta["step"]) != step_idx
+                or str(meta["advantage_mode"]).lower() != "spo-rs"):
+            return None
+        try:
+            reward = float(meta["reward"])
+            advantage = float(meta["advantage"])
+            response_tokens = int(meta["n_response_tokens"])
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(reward) or not math.isfinite(advantage)
+                or response_tokens < 0):
+            return None
+        base = meta_path.name.removesuffix(".meta.json")
+        response_path = meta_path.with_name(base + ".txt")
+        prompt_path = meta_path.with_name(base + ".prompt.txt")
+        if not response_path.is_file() or not prompt_path.is_file():
+            return None
+        artifacts.append({
+            "meta_path": meta_path,
+            "response_path": response_path,
+            "prompt_path": prompt_path,
+            "meta": meta,
+        })
+
+    primary = [
+        item for item in artifacts
+        if bool(item["meta"].get("counts_toward_allocation", True))
+        and int(item["meta"].get("retry_attempt", 0) or 0) == 0
+    ]
+    if len(primary) != expected_primary:
+        return None
+    per_group = {}
+    for item in primary:
+        group = int(item["meta"]["group"])
+        per_group[group] = per_group.get(group, 0) + 1
+    expected_groups = set(range(int(cfg.groups_per_step)))
+    if (set(per_group) != expected_groups
+            or any(count != int(cfg.group_size)
+                   for count in per_group.values())):
+        return None
+    artifacts.sort(key=lambda item: (
+        int(item["meta"]["group"]), int(item["meta"]["rollout"])))
+    return artifacts
+
+
+def _literal_metadata_mapping(value):
+    """Recover mappings stringified by the rollout JSON compatibility layer."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    import ast
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _literal_float_list(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        values = value
+    elif isinstance(value, str):
+        import ast
+        try:
+            values = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return None
+    else:
+        return None
+    try:
+        result = [float(item) for item in values]
+    except (TypeError, ValueError):
+        return None
+    return result if all(math.isfinite(item) for item in result) else None
+
+
+def _metadata_is_code_failure(meta):
+    """Mirror problems.base.is_code_failure from persisted reward fields."""
+    kind = str(meta.get("failure_kind", "") or "").strip().lower()
+    if kind:
+        return kind == "code"
+    if not bool(meta.get("parsed", False)):
+        return True
+    if bool(meta.get("ran", False)):
+        return False
+    return "timeout" not in str(meta.get("msg", "") or "").lower()
+
+
+def _resume_spo_rs_step_from_artifacts(
+        backend, model, tokenizer, sampler, optimizer, step_idx, cfg, exp_dir,
+        problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
+        artifacts):
+    """Finish one interrupted SPO-RS step from its durable evaluations."""
+    import torch
+    from reward import extract_python_code
+    from sampler import State
+
+    if parallel_trainer is None:
+        raise RuntimeError(
+            "evaluated-step recovery requires the configured fast distributed "
+            "trainer")
+    if spo_rs_tracker is None or not spo_rs_tracker.initialized:
+        raise RuntimeError(
+            "evaluated-step recovery requires the pre-step SPO-RS tracker")
+    if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
+        raise FileNotFoundError(
+            "evaluated-step recovery cannot find the sampling adapter: "
+            f"{sampling_adapter_path}")
+
+    parents = sampler.sample_states(int(cfg.groups_per_step))
+    if len(parents) != int(cfg.groups_per_step):
+        raise RuntimeError(
+            "evaluated-step recovery could not reconstruct every selected "
+            f"parent ({len(parents)}/{int(cfg.groups_per_step)})")
+    by_group = {}
+    for item in artifacts:
+        by_group.setdefault(int(item["meta"]["group"]), []).append(item)
+    for group, parent in enumerate(parents):
+        records = by_group.get(group, ())
+        if not records:
+            raise RuntimeError(
+                f"evaluated-step recovery has no rollout group {group}")
+        first = records[0]["meta"]
+        try:
+            saved_value = float(first["parent_value"])
+            saved_timestep = int(first["parent_timestep"])
+            saved_parent_id = str(first["parent_id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"evaluated-step recovery lacks parent identity for group "
+                f"{group}") from error
+        current_value = float(parent.value)
+        if (saved_timestep != int(parent.timestep)
+                or not math.isclose(saved_value, current_value,
+                                    rel_tol=0.0, abs_tol=1e-12)):
+            raise RuntimeError(
+                f"evaluated-step recovery parent {group} does not match the "
+                "restored sampler state")
+        if parent.id != saved_parent_id:
+            if step_idx == 0 and parent.id in sampler._seed_ids:
+                # Fresh seed State UUIDs are intentionally random. Reuse the
+                # durable IDs already embedded in every rollout so the healed
+                # checkpoint preserves the original lineage exactly.
+                sampler._seed_ids.remove(parent.id)
+                parent.id = saved_parent_id
+                sampler._seed_ids.add(parent.id)
+            else:
+                raise RuntimeError(
+                    f"evaluated-step recovery parent ID {group} differs from "
+                    "the restored sampler checkpoint")
+        sampler.record_expansion(parent, count=int(cfg.group_size))
+
+    rewards = [float(item["meta"]["reward"]) for item in artifacts]
+    transformed = spo_rs_tracker.transformed_rewards(rewards)
+    recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
+    saved_advantages = np.asarray(
+        [float(item["meta"]["advantage"]) for item in artifacts],
+        dtype=np.float64)
+    if (recovered_advantages is None
+            or recovered_advantages.shape != saved_advantages.shape
+            or not np.allclose(recovered_advantages, saved_advantages,
+                               rtol=0.0, atol=1e-10)):
+        raise RuntimeError(
+            "evaluated-step recovery advantages do not match the restored "
+            "pre-step SPO-RS tracker; refusing an inexact update")
+
+    spo_infos = [
+        _literal_metadata_mapping(item["meta"].get("spo_rs"))
+        for item in artifacts
+    ]
+    if any(not info or not bool(info.get("used_for_policy_update", False))
+           for info in spo_infos):
+        raise RuntimeError(
+            "evaluated-step recovery found a rollout that was not part of "
+            "the saved SPO-RS policy update")
+    spo_info = spo_infos[0]
+    saved_value_before = spo_info.get("value_before")
+    if (saved_value_before is None
+            or not math.isclose(float(saved_value_before),
+                                float(spo_rs_tracker.baseline()),
+                                rel_tol=0.0, abs_tol=1e-10)):
+        raise RuntimeError(
+            "evaluated-step recovery does not match the saved pre-step "
+            "SPO-RS value")
+    if int(spo_info.get("group_size", -1)) != len(artifacts):
+        raise RuntimeError(
+            "evaluated-step recovery rollout count differs from the saved "
+            "SPO-RS update")
+    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(
+            sampling_adapter_path).name:
+        raise RuntimeError(
+            "evaluated-step recovery sampling adapter differs from the "
+            "saved SPO-RS update")
+    for index, (info, transformed_reward) in enumerate(
+            zip(spo_infos, transformed)):
+        saved_transformed = info.get("transformed_reward")
+        if (saved_transformed is None
+                or not math.isclose(float(saved_transformed),
+                                    float(transformed_reward),
+                                    rel_tol=0.0, abs_tol=1e-10)):
+            raise RuntimeError(
+                "evaluated-step recovery transformed reward differs from "
+                f"the saved SPO-RS record at rollout {index}")
+    divergence = spo_info.get("divergence")
+    if divergence is None:
+        if bool(spo_info.get("divergence_missing", False)):
+            divergence = math.inf
+        else:
+            raise RuntimeError(
+                "evaluated-step recovery has no saved SPO-RS divergence")
+    divergence = float(divergence)
+    if math.isnan(divergence) or divergence < 0.0:
+        raise RuntimeError(
+            "evaluated-step recovery found an invalid SPO-RS divergence")
+    tracker_update = spo_rs_tracker.update(
+        transformed, divergence=divergence,
+        policy_adapter=sampling_adapter_path, step=step_idx)
+    saved_after = spo_info.get("value_after")
+    if (saved_after is not None
+            and not math.isclose(float(saved_after),
+                                 float(tracker_update["value_after"]),
+                                 rel_tol=0.0, abs_tol=1e-10)):
+        raise RuntimeError(
+            "evaluated-step recovery produced a different SPO-RS tracker "
+            "value; refusing an inexact update")
+
+    prompt_cache = {}
+    prompt_job_ids = {}
+    all_examples = []
+    all_children = []
+    strategy_keys = []
+    entropy_directory = None
+    entropy_observations = []
+    if bool(getattr(cfg, "measure_entropy", False)):
+        from entropy_tools import (begin_step, observation_descriptor,
+                                   rollout_observation)
+        entropy_directory = begin_step(exp_dir, step_idx)
+    group_sizes = {group: len(records) for group, records in by_group.items()}
+    for item in artifacts:
+        meta = item["meta"]
+        response_text = item["response_path"].read_text(
+            encoding="utf-8", errors="replace")
+        prompt_text = item["prompt_path"].read_text(
+            encoding="utf-8", errors="replace")
+        response_tokens = tokenizer(
+            response_text, add_special_tokens=False).input_ids
+        expected_tokens = int(meta["n_response_tokens"])
+        if len(response_tokens) != expected_tokens:
+            raise RuntimeError(
+                "evaluated-step recovery cannot reproduce the exact generated "
+                f"token sequence for {item['response_path'].name}: saved "
+                f"{expected_tokens}, retokenized {len(response_tokens)}")
+        if prompt_text not in prompt_cache:
+            prompt_cache[prompt_text] = tokenizer(
+                prompt_text, return_tensors="pt").input_ids
+            prompt_job_ids[prompt_text] = len(prompt_job_ids)
+        group = int(meta["group"])
+        entropy_descriptor = None
+        if entropy_directory is not None:
+            entropy_descriptor = observation_descriptor(
+                entropy_directory, group, int(meta["rollout"]))
+        if response_tokens:
+            all_examples.append({
+                "prompt_ids": prompt_cache[prompt_text],
+                "response_ids": torch.tensor(
+                    [response_tokens], dtype=torch.long),
+                "_entropy_measurement": entropy_descriptor,
+                "advantage": float(meta["advantage"]),
+                "behavior_logprobs": None,
+                "reference_logprobs": None,
+                "reward_constant": False,
+                "rank_entropy_gate": False,
+                "group_id": group,
+                "x_grpo_context_id": group,
+                "x_grpo_fold_index": 0,
+                "rollout_index": int(meta["rollout"]),
+                "prompt_job_id": prompt_job_ids[prompt_text],
+                "x_grpo_group_size": group_sizes[group],
+                "x_grpo_all_tied": False,
+                "x_grpo_trial_advantages": (),
+                "sample_weight": 0.0,
+            })
+
+        code = extract_python_code(response_text)
+        if entropy_descriptor is not None:
+            entropy_observations.append(rollout_observation(
+                entropy_descriptor, meta, code))
+
+        if bool(meta.get("archive_eligible", False)):
+            if not code:
+                raise RuntimeError(
+                    "evaluated-step recovery lost code from an archive-eligible "
+                    f"rollout: {item['response_path'].name}")
+            child = State.make(
+                timestep=step_idx, value=float(meta["reward"]), code=code,
+                raw_score=(float(meta["raw_score"])
+                           if meta.get("raw_score") is not None else None),
+                construction=_literal_float_list(meta.get("construction")),
+            )
+            if meta.get("node_id"):
+                child.id = str(meta["node_id"])
+            parent_group = int(meta.get("parent_group", group))
+            all_children.append((child, parents[parent_group]))
+            strategy_keys.append(
+                int(meta["strategy_index"])
+                if meta.get("strategy_index") is not None else None)
+
+    if not all_examples:
+        raise RuntimeError(
+            "evaluated-step recovery found no nonempty responses to train")
+    trajectory_weight = 1.0 / len(all_examples)
+    for example in all_examples:
+        example["sample_weight"] = trajectory_weight
+
+    archive_stats = sampler.update(
+        all_children,
+        strategy_keys=(strategy_keys if bool(cfg.strategies) else None),
+        strategy_top_r=(int(cfg.strategy_archive_top_r)
+                        if bool(cfg.strategies) else 0),
+    )
+    print(
+        f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
+        "evaluations; generation and CPU evaluation are skipped",
+        flush=True,
+    )
+    print(
+        f"[resume] step {step_idx}: restored {archive_stats['submitted']} "
+        "valid children and the exact saved SPO-RS advantages; resuming at "
+        "adapter training",
+        flush=True,
+    )
+
+    raw_states = [
+        child for child, _parent in all_children
+        if child.raw_score is not None and math.isfinite(float(child.raw_score))
+    ]
+    step_best = (
+        (max(raw_states, key=lambda state: float(state.raw_score))
+         if problem.maximize else
+         min(raw_states, key=lambda state: float(state.raw_score)))
+        if raw_states else None)
+    best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize))
+                 or sampler.best_state())
+    stats = {
+        "planned_rollouts": sum(
+            bool(item["meta"].get("counts_toward_allocation", True))
+            for item in artifacts),
+        "coder_format_retries": sum(
+            int(item["meta"].get("retry_attempt", 0) or 0) > 0
+            for item in artifacts),
+        "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
+        "result_metric_name": str(problem.metric_name),
+        "result_maximize": bool(problem.maximize),
+        "step_best_raw_score": (
+            float(step_best.raw_score) if step_best is not None else None),
+        "step_best_reward": (
+            float(step_best.value) if step_best is not None else None),
+        "best_seen_raw_score": (
+            float(best_seen.raw_score)
+            if best_seen is not None and best_seen.raw_score is not None
+            else None),
+        "best_seen_reward": (
+            float(best_seen.value)
+            if best_seen is not None and best_seen.value is not None else None),
+        "best_seen_step": (
+            int(best_seen.timestep) if best_seen is not None else None),
+        "valid_fraction": (
+            sum(bool(item["meta"]["valid"]) for item in artifacts)
+            / len(artifacts)),
+        "code_valid_fraction": (
+            1.0 - sum(_metadata_is_code_failure(item["meta"])
+                      for item in artifacts) / len(artifacts)),
+        "spo_rs_updates": [tracker_update],
+        "spo_rs_tracker_size": len(spo_rs_tracker),
+        "spo_rs_divergence": (
+            None if not math.isfinite(divergence) else divergence),
+        "spo_rs_context_divergences": spo_info.get(
+            "context_divergences", {}),
+        "spo_rs_missing_policy_scores": int(
+            spo_info.get("missing_policy_scores", 0) or 0),
+        "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
+        "spo_rs_policy_updated": False,
+        "recovered_evaluated_step": True,
+        "recovered_rollouts": len(artifacts),
+        "_entropy_observations": entropy_observations,
+    }
+    stats.update(parallel_trainer.train_rank(
+        all_examples, cfg, step_idx))
+    stats["spo_rs_policy_updated"] = True
+    return stats
 
 
 # ======================================================================
@@ -11333,6 +11802,7 @@ def main():
     # the same completed step.
     resume_payload = None
     legacy_resume = None
+    interrupted_spo_rs_artifacts = None
     start_step = 0
     current_policy_adapter_path = None
     if resume_dir:
@@ -11347,16 +11817,33 @@ def main():
                 print("[resume] legacy batch-growth state ignored; "
                       "using fixed configured batch sizes")
         else:
-            legacy_resume = _legacy_resume_info(exp_dir)
-            start_step, adapter_path = legacy_resume
-            _load_adapter(model, adapter_path)
-            current_policy_adapter_path = adapter_path
-            print(
-                f"[resume] legacy run (no training_state.pt): restarting step "
-                f"{start_step} from {adapter_path.name}. The archive will be "
-                "reconstructed, but old PUCT/optimizer statistics are "
-                "unavailable."
-            )
+            if configured_advantage_mode == "spo-rs":
+                interrupted_spo_rs_artifacts = (
+                    _recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
+            initial_adapter = Path(exp_dir) / "adapter_initial"
+            if (interrupted_spo_rs_artifacts is not None
+                    and initial_adapter.is_dir()):
+                start_step = 0
+                adapter_path = initial_adapter
+                _load_adapter(model, adapter_path)
+                current_policy_adapter_path = adapter_path
+                print(
+                    "[resume] found a fully evaluated interrupted SPO-RS "
+                    "step 0; restored adapter_initial and will skip rollout "
+                    "generation/evaluation",
+                    flush=True,
+                )
+            else:
+                legacy_resume = _legacy_resume_info(exp_dir)
+                start_step, adapter_path = legacy_resume
+                _load_adapter(model, adapter_path)
+                current_policy_adapter_path = adapter_path
+                print(
+                    f"[resume] legacy run (no training_state.pt): restarting "
+                    f"step {start_step} from {adapter_path.name}. The archive "
+                    "will be reconstructed, but old PUCT/optimizer statistics "
+                    "are unavailable."
+                )
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -11960,18 +12447,35 @@ def main():
                     f"({cfg.groups_per_step * cfg.group_size} rollouts)",
                     flush=True)
 
-            stats = train_step(backend, model, tokenizer, sampler, optimizer, step,
-                               step_cfg, exp_dir, problem, gen_pool,
-                               strategy_pool=strategy_pool,
-                               strategy_tokenizer=strategy_tokenizer,
-                               parallel_trainer=parallel_trainer,
-                               spo_rs_tracker=spo_rs_tracker,
-                               sampling_adapter_path=(
-                                   current_policy_adapter_path
-                                   if (binary_coder_cfg.enabled
-                                       or configured_advantage_mode == "spo-rs")
-                                   else None),
-                               ensure_trainer_ready=ensure_trainer_ready)
+            if (resume_dir
+                    and step == start_step
+                    and configured_advantage_mode == "spo-rs"):
+                if interrupted_spo_rs_artifacts is None:
+                    interrupted_spo_rs_artifacts = (
+                        _recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
+            else:
+                interrupted_spo_rs_artifacts = None
+
+            if interrupted_spo_rs_artifacts is not None:
+                stats = _resume_spo_rs_step_from_artifacts(
+                    backend, model, tokenizer, sampler, optimizer, step,
+                    step_cfg, exp_dir, problem, parallel_trainer,
+                    spo_rs_tracker, current_policy_adapter_path,
+                    interrupted_spo_rs_artifacts)
+            else:
+                stats = train_step(
+                    backend, model, tokenizer, sampler, optimizer, step,
+                    step_cfg, exp_dir, problem, gen_pool,
+                    strategy_pool=strategy_pool,
+                    strategy_tokenizer=strategy_tokenizer,
+                    parallel_trainer=parallel_trainer,
+                    spo_rs_tracker=spo_rs_tracker,
+                    sampling_adapter_path=(
+                        current_policy_adapter_path
+                        if (binary_coder_cfg.enabled
+                            or configured_advantage_mode == "spo-rs")
+                        else None),
+                    ensure_trainer_ready=ensure_trainer_ready)
 
             stats = stats or {}
             entropy_observations = stats.pop("_entropy_observations", [])

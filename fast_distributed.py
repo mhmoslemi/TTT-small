@@ -462,7 +462,8 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
 
 
 def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
-                      token_budget, *, memory_fraction=0.80, work_queue=None):
+                      token_budget, *, memory_fraction=0.80, work_queue=None,
+                      activation_offload_semaphore=None):
     """Accumulate one rank's gradients and leave them attached to the model."""
     import torch
     import train_multy_CVaR as training
@@ -760,7 +761,9 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 training._run_oom_resilient_backward(
                     model, [local_batch], attempt,
                     device_label=f"cuda:{logical_id}",
-                    expand_memory=expand_for_long_rollout))
+                    expand_memory=expand_for_long_rollout,
+                    activation_offload_semaphore=(
+                        activation_offload_semaphore)))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
@@ -860,7 +863,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
 def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         token_budget, total_examples, *,
                         memory_fraction=0.80, work_queue=None,
-                        adaptive_batches=True):
+                        adaptive_batches=True,
+                        activation_offload_semaphore=None):
     """Accumulate one rank's exact entropic/GRPO/CVaR gradients.
 
     This is the process-per-GPU counterpart of
@@ -1187,7 +1191,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                     device_label=f"cuda:{logical_id}",
                     expand_memory=expand_for_long_rollout,
                     start_checkpointed=fused_long_singleton,
-                    start_with_headroom=fused_long_singleton))
+                    start_with_headroom=fused_long_singleton,
+                    activation_offload_semaphore=(
+                        activation_offload_semaphore)))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
@@ -1289,7 +1295,8 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
 
 
 def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
-                command_queue, result_queue, dependency_log_path=None):
+                command_queue, result_queue, dependency_log_path=None,
+                activation_offload_semaphore=None):
     """Persistent rank>0 worker command loop."""
     dist_initialized = False
     try:
@@ -1404,7 +1411,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
                     memory_fraction=command.get("memory_fraction", 0.80),
-                    work_queue=work_queue)
+                    work_queue=work_queue,
+                    activation_offload_semaphore=(
+                        activation_offload_semaphore))
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
@@ -1422,7 +1431,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     memory_fraction=command.get("memory_fraction", 0.80),
                     work_queue=work_queue,
                     adaptive_batches=bool(command.get(
-                        "adaptive_batches", True)))
+                        "adaptive_batches", True)),
+                    activation_offload_semaphore=(
+                        activation_offload_semaphore))
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
