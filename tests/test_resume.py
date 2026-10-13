@@ -5,9 +5,14 @@ from types import SimpleNamespace
 import yaml
 
 from sampler import PUCTSampler, State
-from experiment_io import make_experiment_dir
-from train_multy_CVaR import (_legacy_resume_info, _restore_legacy_archive,
-                         load_config)
+from experiment_io import (make_experiment_dir, save_rollout_token_ids)
+from train_multy_CVaR import (
+    _legacy_resume_info,
+    _prepare_recoverable_response_tokens,
+    _reconstruct_saved_response_tokens,
+    _restore_legacy_archive,
+    load_config,
+)
 
 
 def _complete_config():
@@ -144,3 +149,54 @@ def test_legacy_run_restarts_at_adapter_step_and_recovers_archive(tmp_path):
     assert adapter.name == "adapter_step003"
     assert recovered == total == 1
     assert sampler.best_state().construction == [3.0, 4.0]
+
+
+class _RecoveryTokenizer:
+    eos_token_id = 99
+
+    def __init__(self, tokens):
+        self.tokens = list(tokens)
+
+    def __call__(self, _text, **_kwargs):
+        return SimpleNamespace(input_ids=list(self.tokens))
+
+    def decode(self, tokens, **_kwargs):
+        return "" if list(tokens) == [self.eos_token_id] else "visible"
+
+
+def test_legacy_text_recovery_does_not_guess_multiple_missing_tokens():
+    tokenizer = _RecoveryTokenizer([10, 11, 12])
+    model = SimpleNamespace(
+        generation_config=SimpleNamespace(eos_token_id=99))
+
+    tokens, recovery = _reconstruct_saved_response_tokens(
+        model, tokenizer, "saved text", expected_count=5)
+
+    assert tokens == [10, 11, 12, 99]
+    assert recovery["source"] == "canonical-text"
+    assert recovery["restored_terminal"] is True
+    assert recovery["unavailable_original_tokens"] == 1
+    assert recovery["canonical_extra_tokens"] == 0
+
+
+def test_recovery_preflight_prefers_exact_token_sidecar(tmp_path):
+    response_path = tmp_path / "rollout.txt"
+    response_path.write_text("saved text")
+    token_path = tmp_path / "rollout.tokens.zlib"
+    save_rollout_token_ids(token_path, [7, 8, 9, 99])
+    artifact = {
+        "response_path": response_path,
+        "token_path": token_path,
+        "meta": {"n_response_tokens": 4},
+    }
+    tokenizer = _RecoveryTokenizer([10, 11, 12])
+    model = SimpleNamespace(
+        generation_config=SimpleNamespace(eos_token_id=99))
+
+    summary = _prepare_recoverable_response_tokens(
+        model, tokenizer, [artifact])
+
+    assert artifact["response_token_ids"] == [7, 8, 9, 99]
+    assert artifact["response_token_recovery"]["exact"] is True
+    assert summary["exact_sidecars"] == 1
+    assert summary["canonical_text"] == 0

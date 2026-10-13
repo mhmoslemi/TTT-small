@@ -7661,22 +7661,25 @@ def _metadata_is_code_failure(meta):
 
 def _reconstruct_saved_response_tokens(
         model, tokenizer, response_text, expected_count):
-    """Invert vLLM's ``skip_special_tokens=True`` artifact rendering.
+    """Build a safe training sequence from a legacy text-only artifact.
 
-    Rollout metadata counts ``candidate.token_ids`` exactly, including the
-    terminal EOS emitted by vLLM. The paired text intentionally omits special
-    tokens. Ordinary text round-trips directly; a one-token deficit is exact
-    only when the model/tokenizer exposes one unambiguous configured EOS.
-    Anything else is refused instead of guessing a training trajectory.
+    Old runs saved vLLM's decoded text but not ``candidate.token_ids``.  Such
+    text is deliberately decoded with ``skip_special_tokens=True`` and BPE
+    decode/encode is not generally invertible, so matching the recorded token
+    count is neither necessary nor proof that the original IDs were recovered.
+    Use the tokenizer's canonical representation of the *exact saved text* and
+    restore one hidden terminal EOS when the recorded sequence was longer and
+    an unambiguous, invisibly-decoded EOS is available.  Any remaining count
+    difference is diagnostic only; padding it with guessed special tokens
+    would fabricate a trajectory.
+
+    New runs carry an exact ``.tokens.zlib`` sidecar and never use this path.
     """
     token_ids = list(tokenizer(
         response_text, add_special_tokens=False).input_ids)
     expected_count = int(expected_count)
-    if len(token_ids) == expected_count:
-        return token_ids, False
-    if len(token_ids) + 1 != expected_count:
-        raise ValueError(
-            f"saved {expected_count}, retokenized {len(token_ids)}")
+    canonical_count = len(token_ids)
+    restored_terminal = False
 
     configured = []
 
@@ -7695,11 +7698,6 @@ def _reconstruct_saved_response_tokens(
     generation_config = getattr(model, "generation_config", None)
     add_ids(getattr(generation_config, "eos_token_id", None))
     add_ids(getattr(tokenizer, "eos_token_id", None))
-    if not configured:
-        raise ValueError(
-            f"saved {expected_count}, retokenized {len(token_ids)}, and no "
-            "configured EOS token is available")
-
     tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
     try:
         tokenizer_eos = int(tokenizer_eos)
@@ -7707,22 +7705,31 @@ def _reconstruct_saved_response_tokens(
         tokenizer_eos = None
     chosen = (tokenizer_eos if tokenizer_eos in configured
               else configured[0] if len(configured) == 1 else None)
-    if chosen is None:
-        raise ValueError(
-            f"saved {expected_count}, retokenized {len(token_ids)}, and "
-            f"configured EOS is ambiguous: {configured}")
+    if canonical_count < expected_count and chosen is not None:
+        try:
+            visible = tokenizer.decode(
+                [chosen], skip_special_tokens=True,
+                clean_up_tokenization_spaces=False)
+        except TypeError:
+            visible = tokenizer.decode([chosen], skip_special_tokens=True)
+        if not str(visible or ""):
+            token_ids.append(chosen)
+            restored_terminal = True
 
-    try:
-        visible = tokenizer.decode(
-            [chosen], skip_special_tokens=True,
-            clean_up_tokenization_spaces=False)
-    except TypeError:
-        visible = tokenizer.decode([chosen], skip_special_tokens=True)
-    if str(visible or ""):
-        raise ValueError(
-            f"configured EOS token {chosen} is not hidden by the rollout "
-            "text decoder")
-    return token_ids + [chosen], True
+    recovered_count = len(token_ids)
+    recovery = {
+        "source": "canonical-text",
+        "exact": False,
+        "recorded_count": expected_count,
+        "canonical_count": canonical_count,
+        "recovered_count": recovered_count,
+        "restored_terminal": restored_terminal,
+        "unavailable_original_tokens": max(
+            0, expected_count - recovered_count),
+        "canonical_extra_tokens": max(
+            0, recovered_count - expected_count),
+    }
+    return token_ids, recovery
 
 
 def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
@@ -7730,7 +7737,14 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
     from experiment_io import load_rollout_token_ids
     from zlib import error as ZlibError
 
-    restored_terminal_tokens = 0
+    summary = {
+        "exact_sidecars": 0,
+        "canonical_text": 0,
+        "restored_terminal_tokens": 0,
+        "unavailable_original_tokens": 0,
+        "canonical_extra_tokens": 0,
+        "count_changed_responses": 0,
+    }
     for item in artifacts:
         expected_count = int(item["meta"]["n_response_tokens"])
         token_path = item.get("token_path")
@@ -7746,23 +7760,42 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
                     "evaluated-step recovery token sidecar length differs "
                     f"for {Path(token_path).name}: saved metadata "
                     f"{expected_count}, sidecar {len(token_ids)}")
-            restored_terminal = False
+            recovery = {
+                "source": "exact-sidecar",
+                "exact": True,
+                "recorded_count": expected_count,
+                "canonical_count": None,
+                "recovered_count": len(token_ids),
+                "restored_terminal": False,
+                "unavailable_original_tokens": 0,
+                "canonical_extra_tokens": 0,
+            }
+            summary["exact_sidecars"] += 1
         else:
             response_text = item["response_path"].read_text(
                 encoding="utf-8", errors="replace")
             try:
-                token_ids, restored_terminal = (
+                token_ids, recovery = (
                     _reconstruct_saved_response_tokens(
                         model, tokenizer, response_text, expected_count))
             except ValueError as error:
                 raise RuntimeError(
-                    "evaluated-step recovery cannot reproduce the exact "
-                    "generated token sequence for "
+                    "evaluated-step recovery cannot tokenize the saved "
+                    "response text for "
                     f"{item['response_path'].name}: {error}") from error
+            summary["canonical_text"] += 1
         item["response_token_ids"] = token_ids
-        item["restored_terminal_token"] = bool(restored_terminal)
-        restored_terminal_tokens += int(restored_terminal)
-    return restored_terminal_tokens
+        item["response_token_recovery"] = recovery
+        restored_terminal = bool(recovery["restored_terminal"])
+        item["restored_terminal_token"] = restored_terminal
+        summary["restored_terminal_tokens"] += int(restored_terminal)
+        summary["unavailable_original_tokens"] += int(
+            recovery["unavailable_original_tokens"])
+        summary["canonical_extra_tokens"] += int(
+            recovery["canonical_extra_tokens"])
+        summary["count_changed_responses"] += int(
+            len(token_ids) != expected_count)
+    return summary
 
 
 def _resume_spo_rs_step_from_artifacts(
@@ -7916,6 +7949,9 @@ def _resume_spo_rs_step_from_artifacts(
         entropy_directory = begin_step(exp_dir, step_idx)
     group_sizes = {group: len(records) for group, records in by_group.items()}
     restored_terminal_tokens = 0
+    canonical_recovery_responses = 0
+    unavailable_original_tokens = 0
+    canonical_extra_tokens = 0
     for item in artifacts:
         meta = item["meta"]
         response_text = item["response_path"].read_text(
@@ -7926,22 +7962,40 @@ def _resume_spo_rs_step_from_artifacts(
         response_tokens = item.get("response_token_ids")
         if response_tokens is None:
             try:
-                response_tokens, restored_terminal = (
+                response_tokens, recovery = (
                     _reconstruct_saved_response_tokens(
                         model, tokenizer, response_text, expected_tokens))
             except ValueError as error:
                 raise RuntimeError(
-                    "evaluated-step recovery cannot reproduce the exact "
-                    "generated token sequence for "
+                    "evaluated-step recovery cannot tokenize the saved "
+                    "response text for "
                     f"{item['response_path'].name}: {error}") from error
         else:
             response_tokens = list(response_tokens)
-            restored_terminal = bool(item.get("restored_terminal_token"))
-            if len(response_tokens) != expected_tokens:
+            recovery = item.get("response_token_recovery") or {
+                "source": "exact-sidecar",
+                "exact": True,
+                "recorded_count": expected_tokens,
+                "canonical_count": None,
+                "recovered_count": len(response_tokens),
+                "restored_terminal": bool(
+                    item.get("restored_terminal_token")),
+                "unavailable_original_tokens": 0,
+                "canonical_extra_tokens": 0,
+            }
+            if (bool(recovery.get("exact", False))
+                    and len(response_tokens) != expected_tokens):
                 raise RuntimeError(
-                    "evaluated-step recovery token cache changed for "
+                    "evaluated-step recovery exact token cache changed for "
                     f"{item['response_path'].name}")
+        restored_terminal = bool(recovery.get("restored_terminal", False))
         restored_terminal_tokens += int(restored_terminal)
+        canonical_recovery_responses += int(
+            recovery.get("source") == "canonical-text")
+        unavailable_original_tokens += int(
+            recovery.get("unavailable_original_tokens", 0) or 0)
+        canonical_extra_tokens += int(
+            recovery.get("canonical_extra_tokens", 0) or 0)
         if prompt_text not in prompt_cache:
             prompt_cache[prompt_text] = tokenizer(
                 prompt_text, return_tensors="pt").input_ids
@@ -7975,8 +8029,10 @@ def _resume_spo_rs_step_from_artifacts(
 
         code = extract_python_code(response_text)
         if entropy_descriptor is not None:
+            entropy_meta = dict(meta)
+            entropy_meta["n_response_tokens"] = len(response_tokens)
             entropy_observations.append(rollout_observation(
-                entropy_descriptor, meta, code))
+                entropy_descriptor, entropy_meta, code))
 
         if bool(meta.get("archive_eligible", False)):
             if not code:
@@ -8019,6 +8075,15 @@ def _resume_spo_rs_step_from_artifacts(
         print(
             f"[resume] step {step_idx}: restored the omitted terminal EOS in "
             f"{restored_terminal_tokens}/{len(artifacts)} saved responses",
+            flush=True,
+        )
+    if canonical_recovery_responses:
+        print(
+            f"[resume] step {step_idx}: {canonical_recovery_responses} "
+            "legacy text-only response(s) use canonical tokenizer IDs; "
+            f"{unavailable_original_tokens} hidden/noncanonical original "
+            f"token(s) were unavailable and {canonical_extra_tokens} "
+            "canonical token(s) exceeded recorded counts",
             flush=True,
         )
     print(
@@ -11949,15 +12014,19 @@ def main():
                     _recoverable_spo_rs_artifacts(
                         exp_dir, start_step, cfg))
                 if interrupted_spo_rs_artifacts is not None:
-                    restored_terminals = (
+                    token_recovery = (
                         _prepare_recoverable_response_tokens(
                             model, tokenizer,
                             interrupted_spo_rs_artifacts))
                     print(
-                        "[resume] preflight validated the interrupted "
-                        f"step-{start_step} response tokens "
-                        f"({restored_terminals} terminal EOS token(s) "
-                        "restored from skip-special-token text)",
+                        "[resume] preflight prepared the interrupted "
+                        f"step-{start_step} responses: "
+                        f"{token_recovery['exact_sidecars']} exact token "
+                        "sidecar(s), "
+                        f"{token_recovery['canonical_text']} legacy "
+                        "text reconstruction(s), "
+                        f"{token_recovery['restored_terminal_tokens']} "
+                        "terminal EOS token(s) restored",
                         flush=True,
                     )
         else:
@@ -11970,7 +12039,7 @@ def main():
                 start_step = 0
                 adapter_path = initial_adapter
                 _load_adapter(model, adapter_path)
-                restored_terminals = _prepare_recoverable_response_tokens(
+                token_recovery = _prepare_recoverable_response_tokens(
                     model, tokenizer, interrupted_spo_rs_artifacts)
                 current_policy_adapter_path = adapter_path
                 print(
@@ -11980,9 +12049,13 @@ def main():
                     flush=True,
                 )
                 print(
-                    "[resume] preflight validated all saved response token "
-                    f"sequences ({restored_terminals} terminal EOS token(s) "
-                    "restored from skip-special-token text)",
+                    "[resume] preflight prepared all saved responses: "
+                    f"{token_recovery['exact_sidecars']} exact token "
+                    "sidecar(s), "
+                    f"{token_recovery['canonical_text']} legacy text "
+                    "reconstruction(s), "
+                    f"{token_recovery['restored_terminal_tokens']} terminal "
+                    "EOS token(s) restored",
                     flush=True,
                 )
             else:
