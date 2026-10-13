@@ -7582,6 +7582,8 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         response_path = meta_path.with_name(base + ".txt")
         prompt_path = meta_path.with_name(base + ".prompt.txt")
         token_path = meta_path.with_name(base + ".tokens.zlib")
+        behavior_path = meta_path.with_name(
+            base + ".behavior_logprobs.zlib")
         if not response_path.is_file() or not prompt_path.is_file():
             return None
         artifacts.append({
@@ -7589,6 +7591,8 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
             "response_path": response_path,
             "prompt_path": prompt_path,
             "token_path": token_path if token_path.is_file() else None,
+            "behavior_logprobs_path": (
+                behavior_path if behavior_path.is_file() else None),
             "meta": meta,
         })
 
@@ -7734,11 +7738,13 @@ def _reconstruct_saved_response_tokens(
 
 def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
     """Validate/cache artifact token IDs before distributed replicas load."""
-    from experiment_io import load_rollout_token_ids
+    from experiment_io import (load_rollout_logprobs,
+                               load_rollout_token_ids)
     from zlib import error as ZlibError
 
     summary = {
         "exact_sidecars": 0,
+        "behavior_logprob_sidecars": 0,
         "canonical_text": 0,
         "restored_terminal_tokens": 0,
         "unavailable_original_tokens": 0,
@@ -7786,6 +7792,28 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
             summary["canonical_text"] += 1
         item["response_token_ids"] = token_ids
         item["response_token_recovery"] = recovery
+        behavior_path = item.get("behavior_logprobs_path")
+        if behavior_path is not None:
+            if not bool(recovery.get("exact", False)):
+                raise RuntimeError(
+                    "evaluated-step recovery found rollout-policy logprobs "
+                    "without their exact token-ID sidecar for "
+                    f"{Path(behavior_path).name}")
+            try:
+                behavior_logprobs = load_rollout_logprobs(behavior_path)
+            except (OSError, ValueError, ZlibError) as error:
+                raise RuntimeError(
+                    "evaluated-step recovery cannot read rollout-policy "
+                    f"logprobs from {Path(behavior_path).name}: {error}") from error
+            if len(behavior_logprobs) != len(token_ids):
+                raise RuntimeError(
+                    "evaluated-step recovery rollout-policy logprob length "
+                    f"differs for {Path(behavior_path).name}: tokens "
+                    f"{len(token_ids)}, logprobs {len(behavior_logprobs)}")
+            item["behavior_logprobs"] = behavior_logprobs
+            summary["behavior_logprob_sidecars"] += 1
+        else:
+            item["behavior_logprobs"] = None
         restored_terminal = bool(recovery["restored_terminal"])
         item["restored_terminal_token"] = restored_terminal
         summary["restored_terminal_tokens"] += int(restored_terminal)
@@ -8006,13 +8034,19 @@ def _resume_spo_rs_step_from_artifacts(
             entropy_descriptor = observation_descriptor(
                 entropy_directory, group, int(meta["rollout"]))
         if response_tokens:
+            behavior_values = item.get("behavior_logprobs")
+            behavior_logprobs = (
+                torch.tensor(behavior_values, dtype=torch.float32)
+                if behavior_values is not None
+                and len(behavior_values) == len(response_tokens)
+                else None)
             all_examples.append({
                 "prompt_ids": prompt_cache[prompt_text],
                 "response_ids": torch.tensor(
                     [response_tokens], dtype=torch.long),
                 "_entropy_measurement": entropy_descriptor,
                 "advantage": float(meta["advantage"]),
-                "behavior_logprobs": None,
+                "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": None,
                 "reward_constant": False,
                 "rank_entropy_gate": False,
@@ -8224,6 +8258,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     from sampler import State
     from experiment_io import (save_parent_selections, save_rollout,
+                               save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
     from problems.base import ParentContext, RewardResult, is_code_failure
@@ -8746,6 +8781,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Admit every sampled code response exactly once. Incomplete or
         # malformed originals are preserved with their failure reward. Format
         # retries are separate examples and never count toward allocation.
+        token_ids = list(token_ids)
+        if behavior_logprobs is not None:
+            behavior_values = list(behavior_logprobs)
+            behavior_logprobs = (
+                behavior_values
+                if len(behavior_values) == len(token_ids)
+                and all(math.isfinite(float(value))
+                        for value in behavior_values)
+                else None)
         job = prompt_jobs[int(job_idx)]
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
@@ -8784,7 +8828,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "fold_index": int(fold_index),
             "rollout_index": rollout_index,
             "text": text,
-            "token_ids": list(token_ids),
+            "token_ids": token_ids,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
             "output_format_issue": coder_output_issue(
@@ -8811,6 +8855,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             strategy_text=(job.get("strategy_response")
                            if two_stage_rollouts else None),
             response_token_ids=token_ids,
+            behavior_logprobs=behavior_logprobs,
             pending_meta={
                 **retry_metadata(record),
                 "status": "evaluation_pending",
@@ -10150,7 +10195,46 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         prompt_token_ids[job_idx], record["token_ids"]))
                 if spo_rs_mode:
                     reference_scores = [None] * len(score_pairs)
-                    current_policy_scores = [None] * len(score_pairs)
+                    current_policy_scores = [
+                        (list(record["behavior_logprobs"])
+                         if record["behavior_logprobs"] is not None
+                         and len(record["behavior_logprobs"])
+                         == len(record["token_ids"])
+                         else None)
+                        for record in vllm_logprob_records
+                    ]
+                    if any(value is None for value in current_policy_scores):
+                        rescored_current = gen_pool.score_token_logprobs(
+                            score_pairs, show_progress=True,
+                            adapter_path=str(adapter_path),
+                            require_complete=True)
+                        current_policy_scores = [
+                            existing if existing is not None else retry
+                            for existing, retry in zip(
+                                current_policy_scores, rescored_current)
+                        ]
+                    for record, values in zip(
+                            vllm_logprob_records, current_policy_scores):
+                        if values is None or len(values) != len(
+                                record["token_ids"]):
+                            raise RuntimeError(
+                                "SPO-RS could not obtain complete rollout-"
+                                "policy logprobs before training")
+                        if (record["behavior_logprobs"] is None
+                                or len(record["behavior_logprobs"])
+                                != len(record["token_ids"])):
+                            record["behavior_logprobs"] = values
+                            base = (
+                                f"step{int(step_idx):02d}_"
+                                f"group{int(record['group_id']):02d}_"
+                                f"rollout{int(record['rollout_index']):03d}")
+                            save_future = rollout_io_pool.submit(
+                                save_rollout_logprobs,
+                                Path(exp_dir) / f"step{int(step_idx):02d}"
+                                / f"{base}.behavior_logprobs.zlib",
+                                values,
+                            )
+                            rollout_io_futures.append(save_future)
                     previous_policy_scores = [None] * len(score_pairs)
                     same_policy = bool(
                         spo_rs_tracker.initialized
@@ -10171,31 +10255,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 "KL because its previous sampling adapter is "
                                 f"missing: {spo_rs_previous_adapter_path}")
                         else:
-                            # These responses were sampled by adapter_path
-                            # moments ago, and vLLM already returned the exact
-                            # chosen-token logprobs. Re-score only if an engine
-                            # produced an incomplete rollout payload.
-                            current_policy_scores = [
-                                (list(record["behavior_logprobs"])
-                                 if record["behavior_logprobs"] is not None
-                                 and len(record["behavior_logprobs"])
-                                 == len(record["token_ids"])
-                                 else None)
-                                for record in vllm_logprob_records
-                            ]
-                            if any(value is None
-                                   for value in current_policy_scores):
-                                rescored_current = (
-                                    gen_pool.score_token_logprobs(
-                                        score_pairs, show_progress=True,
-                                        adapter_path=str(adapter_path),
-                                        require_complete=True))
-                                current_policy_scores = [
-                                    existing if existing is not None else retry
-                                    for existing, retry in zip(
-                                        current_policy_scores,
-                                        rescored_current)
-                                ]
                             previous_policy_scores = (
                                 gen_pool.score_token_logprobs(
                                     score_pairs, show_progress=True,
@@ -12025,6 +12084,8 @@ def main():
                         "sidecar(s), "
                         f"{token_recovery['canonical_text']} legacy "
                         "text reconstruction(s), "
+                        f"{token_recovery['behavior_logprob_sidecars']} "
+                        "rollout-policy logprob sidecar(s), "
                         f"{token_recovery['restored_terminal_tokens']} "
                         "terminal EOS token(s) restored",
                         flush=True,
@@ -12054,6 +12115,8 @@ def main():
                     "sidecar(s), "
                     f"{token_recovery['canonical_text']} legacy text "
                     "reconstruction(s), "
+                    f"{token_recovery['behavior_logprob_sidecars']} "
+                    "rollout-policy logprob sidecar(s), "
                     f"{token_recovery['restored_terminal_tokens']} terminal "
                     "EOS token(s) restored",
                     flush=True,

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import yaml
 
 from sampler import PUCTSampler, State
-from experiment_io import (make_experiment_dir, save_rollout_token_ids)
+from experiment_io import (load_rollout_logprobs, make_experiment_dir,
+                           save_rollout_logprobs, save_rollout_token_ids)
 from train_multy_CVaR import (
     _legacy_resume_info,
     _prepare_recoverable_response_tokens,
@@ -184,9 +185,12 @@ def test_recovery_preflight_prefers_exact_token_sidecar(tmp_path):
     response_path.write_text("saved text")
     token_path = tmp_path / "rollout.tokens.zlib"
     save_rollout_token_ids(token_path, [7, 8, 9, 99])
+    behavior_path = tmp_path / "rollout.behavior_logprobs.zlib"
+    save_rollout_logprobs(behavior_path, [-0.5, -1.0, -1.5, -2.0])
     artifact = {
         "response_path": response_path,
         "token_path": token_path,
+        "behavior_logprobs_path": behavior_path,
         "meta": {"n_response_tokens": 4},
     }
     tokenizer = _RecoveryTokenizer([10, 11, 12])
@@ -197,6 +201,17 @@ def test_recovery_preflight_prefers_exact_token_sidecar(tmp_path):
         model, tokenizer, [artifact])
 
     assert artifact["response_token_ids"] == [7, 8, 9, 99]
+    assert artifact["behavior_logprobs"] == [-0.5, -1.0, -1.5, -2.0]
     assert artifact["response_token_recovery"]["exact"] is True
     assert summary["exact_sidecars"] == 1
+    assert summary["behavior_logprob_sidecars"] == 1
     assert summary["canonical_text"] == 0
+
+
+def test_rollout_logprob_sidecar_round_trip(tmp_path):
+    path = tmp_path / "rollout.behavior_logprobs.zlib"
+    expected = [-0.5, -1.0, -1.5, -2.0]
+
+    save_rollout_logprobs(path, expected)
+
+    assert load_rollout_logprobs(path) == expected
