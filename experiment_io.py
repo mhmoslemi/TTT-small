@@ -8,6 +8,7 @@ saved, including ones that failed extraction or validation.
 
 Filenames:
     step03_group2_rollout17.txt        ← raw model response
+    step03_group2_rollout17.tokens.zlib ← exact generated token IDs
     step03_group2_rollout17.strategy.txt ← raw planning-stage response
     step03_group2_rollout17.meta.json  ← reward, valid, msg, beta, advantage, etc.
     step03_group02_fold00_strategy01.txt ← strategy saved immediately
@@ -21,9 +22,45 @@ A config.json is also dumped at the root of the run dir.
 
 import json
 import re
+import struct
 import time
+import zlib
 from dataclasses import asdict
 from pathlib import Path
+
+
+_ROLLOUT_TOKEN_MAGIC = b"TTTtok1\0"
+
+
+def save_rollout_token_ids(path, token_ids):
+    """Atomically persist exact generated IDs in a compact portable format."""
+    values = [int(token_id) for token_id in token_ids]
+    if any(token_id < 0 or token_id > 0xFFFFFFFF for token_id in values):
+        raise ValueError("rollout token IDs must fit unsigned 32-bit storage")
+    payload = _ROLLOUT_TOKEN_MAGIC + struct.pack("<Q", len(values))
+    if values:
+        payload += struct.pack(f"<{len(values)}I", *values)
+    compressed = zlib.compress(payload, level=1)
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(compressed)
+    tmp.replace(path)
+
+
+def load_rollout_token_ids(path):
+    """Load and validate a sidecar produced by save_rollout_token_ids."""
+    payload = zlib.decompress(Path(path).read_bytes())
+    header_size = len(_ROLLOUT_TOKEN_MAGIC) + 8
+    if (len(payload) < header_size
+            or payload[:len(_ROLLOUT_TOKEN_MAGIC)] != _ROLLOUT_TOKEN_MAGIC):
+        raise ValueError(f"invalid rollout token sidecar: {path}")
+    count = struct.unpack_from("<Q", payload, len(_ROLLOUT_TOKEN_MAGIC))[0]
+    expected_size = header_size + 4 * count
+    if len(payload) != expected_size:
+        raise ValueError(f"truncated rollout token sidecar: {path}")
+    if not count:
+        return []
+    return list(struct.unpack_from(f"<{count}I", payload, header_size))
 
 
 class StepPlotter:
@@ -210,6 +247,7 @@ def save_rollout_artifacts(
     prompt_text: str = None,
     strategy_text: str = None,
     pending_meta: dict = None,
+    response_token_ids=None,
 ):
     """Persist generated text immediately, before reward evaluation finishes."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
@@ -222,6 +260,9 @@ def save_rollout_artifacts(
         tmp.replace(path)
 
     _atomic_text(step_dir / f"{base}.txt", response_text)
+    if response_token_ids is not None:
+        save_rollout_token_ids(
+            step_dir / f"{base}.tokens.zlib", response_token_ids)
     if strategy_text is not None:
         _atomic_text(step_dir / f"{base}.strategy.txt", strategy_text)
     if prompt_text is not None:

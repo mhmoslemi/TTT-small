@@ -7581,12 +7581,14 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         base = meta_path.name.removesuffix(".meta.json")
         response_path = meta_path.with_name(base + ".txt")
         prompt_path = meta_path.with_name(base + ".prompt.txt")
+        token_path = meta_path.with_name(base + ".tokens.zlib")
         if not response_path.is_file() or not prompt_path.is_file():
             return None
         artifacts.append({
             "meta_path": meta_path,
             "response_path": response_path,
             "prompt_path": prompt_path,
+            "token_path": token_path if token_path.is_file() else None,
             "meta": meta,
         })
 
@@ -7655,6 +7657,112 @@ def _metadata_is_code_failure(meta):
     if bool(meta.get("ran", False)):
         return False
     return "timeout" not in str(meta.get("msg", "") or "").lower()
+
+
+def _reconstruct_saved_response_tokens(
+        model, tokenizer, response_text, expected_count):
+    """Invert vLLM's ``skip_special_tokens=True`` artifact rendering.
+
+    Rollout metadata counts ``candidate.token_ids`` exactly, including the
+    terminal EOS emitted by vLLM. The paired text intentionally omits special
+    tokens. Ordinary text round-trips directly; a one-token deficit is exact
+    only when the model/tokenizer exposes one unambiguous configured EOS.
+    Anything else is refused instead of guessing a training trajectory.
+    """
+    token_ids = list(tokenizer(
+        response_text, add_special_tokens=False).input_ids)
+    expected_count = int(expected_count)
+    if len(token_ids) == expected_count:
+        return token_ids, False
+    if len(token_ids) + 1 != expected_count:
+        raise ValueError(
+            f"saved {expected_count}, retokenized {len(token_ids)}")
+
+    configured = []
+
+    def add_ids(value):
+        if value is None:
+            return
+        values = value if isinstance(value, (list, tuple, set)) else (value,)
+        for item in values:
+            try:
+                item = int(item)
+            except (TypeError, ValueError):
+                continue
+            if item >= 0 and item not in configured:
+                configured.append(item)
+
+    generation_config = getattr(model, "generation_config", None)
+    add_ids(getattr(generation_config, "eos_token_id", None))
+    add_ids(getattr(tokenizer, "eos_token_id", None))
+    if not configured:
+        raise ValueError(
+            f"saved {expected_count}, retokenized {len(token_ids)}, and no "
+            "configured EOS token is available")
+
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    try:
+        tokenizer_eos = int(tokenizer_eos)
+    except (TypeError, ValueError):
+        tokenizer_eos = None
+    chosen = (tokenizer_eos if tokenizer_eos in configured
+              else configured[0] if len(configured) == 1 else None)
+    if chosen is None:
+        raise ValueError(
+            f"saved {expected_count}, retokenized {len(token_ids)}, and "
+            f"configured EOS is ambiguous: {configured}")
+
+    try:
+        visible = tokenizer.decode(
+            [chosen], skip_special_tokens=True,
+            clean_up_tokenization_spaces=False)
+    except TypeError:
+        visible = tokenizer.decode([chosen], skip_special_tokens=True)
+    if str(visible or ""):
+        raise ValueError(
+            f"configured EOS token {chosen} is not hidden by the rollout "
+            "text decoder")
+    return token_ids + [chosen], True
+
+
+def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
+    """Validate/cache artifact token IDs before distributed replicas load."""
+    from experiment_io import load_rollout_token_ids
+    from zlib import error as ZlibError
+
+    restored_terminal_tokens = 0
+    for item in artifacts:
+        expected_count = int(item["meta"]["n_response_tokens"])
+        token_path = item.get("token_path")
+        if token_path is not None:
+            try:
+                token_ids = load_rollout_token_ids(token_path)
+            except (OSError, ValueError, ZlibError) as error:
+                raise RuntimeError(
+                    "evaluated-step recovery cannot read exact token sidecar "
+                    f"{Path(token_path).name}: {error}") from error
+            if len(token_ids) != expected_count:
+                raise RuntimeError(
+                    "evaluated-step recovery token sidecar length differs "
+                    f"for {Path(token_path).name}: saved metadata "
+                    f"{expected_count}, sidecar {len(token_ids)}")
+            restored_terminal = False
+        else:
+            response_text = item["response_path"].read_text(
+                encoding="utf-8", errors="replace")
+            try:
+                token_ids, restored_terminal = (
+                    _reconstruct_saved_response_tokens(
+                        model, tokenizer, response_text, expected_count))
+            except ValueError as error:
+                raise RuntimeError(
+                    "evaluated-step recovery cannot reproduce the exact "
+                    "generated token sequence for "
+                    f"{item['response_path'].name}: {error}") from error
+        item["response_token_ids"] = token_ids
+        item["restored_terminal_token"] = bool(restored_terminal)
+        restored_terminal_tokens += int(restored_terminal)
+    return restored_terminal_tokens
 
 
 def _resume_spo_rs_step_from_artifacts(
@@ -7807,20 +7915,33 @@ def _resume_spo_rs_step_from_artifacts(
                                    rollout_observation)
         entropy_directory = begin_step(exp_dir, step_idx)
     group_sizes = {group: len(records) for group, records in by_group.items()}
+    restored_terminal_tokens = 0
     for item in artifacts:
         meta = item["meta"]
         response_text = item["response_path"].read_text(
             encoding="utf-8", errors="replace")
         prompt_text = item["prompt_path"].read_text(
             encoding="utf-8", errors="replace")
-        response_tokens = tokenizer(
-            response_text, add_special_tokens=False).input_ids
         expected_tokens = int(meta["n_response_tokens"])
-        if len(response_tokens) != expected_tokens:
-            raise RuntimeError(
-                "evaluated-step recovery cannot reproduce the exact generated "
-                f"token sequence for {item['response_path'].name}: saved "
-                f"{expected_tokens}, retokenized {len(response_tokens)}")
+        response_tokens = item.get("response_token_ids")
+        if response_tokens is None:
+            try:
+                response_tokens, restored_terminal = (
+                    _reconstruct_saved_response_tokens(
+                        model, tokenizer, response_text, expected_tokens))
+            except ValueError as error:
+                raise RuntimeError(
+                    "evaluated-step recovery cannot reproduce the exact "
+                    "generated token sequence for "
+                    f"{item['response_path'].name}: {error}") from error
+        else:
+            response_tokens = list(response_tokens)
+            restored_terminal = bool(item.get("restored_terminal_token"))
+            if len(response_tokens) != expected_tokens:
+                raise RuntimeError(
+                    "evaluated-step recovery token cache changed for "
+                    f"{item['response_path'].name}")
+        restored_terminal_tokens += int(restored_terminal)
         if prompt_text not in prompt_cache:
             prompt_cache[prompt_text] = tokenizer(
                 prompt_text, return_tensors="pt").input_ids
@@ -7894,6 +8015,12 @@ def _resume_spo_rs_step_from_artifacts(
         "evaluations; generation and CPU evaluation are skipped",
         flush=True,
     )
+    if restored_terminal_tokens:
+        print(
+            f"[resume] step {step_idx}: restored the omitted terminal EOS in "
+            f"{restored_terminal_tokens}/{len(artifacts)} saved responses",
+            flush=True,
+        )
     print(
         f"[resume] step {step_idx}: restored {archive_stats['submitted']} "
         "valid children and the exact saved SPO-RS advantages; resuming at "
@@ -8618,6 +8745,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             prompt_text=job["prompt_text"],
             strategy_text=(job.get("strategy_response")
                            if two_stage_rollouts else None),
+            response_token_ids=token_ids,
             pending_meta={
                 **retry_metadata(record),
                 "status": "evaluation_pending",
@@ -11816,6 +11944,22 @@ def main():
             if resume_payload["version"] == 1:
                 print("[resume] legacy batch-growth state ignored; "
                       "using fixed configured batch sizes")
+            if configured_advantage_mode == "spo-rs":
+                interrupted_spo_rs_artifacts = (
+                    _recoverable_spo_rs_artifacts(
+                        exp_dir, start_step, cfg))
+                if interrupted_spo_rs_artifacts is not None:
+                    restored_terminals = (
+                        _prepare_recoverable_response_tokens(
+                            model, tokenizer,
+                            interrupted_spo_rs_artifacts))
+                    print(
+                        "[resume] preflight validated the interrupted "
+                        f"step-{start_step} response tokens "
+                        f"({restored_terminals} terminal EOS token(s) "
+                        "restored from skip-special-token text)",
+                        flush=True,
+                    )
         else:
             if configured_advantage_mode == "spo-rs":
                 interrupted_spo_rs_artifacts = (
@@ -11826,11 +11970,19 @@ def main():
                 start_step = 0
                 adapter_path = initial_adapter
                 _load_adapter(model, adapter_path)
+                restored_terminals = _prepare_recoverable_response_tokens(
+                    model, tokenizer, interrupted_spo_rs_artifacts)
                 current_policy_adapter_path = adapter_path
                 print(
                     "[resume] found a fully evaluated interrupted SPO-RS "
                     "step 0; restored adapter_initial and will skip rollout "
                     "generation/evaluation",
+                    flush=True,
+                )
+                print(
+                    "[resume] preflight validated all saved response token "
+                    f"sequences ({restored_terminals} terminal EOS token(s) "
+                    "restored from skip-special-token text)",
                     flush=True,
                 )
             else:
