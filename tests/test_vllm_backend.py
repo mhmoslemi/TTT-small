@@ -1909,7 +1909,7 @@ class VLLMBackendTests(unittest.TestCase):
         scores = pool.score_token_logprobs([
             ([1, 2], [3]),
             ([1], [2, 3]),
-            ([1, 2, 3, 4, 5, 6, 7], [8]),
+            ([1, 2, 3, 4, 5, 6, 7, 8], [9]),
         ], show_progress=False)
 
         self.assertEqual(scores, [[-0.1], [-0.2, -0.3], None])
@@ -1917,6 +1917,61 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(queued[0][0], "__score__")
         self.assertEqual(queued[1][0], "__score__")
         self.assertEqual(sum(len(task[1]) for task in queued), 2)
+
+    def test_exact_scoring_oom_restarts_all_engines_with_smaller_chunk(self):
+        pool = GenerationPool.__new__(GenerationPool)
+        pool.backend = "vllm"
+        pool.num_workers = 2
+        pool.max_seq_length = 8
+        pool.task_queues = [_Queue(), _Queue()]
+        pool.result_queue = _Queue([
+            (0, None, {"error": "CUDA out of memory"}),
+            (0, "__score__", [(0, [-0.25])]),
+        ])
+        pool.procs = [
+            types.SimpleNamespace(exitcode=None),
+            types.SimpleNamespace(exitcode=None),
+        ]
+        pool._worker_options = {"max_num_batched_tokens": 4096}
+        events = []
+        pool._stop_workers = lambda workers: events.append(
+            ("stop", list(workers)))
+        pool._start_workers = lambda workers: events.append(
+            ("start", list(workers)))
+
+        scores = pool.score_token_logprobs(
+            [([1, 2], [3])], show_progress=False,
+            require_complete=True)
+
+        self.assertEqual(scores, [[-0.25]])
+        self.assertEqual(
+            pool._worker_options["max_num_batched_tokens"], 2048)
+        self.assertEqual(events, [
+            ("stop", [0, 1]),
+            ("start", [0, 1]),
+        ])
+
+    def test_optional_exact_scoring_also_uses_memory_backoff(self):
+        pool = GenerationPool.__new__(GenerationPool)
+        pool.backend = "vllm"
+        pool.num_workers = 1
+        pool.max_seq_length = 8
+        pool.task_queues = [_Queue()]
+        pool.result_queue = _Queue([
+            (0, None, {"error": "CUDA out of memory"}),
+            (0, "__score__", [(0, [-0.5])]),
+        ])
+        pool.procs = [types.SimpleNamespace(exitcode=None)]
+        pool._worker_options = {"max_num_batched_tokens": 4096}
+        pool._stop_workers = lambda _workers: None
+        pool._start_workers = lambda _workers: None
+
+        scores = pool.score_token_logprobs(
+            [([1], [2])], show_progress=False)
+
+        self.assertEqual(scores, [[-0.5]])
+        self.assertEqual(
+            pool._worker_options["max_num_batched_tokens"], 2048)
 
     def test_on_demand_pool_releases_shared_gpu(self):
         events = []

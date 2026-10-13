@@ -7571,6 +7571,80 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
     return artifacts
 
 
+def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
+    """Return a completely generated SPO-RS step awaiting final evaluation.
+
+    Generation writes response text, exact token IDs, rollout-policy
+    logprobs, prompts, and provisional metadata atomically as each rollout
+    arrives.  If exact consecutive-policy scoring later fails, those durable
+    artifacts are sufficient to resume without sampling the policy again.
+    Rewards are deliberately recomputed because provisional metadata never
+    claims that an in-memory evaluation survived a process crash.
+    """
+    step_idx = int(step_idx)
+    step_dir = Path(exp_dir) / f"step{step_idx:02d}"
+    summary_path = step_dir / f"step{step_idx:02d}.summary.json"
+    if summary_path.is_file() or not step_dir.is_dir():
+        return None
+    paths = sorted(step_dir.glob(
+        f"step{step_idx:02d}_group*_rollout*.meta.json"))
+    expected_primary = int(cfg.groups_per_step) * int(cfg.group_size)
+    if len(paths) < expected_primary:
+        return None
+
+    artifacts = []
+    for meta_path in paths:
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        if (int(meta.get("step", -1)) != step_idx
+                or meta.get("status") != "evaluation_pending"):
+            return None
+        required = (
+            "group", "parent_group", "rollout", "n_response_tokens",
+            "counts_toward_allocation", "retry_attempt",
+        )
+        if any(name not in meta for name in required):
+            return None
+        base = meta_path.name.removesuffix(".meta.json")
+        response_path = meta_path.with_name(base + ".txt")
+        prompt_path = meta_path.with_name(base + ".prompt.txt")
+        token_path = meta_path.with_name(base + ".tokens.zlib")
+        behavior_path = meta_path.with_name(
+            base + ".behavior_logprobs.zlib")
+        if not all(path.is_file() for path in (
+                response_path, prompt_path, token_path, behavior_path)):
+            return None
+        artifacts.append({
+            "meta_path": meta_path,
+            "response_path": response_path,
+            "prompt_path": prompt_path,
+            "token_path": token_path,
+            "behavior_logprobs_path": behavior_path,
+            "meta": meta,
+        })
+
+    primary = [
+        item for item in artifacts
+        if bool(item["meta"].get("counts_toward_allocation", True))
+        and int(item["meta"].get("retry_attempt", 0) or 0) == 0
+    ]
+    if len(primary) != expected_primary:
+        return None
+    per_group = {}
+    for item in primary:
+        group = int(item["meta"]["group"])
+        per_group[group] = per_group.get(group, 0) + 1
+    if (set(per_group) != set(range(int(cfg.groups_per_step)))
+            or any(count != int(cfg.group_size)
+                   for count in per_group.values())):
+        return None
+    artifacts.sort(key=lambda item: (
+        int(item["meta"]["group"]), int(item["meta"]["rollout"])))
+    return artifacts
+
+
 def _literal_metadata_mapping(value):
     """Recover mappings stringified by the rollout JSON compatibility layer."""
     if isinstance(value, dict):
@@ -7778,6 +7852,326 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
         summary["count_changed_responses"] += int(
             len(token_ids) != expected_count)
     return summary
+
+
+def _finalize_pending_spo_rs_artifacts(
+        tokenizer, sampler, step_idx, cfg, exp_dir, problem, gen_pool,
+        spo_rs_tracker, sampling_adapter_path, artifacts):
+    """Evaluate and score a generated interrupted step, then seal its metadata.
+
+    No policy sampling occurs here.  The exact generated token IDs and their
+    rollout-policy logprobs come from the durable sidecars.  CPU rewards are
+    recomputed while vLLM scores those same trajectories under the preceding
+    policy, after which the ordinary evaluated-step recovery performs the
+    unchanged fast distributed adapter update.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from copy import deepcopy
+    from queue import Queue
+
+    from experiment_io import save_rollout
+    from gen_workers import make_progress_bar
+    from problems.base import ParentContext, RewardResult
+    from sampler import State
+
+    if gen_pool is None or cfg.generation_backend != "vllm":
+        raise RuntimeError(
+            "generated-step SPO-RS recovery requires the configured vLLM "
+            "pool for exact consecutive-policy scoring")
+    if spo_rs_tracker is None or not spo_rs_tracker.initialized:
+        raise RuntimeError(
+            "generated-step SPO-RS recovery requires the restored pre-step "
+            "tracker")
+    if sampling_adapter_path is None or not Path(
+            sampling_adapter_path).is_dir():
+        raise FileNotFoundError(
+            "generated-step SPO-RS recovery cannot find its sampling adapter: "
+            f"{sampling_adapter_path}")
+
+    token_summary = _prepare_recoverable_response_tokens(
+        None, tokenizer, artifacts)
+    if token_summary["exact_sidecars"] != len(artifacts):
+        raise RuntimeError(
+            "generated-step recovery refuses non-exact response token IDs")
+    if token_summary["behavior_logprob_sidecars"] != len(artifacts):
+        raise RuntimeError(
+            "generated-step recovery requires every rollout-policy logprob "
+            "sidecar")
+
+    parents = sampler.sample_states(int(cfg.groups_per_step))
+    if len(parents) != int(cfg.groups_per_step):
+        raise RuntimeError(
+            "generated-step recovery could not reconstruct every parent")
+    parents_path = (
+        Path(exp_dir) / f"step{int(step_idx):02d}"
+        / f"step{int(step_idx):02d}.parents.json")
+    try:
+        saved_parent_rows = json.loads(
+            parents_path.read_text(encoding="utf-8"))["parents"]
+    except (OSError, KeyError, TypeError, ValueError,
+            json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "generated-step recovery cannot read its saved parent selection") \
+            from error
+    saved_parents = {
+        int(row["group"]): row for row in saved_parent_rows
+    }
+    for group, parent in enumerate(parents):
+        row = saved_parents.get(group)
+        if row is None:
+            raise RuntimeError(
+                f"generated-step recovery is missing parent group {group}")
+        if (str(row.get("parent_id")) != str(parent.id)
+                or int(row.get("parent_timestep", -1))
+                != int(parent.timestep)
+                or not math.isclose(
+                    float(row.get("parent_reward")), float(parent.value),
+                    rel_tol=0.0, abs_tol=1e-12)):
+            raise RuntimeError(
+                f"generated-step recovery parent {group} does not match the "
+                "restored sampler checkpoint")
+
+    parent_contexts = [
+        ParentContext(
+            code=parent.code,
+            value=(parent.value if parent.value is not None else 0.0),
+            raw_score=parent.raw_score,
+            construction=parent.construction,
+        )
+        for parent in parents
+    ]
+
+    isolated_eval = bool(getattr(cfg, "isolate_eval", False))
+    isolated_slots = None
+    isolated_memory_limit = None
+    if isolated_eval:
+        cpu_ids = _isolated_evaluation_cpu_ids()
+        processes_per_cpu = int(cfg.reward_workers)
+        isolated_slots = Queue()
+        for _layer in range(processes_per_cpu):
+            for cpu_id in cpu_ids:
+                isolated_slots.put(cpu_id)
+        workers = max(1, min(
+            len(artifacts), len(cpu_ids) * processes_per_cpu))
+        isolated_memory_limit = _automatic_sandbox_memory_limit_bytes(workers)
+    else:
+        workers = max(1, min(
+            len(artifacts), _resolve_reward_workers(cfg, problem)))
+
+    def evaluate(item):
+        meta = item["meta"]
+        issue = meta.get("output_format_issue")
+        if issue:
+            return RewardResult(
+                reward=float(problem.fail_score), msg=str(issue),
+                failure_kind="code")
+        response_text = item["response_path"].read_text(
+            encoding="utf-8", errors="replace")
+        parent_context = parent_contexts[int(meta["parent_group"])]
+        if not isolated_eval:
+            return problem.compute_reward(
+                response_text, parent_context, cfg.sandbox_timeout_s)
+        cpu_id = isolated_slots.get()
+        try:
+            return problem.compute_reward(
+                response_text, parent_context, cfg.sandbox_timeout_s,
+                cpu_id=cpu_id,
+                memory_limit_bytes=isolated_memory_limit)
+        finally:
+            isolated_slots.put(cpu_id)
+
+    evaluation_pool = ThreadPoolExecutor(max_workers=workers)
+    evaluation_futures = {
+        evaluation_pool.submit(evaluate, item): index
+        for index, item in enumerate(artifacts)
+    }
+    results = [None] * len(artifacts)
+    try:
+        prompt_cache = {}
+        score_pairs = []
+        current_scores = []
+        context_ids = []
+        for item in artifacts:
+            prompt_text = item["prompt_path"].read_text(
+                encoding="utf-8", errors="replace")
+            if prompt_text not in prompt_cache:
+                prompt_cache[prompt_text] = tokenizer(
+                    prompt_text).input_ids
+            score_pairs.append((
+                prompt_cache[prompt_text], item["response_token_ids"]))
+            current_scores.append(item["behavior_logprobs"])
+            context_ids.append(int(item["meta"]["parent_group"]))
+
+        previous_name = spo_rs_tracker.last_policy_adapter
+        if previous_name is None:
+            raise RuntimeError(
+                "generated-step recovery has no preceding SPO-RS adapter")
+        previous_adapter_path = Path(exp_dir) / previous_name
+        if not previous_adapter_path.is_dir():
+            raise FileNotFoundError(
+                "generated-step recovery cannot find the preceding policy "
+                f"adapter: {previous_adapter_path}")
+        if (previous_adapter_path.resolve()
+                == Path(sampling_adapter_path).resolve()):
+            previous_scores = current_scores
+        else:
+            try:
+                previous_scores = gen_pool.score_token_logprobs(
+                    score_pairs, show_progress=True,
+                    adapter_path=str(previous_adapter_path),
+                    require_complete=True)
+            finally:
+                if getattr(gen_pool, "sequential", False):
+                    gen_pool.release()
+
+        divergence, missing_scores, context_divergences = (
+            spo_rs_tracker.consecutive_policy_divergence(
+                current_scores, previous_scores, context_ids,
+                required_context_ids=range(int(cfg.groups_per_step))))
+        if missing_scores or not math.isfinite(divergence):
+            raise RuntimeError(
+                "generated-step recovery did not obtain every exact "
+                "consecutive-policy score")
+
+        eval_bar = make_progress_bar(
+            len(evaluation_futures), desc="recovering evaluations")
+        try:
+            for future in as_completed(evaluation_futures):
+                results[evaluation_futures[future]] = future.result()
+                eval_bar.update(1)
+        finally:
+            eval_bar.close()
+    finally:
+        evaluation_pool.shutdown(wait=True, cancel_futures=False)
+
+    rewards = [float(result.reward) for result in results]
+    transformed = spo_rs_tracker.transformed_rewards(rewards)
+    advantages = spo_rs_tracker.normalized_advantages(transformed)
+    if advantages is None:
+        raise RuntimeError(
+            "generated-step recovery lost the pre-step SPO-RS baseline")
+    preview_tracker = deepcopy(spo_rs_tracker)
+    update = preview_tracker.update(
+        transformed, divergence=divergence,
+        policy_adapter=sampling_adapter_path, step=step_idx)
+    prompt_indices = {}
+    for item in artifacts:
+        prompt_text = item["prompt_path"].read_text(
+            encoding="utf-8", errors="replace")
+        if prompt_text not in prompt_indices:
+            prompt_indices[prompt_text] = len(prompt_indices)
+    update.update({
+        "groups": sorted({int(item["meta"]["group"])
+                          for item in artifacts}),
+        "prompt_jobs": list(range(len(prompt_indices))),
+        "contexts": sorted(set(context_ids)),
+        "context_divergences": context_divergences,
+        "missing_policy_scores": int(missing_scores),
+    })
+
+    save_ctor = bool(getattr(problem, "saves_construction", False))
+    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
+                    else "PUCTSampler")
+    step_dir = Path(exp_dir) / f"step{int(step_idx):02d}"
+    for index, (item, result) in enumerate(zip(artifacts, results)):
+        pending = item["meta"]
+        group = int(pending["group"])
+        parent_group = int(pending["parent_group"])
+        rollout = int(pending["rollout"])
+        parent = parents[parent_group]
+        parent_row = saved_parents[parent_group]
+        child = State.make(
+            timestep=step_idx, value=float(result.reward),
+            code=result.code or "", raw_score=result.raw_score,
+            construction=result.construction)
+        archive_eligible = bool(result.valid and result.code)
+        strategy_source = pending.get("strategy_source_job_idx")
+        strategy_index = (
+            int(strategy_source) % int(cfg.strategies_per_parent)
+            if bool(cfg.strategies) and strategy_source is not None else None)
+        base = item["meta_path"].name.removesuffix(".meta.json")
+        strategy_path = step_dir / f"{base}.strategy.txt"
+        strategy = None
+        if strategy_path.is_file():
+            raw_strategy = strategy_path.read_text(
+                encoding="utf-8", errors="replace")
+            strategy, _issue = _extract_final_strategy(raw_strategy)
+        info = {
+            **update,
+            "transformed_reward": float(transformed[index]),
+            "used_for_policy_update": True,
+        }
+        meta = {
+            key: value for key, value in pending.items()
+            if key != "status"
+        }
+        meta.update({
+            "node_id": child.id,
+            "parent_id": parent.id,
+            "parent_timestep": int(parent.timestep),
+            "sampler_type": sampler_type,
+            "reward": float(result.reward),
+            "raw_score": (float(result.raw_score)
+                          if result.raw_score is not None else None),
+            "valid": bool(result.valid),
+            "parsed": bool(result.parsed),
+            "ran": bool(result.ran),
+            "msg": result.msg,
+            "failure_kind": result.failure_kind,
+            "advantage": float(advantages[index]),
+            "beta": float(cfg.spo_rs_beta),
+            "advantage_mode": "spo-rs",
+            "advantage_scale": float(cfg.spo_rs_beta),
+            "sandbox_stdout": (result.stdout or "")[:2000],
+            "parent_value": (float(parent.value)
+                             if parent.value is not None else None),
+            "parent_raw_score": (float(parent.raw_score)
+                                 if parent.raw_score is not None else None),
+            "parent_is_seed": parent.id in sampler._seed_ids,
+            "parent_visit_count": int(parent_row.get("visit_count", 0)),
+            "parent_q_value": parent_row.get("q_value"),
+            "parent_prior": parent_row.get("prior"),
+            "parent_exploration_bonus": parent_row.get(
+                "exploration_bonus"),
+            "parent_selection_score": parent_row.get("selection_score"),
+            "archive_eligible": archive_eligible,
+            "two_stage_rollout": bool(cfg.strategies),
+            "strategy": strategy,
+            "strategy_index": strategy_index,
+            "strategy_model_name": (
+                cfg.strategy_model_name if bool(cfg.strategies) else None),
+            "programs_per_strategy": (
+                int(cfg.programs_per_strategy)
+                if bool(cfg.strategies) else None),
+            "construction": (
+                _as_float_list(result.construction,
+                               cfg.max_saved_construction)
+                if save_ctor else None),
+            "parent_construction": (
+                _as_float_list(parent.construction,
+                               cfg.max_saved_construction)
+                if save_ctor else None),
+            "seed": int(cfg.seed),
+            "spo_rs": info,
+        })
+        response_text = item["response_path"].read_text(
+            encoding="utf-8", errors="replace")
+        save_rollout(
+            exp_dir, step_idx, group, rollout, response_text, meta,
+            artifacts_already_saved=True)
+
+    print(
+        f"[resume] step {step_idx}: reused {len(artifacts)} exact generated "
+        "rollouts, recomputed their CPU rewards, and completed exact "
+        "consecutive-policy scoring; no policy sampling was repeated",
+        flush=True,
+    )
+    completed = _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg)
+    if completed is None:
+        raise RuntimeError(
+            "generated-step recovery failed to seal complete rollout metadata")
+    _prepare_recoverable_response_tokens(None, tokenizer, completed)
+    return completed
 
 
 def _resume_spo_rs_step_from_artifacts(
@@ -12683,11 +13077,17 @@ def main():
             if (resume_dir
                     and step == start_step
                     and configured_advantage_mode == "spo-rs"):
+                pending_spo_rs_artifacts = None
                 if interrupted_spo_rs_artifacts is None:
                     interrupted_spo_rs_artifacts = (
                         _recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
+                if interrupted_spo_rs_artifacts is None:
+                    pending_spo_rs_artifacts = (
+                        _recoverable_pending_spo_rs_artifacts(
+                            exp_dir, step, step_cfg))
             else:
                 interrupted_spo_rs_artifacts = None
+                pending_spo_rs_artifacts = None
 
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(
@@ -12695,6 +13095,24 @@ def main():
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
                     interrupted_spo_rs_artifacts)
+            elif pending_spo_rs_artifacts is not None:
+                print(
+                    f"[resume] found {len(pending_spo_rs_artifacts)} exact "
+                    f"saved trajectories for interrupted SPO-RS step {step}; "
+                    "skipping strategist and coder generation",
+                    flush=True,
+                )
+                completed_spo_rs_artifacts = (
+                    _finalize_pending_spo_rs_artifacts(
+                        tokenizer, sampler, step, step_cfg, exp_dir, problem,
+                        gen_pool, spo_rs_tracker,
+                        current_policy_adapter_path,
+                        pending_spo_rs_artifacts))
+                stats = _resume_spo_rs_step_from_artifacts(
+                    backend, model, tokenizer, sampler, optimizer, step,
+                    step_cfg, exp_dir, problem, parallel_trainer,
+                    spo_rs_tracker, current_policy_adapter_path,
+                    completed_spo_rs_artifacts)
             else:
                 stats = train_step(
                     backend, model, tokenizer, sampler, optimizer, step,

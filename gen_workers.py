@@ -90,6 +90,9 @@ setting_log_only = getattr(
 # real headroom for the projection instead of letting an otherwise healthy
 # engine die after rollouts have already completed.
 VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS = 4096
+VLLM_TOKEN_SCORING_MIN_BATCHED_TOKENS = 512
+VLLM_TOKEN_SCORING_MAX_RETRIES = 5
+VLLM_OPTIONAL_TOKEN_SCORING_MAX_RETRIES = 3
 VLLM_STARTUP_FREE_MARGIN_GIB = 1.0
 
 # tqdm ships with transformers/huggingface_hub, so it's almost always present.
@@ -2189,7 +2192,10 @@ class GenerationPool:
         try:
             pending = list(scorable)
             retries = max(0, int(
-                2 if max_retries is None and require_complete
+                VLLM_TOKEN_SCORING_MAX_RETRIES
+                if max_retries is None and require_complete else
+                VLLM_OPTIONAL_TOKEN_SCORING_MAX_RETRIES
+                if max_retries is None
                 else (max_retries or 0)))
             attempt = 0
             while pending:
@@ -2203,15 +2209,46 @@ class GenerationPool:
                 attempt += 1
                 if failed_workers:
                     failed = sorted(failed_workers)
-                    print(
-                        f"[pool] exact token scoring retry {attempt}/"
-                        f"{retries}: restarting failed vLLM worker(s) "
-                        f"{failed} and rescoring {len(pending)} missing "
-                        "trajectories",
-                        flush=True,
-                    )
-                    self._stop_workers(failed)
-                    self._start_workers(failed)
+                    worker_options = getattr(self, "_worker_options", {})
+                    current_chunk = int(
+                        worker_options.get("max_num_batched_tokens", 0) or 0)
+                    smaller_chunk = (
+                        max(VLLM_TOKEN_SCORING_MIN_BATCHED_TOKENS,
+                            current_chunk // 2)
+                        if current_chunk
+                        > VLLM_TOKEN_SCORING_MIN_BATCHED_TOKENS
+                        else None)
+                    if (smaller_chunk is not None
+                            and smaller_chunk < current_chunk):
+                        # max_num_batched_tokens is fixed when an engine is
+                        # constructed.  Restart every independent engine with
+                        # the smaller prefill chunk so retry work cannot land
+                        # on a surviving engine that still materializes the
+                        # same oversized vocabulary projection.  This changes
+                        # only scheduling: token IDs, adapters and exact
+                        # chosen-token log probabilities are unchanged.
+                        worker_options["max_num_batched_tokens"] = (
+                            smaller_chunk)
+                        restart_workers = list(range(self.num_workers))
+                        print(
+                            f"[pool] exact token scoring retry {attempt}/"
+                            f"{retries}: reducing the exact prefill chunk "
+                            f"{current_chunk}->{smaller_chunk}, restarting "
+                            f"all {self.num_workers} vLLM engine(s), and "
+                            f"rescoring {len(pending)} missing trajectories",
+                            flush=True,
+                        )
+                    else:
+                        restart_workers = failed
+                        print(
+                            f"[pool] exact token scoring retry {attempt}/"
+                            f"{retries}: restarting failed vLLM worker(s) "
+                            f"{failed} and rescoring {len(pending)} missing "
+                            "trajectories",
+                            flush=True,
+                        )
+                    self._stop_workers(restart_workers)
+                    self._start_workers(restart_workers)
                 else:
                     print(
                         f"[pool] exact token scoring retry {attempt}/"
