@@ -314,7 +314,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
         c5_bound = evaluate_erdos_solution(h_values, c5_bound, n_points)
         res.valid = True
         res.raw_score = float(c5_bound)
-        res.reward = float(1.0 / (1e-8 + c5_bound))
+        res.reward = float(1.0 / c5_bound)
         res.construction = list(np.asarray(h_values).ravel())
         res.msg = f"C5 bound: {c5_bound}"
         return res
@@ -334,7 +334,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
             c5_bound = float(np.max(correlation))
             seeds.append(SeedState(
                 code="",
-                value=float(1.0 / (1e-8 + c5_bound)),
+                value=float(1.0 / c5_bound),
                 raw_score=c5_bound,
                 construction=list(construction),
             ))
