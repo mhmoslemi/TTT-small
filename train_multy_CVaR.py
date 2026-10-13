@@ -411,66 +411,20 @@ def _resolve_coder_token_limits(merged):
 
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
-    """Keep Qwen3.8 pilot and adaptive rollouts at medium effort."""
-    if getattr(cfg, "coder_template_kind", "generic") == "qwen3.8":
-        if phase in {"pilot", "adaptive"}:
-            return "medium"
+    """Use the configured coder effort uniformly in every rollout phase."""
     return getattr(cfg, "coder_reasoning_effort", None)
 
 
-def _qwen38_pilot_effort_entries(
+def _coder_effort_entries(
         prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
-    """Split two strategies per parent into medium + one xhigh pilot.
-
-    Selection is pseudorandom but stable for a run seed, step, and parent, so
-    restarting an interrupted step reproduces the same pilot composition. The
-    split preserves both the per-strategy pilot count and the total budget.
-    """
-    entries = [
-        (int(source_idx), int(count), None)
+    """Attach the configured effort without changing rollout allocation."""
+    del prompt_jobs, step_idx
+    effort = _coder_effort_for_rollout_phase(cfg, phase)
+    return [
+        (int(source_idx), int(count), effort)
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
-    if (str(phase) != "pilot"
-            or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
-        return entries
-
-    strategies_by_parent = {}
-    for source_idx, count, _effort in entries:
-        if count < 1:
-            continue
-        job = prompt_jobs[source_idx]
-        parent_group = int(job["parent_group"])
-        strategies_by_parent.setdefault(parent_group, set()).add(
-            int(job["strategy_index"]))
-
-    selected_by_parent = {}
-    base_seed = int(getattr(cfg, "seed", 0))
-    for parent_group, strategy_indices in strategies_by_parent.items():
-        candidates = sorted(strategy_indices)
-        rng = random.Random(
-            base_seed * 1_000_003
-            + (int(step_idx) + 1) * 97_409
-            + (int(parent_group) + 1) * 65_537)
-        selected_by_parent[parent_group] = set(
-            rng.sample(candidates, min(2, len(candidates))))
-
-    xhigh_entries = []
-    medium_entries = []
-    for source_idx, count, _effort in entries:
-        job = prompt_jobs[source_idx]
-        selected = int(job["strategy_index"]) in selected_by_parent.get(
-            int(job["parent_group"]), set())
-        if not selected:
-            medium_entries.append((source_idx, count, "medium"))
-            continue
-        if count > 1:
-            medium_entries.append((source_idx, count - 1, "medium"))
-        # Put the long xhigh groups together at the front of the same
-        # scheduler call. Round-robin dispatch then spreads them across the
-        # available engines instead of clustering the stragglers on a subset.
-        xhigh_entries.append((source_idx, 1, "xhigh"))
-    return xhigh_entries + medium_entries
 
 
 def _phase_coder_prompt_job(
@@ -9838,7 +9792,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     def _run_vllm_code_phase(
                             counts, *, phase, seed_offset, progress_desc,
                             defer_format_retries=False):
-                        active = _qwen38_pilot_effort_entries(
+                        active = _coder_effort_entries(
                             prompt_jobs, source_job_indices, counts, cfg,
                             step_idx, phase)
                         if not active:
@@ -10048,7 +10002,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     def _run_local_code_phase(
                             counts, *, phase, seed_offset, progress_desc,
                             defer_format_retries=False):
-                        active = _qwen38_pilot_effort_entries(
+                        active = _coder_effort_entries(
                             prompt_jobs, source_job_indices, counts, cfg,
                             step_idx, phase)
                         if not active:
@@ -11915,17 +11869,8 @@ def main():
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
-        pilot_count = int(getattr(cfg, "pilot_programs_per_strategy", -1))
-        if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-                and pilot_count > 0):
-            selected_count = min(2, int(cfg.strategies_per_parent))
-            print("Coder reasoning:    pilot=medium, with 1 xhigh sample on "
-                  f"{selected_count} seeded-random strategies/parent; "
-                  "phase 2=medium")
-        else:
-            print(f"Coder reasoning:    pilot/base="
-                  f"{_coder_effort_for_rollout_phase(cfg)}, phase 2="
-                  f"{_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
+        print(f"Coder reasoning:    all rollout phases="
+              f"{_coder_effort_for_rollout_phase(cfg)}")
     else:
         direct_effort = _coder_effort_for_rollout_phase(cfg)
         if direct_effort is not None:

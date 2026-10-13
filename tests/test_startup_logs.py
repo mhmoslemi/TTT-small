@@ -277,7 +277,7 @@ class StartupLogTests(unittest.TestCase):
                     saved)
                 self.assertIn("normal runtime output", output)
                 if strategies:
-                    self.assertIn("phase 2=medium", output)
+                    self.assertIn("Coder reasoning: all rollout phases=medium", output)
                 else:
                     self.assertIn("Coder reasoning: direct=medium", output)
                     self.assertNotIn("phase 2=", output)

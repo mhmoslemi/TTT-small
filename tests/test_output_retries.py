@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from copy import deepcopy
 import io
 import json
+import math
 from pathlib import Path
 import queue
 import random
@@ -144,7 +145,8 @@ class RunnerRetryTests(unittest.TestCase):
             generation_backend=backend, sandbox_timeout_s=600,
             coder_retry=True)
         scope = dict(
-            cfg=cfg, Future=Future, coder_output_issue=coder_output_issue,
+            cfg=cfg, Future=Future, math=math,
+            coder_output_issue=coder_output_issue,
             coder_retry_gate=coder_retry_gate,
             coder_retry_prompt_job=coder_retry_prompt_job, retry_metadata=retry_metadata,
             parent_ctxs=[object()], step_idx=0, exp_dir=Path("unused"),
@@ -208,7 +210,7 @@ class RunnerRetryTests(unittest.TestCase):
         scope["generate_prompt_jobs"] = lambda m, t, p, c, cfg, **kw: generate(p, c, False)
         functions_from_file("train_multy_CVaR.py", {
             "_coder_effort_for_rollout_phase",
-            "_qwen38_pilot_effort_entries", "_phase_coder_prompt_job",
+            "_coder_effort_entries", "_phase_coder_prompt_job",
             "_queue_rollout", "_submit_rollout", "_run_coder_format_retries",
             "_defer_coder_format_retries",
             "_drain_deferred_coder_format_retries",
@@ -244,7 +246,7 @@ class RunnerRetryTests(unittest.TestCase):
                     self.assertEqual(len(set(seeds)), 3)
                     self.assertEqual(
                         {prompt.split("[", 1)[0] for prompt in calls[0][0]},
-                        {"medium", "xhigh"})
+                        {"medium"})
                     self.assertTrue(calls[1][0][0].startswith("medium"))
                     self.assertTrue(calls[2][0][0].startswith("medium"))
                     for rec in s["coder_retry_records"]:
@@ -256,10 +258,8 @@ class RunnerRetryTests(unittest.TestCase):
                         job = s["prompt_jobs"][rec["job_idx"]]
                         original = s["prompt_jobs"][parent["job_idx"]]
                         self.assertEqual(job["coder_reasoning_effort"], "medium")
-                        if original["coder_reasoning_effort"] == "xhigh":
-                            self.assertNotEqual(
-                                job["coder_reasoning_effort"],
-                                original["coder_reasoning_effort"])
+                        self.assertEqual(
+                            original["coder_reasoning_effort"], "medium")
                         self.assertTrue(job["prompt_text"].startswith(job["coder_reasoning_effort"]))
                         self.assertEqual(saved[rec["rollout_index"]][1]["pending_meta"]["coder_reasoning_effort"],
                                          job["coder_reasoning_effort"])
