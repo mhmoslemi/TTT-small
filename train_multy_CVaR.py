@@ -99,9 +99,124 @@ _QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
 _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = (
     "deepseek-r1-0528-qwen3-8b")
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
+_EXACT_SHARDED_RECOVERY_FILE = ".exact_sharded_recovery.json"
 _ANSI_ORANGE = "\033[38;5;208m"
 _ANSI_YELLOW = "\033[93m"
 _ANSI_RESET = "\033[0m"
+
+
+class ExactLongContextTrainingOOM(RuntimeError):
+    """One exact trajectory needs the automatic multi-GPU training path."""
+
+
+def _exact_sharded_recovery_path(run_dir):
+    return Path(run_dir) / _EXACT_SHARDED_RECOVERY_FILE
+
+
+def _read_exact_sharded_recovery(run_dir):
+    if run_dir is None:
+        return None
+    path = _exact_sharded_recovery_path(run_dir)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        step = int(payload["step"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"invalid exact long-context recovery marker: {path}") from error
+    if step < 0:
+        raise RuntimeError(
+            f"invalid exact long-context recovery step {step}: {path}")
+    return {**payload, "step": step, "path": str(path)}
+
+
+def _infer_exact_sharded_recovery(run_dir):
+    """Recognize a pre-fix exact-OOM crash without repeating its failed pass."""
+    if run_dir is None:
+        return None
+    log_path = Path(run_dir) / "temirnal.log"
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 4 * 1024 * 1024), os.SEEK_SET)
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    failure_offset = tail.rfind("exact long-context training failed for a ")
+    if failure_offset < 0:
+        return None
+    steps = re.findall(r"\[step (\d+)\]", tail[:failure_offset])
+    if not steps:
+        return None
+    step = int(steps[-1])
+    step_dir = Path(run_dir) / f"step{step:02d}"
+    summary = step_dir / f"step{step:02d}.summary.json"
+    rollout_pattern = f"step{step:02d}_group*_rollout*.meta.json"
+    if summary.is_file() or not any(step_dir.glob(rollout_pattern)):
+        return None
+    return {
+        "version": 1,
+        "step": step,
+        "reason": "inferred from the previous exact single-GPU OOM",
+    }
+
+
+def _write_exact_sharded_recovery(run_dir, step, error):
+    path = _exact_sharded_recovery_path(run_dir)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "version": 1,
+        "step": int(step),
+        "reason": str(error),
+        "created_at": time.time(),
+    }
+    temporary.write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _clear_exact_sharded_recovery(run_dir):
+    path = _exact_sharded_recovery_path(run_dir)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _resume_process_argv(run_dir):
+    """Rebuild this Python invocation with exactly one authoritative resume."""
+    original = list(sys.argv[1:])
+    filtered = []
+    index = 0
+    while index < len(original):
+        argument = original[index]
+        if argument in {"--resume", "--resume-from"}:
+            index += 2
+            continue
+        if (argument.startswith("--resume=")
+                or argument.startswith("--resume-from=")):
+            index += 1
+            continue
+        filtered.append(argument)
+        index += 1
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *filtered,
+        "--resume",
+        str(Path(run_dir).resolve()),
+    ]
+
+
+def _restart_for_exact_resume(run_dir):
+    """Replace the current process after every child/GPU has been stopped."""
+    argv = _resume_process_argv(run_dir)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(sys.executable, argv, dict(os.environ))
 
 
 _GPT_OSS_CODER_DEVELOPER_INSTRUCTIONS = '''Formatting re-enabled
@@ -1911,6 +2026,46 @@ def load_config():
     _apply_coder_model_profile(merged, profile_explicit_keys)
     _resolve_coder_token_limits(merged)
 
+    exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
+    if exact_sharded_recovery is not None:
+        recovery_step = int(exact_sharded_recovery["step"])
+        completed_summary = (
+            Path(resume_dir) / f"step{recovery_step:02d}"
+            / f"step{recovery_step:02d}.summary.json")
+        if completed_summary.is_file():
+            _clear_exact_sharded_recovery(resume_dir)
+            exact_sharded_recovery = None
+            print(
+                "[recovery] removed a stale exact sharded marker for an "
+                "already checkpointed step")
+    if exact_sharded_recovery is None:
+        exact_sharded_recovery = _infer_exact_sharded_recovery(resume_dir)
+        if exact_sharded_recovery is not None:
+            marker = _write_exact_sharded_recovery(
+                resume_dir,
+                exact_sharded_recovery["step"],
+                exact_sharded_recovery["reason"],
+            )
+            exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
+            print(
+                "[recovery] recognized the previous exact single-GPU OOM; "
+                f"created {marker.name} so the failed forward/backward is "
+                "not repeated")
+    if exact_sharded_recovery is not None:
+        # This marker is written only after a fully durable SPO-RS rollout
+        # batch proves that one exact trajectory cannot fit on a replicated
+        # trainer GPU. Temporarily distribute one trainable model over every
+        # selected GPU. The completed step removes the marker and restarts in
+        # the original fast replicated layout automatically.
+        merged["training_layout"] = "sharded"
+        merged["fast"] = False
+        merged["_exact_sharded_recovery_step"] = int(
+            exact_sharded_recovery["step"])
+        print(
+            "[recovery] exact long-context adapter update will use one "
+            "model sharded across all training GPUs; ordinary fast replicated "
+            "training resumes after this step")
+
     training_layout = str(
         merged.get("training_layout") or "auto").strip().lower()
     if training_layout not in {"auto", "replicated", "sharded"}:
@@ -3614,7 +3769,7 @@ def _run_oom_resilient_backward(
                     "insufficient memory after checkpointing, reserved "
                     "headroom, and CPU activation offload"
                 )
-                raise RuntimeError(
+                raise ExactLongContextTrainingOOM(
                     f"exact long-context training failed for a "
                     f"{victim_tokens}-token rollout on {device_label}: "
                     f"{failure}. The configured coder profile forbids "
@@ -6308,9 +6463,15 @@ class ProcessDistributedTrainer:
             message_event = message.get("event")
             rank = int(message.get("rank", -1))
             if message_event == "error":
+                traceback_text = message.get("traceback", "no traceback")
+                if "ExactLongContextTrainingOOM" in traceback_text:
+                    raise ExactLongContextTrainingOOM(
+                        f"fast trainer rank {rank} exhausted exact "
+                        "single-GPU long-context fallbacks:\n"
+                        f"{traceback_text}")
                 raise RuntimeError(
                     f"fast trainer rank {rank} failed:\n"
-                    f"{message.get('traceback', 'no traceback')}")
+                    f"{traceback_text}")
             if message_event != event or rank not in pending:
                 raise RuntimeError(
                     f"unexpected fast trainer message while waiting for "
@@ -8205,10 +8366,11 @@ def _resume_spo_rs_step_from_artifacts(
     from reward import extract_python_code
     from sampler import State
 
-    if parallel_trainer is None:
+    if (parallel_trainer is None
+            and str(getattr(cfg, "training_layout", "")) != "sharded"):
         raise RuntimeError(
-            "evaluated-step recovery requires the configured fast distributed "
-            "trainer")
+            "evaluated-step recovery requires either the configured fast "
+            "distributed trainer or the automatic exact sharded trainer")
     if spo_rs_tracker is None or not spo_rs_tracker.initialized:
         raise RuntimeError(
             "evaluated-step recovery requires the pre-step SPO-RS tracker")
@@ -8551,8 +8713,27 @@ def _resume_spo_rs_step_from_artifacts(
         "recovered_rollouts": len(artifacts),
         "_entropy_observations": entropy_observations,
     }
-    stats.update(parallel_trainer.train_rank(
-        all_examples, cfg, step_idx))
+    if parallel_trainer is not None:
+        stats.update(parallel_trainer.train_rank(
+            all_examples, cfg, step_idx))
+    else:
+        try:
+            input_device = next(
+                model.get_input_embeddings().parameters()).device
+        except (AttributeError, StopIteration):
+            input_device = model.device
+        for example in all_examples:
+            example["prompt_ids"] = example["prompt_ids"].to(input_device)
+            example["response_ids"] = example["response_ids"].to(input_device)
+        print(
+            f"[recovery] step {step_idx}: applying the unchanged SPO-RS "
+            "update with one exact model sharded across "
+            f"{int(cfg.num_training_gpus)} GPUs",
+            flush=True,
+        )
+        stats.update(_train_rank_examples(
+            backend, model, tokenizer, optimizer, all_examples,
+            cfg, step_idx))
     stats["spo_rs_policy_updated"] = True
     return stats
 
@@ -11697,7 +11878,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             or (best_value > previous_best_value if problem.maximize
                 else best_value < previous_best_value)
         )
-        target = getattr(problem, "target", None)
+        # ``target`` is part of the problem context shown to the model.
+        # ``target_print`` is deliberately display-only, so changing the SOTA
+        # comparison printed here cannot leak a new target into the prompt.
+        target = getattr(cfg, "target_print", getattr(problem, "target", None))
         try:
             target = float(target) if target is not None else None
         except (TypeError, ValueError):
@@ -11717,7 +11901,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       else target - best_value)
             message += (
                 f"  🏆 CONGRATULATIONS — NEW SOTA! "
-                f"target={target:.9f}, beaten by {margin:.9f} 🏆")
+                f"target={target:.12f}, beaten by {margin:.12f} 🏆")
             color = "\033[32m"       # dark green
         elif improved:
             message += "  ★ NEW RUN BEST"
@@ -12218,7 +12402,8 @@ def main():
     if cfg.generation_backend == "vllm":
         print(f"vLLM parallelism:   TP={cfg.vllm_tensor_parallel_size or 'auto'} "
               f"PP={cfg.vllm_pipeline_parallel_size}")
-    print(f"Target:             {cfg.target}")
+    print(f"Prompt target:      {cfg.target}")
+    print(f"Print/SOTA target:  {getattr(cfg, 'target_print', cfg.target)}")
     print(f"Steps:              {cfg.num_steps}")
     print(f"Search selection:   {'UCT' if cfg.uct else 'PUCT'} "
           f"(c={cfg.puct_c})")
@@ -13057,10 +13242,14 @@ def main():
     if cumulative_training_seconds:
         print(f"[resume] prior cumulative training time: "
               f"{cumulative_training_seconds:.1f}s")
+    restart_for_exact_recovery = False
+    restart_after_exact_recovery = False
+    active_step = None
     try:
         if start_step >= cfg.num_steps:
             print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
         for step in range(start_step, cfg.num_steps):
+            active_step = int(step)
             step_cfg = cfg
             if binary_coder_cfg.enabled:
                 step_cfg = SimpleNamespace(**vars(cfg))
@@ -13254,6 +13443,48 @@ def main():
                       flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
             step_plotter.submit(step)
+            recovery_step = getattr(
+                cfg, "_exact_sharded_recovery_step", None)
+            if recovery_step is not None:
+                if int(recovery_step) != int(step):
+                    raise RuntimeError(
+                        "exact sharded recovery marker expected step "
+                        f"{int(recovery_step)}, but completed step {step}")
+                _clear_exact_sharded_recovery(exp_dir)
+                restart_after_exact_recovery = True
+                print(
+                    f"[recovery] exact sharded update for step {step} is "
+                    "checkpointed; restarting the normal fast replicated "
+                    "trainer at the next step",
+                    flush=True,
+                )
+                break
+    except ExactLongContextTrainingOOM as error:
+        if getattr(cfg, "_exact_sharded_recovery_step", None) is not None:
+            raise RuntimeError(
+                "an exact trajectory still failed after distributing the "
+                "trainer across every selected GPU") from error
+        if (active_step is None
+                or configured_advantage_mode != "spo-rs"):
+            raise
+        recoverable = _recoverable_spo_rs_artifacts(
+            exp_dir, active_step, cfg)
+        if recoverable is None:
+            raise RuntimeError(
+                "the exact long-context trainer needs a multi-GPU retry, but "
+                "this step does not yet have a complete durable SPO-RS "
+                "rollout/evaluation set") from error
+        marker = _write_exact_sharded_recovery(
+            exp_dir, active_step, error)
+        restart_for_exact_recovery = True
+        print(
+            f"[recovery] step {active_step}: one exact trajectory exceeded "
+            "single-GPU training capacity; all generated tokens, rewards, "
+            "advantages, and policy scores are already durable. Restarting "
+            "automatically with the trainer sharded across all GPUs "
+            f"({marker.name}); generation and CPU evaluation will not repeat",
+            flush=True,
+        )
     finally:
         # Plotting uses no GPUs and never delays generation of the next step.
         # Finish queued figures on normal completion; cancel pending work when
@@ -13269,6 +13500,9 @@ def main():
                 and hasattr(parallel_trainer, "shutdown")):
             print("[shutdown] stopping process-distributed trainer ...")
             parallel_trainer.shutdown()
+
+    if restart_for_exact_recovery or restart_after_exact_recovery:
+        _restart_for_exact_resume(exp_dir)
 
     # ---- summary ----
     print("\n" + "=" * 70)

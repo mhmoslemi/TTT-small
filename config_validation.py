@@ -93,7 +93,7 @@ PROBLEM_REQUIRED_KEYS = {
 
 PROBLEM_OPTIONAL_KEYS = {
     "circle_packing": frozenset(),
-    "erdos": frozenset(),
+    "erdos": frozenset({"target_print"}),
     "erdos-c4": frozenset(),
     "ac1": frozenset(),
     "ac2": frozenset(),
