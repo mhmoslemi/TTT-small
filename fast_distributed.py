@@ -14,7 +14,7 @@ import traceback
 STANDARD_TRAINING_MEMORY_FRACTION = 0.80
 MAX_STANDARD_TRAINING_MEMORY_FRACTION = 0.90
 LONG_ROLLOUT_MEMORY_FRACTION = 0.96
-LONG_ROLLOUT_MEMORY_FRACTIONS = (0.96, 0.98)
+LONG_ROLLOUT_MEMORY_FRACTIONS = (0.96, 0.98, 0.99)
 MAX_LONG_ROLLOUT_MEMORY_FRACTION = max(LONG_ROLLOUT_MEMORY_FRACTIONS)
 SHARED_PREFIX_WORK_KEY = "__ttt_shared_prefix_examples__"
 
@@ -176,8 +176,10 @@ def set_long_rollout_memory_ceiling(
     This is used after the batch has been reduced to one rollout and before
     resorting to saved-activation CPU offload. External allocations (including
     sleeping vLLM processes and NCCL) remain part of the total. Callers first
-    use the 96% ceiling and may explicitly escalate to 98% after a proven OOM;
-    the last two percent of the card always remains outside the total ceiling.
+    use the 96% ceiling and may explicitly escalate to 98% and then 99% after
+    proven OOMs.  External allocations are measured before every escalation,
+    so even the final stage leaves one percent of the complete card outside
+    the total ceiling rather than granting one process the entire device.
     """
     return _set_total_memory_ceiling(
         logical_id, fraction,
@@ -468,6 +470,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     import torch
     import train_multy_CVaR as training
     from host_memory import reclaim_unused_host_memory
+    from model_backend import fused_long_attention_is_active
 
     if not 0.0 < float(memory_fraction) <= (
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
@@ -535,6 +538,19 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     def example_gate(example):
         return bool(example["rank_entropy_gate"] and entropy_coef > 0.0)
 
+    def needs_fused_long_singleton(example):
+        return bool(
+            fused_long_attention_is_active()
+            and training._requires_fused_long_singleton(
+                cfg, example_length(example))
+        )
+
+    def fused_pack_limit():
+        if (fused_long_attention_is_active()
+                and getattr(cfg, "fused_long_attention", False)):
+            return training._FUSED_LONG_SINGLETON_MIN_TOKENS
+        return None
+
     max_examples_per_batch = 64
     if work_queue is None:
         partitions = {False: [], True: []}
@@ -554,11 +570,19 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
             pending = partitions[partition_key]
             batch = [pending.pop()]
             maximum = example_length(batch[0])
+            if needs_fused_long_singleton(batch[0]):
+                return batch
             while pending and len(batch) < max_examples_per_batch:
                 candidate = pending[-1]
+                if needs_fused_long_singleton(candidate):
+                    break
                 candidate_length = example_length(candidate)
                 next_maximum = max(maximum, candidate_length)
-                if next_maximum * (len(batch) + 1) > budget:
+                next_padded_tokens = next_maximum * (len(batch) + 1)
+                pack_limit = fused_pack_limit()
+                if (next_padded_tokens > budget
+                        or (pack_limit is not None
+                            and next_padded_tokens >= pack_limit)):
                     break
                 batch.append(pending.pop())
                 maximum = next_maximum
@@ -578,7 +602,9 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
             nonlocal queue_finished, deferred, prefix_remainder
             if prefix_remainder:
                 batch, prefix_remainder = _take_shared_prefix_chunk(
-                    prefix_remainder, budget, max_examples_per_batch)
+                    prefix_remainder, budget, max_examples_per_batch,
+                    singleton_predicate=needs_fused_long_singleton,
+                    packed_token_limit=fused_pack_limit())
                 return batch
             if queue_finished and deferred is None:
                 return []
@@ -593,11 +619,15 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     and SHARED_PREFIX_WORK_KEY in first):
                 batch, prefix_remainder = _take_shared_prefix_chunk(
                     first[SHARED_PREFIX_WORK_KEY], budget,
-                    max_examples_per_batch)
+                    max_examples_per_batch,
+                    singleton_predicate=needs_fused_long_singleton,
+                    packed_token_limit=fused_pack_limit())
                 return batch
             batch = [first]
             maximum = example_length(first)
             gate = example_gate(first)
+            if needs_fused_long_singleton(first):
+                return batch
             while (not queue_finished
                    and len(batch) < max_examples_per_batch):
                 candidate = work_queue.get()
@@ -608,10 +638,17 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                         and SHARED_PREFIX_WORK_KEY in candidate):
                     deferred = candidate
                     break
+                if needs_fused_long_singleton(candidate):
+                    deferred = candidate
+                    break
                 candidate_length = example_length(candidate)
                 next_maximum = max(maximum, candidate_length)
+                next_padded_tokens = next_maximum * (len(batch) + 1)
+                pack_limit = fused_pack_limit()
                 if (example_gate(candidate) != gate
-                        or next_maximum * (len(batch) + 1) > budget):
+                        or next_padded_tokens > budget
+                        or (pack_limit is not None
+                            and next_padded_tokens >= pack_limit)):
                     deferred = candidate
                     break
                 batch.append(candidate)
@@ -624,6 +661,9 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         if not cpu_batch:
             break
         requested_padded_tokens = _padded_token_count(cpu_batch)
+        fused_long_singleton = bool(
+            len(cpu_batch) == 1
+            and needs_fused_long_singleton(cpu_batch[0]))
 
         with torch.cuda.device(logical_id):
             base_allocated = int(torch.cuda.memory_allocated())
@@ -762,6 +802,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     model, [local_batch], attempt,
                     device_label=f"cuda:{logical_id}",
                     expand_memory=expand_for_long_rollout,
+                    start_checkpointed=fused_long_singleton,
+                    start_with_headroom=fused_long_singleton,
                     activation_offload_semaphore=(
                         activation_offload_semaphore)))
             peak_allocated = int(torch.cuda.max_memory_allocated())

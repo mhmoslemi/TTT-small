@@ -727,6 +727,22 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertAlmostEqual(actual, 0.88)
         setter.assert_called_once_with(0.88, device=2)
 
+    def test_long_rollout_ceiling_can_escalate_to_99_percent(self):
+        from fast_distributed import (LONG_ROLLOUT_MEMORY_FRACTIONS,
+                                      set_long_rollout_memory_ceiling)
+
+        self.assertEqual(LONG_ROLLOUT_MEMORY_FRACTIONS, (0.96, 0.98, 0.99))
+        with (patch("torch.cuda.device", return_value=nullcontext()),
+              patch("torch.cuda.empty_cache"),
+              patch("torch.cuda.memory_allocated", return_value=200),
+              patch("torch.cuda.memory_reserved", return_value=100),
+              patch("torch.cuda.mem_get_info", return_value=(800, 1000)),
+              patch("torch.cuda.set_per_process_memory_fraction") as setter):
+            actual = set_long_rollout_memory_ceiling(2, 0.99)
+
+        self.assertAlmostEqual(actual, 0.89)
+        setter.assert_called_once_with(0.89, device=2)
+
     def test_gpt_oss_qlora_uses_trainable_checkpoint_only_for_training(self):
         from train_multy_CVaR import (_resolve_training_backend,
                                  _resolve_training_model_name)

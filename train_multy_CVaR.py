@@ -6233,7 +6233,7 @@ class ProcessDistributedTrainer:
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
-            "exact long-rollout rescue staged at 96% then 98%; "
+            "exact long-rollout rescue staged at 96%, 98%, then 99%; "
             f"CPU activation offload admitted on at most "
             f"{self._activation_offload_slots}/{self._world_size} ranks",
             flush=True)
@@ -6573,7 +6573,7 @@ class ProcessDistributedTrainer:
               flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling="
               f"{self._memory_percentage:g}%; "
-              "exact singleton rescue=96%->98%; "
+              "exact singleton rescue=96%->98%->99%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -6993,7 +6993,7 @@ class ProcessDistributedTrainer:
             f"{int(cfg.train_examples_per_microbatch)} examples")
         print(f"[{process_label}] one process/GPU; {scheduler_label}; "
               f"memory ceiling={self._memory_percentage:g}%; "
-              "exact singleton rescue=96%->98%; "
+              "exact singleton rescue=96%->98%->99%; "
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
@@ -12367,7 +12367,7 @@ def main():
     print(f"Deterministic:      {cfg.deterministic}")
     if use_process_distributed_training:
         print(f"Training memory cap: {100.0 * float(cfg.training_memory_fraction):g}% "
-              "per GPU (96%->98% staged exact long-rollout rescue)")
+              "per GPU (96%->98%->99% staged exact long-rollout rescue)")
     print(f"Logprob chunk:      {cfg.logprob_chunk or 'off (single shot)'}")
     print(f"Seed:               {cfg.seed}")
     print(f"Sandbox timeout:    {cfg.sandbox_timeout_s}s")
