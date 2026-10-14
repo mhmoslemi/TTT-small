@@ -97,6 +97,14 @@ def _run_info(run_dir):
     return config, problem, "reward", True
 
 
+def _display_target(config):
+    """Return the display/SOTA target without changing the prompt target."""
+    target = _finite_float(config.get("target_print"))
+    if target is None:
+        target = _finite_float(config.get("target"))
+    return target
+
+
 def load_best_curve(run_dir, max_step=None):
     """Return (steps, cumulative_best, per_step_best, valid_rollout_count)."""
     # Validate the requested run directory.
@@ -107,8 +115,12 @@ def load_best_curve(run_dir, max_step=None):
     # Determine which score to read and whether to minimize or maximize it.
     _, problem, metric_name, maximize = _run_info(run_dir)
 
-    # Collect the best valid score found inside each training step.
+    # Collect the best valid rollout found inside each training step. These
+    # files are also used to count valid evaluations and support old runs that
+    # predate authoritative per-step summaries.
     best_by_step = {}
+    summary_best_by_step = {}
+    summary_cumulative_by_step = {}
     seen_steps = set()
     valid_count = 0
     pattern = "step*/step*_group*_rollout*.meta.json"
@@ -143,22 +155,56 @@ def load_best_curve(run_dir, max_step=None):
         initial = -math.inf if maximize else math.inf
         best_by_step[step] = choose(best_by_step.get(step, initial), score)
 
-    # Stop with a clear error when there is no usable rollout data.
+    # Completed step summaries carry the sampler's independent best-ever raw
+    # record. Unlike a metadata-only cumulative minimum/maximum, this includes
+    # a seed that remains unbeaten and a better stochastic realization removed
+    # later by exact-code deduplication or archive pruning.
+    step_key = ("step_best_reward" if metric_name == "reward"
+                else "step_best_raw_score")
+    cumulative_key = ("best_seen_reward" if metric_name == "reward"
+                      else "best_seen_raw_score")
+    for path in sorted(run_dir.glob("step*/step*.summary.json")):
+        try:
+            summary = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        step = _step_number(summary, path)
+        if step is None or step < 0:
+            continue
+        if max_step is not None and step > max_step:
+            continue
+        seen_steps.add(step)
+        step_score = _finite_float(summary.get(step_key))
+        if step_score is not None:
+            summary_best_by_step[step] = step_score
+        cumulative_score = _finite_float(summary.get(cumulative_key))
+        if cumulative_score is not None:
+            summary_cumulative_by_step[step] = cumulative_score
+
+    # Stop with a clear error when there is no usable completed-step data.
     if not seen_steps:
-        raise ValueError(f"no rollout metadata found under {run_dir}/step*/")
-    if not best_by_step:
-        raise ValueError("the run contains no valid rollout with a numeric score")
+        raise ValueError(f"no completed step data found under {run_dir}/step*/")
+    if not best_by_step and not summary_cumulative_by_step:
+        raise ValueError(
+            "the run contains no valid rollout or best-seen numeric score")
 
-    # Build one entry for every step, using NaN for steps with no valid score.
+    # Prefer the saved step summary, then fall back to the rollout scan.
     steps = list(range(0, max(seen_steps) + 1))
-    per_step = [best_by_step.get(step, math.nan) for step in steps]
+    per_step = [
+        summary_best_by_step.get(step, best_by_step.get(step, math.nan))
+        for step in steps
+    ]
 
-    # Turn the per-step scores into a best-score-seen-so-far curve.
+    # Prefer each completed summary's authoritative cumulative best. Derive a
+    # value only when plotting an older or partially written run without one.
     cumulative = []
     best = -math.inf if maximize else math.inf
     choose = max if maximize else min
-    for value in per_step:
-        if math.isfinite(value):
+    for step, value in zip(steps, per_step):
+        saved_best = summary_cumulative_by_step.get(step)
+        if saved_best is not None:
+            best = saved_best
+        elif math.isfinite(value):
             best = choose(best, value)
         cumulative.append(best if math.isfinite(best) else math.nan)
     return steps, cumulative, per_step, valid_count
@@ -296,7 +342,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     """Load a run, draw its best-so-far curve, and save PNG and PDF files."""
     # Load the problem settings and score history.
     run_dir = Path(run_dir)
-    _, problem, metric_name, maximize = _run_info(run_dir)
+    config, problem, metric_name, maximize = _run_info(run_dir)
     steps, cumulative, per_step, valid_count = load_best_curve(
         run_dir, max_step=max_step)
 
@@ -350,22 +396,16 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     ax.plot(xs, ys, ls="none", marker="o", ms=4.8, color=BLUE,
             mec=SURFACE, mew=1.0, zorder=5)
 
-    # Read the optional target score from the run configuration.
-    config_path = run_dir / "config.json"
-    target = None
-    if config_path.is_file():
-        try:
-            target = _finite_float(json.loads(config_path.read_text()).get("target"))
-        except (OSError, json.JSONDecodeError):
-            pass
-    # Use the fixed Erdos target shown by this plot.
-    target = 0.380876            
+    # Plot the problem's display-only SOTA threshold when configured. Fall
+    # back to the prompt target for older run directories. Never hard-code an
+    # Erdos value here: this renderer is shared by Erdos, AC1, and AC2.
+    target = _display_target(config)
 
     # Draw the target as a dashed horizontal reference line.
     if target is not None:
         ax.axhline(target, color=INK_MUTED, linewidth=1.2,
                    linestyle=(0, (5, 4)), zorder=2)
-        ax.text(steps[0] + 0.15, target, f"target  {target:.6f}",
+        ax.text(steps[0] + 0.15, target, f"target  {target:.9f}",
                 va="bottom", ha="left", fontsize=9, color=INK_SOFT, zorder=3)
 
     # Mark meaningful improvements and create labels for selected points.

@@ -532,7 +532,7 @@ def _coder_effort_for_rollout_phase(cfg, phase=None):
 
 def _coder_effort_entries(
         prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
-    """Route Qwen3.8 pilots through two xhigh samples per strategy.
+    """Route the configured number of Qwen3.8 pilots through xhigh effort.
 
     The split changes only the chat-template reasoning control. Every source
     keeps exactly its requested sample count, allocation identity, and pilot
@@ -546,14 +546,16 @@ def _coder_effort_entries(
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
-    if (str(phase) != "pilot"
+    xhigh_per_strategy = int(getattr(
+        cfg, "pilot_xhigh_programs_per_strategy", 0))
+    if (str(phase) != "pilot" or xhigh_per_strategy <= 0
             or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
         return entries
 
     xhigh_entries = []
     base_entries = []
     for source_idx, count, _effort in entries:
-        xhigh_count = min(2, count)
+        xhigh_count = min(xhigh_per_strategy, count)
         xhigh_entries.append((source_idx, xhigh_count, "xhigh"))
         if count > xhigh_count:
             base_entries.append(
@@ -2098,6 +2100,15 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
+    pilot_xhigh_programs_per_strategy = merged.get(
+        "pilot_xhigh_programs_per_strategy", 0)
+    if (isinstance(pilot_xhigh_programs_per_strategy, bool)
+            or not isinstance(pilot_xhigh_programs_per_strategy, int)
+            or pilot_xhigh_programs_per_strategy < 0):
+        raise ValueError(
+            "pilot_xhigh_programs_per_strategy must be a non-negative integer")
+    merged["pilot_xhigh_programs_per_strategy"] = (
+        pilot_xhigh_programs_per_strategy)
     strategy_format_max_retries = merged.get("strategy_format_max_retries", 3)
     if (isinstance(strategy_format_max_retries, bool)
             or not isinstance(strategy_format_max_retries, int)
@@ -2142,6 +2153,17 @@ def load_config():
             raise ValueError(
                 "pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
+        if (pilot_xhigh_programs_per_strategy > 0
+                and pilot_programs_per_strategy < 1):
+            raise ValueError(
+                "positive pilot_xhigh_programs_per_strategy requires "
+                "adaptive pilots to be enabled")
+        if (pilot_programs_per_strategy > 0
+                and pilot_xhigh_programs_per_strategy
+                > pilot_programs_per_strategy):
+            raise ValueError(
+                "pilot_xhigh_programs_per_strategy cannot exceed "
+                "pilot_programs_per_strategy")
         if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
             raise ValueError(
                 "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
@@ -4778,6 +4800,104 @@ def _prepare_entropic_overlap_group(
     return prepared
 
 
+def _prepare_spo_rs_overlap_inputs(
+        tokenizer, group_responses, reward_futures, prompt_jobs):
+    """Build every reward-independent SPO-RS training input on CPU.
+
+    SPO-RS uses rollout-policy logprobs produced by vLLM and a frozen
+    pre-step tracker baseline.  Prompt/response tensors, behavior scores, the
+    exact step-wide trajectory weight, and scheduling keys therefore exist
+    before sandbox rewards finish.  The reward future stays only on the local
+    staging object and is removed before the example enters a multiprocessing
+    queue.
+    """
+    import torch
+
+    prompt_ids_by_job = {}
+    prepared = []
+    for group_id in sorted(group_responses):
+        responses = group_responses[group_id]
+        futures = reward_futures[group_id]
+        if len(responses) != len(futures):
+            raise RuntimeError(
+                f"SPO-RS overlap group {group_id} has {len(responses)} "
+                f"responses but {len(futures)} reward futures")
+        for rollout_index, (record, reward_future) in enumerate(
+                zip(responses, futures)):
+            token_ids = list(record.get("token_ids") or ())
+            behavior_values = record.get("behavior_logprobs")
+            if not token_ids or behavior_values is None:
+                continue
+            try:
+                behavior_array = np.asarray(
+                    behavior_values, dtype=np.float32)
+            except (TypeError, ValueError):
+                continue
+            if (behavior_array.ndim != 1
+                    or behavior_array.size != len(token_ids)
+                    or not np.isfinite(behavior_array).all()):
+                continue
+
+            job_idx = int(record["job_idx"])
+            if job_idx not in prompt_ids_by_job:
+                prompt_ids_by_job[job_idx] = tokenizer(
+                    prompt_jobs[job_idx]["prompt_text"],
+                    return_tensors="pt").input_ids.cpu()
+            example = {
+                "prompt_ids": prompt_ids_by_job[job_idx],
+                "response_ids": torch.tensor(
+                    [token_ids], dtype=torch.long, device="cpu"),
+                "_entropy_measurement": record.get("_entropy_measurement"),
+                "advantage": None,
+                "behavior_logprobs": torch.as_tensor(
+                    behavior_array, dtype=torch.float32).cpu(),
+                "reference_logprobs": None,
+                "reward_constant": False,
+                "rank_entropy_gate": False,
+                "group_id": int(group_id),
+                "x_grpo_context_id": int(record["context_id"]),
+                "x_grpo_fold_index": int(record["fold_index"]),
+                "rollout_index": int(rollout_index),
+                "prompt_job_id": job_idx,
+                "x_grpo_group_size": len(responses),
+                "x_grpo_all_tied": False,
+                "x_grpo_trial_advantages": (),
+                "sample_weight": 0.0,
+                "_overlap_key": (int(group_id), int(rollout_index)),
+                "_overlap_reward_future": reward_future,
+            }
+            record["_spo_rs_overlap_example"] = example
+            prepared.append(example)
+
+    if prepared:
+        trajectory_weight = 1.0 / len(prepared)
+        for example in prepared:
+            example["sample_weight"] = trajectory_weight
+    return prepared
+
+
+def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker):
+    """Attach exact SPO-RS advantages to reward-complete staged inputs."""
+    if not examples:
+        return []
+    futures = [example.get("_overlap_reward_future") for example in examples]
+    if any(future is None or not future.done() for future in futures):
+        raise RuntimeError(
+            "SPO-RS overlap received an example before its reward completed")
+    rewards = [float(future.result().reward) for future in futures]
+    transformed = spo_rs_tracker.transformed_rewards(rewards)
+    advantages = spo_rs_tracker.normalized_advantages(transformed)
+    if advantages is None:
+        raise RuntimeError(
+            "SPO-RS overlap lost its frozen pre-step tracker baseline")
+    for example, advantage in zip(examples, advantages):
+        example["advantage"] = float(advantage)
+        # concurrent.futures.Future is not process-queue serializable and is
+        # no longer needed once its immutable reward has been consumed.
+        example.pop("_overlap_reward_future", None)
+    return examples
+
+
 def _precompute_binary_coder_backward(
         backend, model, tokenizer, optimizer, examples, cfg, step_idx):
     """Run the exact one-epoch binary backward while rewards finish on CPU.
@@ -6288,6 +6408,7 @@ class ProcessDistributedTrainer:
         self._closed = False
         self._workers_idle = True
         self._entropic_overlap = None
+        self._spo_rs_overlap = None
         self._dist_initialized = False
         self._queue_module = queue
         self._context = mp.get_context("spawn")
@@ -7113,6 +7234,249 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
+    def begin_spo_rs_overlap(self, cfg, step_idx):
+        """Start exact clipped SPO-RS backward while CPU evaluation runs."""
+        from concurrent.futures import ThreadPoolExecutor
+        from fast_distributed import local_rank_update
+
+        if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
+            raise ValueError("streaming clipped overlap is SPO-RS-only")
+        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+            raise ValueError("streaming SPO-RS requires one update epoch")
+        if self._closed or not self._workers_idle:
+            raise RuntimeError(
+                "process trainer is not idle for an SPO-RS overlap update")
+        if self._spo_rs_overlap is not None:
+            raise RuntimeError("an SPO-RS overlap update is already active")
+        if self._entropic_overlap is not None:
+            raise RuntimeError("an entropic overlap update is already active")
+        if self._offloaded:
+            print(f"[{self._process_label}] restoring {self._world_size} "
+                  "process trainers while CPU evaluation continues",
+                  flush=True)
+            self.restore_after_generation()
+
+        self.model.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "train_rank",
+                "step_cfg": dict(vars(cfg)),
+                "token_budget": self._token_budgets[rank],
+                "memory_fraction": self._memory_fraction,
+            })
+
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="spo-rs-rank0-overlap")
+        state = {
+            "step_idx": int(step_idx),
+            "started_at": time.time(),
+            "computed_at": None,
+            "executor": executor,
+            "future": None,
+            "queued_examples": 0,
+            "scheduled_keys": set(),
+            "supplied_old": 0,
+            "sealed": False,
+        }
+        future = executor.submit(
+            local_rank_update,
+            self.backend, self.model, self.tokenizer, (), cfg, 0,
+            self._token_budgets[0],
+            memory_fraction=self._memory_fraction,
+            work_queue=self._work_queue,
+            activation_offload_semaphore=(
+                self._activation_offload_semaphore))
+        state["future"] = future
+
+        def _record_completion(_future):
+            state["computed_at"] = time.time()
+
+        future.add_done_callback(_record_completion)
+        self._spo_rs_overlap = state
+        return state
+
+    def queue_spo_rs_overlap(self, examples):
+        """Feed reward-complete SPO-RS trajectories to all free GPUs."""
+        state = self._spo_rs_overlap
+        if state is None or state["sealed"]:
+            raise RuntimeError("SPO-RS overlap queue is not open")
+        if any(example.get("advantage") is None for example in examples):
+            raise RuntimeError(
+                "SPO-RS overlap cannot queue an unresolved advantage")
+        queued = self._queue_examples(
+            examples, seal=False, announce=False)
+        state["queued_examples"] += len(queued)
+        state["supplied_old"] += sum(
+            _valid_example_token_logprobs(example, "behavior_logprobs")
+            for example in queued)
+        state["scheduled_keys"].update(
+            example["_overlap_key"] for example in queued)
+        return len(queued)
+
+    def seal_spo_rs_overlap(self):
+        """Tell every clipped-policy GPU consumer the stream is complete."""
+        state = self._spo_rs_overlap
+        if state is None:
+            return
+        if not state["sealed"]:
+            for _ in range(self._world_size):
+                self._work_queue.put(None)
+            state["sealed"] = True
+
+    def finish_spo_rs_overlap(self, cfg, step_idx, expected_examples, *,
+                              apply_update=True):
+        """Reduce and apply the exact streamed SPO-RS gradients once."""
+        import torch
+        from fast_distributed import (broadcast_trainable_parameters,
+                                      reduce_trainable_gradients)
+
+        state = self._spo_rs_overlap
+        if state is None:
+            raise RuntimeError("no SPO-RS overlap update is active")
+        self.seal_spo_rs_overlap()
+        expected_examples = int(expected_examples)
+        queued_examples = int(state["queued_examples"])
+        if apply_update and expected_examples != queued_examples:
+            raise RuntimeError(
+                "SPO-RS overlap final example count changed: "
+                f"queued={queued_examples}, final={expected_examples}")
+
+        try:
+            local_stats = state["future"].result()
+            child_messages = self._collect_event(
+                "computed", range(1, self._world_size))
+            # Rank 0 can finish before a longer worker. Record completion only
+            # after every GPU has drained the shared queue.
+            state["computed_at"] = time.time()
+            rank_stats = [local_stats] + [
+                child_messages[rank]["stats"]
+                for rank in range(1, self._world_size)
+            ]
+            accounted_examples = sum(
+                int(stats["trained_examples"])
+                + int(stats["quarantined_examples"])
+                for stats in rank_stats)
+            if accounted_examples != queued_examples:
+                raise RuntimeError(
+                    "streaming SPO-RS queue lost or duplicated work: "
+                    f"accounted for {accounted_examples}/{queued_examples} "
+                    "examples")
+
+            for command_queue in self._command_queues.values():
+                command_queue.put({
+                    "kind": "finish_update",
+                    "apply_update": bool(apply_update),
+                })
+
+            grad_norm = None
+            update_error = None
+            if apply_update:
+                reduce_trainable_gradients(
+                    self.model, destination_rank=0)
+                try:
+                    grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                        [parameter for parameter in self.model.parameters()
+                         if parameter.requires_grad],
+                        max_norm=cfg.grad_clip, error_if_nonfinite=True)
+                    self.optimizer.step()
+                    grad_norm = float(grad_norm_tensor.item())
+                except BaseException as error:
+                    update_error = error
+                finally:
+                    self.model.zero_grad(set_to_none=True)
+                    broadcast_trainable_parameters(
+                        self.model, source_rank=0)
+            else:
+                self.model.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
+
+            self._collect_event("updated", range(1, self._world_size))
+            self._workers_idle = True
+            if update_error is not None:
+                raise update_error
+        except BaseException:
+            self._workers_idle = False
+            self._abort_workers()
+            raise
+        finally:
+            state["executor"].shutdown(wait=True, cancel_futures=False)
+            self._spo_rs_overlap = None
+
+        for rank, stats in enumerate(rank_stats):
+            self._token_budgets[rank] = max(
+                1, int(stats["token_budget"]))
+        if not apply_update:
+            return {}
+
+        metric_keys = (
+            "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+            "ratio", "clipped_fraction",
+        )
+        totals = {
+            key: sum(float(stats["totals"][key]) for stats in rank_stats)
+            for key in metric_keys
+        }
+        max_ratio = max(float(stats["max_ratio"]) for stats in rank_stats)
+        max_prefix_ratio = max(
+            float(stats["max_prefix_ratio"]) for stats in rank_stats)
+        entropy_examples = sum(
+            int(stats["entropy_examples"]) for stats in rank_stats)
+        quarantined_examples = sum(
+            int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [
+            int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [
+            int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [
+            float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [
+            float(stats["allocator_memory_fraction"])
+            for stats in rank_stats]
+        peak_percentages = [
+            round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [
+            round(100.0 * fraction, 1)
+            for fraction in allocator_fractions]
+        completed_at = state["computed_at"] or time.time()
+        elapsed = max(0.0, completed_at - state["started_at"])
+        history = [{
+            "epoch": 1, **totals, "ratio_max": max_ratio,
+            "prefix_ratio_max": max_prefix_ratio,
+            "entropy_examples": entropy_examples,
+            "oom_quarantined_examples": quarantined_examples,
+            "grad_norm": grad_norm,
+        }]
+        print(f"[{self._process_label}] trained examples/GPU="
+              f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
+              f"final padded-token budgets/GPU={self._token_budgets}; "
+              f"peak memory/GPU={peak_percentages}%; allocator caps/GPU="
+              f"{allocator_percentages}%", flush=True)
+        print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
+              f"loss={totals['loss']:.6f} "
+              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+              f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+              f"clipped={totals['clipped_fraction']:.1%} "
+              f"entropy examples={entropy_examples} "
+              f"OOM-quarantined={quarantined_examples} "
+              "(forward/backward overlapped CPU evaluation)", flush=True)
+        return {
+            "rank_updates": history,
+            "rank_train_seconds": elapsed,
+            "training_parallel_gpus": self._world_size,
+            "training_fast": True,
+            "training_fast_processes": True,
+            "training_overlapped_evaluation": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(self._token_budgets),
+            "fast_peak_memory_fraction": peak_fractions,
+            "fast_allocator_memory_fraction": allocator_fractions,
+            "oom_quarantined_examples": quarantined_examples,
+        }
+
     def train_policy(self, examples, cfg, step_idx):
         """Run the exact standard policy loss on the process-per-GPU path."""
         import torch
@@ -7383,6 +7747,18 @@ class ProcessDistributedTrainer:
                 state["executor"].shutdown(
                     wait=True, cancel_futures=False)
                 self._entropic_overlap = None
+
+        if self._spo_rs_overlap is not None:
+            state = self._spo_rs_overlap
+            self.seal_spo_rs_overlap()
+            try:
+                state["future"].result()
+            except Exception:
+                pass
+            finally:
+                state["executor"].shutdown(
+                    wait=True, cancel_futures=False)
+                self._spo_rs_overlap = None
 
         if (not self._workers_idle or not self._dist_initialized
                 or self._dead_workers(range(1, self._world_size))):
@@ -8875,6 +9251,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     binary_coder_diagnostics = []
     binary_overlap_state = None
     entropic_overlap_state = None
+    spo_rs_overlap_state = None
     all_children = []
     all_child_strategy_keys = []
     strategy_pilot_diagnostics = []
@@ -10924,6 +11301,107 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
+            # SPO-RS advantages are trajectory-local once the pre-step tracker
+            # baseline is frozen: A_i = (exp(beta*r_i) / v_t - 1) / beta.
+            # Therefore no cross-rollout reward statistic is needed. Build all
+            # reward-independent CPU tensors immediately, restore the same
+            # process-per-GPU trainer used by the ordinary --fast path, and
+            # stream each completed evaluation into its shared work queue.
+            # Parameters remain frozen and the optimizer step stays below the
+            # rollout-persistence barrier, preserving the exact objective.
+            spo_rs_overlap_eligible = bool(
+                spo_rs_mode
+                and training_enabled
+                and parallel_trainer is not None
+                and hasattr(parallel_trainer, "begin_spo_rs_overlap")
+                and cfg.generation_backend == "vllm"
+                and int(getattr(cfg, "rank_update_epochs", 1)) == 1
+                and not deferred_rollouts
+                and not evaluation_trainer_offloaded
+            )
+            if spo_rs_overlap_eligible:
+                staged_spo_rs_examples = []
+                try:
+                    staged_spo_rs_examples = (
+                        _prepare_spo_rs_overlap_inputs(
+                            tokenizer, group_responses, reward_futures,
+                            prompt_jobs))
+                    if staged_spo_rs_examples:
+                        pending_by_future = {
+                            example["_overlap_reward_future"]: example
+                            for example in staged_spo_rs_examples
+                        }
+                        if (len(pending_by_future)
+                                != len(staged_spo_rs_examples)):
+                            raise RuntimeError(
+                                "SPO-RS overlap found a reward future shared "
+                                "by multiple rollout records")
+                        pending_before = sum(
+                            not future.done() for future in all_futs)
+                        spo_rs_overlap_state = (
+                            parallel_trainer.begin_spo_rs_overlap(
+                                cfg, step_idx))
+                        print(
+                            f"[step {step_idx}] SPO-RS "
+                            "evaluation/training overlap started; "
+                            f"prepared {len(staged_spo_rs_examples)} exact "
+                            "training inputs; "
+                            f"{pending_before}/{len(all_futs)} CPU "
+                            "evaluations were pending before trainer restore",
+                            flush=True,
+                        )
+
+                        while pending_by_future:
+                            ready_futures = [
+                                future for future in pending_by_future
+                                if future.done()
+                            ]
+                            if not ready_futures:
+                                wait(tuple(pending_by_future),
+                                     return_when=FIRST_COMPLETED)
+                                continue
+                            ready_examples = [
+                                pending_by_future.pop(future)
+                                for future in ready_futures
+                            ]
+                            _complete_spo_rs_overlap_examples(
+                                ready_examples, spo_rs_tracker)
+                            parallel_trainer.queue_spo_rs_overlap(
+                                ready_examples)
+
+                        parallel_trainer.seal_spo_rs_overlap()
+                        print(
+                            f"[step {step_idx}] SPO-RS overlap queued "
+                            f"{spo_rs_overlap_state['queued_examples']} "
+                            "examples to the shared "
+                            f"{parallel_trainer.world_size}-GPU work queue "
+                            f"(old logprobs "
+                            f"{spo_rs_overlap_state['supplied_old']}/"
+                            f"{spo_rs_overlap_state['queued_examples']}); "
+                            "backward continues while rollout artifacts are "
+                            "processed; optimizer step deferred",
+                            flush=True,
+                        )
+                except Exception as error:
+                    if spo_rs_overlap_state is not None:
+                        parallel_trainer.finish_spo_rs_overlap(
+                            cfg, step_idx,
+                            spo_rs_overlap_state["queued_examples"],
+                            apply_update=False)
+                    elif not parallel_trainer._workers_idle:
+                        raise
+                    for responses in group_responses.values():
+                        for record in responses:
+                            record.pop("_spo_rs_overlap_example", None)
+                    spo_rs_overlap_state = None
+                    print(
+                        f"[warn] SPO-RS evaluation/training overlap was "
+                        f"disabled for this step ({type(error).__name__}: "
+                        f"{error}); falling back to the unchanged "
+                        "post-evaluation update",
+                        flush=True,
+                    )
+
             # Entropic advantages need every reward in their own group, not the
             # rewards of later groups. Stream each completed group into the
             # process-per-GPU trainer while the remaining sandbox jobs continue
@@ -11638,7 +12116,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 continue
             prepared = (
                 record.get("_binary_overlap_example")
-                or record.get("_entropic_overlap_example"))
+                or record.get("_entropic_overlap_example")
+                or record.get("_spo_rs_overlap_example"))
             res = outs[r_idx]
             if prepared is not None:
                 prepared_advantage = prepared.get("advantage")
@@ -11695,9 +12174,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before the
-    # optimizer can mutate the adapter. Binary coder and streamed entropic mode
-    # may already have accumulated exact gradients during CPU evaluation, but
-    # their single update is deliberately deferred until this barrier.
+    # optimizer can mutate the adapter. Binary coder, streamed entropic mode,
+    # and streamed SPO-RS may already have accumulated exact gradients during
+    # CPU evaluation, but their single update is deliberately deferred until
+    # this barrier.
     # stepXX.summary.json remains the completion marker and is written only
     # after the adapter/checkpoint.
     save_suffix = ("with training disabled"
@@ -11792,13 +12272,42 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             )
             entropic_overlap_state = None
 
+    if spo_rs_overlap_state is not None:
+        actual_keys = {
+            example.get("_overlap_key") for example in all_examples
+            if example.get("_overlap_key") is not None
+        }
+        advantages_complete = all(
+            example.get("advantage") is not None
+            and math.isfinite(float(example["advantage"]))
+            for example in all_examples)
+        advantages_match = not any(
+            example.get("_overlap_label_mismatch", False)
+            for example in all_examples)
+        expected_keys = spo_rs_overlap_state["scheduled_keys"]
+        if (actual_keys != expected_keys
+                or not advantages_complete or not advantages_match):
+            parallel_trainer.finish_spo_rs_overlap(
+                cfg, step_idx,
+                spo_rs_overlap_state["queued_examples"],
+                apply_update=False)
+            print(
+                f"[warn] discarded streamed SPO-RS gradients because the "
+                f"final training set changed ({len(actual_keys)}/"
+                f"{len(expected_keys)} records); using the unchanged "
+                "post-evaluation update",
+                flush=True,
+            )
+            spo_rs_overlap_state = None
+
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples))
                       if training_enabled else "disabled")
     rollout_phase_label = (
         "rollout+eval+overlapped-backward wall time"
         if (binary_overlap_state is not None
-            or entropic_overlap_state is not None)
+            or entropic_overlap_state is not None
+            or spo_rs_overlap_state is not None)
         else "rollout+eval time")
     print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
           f"training examples: {training_label}  "
@@ -12058,6 +12567,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if binary_overlap_state is not None:
             step_stats.update(_finish_binary_coder_overlap_update(
                 model, optimizer, cfg, step_idx, binary_overlap_state))
+        elif spo_rs_overlap_state is not None:
+            step_stats.update(parallel_trainer.finish_spo_rs_overlap(
+                cfg, step_idx, len(all_examples), apply_update=True))
+            spo_rs_overlap_state = None
         elif parallel_trainer is not None:
             step_stats.update(parallel_trainer.train_rank(
                 all_examples, cfg, step_idx))
@@ -12080,7 +12593,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         else:
             step_stats.update(parallel_trainer.train_policy(
                 all_examples, cfg, step_idx))
-        best = sampler.best_state()
+        best = (sampler.best_raw_state(maximize=bool(problem.maximize))
+                or sampler.best_state())
         if best is not None:
             raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
             print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
@@ -12206,7 +12720,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
           f"{total_logp_delta / n_examples:.9f}{is_msg}  "
           f"OOM-quarantined={len(quarantined)}")
 
-    best = sampler.best_state()
+    # Save the same problem-native best-ever state reported after each step.
+    # The independent raw record includes seeds and candidates removed by
+    # exact-code deduplication/archive pruning; ``best_state()`` alone can
+    # therefore save an older or worse stochastic realization.
+    best = (sampler.best_raw_state(maximize=bool(problem.maximize))
+            or sampler.best_state())
     if best is not None:
         raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
         print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
@@ -12237,6 +12756,7 @@ def main():
 
         # Save the reusable base configuration before runtime-only adjustments.
         from experiment_io import (append_step_result, make_experiment_dir,
+                                   save_best_state_snapshot,
                                    save_final_summary, save_step_summary)
         resume_dir = merged.pop("_resume_dir", None)
         exp_dir = make_experiment_dir(
@@ -12474,8 +12994,11 @@ def main():
         pilot_count = int(getattr(
             cfg, "pilot_programs_per_strategy", -1))
         if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-                and pilot_count > 0):
-            xhigh_count = min(2, pilot_count)
+                and pilot_count > 0
+                and int(getattr(
+                    cfg, "pilot_xhigh_programs_per_strategy", 0)) > 0):
+            xhigh_count = min(
+                int(cfg.pilot_xhigh_programs_per_strategy), pilot_count)
             print(
                 "Coder reasoning:    pilot/strategy="
                 f"{xhigh_count} xhigh + {pilot_count - xhigh_count} "
@@ -13399,6 +13922,28 @@ def main():
                 "group_size": int(cfg.group_size),
                 **(stats or {}),
             }
+            # Snapshot the sampler's independent native-metric optimum before
+            # asynchronous plotting starts.  This includes unbeaten seeds and
+            # evaluated children that no longer survive archive pruning.
+            best_seen_state = (
+                sampler.best_raw_state(maximize=bool(problem.maximize))
+                or sampler.best_state()
+            )
+            best_snapshot_path = save_best_state_snapshot(
+                exp_dir, step, best_seen_state,
+                metric_name=str(problem.metric_name),
+                maximize=bool(problem.maximize),
+                construction=(
+                    _as_float_list(
+                        getattr(best_seen_state, "construction", None),
+                        cfg.max_saved_construction)
+                    if (best_seen_state is not None
+                        and getattr(problem, "saves_construction", False))
+                    else None),
+            )
+            step_summary["best_seen_snapshot"] = (
+                str(Path(best_snapshot_path).relative_to(exp_dir))
+                if best_snapshot_path is not None else None)
             save_step_summary(exp_dir, step, step_summary)
             append_step_result(exp_dir, step, step_summary)
             if getattr(step_cfg, "measure_entropy", False):
@@ -13508,7 +14053,10 @@ def main():
     print("\n" + "=" * 70)
     print("TRAINING DONE")
     print("=" * 70)
-    best = sampler.best_state()
+    # Use the problem-native best-ever record, not merely the best state that
+    # survived archive deduplication/pruning.
+    best = (sampler.best_raw_state(maximize=bool(problem.maximize))
+            or sampler.best_state())
     if best is not None:
         raw = f"  (raw {getattr(problem, 'metric_name', 'metric')} = {best.raw_score:.9f})" \
             if best.raw_score is not None else ""

@@ -139,6 +139,8 @@ class StepPlotter:
         scripts = [("plot_erdos_best_curve.py", [])]
         if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
             scripts.insert(0, ("plot_erdos.py", ["--saved-only"]))
+        elif self.problem in {"ac1", "ac2"}:
+            scripts.insert(0, ("plot_ac.py", []))
         environment = dict(os.environ)
         environment.update({
             "MPLBACKEND": "Agg", "CUDA_VISIBLE_DEVICES": "",
@@ -402,6 +404,63 @@ def save_step_summary(exp_dir: Path, step: int, summary: dict):
     )
 
 
+def save_best_state_snapshot(exp_dir: Path, step: int, state, *,
+                             metric_name: str, maximize: bool,
+                             construction=None):
+    """Persist the sampler's authoritative best-ever state at a completed step.
+
+    Rollout metadata is not authoritative here: the best state may be an
+    unbeaten seed or a valid child later removed by archive deduplication or
+    pruning.  Keeping one small, step-scoped snapshot also lets asynchronous
+    plotting reproduce exactly the best state known at *that* completed step.
+    """
+    if state is None:
+        return None
+    payload = {
+        "version": 1,
+        "completed_step": int(step),
+        "metric_name": str(metric_name),
+        "maximize": bool(maximize),
+        "state_id": str(getattr(state, "id", "")),
+        "found_step": int(getattr(state, "timestep", step)),
+        "is_seed": bool(getattr(state, "is_seed", False)),
+        "raw_score": (float(state.raw_score)
+                      if getattr(state, "raw_score", None) is not None
+                      else None),
+        "reward": (float(state.value)
+                   if getattr(state, "value", None) is not None else None),
+        "code": str(getattr(state, "code", "") or ""),
+        "construction": construction,
+        "construction_saved": construction is not None,
+    }
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    step_dir.mkdir(exist_ok=True)
+    path = step_dir / f"step{step:02d}.best.json"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+    return path
+
+
+def load_best_state_snapshot(exp_dir: Path, max_step=None):
+    """Load the latest authoritative best-state snapshot through max_step."""
+    candidates = []
+    for path in Path(exp_dir).glob("step*/step*.best.json"):
+        try:
+            payload = json.loads(path.read_text())
+            completed_step = int(payload["completed_step"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if max_step is not None and completed_step > int(max_step):
+            continue
+        candidates.append((completed_step, path, payload))
+    if not candidates:
+        return None
+    _step, path, payload = max(candidates, key=lambda item: item[0])
+    payload["_snapshot_path"] = path
+    return payload
+
+
 def append_step_result(exp_dir: Path, step: int, summary: dict):
     """Append one idempotent per-step result line to the run-level log."""
     step = int(step)
@@ -451,10 +510,10 @@ def save_final_summary(exp_dir: Path, best_value, best_code, best_step,
     """
     Write the end-of-run summary.
 
-    best_construction is the actual solution object (for Erdos, the h array).
-    Written both into the summary and to its own file, because a plot or a
-    verification wants the array on its own and should never have to re-run the
-    program to get it.
+    best_construction is the actual solution object (the Erdos h array or an
+    AC coefficient sequence). Written both into the summary and to its own
+    file, because a plot or verifier should never have to re-run a stochastic,
+    wall-clock-bounded program to recover the answer.
     """
     out = {
         "best_value": float(best_value) if best_value is not None else None,

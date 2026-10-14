@@ -18,6 +18,7 @@ def _runtime_scope(kind="qwen3.8", backend="vllm"):
              if isinstance(node, ast.FunctionDef) and node.name in names]
     cfg = SimpleNamespace(
         coder_template_kind=kind, coder_reasoning_effort="medium",
+        pilot_xhigh_programs_per_strategy=2,
         coder_preserve_thinking=True, thinking=True,
         generation_backend=backend, max_new_tokens=64, temperature=.6,
         top_p=.95, sampling_top_k=0, sampling_min_p=0.0)
@@ -101,6 +102,21 @@ class PhaseReasoningTests(unittest.TestCase):
         self.assertEqual(scope["_coder_effort_entries"](
             jobs, [0], [5], scope["cfg"], 1, "adaptive"), [
                 (0, 5, "low"),
+            ])
+
+    def test_yaml_count_controls_xhigh_split_and_zero_disables_it(self):
+        scope, _ = _runtime_scope()
+        jobs = [dict(parent_group=0, strategy_index=0)]
+        scope["cfg"].pilot_xhigh_programs_per_strategy = 3
+        self.assertEqual(scope["_coder_effort_entries"](
+            jobs, [0], [7], scope["cfg"], 1, "pilot"), [
+                (0, 3, "xhigh"),
+                (0, 4, "medium"),
+            ])
+        scope["cfg"].pilot_xhigh_programs_per_strategy = 0
+        self.assertEqual(scope["_coder_effort_entries"](
+            jobs, [0], [7], scope["cfg"], 1, "pilot"), [
+                (0, 7, "medium"),
             ])
 
     def test_both_generation_backends_retain_correct_prompt_ids_for_training(self):

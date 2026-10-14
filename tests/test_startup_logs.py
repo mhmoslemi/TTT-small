@@ -206,6 +206,7 @@ class StartupLogTests(unittest.TestCase):
             max_new_tokens=262144, max_seq_length=262144, coder_template_kind="qwen3.8",
             coder_reasoning_effort="medium", temperature=1, top_p=1, thinking=True,
             strategies_per_parent=3, programs_per_strategy=12, pilot_programs_per_strategy=7,
+            pilot_xhigh_programs_per_strategy=2,
             phase2_allocation_method="hurdle", strategy_archive_top_r=2, topk_children_per_parent=8,
             strategy_format_max_retries=3, strategy_max_new_tokens=131072,
             strategy_max_seq_length=131072, strategy_temperature=1, strategy_top_p=1,
@@ -277,7 +278,9 @@ class StartupLogTests(unittest.TestCase):
                     saved)
                 self.assertIn("normal runtime output", output)
                 if strategies:
-                    self.assertIn("Coder reasoning: all rollout phases=medium", output)
+                    self.assertIn(
+                        "Coder reasoning: pilot/strategy=2 xhigh + 5 medium; "
+                        "phase 2=medium", output)
                 else:
                     self.assertIn("Coder reasoning: direct=medium", output)
                     self.assertNotIn("phase 2=", output)

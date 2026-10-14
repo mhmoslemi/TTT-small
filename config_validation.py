@@ -28,7 +28,8 @@ vllm_pipeline_parallel_size vllm_quantization
 vllm_max_num_batched_tokens vllm_enable_expert_parallel vllm_sleep_level
 vllm_staged_loading strategy_vllm_sleep_level strategy_vllm_staged_loading
 num_steps groups_per_step group_size strategies_per_parent
-programs_per_strategy pilot_programs_per_strategy strategy_archive_top_r
+programs_per_strategy pilot_programs_per_strategy
+pilot_xhigh_programs_per_strategy strategy_archive_top_r
 num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
 train_examples_per_microbatch logprob_chunk
@@ -95,8 +96,8 @@ PROBLEM_OPTIONAL_KEYS = {
     "circle_packing": frozenset(),
     "erdos": frozenset({"target_print"}),
     "erdos-c4": frozenset(),
-    "ac1": frozenset(),
-    "ac2": frozenset(),
+    "ac1": frozenset({"target_print"}),
+    "ac2": frozenset({"target_print"}),
     "denoising": frozenset(),
     "gpu_mode": frozenset({"kernel_lib_dir", "mla_seed_runtime_us"}),
 }
@@ -226,6 +227,26 @@ def validate_problem_config(
             raise ValueError(
                 f"{_label(source)}: pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
+    if "pilot_xhigh_programs_per_strategy" in data:
+        xhigh_count = data["pilot_xhigh_programs_per_strategy"]
+        if (isinstance(xhigh_count, bool)
+                or not isinstance(xhigh_count, int)
+                or xhigh_count < 0):
+            raise ValueError(
+                f"{_label(source)}: pilot_xhigh_programs_per_strategy must "
+                "be a non-negative integer")
+        pilot_count = data.get("pilot_programs_per_strategy")
+        if xhigh_count > 0 and isinstance(pilot_count, int):
+            if pilot_count < 1:
+                raise ValueError(
+                    f"{_label(source)}: positive "
+                    "pilot_xhigh_programs_per_strategy requires adaptive "
+                    "pilots to be enabled")
+            if xhigh_count > pilot_count:
+                raise ValueError(
+                    f"{_label(source)}: "
+                    "pilot_xhigh_programs_per_strategy cannot exceed "
+                    "pilot_programs_per_strategy")
     if "phase2_allocation_method" in data:
         allocation_method = str(data["phase2_allocation_method"]).strip().lower()
         if allocation_method not in {"rule_based", "bandit", "hurdle"}:

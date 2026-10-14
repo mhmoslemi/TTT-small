@@ -1431,6 +1431,10 @@ class VLLMBackendTests(unittest.TestCase):
             else:
                 self.assertNotIn("num_circles", data, path.name)
 
+            if data["problem"] in {"ac1", "ac2"}:
+                self.assertIn("target_print", data, path.name)
+                self.assertEqual(data["target_print"], data["target"], path.name)
+
             if data.get("problem_type") == "mla_decode_nvidia":
                 self.assertIn("mla_seed_runtime_us", data, path.name)
 

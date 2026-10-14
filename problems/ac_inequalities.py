@@ -2,7 +2,7 @@
 Autocorrelation Inequalities (AC1 and AC2).
 
   - problem_type "ac1": entrypoint propose_candidate, minimize upper bound,
-                        reward = 1/(1e-8 + result)
+                        reward = 1/result
   - problem_type "ac2": entrypoint construct_function, maximize lower bound,
                         reward = result
 
@@ -20,10 +20,8 @@ from problems.base import (
 )
 
 from examples.ac_inequalities.prompt import (
-    AC1_EVAL_FUNCTION,
     AC1_LITERATURE,
     AC2_LITERATURE,
-    ae_verifier_program,
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
 )
@@ -94,27 +92,9 @@ def evaluate_sequence(sequence: list) -> float:
 evaluate_sequence_ac2 = evaluate_sequence
 
 
-def verify_ac1_solution(result) -> bool:
-    try:
-        value = evaluate_sequence_ac1(result)
-        if value == np.inf:
-            return False
-    except Exception:
-        return False
-    return True
-
-
-def verify_ac2_solution(result) -> bool:
-    try:
-        value = evaluate_sequence_ac2(result)
-        if value == np.inf:
-            return False
-    except Exception:
-        return False
-    return True
-
-
 class ACInequalities(Problem):
+    two_stage_rollouts = True
+    saves_construction = True
     name = "ac_inequalities"
 
     def __init__(self, cfg: dict):
@@ -131,7 +111,6 @@ class ACInequalities(Problem):
             if self.target is None:
                 self.target = 1.5030
             self._evaluate = evaluate_sequence_ac1
-            self._verify = verify_ac1_solution
             self._eval_src = inspect.getsource(evaluate_sequence_ac1)
         else:
             self.entrypoint = "construct_function"
@@ -140,7 +119,6 @@ class ACInequalities(Problem):
             if self.target is None:
                 self.target = 0.97
             self._evaluate = evaluate_sequence_ac2
-            self._verify = verify_ac2_solution
             self._eval_src = inspect.getsource(evaluate_sequence_ac2)
 
     # ------------------------------------------------------------------
@@ -151,77 +129,181 @@ class ACInequalities(Problem):
             ctx += f"\nLength of the construction: {len(parent.construction)}"
         return ctx
 
+    @staticmethod
+    def _append_user_instruction(messages: List[dict], instruction: str
+                                 ) -> List[dict]:
+        staged = [dict(message) for message in messages]
+        if staged and staged[-1].get("role") == "user":
+            staged[-1]["content"] = (
+                str(staged[-1].get("content", "")).rstrip()
+                + "\n\n" + instruction.strip() + "\n"
+            )
+        else:
+            staged.append({"role": "user", "content": instruction.strip()})
+        return staged
+
+    def build_strategy_messages(
+            self, messages: List[dict],
+            previous_strategies: List[str] | None = None) -> List[dict]:
+        common = '''
+Autocorrelation-specific implementation constraints:
+- If a current construction exists, `height_sequence_1` is already supplied
+  to the executed program as a one-dimensional NumPy array. Never copy,
+  serialize, reconstruct, or hard-code that array. Plan a compact algorithm
+  that reads it directly. Never propose a long explicit numeric table or an
+  unrolled pattern.
+- The entrypoint must return a non-empty Python `list` of finite real numbers.
+  Keep the returned coefficients explicitly nonnegative and no larger than
+  1000; do not depend on the evaluator's defensive clipping to repair a search
+  candidate. Retain a separately copied, exactly re-evaluated best candidate
+  and a concrete valid fallback throughout the run.
+- The authoritative evaluator uses full *linear* self-convolution, producing
+  2*n-1 coefficients. It is not circular convolution. Derive every surrogate,
+  gradient, or convolution index against that definition and accept candidates
+  only by calling the supplied exact `evaluate_sequence`.
+- Positive rescaling below the coefficient cap leaves the objective unchanged.
+  Do not claim that changing scale alone is an improvement, and do not let
+  normalization interact with clipping in a way that changes the candidate.
+- Products of the submitted coefficients make the search generally nonconvex.
+  A direct CVXPY call is not a solution unless the stated subproblem satisfies
+  the solver's rules. Explain any relaxation or alternating subproblem, how a
+  candidate is recovered, and how it is checked by the original evaluator.
+- Derive dimensions from runtime inputs. If changing resolution, specify the
+  exact interpolation/resampling rule, normalization, validity checks, and how
+  the new candidate is compared with the parent. Explain initialization when
+  no parent is available.'''
+        if self.problem_type == "ac1":
+            mathematical = '''
+AC1 mathematical checks for the final plan:
+- For a returned sequence a of length n, the exact lower-is-better objective is
+  2*n*max(convolve(a, a, mode="full"))/sum(a)^2, with sum(a) >= 0.01 after
+  defensive clipping. Include every one of the 2*n-1 convolution positions.
+- Any normalization or LP direction must preserve nonnegativity and must be
+  evaluated with that exact ratio. Do not infer monotonic improvement from a
+  surrogate bound without an exact acceptance comparison.'''
+        else:
+            mathematical = '''
+AC2 mathematical checks for the final plan:
+- Let c=convolve(a,a,mode="full") have m=2*n-1 entries and let
+  y=(0,c_0,...,c_{m-1},0). The evaluator uses uniform spacing
+  dx=1/(m+1), the piecewise-linear integral
+  L2sq=sum_i dx/3*(y_i^2+y_i*y_{i+1}+y_{i+1}^2),
+  L1=sum(abs(c))/(m+1), and Linf=max(abs(c)). The exact higher-is-better
+  objective is L2sq/(L1*Linf).
+- Keep L1 and Linf strictly positive and use the same endpoint convention and
+  spacing in any analytic gradient or surrogate. Re-evaluate every accepted
+  candidate with the supplied function rather than trusting an internal score.'''
+        staged = self._append_user_instruction(messages, common + mathematical)
+        return super().build_strategy_messages(
+            staged, previous_strategies=previous_strategies)
+
+    def build_code_messages(self, messages: List[dict],
+                            strategy: str) -> List[dict]:
+        staged = super().build_code_messages(messages, strategy)
+        entrypoint = ("propose_candidate" if self.problem_type == "ac1"
+                      else "construct_function")
+        return self._append_user_instruction(staged, f'''
+## Mandatory compact-source and return contract
+
+- `height_sequence_1` is runtime input when a parent construction exists.
+  Reference it directly; NEVER assign a pasted copy of its values, serialize
+  it, or reconstruct it as a literal. If no parent was announced, create a
+  starting vector under a different name.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- Keep the source concise: at most 300 lines and about 12,000 characters.
+  Finish `{entrypoint}`, return a non-empty Python list of finite coefficients,
+  and close the single Python fence well before the generation limit.
+- Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
+  best-so-far fallback and return it before the configured deadline.
+
+These are hard output constraints even if the proposed strategy conflicts
+with them.''')
+
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = self._state_ctx(parent)
         budget_s = self.budget_s
-
         if self.problem_type == "ac1":
-            user = f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
-
-Your task is to generate the sequence of non-negative heights of a step function, that minimizes the following evaluation function:
-
-{AC1_EVAL_FUNCTION}
-
-{AC1_LITERATURE}
-
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
-
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
-
-{state_ctx}
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable. 
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
-
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
-Unless you make a meaningful improvement, you will not be rewarded.
-
-Rules:
-- You must define the `propose_candidate` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {self.eval_cpus} CPUs.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked.
-- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
-- Include a short docstring at the top summarizing your algorithm.
-
-Make sure to think and return the final program between ```python and ```.'''
+            direction = "minimize"
+            metric = "the AC1 upper bound"
+            entrypoint = "propose_candidate"
+            literature = AC1_LITERATURE
         else:
-            user = f''''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
+            direction = "maximize"
+            metric = "the AC2 lower bound"
+            entrypoint = "construct_function"
+            literature = AC2_LITERATURE
 
-Your task is to generate the sequence of non-negative heights of a step functions, that maximizes the following evaluation function:
+        construction_section = ""
+        if parent.construction is not None and len(parent.construction) > 0:
+            construction_section = f'''
+The current construction is already available to the executed program as the
+one-dimensional NumPy array `height_sequence_1` (length
+{len(parent.construction)}). Use it directly as one possible initialization;
+do not copy its values into the response. You may also explore genuinely
+different compactly generated initializations.'''
 
+        direct_output_section = ""
+        if not self.two_stage_rollouts:
+            direct_output_section = f'''
+## Required output
+
+Return exactly one complete fenced Python code block, beginning with
+```python and ending with ```, and nothing else. The extracted block must
+define `{entrypoint}` at top level. Do not output a strategy, analysis, prose,
+notes, example usage, a second code block, or a partial snippet. Do not embed
+the parent construction as data. Finish the program and close the fence well
+before the response-token limit.'''
+
+        correction_instruction = (
+            "The downstream coder must treat a strategy as guidance and "
+            "correct any conflict with the evaluator or interface."
+            if self.two_stage_rollouts else
+            "The returned program must follow the evaluator and interface "
+            "even if an exploratory idea conflicts with them."
+        )
+
+        user = f'''You are an expert in harmonic analysis, autocorrelation
+inequalities, and numerical optimization. Write a compact search program whose
+returned nonnegative step-function heights {direction} {metric}.
+
+## Authoritative evaluator
+
+The evaluator below is read-only and is the only definition of the score:
 ```python
-{ae_verifier_program}
+{self._eval_src}
 ```
 
-{AC2_LITERATURE}
-Your task is to write a search function, construct_function(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+{literature}
 
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
+## Runtime contract and resources
+
+- Define `{entrypoint}(seed={self.seed}, budget_s={budget_s}, **kwargs)`.
+- The harness invokes `{entrypoint}()` with no arguments, so those defaults are
+  active. Return a non-empty Python list of finite real coefficients.
+- `evaluate_sequence` is pre-imported and may be called during search. Do not
+  redefine or import it.
+- Time budget: {budget_s} seconds. Check the deadline inside expensive loops
+  and solver calls, preserve the best exact-scoring valid candidate, and return
+  it with headroom before the hard sandbox timeout.
+- Candidate failure receives the configured failure reward; do not hide an
+  error by returning an empty or non-finite sequence.
+- You may use NumPy, SciPy, CVXPY, math, and the Python standard library. Use
+  at most {self.eval_cpus} CPUs.
+- Make helper functions top-level. Do not use nested-function closures or
+  lambda functions. Do not use filesystem or network I/O.
+- Construct large arrays algorithmically. Do not paste long numeric literals,
+  lookup tables, repeated-value lists, or unrolled patterns.
 
 {state_ctx}
+{construction_section}
 
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable. 
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
-
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
-Unless you make a meaningful improvement, you will not be rewarded, if you are stuck you should think about how to get unstuck.
-
-Rules:
-- You must define the `construct_function` function as this is what will be invoked.
-- You can use scientific libraries like scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math.
-- You can use up to {self.eval_cpus} CPUs.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
-- No filesystem or network IO.
-- Do not import evaluate_sequence yourself. Assume it will already be imported and can be directly invoked. Do not import height_sequence_1 yourself; it will already be available.
-- **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
-- Include a short docstring at the top summarizing your algorithm.
-
-Make sure to think and return the final program between ```python and ```.'''
+Reason from the exact evaluator and improve meaningfully over the supplied
+parent/search program when one exists. {correction_instruction}
+{direct_output_section}
+'''
         return [{"role": "user", "content": user}]
 
     # ------------------------------------------------------------------
@@ -243,16 +325,26 @@ Make sure to think and return the final program between ```python and ```.'''
             res.msg = "bad_return_values"
             res.failure_kind = "code"
             return res
-        if not self._verify(output):
-            res.msg = "Invalid solution."
+        # AC entrypoints return only the construction, not a model-reported
+        # score. Unlike Erdos there is therefore no claimed-vs-computed scalar
+        # and no numerical comparison tolerance to tune: independently run the
+        # authoritative evaluator once and trust only that result.
+        try:
+            result = float(self._evaluate(output))
+        except Exception as exc:
+            res.msg = f"invalid_solution: {exc}"
+            res.failure_kind = "constraint"
             return res
-        result = float(self._evaluate(output))
+        if not np.isfinite(result) or result <= 0.0:
+            res.msg = f"invalid_score: {result}"
+            res.failure_kind = "constraint"
+            return res
         res.valid = True
         res.raw_score = result
         res.construction = list(output)
         res.msg = f"Success; raw_score={result}"
         if self.problem_type == "ac1":
-            res.reward = float(1.0 / (1e-8 + result))
+            res.reward = float(1.0 / result)
         else:
             res.reward = result
         return res
@@ -265,7 +357,7 @@ Make sure to think and return the final program between ```python and ```.'''
             construction = [float(rng.random())] * int(rng.integers(1000, 8000))
             if self.problem_type == "ac1":
                 raw = float(evaluate_sequence_ac1(construction))
-                value = float(1.0 / (1e-8 + raw))
+                value = float(1.0 / raw)
                 code = example_ae_program_random_init(self.budget_s)
             else:
                 raw = float(evaluate_sequence_ac2(construction))

@@ -150,6 +150,39 @@ class CoderTokenLimitTests(unittest.TestCase):
             self.assertRegex(text, r"(?m)^strategy_max_seq_length: 131072$")
             self.assertRegex(text, r"(?m)^strategy_max_new_tokens: 131072$")
 
+    def test_pilot_xhigh_count_is_explicit_and_budget_bounded(self):
+        for path in (ROOT / "configs").glob("*.yaml"):
+            self.assertRegex(
+                path.read_text(),
+                r"(?m)^pilot_xhigh_programs_per_strategy: [0-9]+$",
+                path.name,
+            )
+        base = {
+            "problem": "erdos",
+            "pilot_programs_per_strategy": 5,
+            "programs_per_strategy": 8,
+        }
+        for count in (0, 2, 5):
+            validate_problem_config(
+                dict(base, pilot_xhigh_programs_per_strategy=count),
+                require_complete=False,
+            )
+        for count in (-1, True, 6):
+            with self.subTest(count=count), self.assertRaisesRegex(
+                    ValueError, "pilot_xhigh_programs_per_strategy"):
+                validate_problem_config(
+                    dict(base, pilot_xhigh_programs_per_strategy=count),
+                    require_complete=False,
+                )
+        with self.assertRaisesRegex(
+                ValueError, "requires adaptive pilots"):
+            validate_problem_config({
+                "problem": "erdos",
+                "pilot_programs_per_strategy": -1,
+                "programs_per_strategy": 8,
+                "pilot_xhigh_programs_per_strategy": 1,
+            }, require_complete=False)
+
     def test_real_config_loader_profile_cli_and_resume_precedence(self):
         numpy = ModuleType("numpy")
         numpy.integer = int

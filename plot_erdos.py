@@ -4,10 +4,14 @@ Plot the step function h from an Erdos rollout.
 
 Three routes to h, tried in this order:
 
-  1. meta["construction"]   the array that was actually scored. Exact, no
-                            execution. Runs from the patched trainer have it.
-  2. --h-json FILE          an array you supply.
-  3. replay                 re-execute the saved program. The fallback for
+  1. stepXX.best.json       the sampler's best-ever state through that
+                            completed step, including seeds and pruned states.
+                            Exact, no execution.
+  2. meta["construction"]   the array that was actually scored. Exact, no
+                            execution. Used for explicit rollout inspection
+                            and older runs without best-state snapshots.
+  3. --h-json FILE          an array you supply.
+  4. replay                 re-execute the saved program. The fallback for
                             older runs, and only ever approximate: a mid-run
                             rollout was generated with its parent's h in scope
                             as `initial_h_values`, and older runs did not save
@@ -20,7 +24,7 @@ into every rollout meta. Replay is a last resort, not the design.
 
 Usage:
 
-    python plot_erdos.py runs/erdos_.../                    # best valid rollout
+    python plot_erdos.py runs/erdos_.../                    # best-ever solution
     python plot_erdos.py runs/erdos_.../ --step 13 --group 0 --rollout 2
     python plot_erdos.py runs/erdos_.../ --file best_code.py
     python plot_erdos.py runs/erdos_.../ --h-json h.json    # exact, no replay
@@ -35,6 +39,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+from experiment_io import load_best_state_snapshot
 
 _FENCE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
@@ -259,21 +265,41 @@ def main():
 
     # --- route 1: the saved solution, exact ---
     if not args.h_json and not args.file:
-        metas = load_metas(run_dir, max_step=args.max_step)
-        if not metas:
-            raise SystemExit(f"no step*/*.meta.json under {run_dir}")
-        m = pick(metas, args.step, args.group, args.rollout)
+        explicit_rollout = any(
+            value is not None
+            for value in (args.step, args.group, args.rollout))
+        m = None
+        if not explicit_rollout:
+            m = load_best_state_snapshot(run_dir, max_step=args.max_step)
+        if m is None:
+            metas = load_metas(run_dir, max_step=args.max_step)
+            if not metas:
+                raise SystemExit(
+                    f"no saved best state or rollout metadata under {run_dir}")
+            m = pick(metas, args.step, args.group, args.rollout)
         recorded = m.get("raw_score")
-        label = (f"step {m.get('step')} group {m.get('group')} "
-                 f"rollout {m.get('rollout')}")
-        print(f"selected {label}: recorded raw_score = {recorded}, "
-              f"parent_is_seed = {m.get('parent_is_seed')}")
+        if "completed_step" in m:
+            origin = "seed" if m.get("is_seed") else (
+                f"step {m.get('found_step')}")
+            label = (f"best through step {m.get('completed_step')}, "
+                     f"found in {origin}")
+            print(f"selected authoritative {label}: "
+                  f"recorded raw_score = {recorded}")
+        else:
+            label = (f"step {m.get('step')} group {m.get('group')} "
+                     f"rollout {m.get('rollout')}")
+            print(f"selected {label}: recorded raw_score = {recorded}, "
+                  f"parent_is_seed = {m.get('parent_is_seed')}")
         saved = as_array(m.get("construction"))
         if saved is not None and not args.replay:
             h_raw = saved
             print(f"using the SAVED construction ({len(h_raw)} points): exact, "
                   f"no re-execution")
         else:
+            if "completed_step" in m:
+                raise SystemExit(
+                    "best-ever state has no complete saved construction; "
+                    "refusing to replay or plot a different, worse answer")
             if args.saved_only:
                 raise SystemExit(
                     "selected rollout has no saved construction; plot skipped "

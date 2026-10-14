@@ -140,6 +140,7 @@ class RunnerRetryTests(unittest.TestCase):
     def runner(self, backend, *, x_grpo=False):
         cfg = SimpleNamespace(
             coder_template_kind="qwen3.8", coder_reasoning_effort="medium",
+            pilot_xhigh_programs_per_strategy=0,
             group_size=3, seed=12, max_new_tokens=32000, temperature=.9,
             top_p=.92, sampling_top_k=0, sampling_min_p=0,
             generation_backend=backend, sandbox_timeout_s=600,
@@ -375,6 +376,69 @@ class RunnerRetryTests(unittest.TestCase):
             self.assertIs(record["_entropic_overlap_example"], ex)
             self.assertEqual(ex["prompt_ids"].value, s["prompt_jobs"][record["job_idx"]]["prompt_text"])
         self.assertLess(examples[1]["advantage"], 0)  # original failure retained
+
+    def test_spo_rs_overlap_prepares_before_reward_and_streams_exact_advantage(self):
+        class Tensor:
+            def __init__(self, value, **kwargs):
+                self.value = value
+            def cpu(self):
+                return self
+        class Array:
+            ndim = 1
+            def __init__(self, values):
+                self.values = list(values)
+                self.size = len(self.values)
+        class Finite:
+            def all(self):
+                return True
+        fake_np = SimpleNamespace(
+            float32="float32",
+            asarray=lambda values, **kw: Array(values),
+            isfinite=lambda values: Finite(),
+        )
+        fake_torch = SimpleNamespace(
+            as_tensor=lambda value, **kw: Tensor(value),
+            tensor=lambda value, **kw: Tensor(value),
+            float32="float32", long="long",
+        )
+        tokenize = lambda text, **kw: SimpleNamespace(input_ids=Tensor(text))
+        reward_future = Future()
+        record = {
+            "token_ids": [4, 5],
+            "behavior_logprobs": [-0.4, -0.5],
+            "job_idx": 0,
+            "context_id": 2,
+            "fold_index": 0,
+        }
+        scope = {"np": fake_np}
+        functions_from_file(
+            "train_multy_CVaR.py",
+            {"_prepare_spo_rs_overlap_inputs",
+             "_complete_spo_rs_overlap_examples"},
+            scope,
+        )
+        with patch.dict("sys.modules", {"torch": fake_torch}):
+            examples = scope["_prepare_spo_rs_overlap_inputs"](
+                tokenize, {0: [record]}, {0: [reward_future]},
+                [{"prompt_text": "prompt"}],
+            )
+        self.assertEqual(len(examples), 1)
+        self.assertIs(record["_spo_rs_overlap_example"], examples[0])
+        self.assertIsNone(examples[0]["advantage"])
+        self.assertEqual(examples[0]["sample_weight"], 1.0)
+
+        reward_future.set_result(SimpleNamespace(reward=3.0))
+        tracker = SimpleNamespace(
+            transformed_rewards=lambda rewards: [2.0 * reward
+                                                  for reward in rewards],
+            normalized_advantages=lambda values: [value - 1.0
+                                                  for value in values],
+        )
+        completed = scope["_complete_spo_rs_overlap_examples"](
+            examples, tracker)
+        self.assertIs(completed, examples)
+        self.assertEqual(examples[0]["advantage"], 5.0)
+        self.assertNotIn("_overlap_reward_future", examples[0])
 
 
 class StrategyAttemptTests(unittest.TestCase):

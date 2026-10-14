@@ -146,11 +146,11 @@ class Problem(ABC):
     maximize: bool = True
 
     # Whether RewardResult.construction is the actual solution object and
-    # therefore worth writing into every rollout's meta. True only where the
-    # construction cannot be recovered by re-running the program: Erdos returns
-    # an h array produced by a stochastic, wall-clock-bounded optimizer, so a
-    # replay does not reproduce it. Circle packing and gpu_mode carry no
-    # construction at all, and their programs are the artifact.
+    # therefore worth writing into every rollout's meta. Enable it where the
+    # construction cannot be recovered by re-running the program: Erdos and the
+    # AC problems return arrays produced by stochastic, wall-clock-bounded
+    # optimizers, so a replay need not reproduce them. Circle packing and
+    # gpu_mode carry no construction at all, and their programs are the artifact.
     saves_construction: bool = False
     two_stage_rollouts: bool = False
 
