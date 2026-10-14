@@ -89,6 +89,20 @@ class PhaseReasoningTests(unittest.TestCase):
         self.assertEqual(scope["_phase_coder_prompt_job"](
             jobs, 0, "adaptive", scope["cfg"], scope["_render"], {}), 0)
 
+    def test_qwen38_xhigh_pilots_preserve_resumed_base_effort(self):
+        scope, _ = _runtime_scope()
+        scope["cfg"].coder_reasoning_effort = "low"
+        jobs = [dict(parent_group=0, strategy_index=0)]
+        self.assertEqual(scope["_coder_effort_entries"](
+            jobs, [0], [11], scope["cfg"], 1, "pilot"), [
+                (0, 2, "xhigh"),
+                (0, 9, "low"),
+            ])
+        self.assertEqual(scope["_coder_effort_entries"](
+            jobs, [0], [5], scope["cfg"], 1, "adaptive"), [
+                (0, 5, "low"),
+            ])
+
     def test_both_generation_backends_retain_correct_prompt_ids_for_training(self):
         for backend in ["vllm", "hf"]:
             with self.subTest(backend=backend):
@@ -148,13 +162,14 @@ class PhaseReasoningTests(unittest.TestCase):
                                 progress_desc="adaptive")
                 self.assertEqual(len(pilots) + len(followups), 23)
                 self.assertEqual(jobs[:2], originals)
-                self.assertEqual(batches[0][1], [10, 10])
+                self.assertEqual(batches[0][1], [2, 2, 8, 8])
                 self.assertEqual(batches[1][1], [3])
-                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len(jobs), 4)
                 for source_idx in (0, 1):
                     records = [r for r in pilots if r["strategy_source_job_idx"] == source_idx]
                     efforts = [jobs[r["job_idx"]]["coder_reasoning_effort"] for r in records]
-                    self.assertEqual(efforts.count("medium"), 10)
+                    self.assertEqual(efforts.count("xhigh"), 2)
+                    self.assertEqual(efforts.count("medium"), 8)
                     self.assertTrue(all(r["rollout_phase"] == "pilot" for r in records))
                     for record in records:
                         job = jobs[record["job_idx"]]
@@ -170,7 +185,7 @@ class PhaseReasoningTests(unittest.TestCase):
                 again = run([0, 1], phase="adaptive", seed_offset=4100000,
                             progress_desc="adaptive")
                 self.assertEqual(again[0]["job_idx"], 1)
-                self.assertEqual(len(jobs), 2)
+                self.assertEqual(len(jobs), 4)
 
     def test_effort_entries_preserve_every_count_and_budget(self):
         scope, _ = _runtime_scope()
@@ -183,15 +198,23 @@ class PhaseReasoningTests(unittest.TestCase):
         split = scope["_coder_effort_entries"](
             jobs, indices, counts, scope["cfg"], 7, "pilot")
         self.assertEqual(sum(count for _, count, _ in split), sum(counts))
-        self.assertEqual(len(split), len(counts))
-        self.assertTrue(all(effort == "medium" for _, _, effort in split))
+        self.assertEqual(len(split), 2 * len(counts))
+        for source_idx in indices:
+            source_entries = [entry for entry in split
+                              if entry[0] == source_idx]
+            self.assertEqual(source_entries, [
+                (source_idx, 2, "xhigh"),
+                (source_idx, 8, "medium"),
+            ])
         self.assertEqual(
             split,
             scope["_coder_effort_entries"](
                 jobs, indices, counts, scope["cfg"], 7, "pilot"))
         adaptive = scope["_coder_effort_entries"](
             jobs, indices, counts, scope["cfg"], 7, "adaptive")
-        self.assertEqual(adaptive, split)
+        self.assertEqual(adaptive, [
+            (source_idx, 10, "medium") for source_idx in indices
+        ])
 
     def test_retry_remains_medium_and_in_pilot_allocation(self):
         scope, calls = _runtime_scope()

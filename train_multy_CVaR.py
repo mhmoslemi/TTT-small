@@ -417,14 +417,36 @@ def _coder_effort_for_rollout_phase(cfg, phase=None):
 
 def _coder_effort_entries(
         prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
-    """Attach the configured effort without changing rollout allocation."""
+    """Route Qwen3.8 pilots through two xhigh samples per strategy.
+
+    The split changes only the chat-template reasoning control. Every source
+    keeps exactly its requested sample count, allocation identity, and pilot
+    status. All non-pilot work and all other coder models retain the run's
+    configured effort unchanged.
+    """
     del prompt_jobs, step_idx
-    effort = _coder_effort_for_rollout_phase(cfg, phase)
-    return [
-        (int(source_idx), int(count), effort)
+    base_effort = _coder_effort_for_rollout_phase(cfg, phase)
+    entries = [
+        (int(source_idx), int(count), base_effort)
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
+    if (str(phase) != "pilot"
+            or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
+        return entries
+
+    xhigh_entries = []
+    base_entries = []
+    for source_idx, count, _effort in entries:
+        xhigh_count = min(2, count)
+        xhigh_entries.append((source_idx, xhigh_count, "xhigh"))
+        if count > xhigh_count:
+            base_entries.append(
+                (source_idx, count - xhigh_count, base_effort))
+    # Keep all xhigh variants in the same scheduler call and place those groups
+    # first so round-robin assignment spreads the longer requests across the
+    # available engines. This adds no rollout or allocation budget.
+    return xhigh_entries + base_entries
 
 
 def _phase_coder_prompt_job(
@@ -12263,8 +12285,18 @@ def main():
         print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
-        print(f"Coder reasoning:    all rollout phases="
-              f"{_coder_effort_for_rollout_phase(cfg)}")
+        base_effort = _coder_effort_for_rollout_phase(cfg)
+        pilot_count = int(getattr(
+            cfg, "pilot_programs_per_strategy", -1))
+        if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
+                and pilot_count > 0):
+            xhigh_count = min(2, pilot_count)
+            print(
+                "Coder reasoning:    pilot/strategy="
+                f"{xhigh_count} xhigh + {pilot_count - xhigh_count} "
+                f"{base_effort}; phase 2={base_effort}")
+        else:
+            print(f"Coder reasoning:    all rollout phases={base_effort}")
     else:
         direct_effort = _coder_effort_for_rollout_phase(cfg)
         if direct_effort is not None:
