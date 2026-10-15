@@ -3989,6 +3989,17 @@ def _run_oom_resilient_backward(
                              reclaim_unused_host_memory)
     from model_backend import set_gradient_checkpointing
 
+    # The selective SPO-RS overflow path already preserves the gradients from
+    # every replica-safe trajectory and sends only oversized singletons to one
+    # model sharded across all GPUs. Building a 100K+ token saved-activation
+    # graph on CPU before taking that path can consume hundreds of GiB per
+    # rank, OOM-kill worker processes, and lose the otherwise durable partial
+    # update. In defer mode, exhaust the exact GPU/headroom stages and defer
+    # directly; no sample is truncated, excluded, or assigned a different
+    # objective.
+    if defer_exact_oom:
+        allow_activation_offload = False
+
     active = [list(batch) for batch in batches if batch]
     quarantined = []
     profile = getattr(model, "_ttt_oom_execution_profile", None)
@@ -7384,14 +7395,21 @@ class ProcessDistributedTrainer:
             self._abort_workers()
             raise
 
+        if str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs":
+            fallback_description = (
+                "oversized exact trajectories route directly to the "
+                "model-sharded overflow lane; replica CPU activation "
+                "offload disabled")
+        else:
+            fallback_description = (
+                "CPU activation offload admitted on at most "
+                f"{self._activation_offload_slots}/{self._world_size} ranks")
         setting_log_only(
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
             "exact long-rollout rescue staged at 96%, 98%, then 99%; "
-            f"CPU activation offload admitted on at most "
-            f"{self._activation_offload_slots}/{self._world_size} ranks",
-            flush=True)
+            f"{fallback_description}", flush=True)
 
     @property
     def world_size(self):

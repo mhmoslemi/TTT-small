@@ -604,7 +604,7 @@ class VLLMBackendTests(unittest.TestCase):
 
         with (patch("torch.cuda.empty_cache"),
               patch("torch.autograd.graph.save_on_cpu",
-                    return_value=nullcontext())):
+                    return_value=nullcontext()) as offload):
             result, effective, deferred = _run_oom_resilient_backward(
                 model, [[example]], attempt, device_label="cuda:0",
                 defer_exact_oom=True)
@@ -612,6 +612,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(effective, [])
         self.assertEqual(deferred, [example])
+        offload.assert_not_called()
 
     def test_strict_training_still_raises_without_selective_overflow(self):
         import torch
