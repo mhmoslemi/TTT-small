@@ -770,15 +770,36 @@ def _extract_final_strategy(response_text):
     if not matches:
         return _STRATEGY_FALLBACK, "missing complete final strategy"
 
-    match = matches[-1]
-    trailing = final_text[match.end():]
-    if re.search(r"<strategy\b", trailing, flags=re.IGNORECASE):
-        return _STRATEGY_FALLBACK, "unclosed final strategy block"
-
-    body = match.group(1).strip()
-    if not body:
-        return _STRATEGY_FALLBACK, "empty final strategy"
-    return body, None
+    last_issue = "missing complete final strategy"
+    for match in reversed(matches):
+        body = match.group(1).strip()
+        if not body:
+            last_issue = "empty final strategy"
+            continue
+        if len(body) < 80:
+            last_issue = "missing complete final strategy"
+            continue
+        # The strategy contract forbids executable source. A bare fence used
+        # only to display a formula is harmless; an explicitly Python/code-like
+        # fence means the planner attempted the coder's job and is retried.
+        if (re.search(r"```\s*python\b", body, flags=re.IGNORECASE)
+                or re.search(
+                    r"```[^`]*(?:^|\n)\s*(?:def |class |from \S+ import |import \S+)",
+                    body, flags=re.IGNORECASE | re.DOTALL)):
+            last_issue = "strategy contained a code fence"
+            continue
+        # Reject explicit stand-ins for omitted work. They satisfy the XML
+        # syntax but hand the coder an intentionally incomplete plan.
+        if re.search(
+                r"<\s*\.\.\.\s*>|\brest of (?:the )?(?:long )?strategy\b|"
+                r"\bcontinue(?:d)? (?:in|with) (?:the )?next response\b|"
+                r"\bplaceholder implementation\b|"
+                r"\bcannot (?:provide|deliver|write) (?:the )?(?:full|complete)\b",
+                body, flags=re.IGNORECASE):
+            last_issue = "incomplete final strategy"
+            continue
+        return body, None
+    return _STRATEGY_FALLBACK, last_issue
 
 
 class _TimestampedLineStream:
@@ -9841,7 +9862,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         prompt_indices = [coder_retry_prompt_job(
             prompt_jobs, record, _render, coder_retry_prompt_cache,
             reasoning_effort=_coder_effort_for_rollout_phase(
-                cfg, record.get("strategy_rollout_phase")))
+                cfg, record.get("strategy_rollout_phase")),
+            continue_from_failure=bool(getattr(
+                problem, "coder_retry_uses_failed_response", False)))
             for record in failed]
         prompts = [prompt_jobs[index]["prompt_text"] for index in prompt_indices]
         with eval_progress_condition:

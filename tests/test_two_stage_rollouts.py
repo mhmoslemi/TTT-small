@@ -140,6 +140,18 @@ def test_extract_final_strategy_rejects_short_block():
     assert reason == "missing complete final strategy"
 
 
+def test_extract_final_strategy_rejects_explicit_omission_placeholder():
+    raw = (
+        "assistantfinal<strategy>"
+        + "Detailed implementation steps and mathematical checks. " * 4
+        + "<...> (rest of long strategy here ...)"
+        + "</strategy>"
+    )
+    body, reason = _extract_final_strategy(raw)
+    assert body == _STRATEGY_FALLBACK
+    assert reason == "incomplete final strategy"
+
+
 def test_extract_final_strategy_empty_response_returns_fallback():
     body, reason = _extract_final_strategy("")
     assert body == _STRATEGY_FALLBACK

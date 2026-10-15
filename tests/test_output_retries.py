@@ -106,6 +106,23 @@ class OutputContractTests(unittest.TestCase):
             self.assertEqual(retry[-1]["content"].count("Your previous attempt"), 1)
             self.assertEqual(retry, output_retry_messages(original, kind))
 
+    def test_coder_continuation_retry_keeps_failed_work_in_separate_turn(self):
+        original = [{"role": "user", "content": "parent and strategy"}]
+        retry = output_retry_messages(
+            original, "coder", failed_response="partial derivation and code")
+        self.assertEqual(original, [{"role": "user", "content": "parent and strategy"}])
+        self.assertEqual(retry[-2], {
+            "role": "assistant", "content": "partial derivation and code"})
+        self.assertEqual(retry[-1]["role"], "user")
+        self.assertIn("do not restart the mathematical derivation",
+                      retry[-1]["content"])
+        self.assertIn("complete fenced Python block", retry[-1]["content"])
+
+        long_retry = output_retry_messages(
+            original, "coder", failed_response="head" + "x" * 60_000)
+        self.assertNotIn("head", long_retry[-2]["content"])
+        self.assertTrue(long_retry[-2]["content"].endswith("x" * 48_000))
+
     def test_strategy_three_retries_means_four_total_attempts(self):
         for attempt in range(3):
             self.assertTrue(strategy_retry_needed("missing", attempt, 3, label="s1"))

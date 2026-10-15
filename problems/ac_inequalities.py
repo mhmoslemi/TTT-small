@@ -95,6 +95,10 @@ evaluate_sequence_ac2 = evaluate_sequence
 class ACInequalities(Problem):
     two_stage_rollouts = True
     saves_construction = True
+    # A malformed AC answer commonly ends after a long mathematical
+    # derivation.  Give the recovery turn that work so it completes the
+    # program instead of repeating the derivation from the beginning.
+    coder_retry_uses_failed_response = True
     name = "ac_inequalities"
 
     def __init__(self, cfg: dict):
@@ -168,6 +172,17 @@ Autocorrelation-specific implementation constraints:
   A direct CVXPY call is not a solution unless the stated subproblem satisfies
   the solver's rules. Explain any relaxation or alternating subproblem, how a
   candidate is recovered, and how it is checked by the original evaluator.
+- The supplied parents can contain several thousand coefficients. Never form a
+  dense n-by-n identity, Toeplitz/convolution operator, Hessian, or constraint
+  matrix, and never estimate a gradient with one evaluator call per
+  coordinate. Those constructions have quadratic memory or evaluation count
+  and are not feasible here. An LP is acceptable only with a genuinely sparse
+  or matrix-free operator whose storage and solver behavior you spell out.
+- The exact evaluator itself performs the authoritative full convolution, so
+  exact acceptance calls are the scarce resource. Use cheap vectorized or FFT
+  surrogates to propose candidates if useful, then spend a bounded number of
+  exact calls on acceptance. Adapt that count from measured elapsed time and
+  retain enough headroom to return the fallback.
 - Derive dimensions from runtime inputs. If changing resolution, specify the
   exact interpolation/resampling rule, normalization, validity checks, and how
   the new candidate is compared with the parent. Explain initialization when
@@ -218,6 +233,11 @@ AC2 mathematical checks for the final plan:
   and close the single Python fence well before the generation limit.
 - Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
   best-so-far fallback and return it before the configured deadline.
+- The expert plan has already done the mathematical design. Do not spend the
+  response re-deriving the problem on toy lengths or narrating alternatives.
+  Resolve only implementation details in private reasoning, then emit the
+  complete program. A simple executable implementation with the parent as a
+  fallback is preferable to an ambitious program that is never finished.
 
 These are hard output constraints even if the proposed strategy conflicts
 with them.''')
@@ -296,6 +316,12 @@ The evaluator below is read-only and is the only definition of the score:
   lambda functions. Do not use filesystem or network I/O.
 - Construct large arrays algorithmically. Do not paste long numeric literals,
   lookup tables, repeated-value lists, or unrolled patterns.
+- Runtime parent lengths are commonly in the thousands. Do not allocate dense
+  n-by-n matrices (including `np.eye(n)`), dense convolution/Toeplitz
+  operators, or use one finite-difference evaluation per coordinate. Generated
+  programs must keep auxiliary storage linear or near-linear in n. If using a
+  solver, use a truly sparse/matrix-free formulation and set an internal stop
+  condition that leaves time to return the saved fallback.
 
 {state_ctx}
 {construction_section}

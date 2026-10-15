@@ -2,91 +2,57 @@ example_ae_program_random_init = (
     lambda num_seconds: f'''
 import numpy as np
 import time
-from scipy import optimize
-linprog = optimize.linprog
 
 
-def get_good_direction_to_move_into(sequence):
-    """Returns a better direction using LP to find g with larger sum while keeping conv bounded."""
-    n = len(sequence)
-    sum_sequence = np.sum(sequence)
-    normalized_sequence = [x * np.sqrt(2 * n) / sum_sequence for x in sequence]
-    rhs = np.max(np.convolve(normalized_sequence, normalized_sequence))
-    g_fun = solve_convolution_lp(normalized_sequence, rhs)
-    if g_fun is None:
-        return None
-    sum_g = np.sum(g_fun)
-    normalized_g_fun = [x * np.sqrt(2 * n) / sum_g for x in g_fun]
-    t = 0.01
-    new_sequence = [(1 - t) * x + t * y for x, y in zip(sequence, normalized_g_fun)]
-    return new_sequence
-
-
-def solve_convolution_lp(f_sequence, rhs):
-    """Solves the LP: maximize sum(b) s.t. conv(f, b) <= rhs, b >= 0."""
-    n = len(f_sequence)
-    c = -np.ones(n)
-    a_ub = []
-    b_ub = []
-    for k in range(2 * n - 1):
-        row = np.zeros(n)
-        for i in range(n):
-            j = k - i
-            if 0 <= j < n:
-                row[j] = f_sequence[i]
-        a_ub.append(row)
-        b_ub.append(rhs)
-    a_ub_nonneg = -np.eye(n)
-    b_ub_nonneg = np.zeros(n)
-    a_ub = np.vstack([a_ub, a_ub_nonneg])
-    b_ub = np.hstack([b_ub, b_ub_nonneg])
-    result = linprog(c, A_ub=a_ub, b_ub=b_ub, options={{
-        'time_limit': 10.0,   # seconds, make sure we don't get stuck
-        'disp': False,
-    }})
-    if result.success:
-        return result.x
-    return None
+def make_block_perturbation(base, rng):
+    """Return one O(n)-memory nonnegative perturbation of ``base``."""
+    candidate = np.asarray(base, dtype=np.float64).copy()
+    n = candidate.size
+    width = int(rng.integers(max(1, n // 200), max(2, n // 12)))
+    start = int(rng.integers(0, max(1, n - width + 1)))
+    stop = min(n, start + width)
+    candidate[start:stop] *= float(np.exp(rng.normal(0.0, 0.12)))
+    if rng.random() < 0.35:
+        candidate = 0.5 * (candidate + candidate[::-1])
+    return np.clip(candidate, 0.0, 1000.0)
 
 
 def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
-    np.random.seed(seed)
-    deadline = time.time() + budget_s - 10
-        
-    if np.random.rand() < 0.5:
-        # Start from the SOTA sequence (already available as height_sequence_1)
-        best_sequence = list(height_sequence_1)
-    else:
-        # Start from random initialization, could help if height_sequence_1 is a local minimum
-        best_sequence = [np.random.random()] * np.random.randint(100, 1000)
-    curr_sequence = best_sequence.copy()
-    best_score = evaluate_sequence(best_sequence)
-    
-    while time.time() < deadline:
-        h_function = get_good_direction_to_move_into(curr_sequence)
-        if h_function is None:
-            # Random perturbation if LP fails
-            idx = np.random.randint(len(curr_sequence))
-            curr_sequence[idx] = max(0, curr_sequence[idx] + np.random.randn() * 0.01)
-        else:
-            curr_sequence = h_function
-        
-        try:
-            curr_score = evaluate_sequence(curr_sequence)
-            if curr_score < best_score:
-                best_score = curr_score
-                best_sequence = curr_sequence.copy()
-        except:
-            pass
-    
-    return best_sequence
+    """Memory-bounded exact-evaluation local search with a valid fallback."""
+    rng = np.random.default_rng(seed)
+    deadline = time.monotonic() + max(0.0, float(budget_s) - 3.0)
+    parent = np.clip(
+        np.asarray(height_sequence_1, dtype=np.float64), 0.0, 1000.0)
+    if parent.ndim != 1 or parent.size == 0 or not np.isfinite(parent).all():
+        parent = np.ones(256, dtype=np.float64)
+    best = parent.copy()
+    best_score = float(evaluate_sequence(best.tolist()))
+
+    # Each proposal uses O(n) auxiliary memory.  The exact evaluator remains
+    # authoritative, and timing naturally limits calls for longer sequences.
+    while time.monotonic() < deadline:
+        candidate = make_block_perturbation(best, rng)
+        score = float(evaluate_sequence(candidate.tolist()))
+        if np.isfinite(score) and score < best_score:
+            best = candidate
+            best_score = score
+
+    return [float(x) for x in best]
 ''')
 
 
 AC1_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encouraged to explore.
 ```latex
 Starting from a nonnegative step function $f=(a_0,\dots,a_{n-1})$ normalized so that $\sum_j a_j=\sqrt{2n}$, set $M=\|f*f\|_\infty$. Next compute $g_0=(b_0,\dots,b_{n-1})$ by solving a linear program, i.e.\ maximizing $\sum_j b_j$ subject to $b_j\ge0$ and $\|f*g_0\|_\infty\le M$; as is standard, the optimum is attained at an extreme point determined by an active set of binding inequalities, here corresponding to important constraints where the convolution bound $(f*g_0)(x)\le M$ is tight and limiting. Rescale $g_0$ to match the normalization, $g=\frac{\sqrt{2n}}{\sum_j b_j}g_0$, and update $f\leftarrow (1-t)f+t g$ for a small $t>0$. Repeating this step produces a sequence with nonincreasing $\|f*f\|_\infty$, and the iteration is continued until it stabilizes.
-```"""
+```
+
+This is a mathematical description, not permission to materialize its full
+linear operator densely. For a runtime sequence of length n, a dense
+convolution/Toeplitz matrix or dense n-by-n identity has quadratic storage and
+is not a viable implementation. Any LP realization must use a genuinely
+sparse or matrix-free formulation with bounded working memory; otherwise use
+a different search method.
+"""
 
 
 AC1_EVAL_FUNCTION = '''```python

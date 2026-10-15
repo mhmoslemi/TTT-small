@@ -68,6 +68,7 @@ def test_two_stage_prompts_preserve_exact_math_and_compact_handoff(
 
     strategy_text = problem.build_strategy_messages(base)[-1]["content"]
     assert "full *linear* self-convolution" in strategy_text
+    assert "Never form a\n  dense n-by-n identity" in strategy_text
     assert "<strategy>" in strategy_text
     if problem_type == "ac1":
         assert "2*n*max(convolve" in strategy_text
@@ -78,6 +79,8 @@ def test_two_stage_prompts_preserve_exact_math_and_compact_handoff(
     assert "Treat the strategy as planning guidance" in coder_text
     assert "Mandatory compact-source and return contract" in coder_text
     assert "at most 32 scalar" in coder_text
+    assert "Do not spend the\n  response re-deriving" in coder_text
+    assert problem.coder_retry_uses_failed_response is True
 
     problem.two_stage_rollouts = False
     direct_text = problem.build_prompt(parent)[-1]["content"]

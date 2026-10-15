@@ -4,6 +4,9 @@ from copy import deepcopy
 import re
 
 
+_CODER_RETRY_CONTEXT_MAX_CHARS = 48_000
+
+
 def final_answer_scope(response, *, require_final_marker=False):
     text = str(response or "")
     lowered = text.lower()
@@ -37,8 +40,14 @@ def coder_output_issue(response, *, require_final_marker=False):
     return None
 
 
-def output_retry_messages(messages, kind):
-    """Add one reminder to the frozen original; never include failed reasoning."""
+def output_retry_messages(messages, kind, *, failed_response=None):
+    """Add one reminder to the frozen original.
+
+    A coder recovery may retain the failed assistant turn so a reasoning model
+    can finish work it already performed instead of restarting the same long
+    derivation. Strategy retries deliberately remain fresh attempts: an
+    invalid strategy is never admitted into the dependent strategy chain.
+    """
     if kind == "strategy":
         contract = (
             "one complete <strategy>...</strategy> block containing the full "
@@ -59,7 +68,21 @@ def output_retry_messages(messages, kind):
         "You may reason as needed, but you MUST finish with " + contract + ". "
         "Close the required block before the token limit and put nothing after it.")
     result = deepcopy(messages)
-    if result and result[-1].get("role") == "user":
+    if kind == "coder" and failed_response is not None:
+        failed_text = str(failed_response)
+        if len(failed_text) > _CODER_RETRY_CONTEXT_MAX_CHARS:
+            failed_text = (
+                "[Earlier failed reasoning omitted; the most recent work "
+                "follows.]\n" + failed_text[-_CODER_RETRY_CONTEXT_MAX_CHARS:])
+        result.append({"role": "assistant", "content": failed_text})
+        reminder = (
+            "The assistant attempt immediately above failed only because it "
+            "did not deliver the required complete final program. Continue "
+            "from that work; do not restart the mathematical derivation, do "
+            "not analyze toy cases, and do not repeat discarded alternatives. "
+            "Now produce " + contract + ". Put nothing after the closing fence.")
+        result.append({"role": "user", "content": reminder})
+    elif result and result[-1].get("role") == "user":
         result[-1]["content"] = str(result[-1].get("content", "")) + "\n\n" + reminder
     else:
         result.append({"role": "user", "content": reminder})
@@ -97,14 +120,22 @@ def coder_retry_gate(records):
 
 
 def coder_retry_prompt_job(
-        prompt_jobs, record, render, cache, *, reasoning_effort=None):
+        prompt_jobs, record, render, cache, *, reasoning_effort=None,
+        continue_from_failure=False):
     """Separate prompt ID so generation, reference scoring and training agree."""
     source_idx = int(record["job_idx"])
     phase = record.get("strategy_rollout_phase")
-    key = (source_idx, phase, reasoning_effort)
+    retry_identity = (
+        (record.get("group_id"), record.get("rollout_index"))
+        if continue_from_failure else None)
+    key = (source_idx, phase, reasoning_effort, retry_identity)
     if key not in cache:
         source = prompt_jobs[source_idx]
-        messages = output_retry_messages(source["messages"], "coder")
+        messages = output_retry_messages(
+            source["messages"], "coder",
+            failed_response=(record.get("text")
+                             if continue_from_failure else None),
+        )
         render_options = {"rollout_phase": phase}
         if reasoning_effort is not None:
             render_options["reasoning_effort"] = reasoning_effort
