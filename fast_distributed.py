@@ -465,7 +465,8 @@ def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
 
 def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                       token_budget, *, memory_fraction=0.80, work_queue=None,
-                      activation_offload_semaphore=None):
+                      activation_offload_semaphore=None,
+                      defer_exact_oom=False):
     """Accumulate one rank's gradients and leave them attached to the model."""
     import torch
     import train_multy_CVaR as training
@@ -494,6 +495,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     max_prefix_ratio = 0.0
     entropy_examples = 0
     quarantined_examples = 0
+    deferred_keys = []
+    deferred_token_lengths = []
     backward_batches = 0
     trained_examples = 0
     peak_memory_fraction = 0.0
@@ -534,6 +537,14 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         return int(
             example["prompt_ids"].shape[1]
             + example["response_ids"].shape[1])
+
+    def record_deferred(example):
+        key = example.get("_overlap_key")
+        if (not isinstance(key, (tuple, list)) or len(key) != 2):
+            raise RuntimeError(
+                "deferred exact SPO-RS trajectory has no stable overlap key")
+        deferred_keys.append((int(key[0]), int(key[1])))
+        deferred_token_lengths.append(example_length(example))
 
     def example_gate(example):
         return bool(example["rank_entropy_gate"] and entropy_coef > 0.0)
@@ -660,6 +671,18 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         cpu_batch = take_batch()
         if not cpu_batch:
             break
+        forced_overflow_min_tokens = int(getattr(
+            cfg, "_exact_replica_overflow_min_tokens", 0) or 0)
+        if defer_exact_oom and forced_overflow_min_tokens > 0:
+            retained = []
+            for example in cpu_batch:
+                if example_length(example) >= forced_overflow_min_tokens:
+                    record_deferred(example)
+                else:
+                    retained.append(example)
+            cpu_batch = retained
+            if not cpu_batch:
+                continue
         requested_padded_tokens = _padded_token_count(cpu_batch)
         fused_long_singleton = bool(
             len(cpu_batch) == 1
@@ -797,7 +820,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     attempt_entropy_examples,
                 )
 
-            result, effective_batches, quarantined = (
+            result, effective_batches, unprocessed = (
                 training._run_oom_resilient_backward(
                     model, [local_batch], attempt,
                     device_label=f"cuda:{logical_id}",
@@ -805,7 +828,8 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     start_checkpointed=fused_long_singleton,
                     start_with_headroom=fused_long_singleton,
                     activation_offload_semaphore=(
-                        activation_offload_semaphore)))
+                        activation_offload_semaphore),
+                    defer_exact_oom=bool(defer_exact_oom)))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
             used_at_peak = min(
@@ -834,7 +858,11 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 entropy_examples += result[3]
 
             model.zero_grad(set_to_none=True)
-            quarantined_examples += len(quarantined)
+            if defer_exact_oom:
+                for deferred_example in unprocessed:
+                    record_deferred(deferred_example)
+            else:
+                quarantined_examples += len(unprocessed)
             backward_batches += len(effective_batches)
             trained_examples += sum(
                 len(batch) for batch in effective_batches)
@@ -846,7 +874,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                      + example["response_ids"].shape[1])
                  for batch in effective_batches for example in batch),
                 default=1)
-            backed_off = bool(len(effective_batches) > 1 or quarantined)
+            backed_off = bool(len(effective_batches) > 1 or unprocessed)
             if not effective_batches:
                 budget = max(1, budget // 2)
             elif backed_off:
@@ -876,7 +904,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     longest_successful,
                     int(round(0.5 * budget + 0.5 * desired_budget)))
 
-        del local_batch, effective_batches, quarantined
+        del local_batch, effective_batches, unprocessed
 
     with torch.cuda.device(logical_id), torch.no_grad():
         for parameter, accumulator in zip(
@@ -892,6 +920,9 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         "max_prefix_ratio": max_prefix_ratio,
         "entropy_examples": entropy_examples,
         "quarantined_examples": quarantined_examples,
+        "deferred_examples": len(deferred_keys),
+        "deferred_keys": deferred_keys,
+        "deferred_token_lengths": deferred_token_lengths,
         "backward_batches": backward_batches,
         "trained_examples": trained_examples,
         "peak_memory_fraction": peak_memory_fraction,
@@ -1455,7 +1486,9 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     memory_fraction=command.get("memory_fraction", 0.80),
                     work_queue=work_queue,
                     activation_offload_semaphore=(
-                        activation_offload_semaphore))
+                        activation_offload_semaphore),
+                    defer_exact_oom=bool(command.get(
+                        "defer_exact_oom", False)))
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,

@@ -587,6 +587,110 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(effective, [[example]])
         self.assertEqual(quarantined, [])
 
+    def test_strict_training_can_defer_only_untrainable_singleton(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        model._ttt_strict_exact_long_training = True
+        example = {
+            "prompt_ids": torch.zeros((1, 5), dtype=torch.long),
+            "response_ids": torch.zeros((1, 7), dtype=torch.long),
+            "_overlap_key": (3, 11),
+        }
+
+        def attempt(_batches):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    return_value=nullcontext())):
+            result, effective, deferred = _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0",
+                defer_exact_oom=True)
+
+        self.assertIsNone(result)
+        self.assertEqual(effective, [])
+        self.assertEqual(deferred, [example])
+
+    def test_strict_training_still_raises_without_selective_overflow(self):
+        import torch
+        from train_multy_CVaR import (
+            ExactLongContextTrainingOOM, _run_oom_resilient_backward)
+
+        model = torch.nn.Linear(2, 1)
+        model._ttt_strict_exact_long_training = True
+        example = {
+            "prompt_ids": torch.zeros((1, 5), dtype=torch.long),
+            "response_ids": torch.zeros((1, 7), dtype=torch.long),
+        }
+
+        def attempt(_batches):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    return_value=nullcontext()),
+              self.assertRaises(ExactLongContextTrainingOOM)):
+            _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0")
+
+    def test_selective_overflow_persists_and_merges_completed_gradients(self):
+        import torch
+        from train_multy_CVaR import (
+            _apply_precomputed_exact_gradients,
+            _clear_exact_sharded_recovery,
+            _load_exact_spo_rs_overflow,
+            _save_exact_spo_rs_overflow,
+            _write_exact_sharded_recovery,
+        )
+
+        model = torch.nn.Linear(2, 1)
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 2.0)
+        totals = {
+            "loss": 1.0,
+            "policy_loss": 0.5,
+            "kl_estimate": 0.0,
+            "entropy_estimate": 0.0,
+            "ratio": 1.0,
+            "clipped_fraction": 0.0,
+        }
+        rank_stats = [{
+            "totals": totals,
+            "max_ratio": 1.1,
+            "max_prefix_ratio": 1.2,
+            "entropy_examples": 0,
+            "trained_examples": 4,
+            "backward_batches": 2,
+            "deferred_examples": 1,
+            "deferred_keys": [(0, 4)],
+        }]
+
+        with tempfile.TemporaryDirectory() as directory:
+            gradient_path, marker, _keys, _stats = (
+                _save_exact_spo_rs_overflow(
+                    directory, 3, model, rank_stats))
+            # The generic top-level recovery handler rewrites the reason after
+            # worker shutdown; selective metadata must survive that rewrite.
+            _write_exact_sharded_recovery(
+                directory, 3, "automatic restart")
+            loaded = _load_exact_spo_rs_overflow(directory, 3)
+
+            self.assertTrue(gradient_path.is_file())
+            self.assertTrue(marker.is_file())
+            self.assertEqual(loaded["deferred_keys"], [(0, 4)])
+            for parameter in model.parameters():
+                parameter.grad = torch.full_like(parameter, 3.0)
+            _apply_precomputed_exact_gradients(model, loaded, 3)
+            for parameter in model.parameters():
+                torch.testing.assert_close(
+                    parameter.grad, torch.full_like(parameter, 5.0))
+
+            _clear_exact_sharded_recovery(directory)
+            self.assertFalse(gradient_path.exists())
+            self.assertFalse(marker.exists())
+
     def test_training_oom_profile_reuses_learned_work_cap(self):
         import torch
         from train_multy_CVaR import _run_oom_resilient_backward
