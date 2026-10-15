@@ -635,11 +635,45 @@ class VLLMBackendTests(unittest.TestCase):
             _run_oom_resilient_backward(
                 model, [[example]], attempt, device_label="cuda:0")
 
+    def test_sharded_overflow_disables_unbounded_cpu_activation_offload(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PyTorch is required for exact OOM recovery")
+        import torch
+        from train_multy_CVaR import (
+            ExactLongContextTrainingOOM, _run_oom_resilient_backward)
+
+        model = torch.nn.Linear(2, 1)
+        model._ttt_strict_exact_long_training = True
+        example = {
+            "prompt_ids": torch.zeros((1, 5), dtype=torch.long),
+            "response_ids": torch.zeros((1, 7), dtype=torch.long),
+        }
+        expansions = iter((0.96, 0.98, 0.99))
+
+        def attempt(_batches):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("torch.autograd.graph.save_on_cpu") as offload,
+              self.assertRaises(ExactLongContextTrainingOOM)):
+            _run_oom_resilient_backward(
+                model, [[example]], attempt,
+                device_label="model-sharded GPUs",
+                expand_memory=lambda: next(expansions, None),
+                start_checkpointed=True,
+                start_with_headroom=True,
+                allow_activation_offload=False)
+
+        offload.assert_not_called()
+
     def test_selective_overflow_persists_and_merges_completed_gradients(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PyTorch is required for overflow gradient recovery")
         import torch
         from train_multy_CVaR import (
             _apply_precomputed_exact_gradients,
             _clear_exact_sharded_recovery,
+            _commit_exact_spo_rs_overflow_progress,
             _load_exact_spo_rs_overflow,
             _save_exact_spo_rs_overflow,
             _write_exact_sharded_recovery,
@@ -663,8 +697,8 @@ class VLLMBackendTests(unittest.TestCase):
             "entropy_examples": 0,
             "trained_examples": 4,
             "backward_batches": 2,
-            "deferred_examples": 1,
-            "deferred_keys": [(0, 4)],
+            "deferred_examples": 2,
+            "deferred_keys": [(0, 4), (0, 5)],
         }]
 
         with tempfile.TemporaryDirectory() as directory:
@@ -679,9 +713,30 @@ class VLLMBackendTests(unittest.TestCase):
 
             self.assertTrue(gradient_path.is_file())
             self.assertTrue(marker.is_file())
-            self.assertEqual(loaded["deferred_keys"], [(0, 4)])
+            self.assertEqual(loaded["deferred_keys"], [(0, 4), (0, 5)])
+            self.assertEqual(loaded["remaining_keys"], [(0, 4), (0, 5)])
             for parameter in model.parameters():
                 parameter.grad = torch.full_like(parameter, 3.0)
+            trajectory_stats = {
+                "totals": totals,
+                "max_ratio": 1.3,
+                "max_prefix_ratio": 1.4,
+                "entropy_examples": 0,
+            }
+            remaining = _commit_exact_spo_rs_overflow_progress(
+                model, loaded, 3, (0, 4), trajectory_stats,
+                training_seconds=7.0)
+            self.assertEqual(remaining, 1)
+
+            loaded = _load_exact_spo_rs_overflow(directory, 3)
+            self.assertEqual(loaded["completed_keys"], [(0, 4)])
+            self.assertEqual(loaded["remaining_keys"], [(0, 5)])
+            self.assertEqual(
+                loaded["overflow_stats"]["trained_examples"], 1)
+            self.assertEqual(
+                loaded["overflow_stats"]["training_seconds"], 7.0)
+            for parameter in model.parameters():
+                parameter.grad = torch.zeros_like(parameter)
             _apply_precomputed_exact_gradients(model, loaded, 3)
             for parameter in model.parameters():
                 torch.testing.assert_close(
@@ -690,6 +745,24 @@ class VLLMBackendTests(unittest.TestCase):
             _clear_exact_sharded_recovery(directory)
             self.assertFalse(gradient_path.exists())
             self.assertFalse(marker.exists())
+
+    def test_sharded_gradient_clip_uses_one_global_norm(self):
+        if importlib.util.find_spec("torch") is None:
+            self.skipTest("PyTorch is required for gradient clipping")
+        import torch
+        from train_multy_CVaR import _clip_sharded_grad_norm_
+
+        first = torch.nn.Parameter(torch.tensor([3.0]))
+        second = torch.nn.Parameter(torch.tensor([4.0]))
+        first.grad = torch.tensor([3.0])
+        second.grad = torch.tensor([4.0])
+
+        norm = _clip_sharded_grad_norm_(
+            [first, second], 2.5, error_if_nonfinite=True)
+
+        self.assertAlmostEqual(norm, 5.0, places=6)
+        torch.testing.assert_close(first.grad, torch.tensor([1.5]))
+        torch.testing.assert_close(second.grad, torch.tensor([2.0]))
 
     def test_training_oom_profile_reuses_learned_work_cap(self):
         import torch
