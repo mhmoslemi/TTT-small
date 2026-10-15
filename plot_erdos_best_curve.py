@@ -17,6 +17,9 @@ from pathlib import Path
 
 # Match the numeric part of folder names such as "step03".
 _STEP_RE = re.compile(r"step(\d+)")
+_PRINT_TARGET_RE = re.compile(
+    r"Print/SOTA target:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+)
 
 # CVD-friendly palette and paper-style surface from the reference plot.
 BLUE = "#2a78d6"
@@ -97,9 +100,25 @@ def _run_info(run_dir):
     return config, problem, "reward", True
 
 
-def _display_target(config):
-    """Return the display/SOTA target without changing the prompt target."""
+def _display_target(config, run_dir=None):
+    """Return the display/SOTA target without changing the prompt target.
+
+    Older run snapshots may predate ``target_print`` even when a later resume
+    used it. In that case, recover the run-specific value recorded in
+    ``setting.log`` before falling back to the prompt target.
+    """
     target = _finite_float(config.get("target_print"))
+    if target is None and run_dir is not None:
+        setting_log = Path(run_dir) / "setting.log"
+        try:
+            matches = _PRINT_TARGET_RE.findall(setting_log.read_text(
+                encoding="utf-8", errors="replace"))
+        except OSError:
+            matches = []
+        for value in reversed(matches):
+            target = _finite_float(value)
+            if target is not None:
+                break
     if target is None:
         target = _finite_float(config.get("target"))
     return target
@@ -399,7 +418,7 @@ def plot_best_curve(run_dir, output=None, title=None, min_label_delta=1e-5,
     # Plot the problem's display-only SOTA threshold when configured. Fall
     # back to the prompt target for older run directories. Never hard-code an
     # Erdos value here: this renderer is shared by Erdos, AC1, and AC2.
-    target = _display_target(config)
+    target = _display_target(config, run_dir)
 
     # Draw the target as a dashed horizontal reference line.
     if target is not None:

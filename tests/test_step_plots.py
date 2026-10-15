@@ -160,6 +160,13 @@ class StepPlotTests(unittest.TestCase):
             _display_target({"target": 10.0, "target_print": 20.0}), 20.0)
         self.assertEqual(_display_target({"target": 10.0}), 10.0)
 
+    def test_display_target_recovers_print_target_from_old_run_log(self):
+        (self.root / "setting.log").write_text(
+            "[00:00:00] Target:             10.0\n"
+            "[00:00:01] Print/SOTA target:  20.0\n"
+        )
+        self.assertEqual(_display_target({"target": 10.0}, self.root), 20.0)
+
     def test_curve_uses_authoritative_best_seen_in_step_summary(self):
         (self.root / "config.json").write_text(json.dumps({
             "problem": "ac1", "problem_type": "ac1",
