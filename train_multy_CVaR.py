@@ -110,18 +110,6 @@ class ExactLongContextTrainingOOM(RuntimeError):
     """One exact trajectory needs the automatic multi-GPU training path."""
 
 
-class ExactOverflowProgressRestart(RuntimeError):
-    """One durable overflow gradient finished; restart before the next one."""
-
-    def __init__(self, step, completed_key, remaining):
-        self.step = int(step)
-        self.completed_key = tuple(int(value) for value in completed_key)
-        self.remaining = int(remaining)
-        super().__init__(
-            f"step {self.step} committed exact overflow trajectory "
-            f"{self.completed_key}; {self.remaining} remain")
-
-
 def _exact_sharded_recovery_path(run_dir):
     return Path(run_dir) / _EXACT_SHARDED_RECOVERY_FILE
 
@@ -5767,10 +5755,13 @@ def _train_durable_exact_spo_rs_overflow(
                             reference_lp.detach())
 
         # The durable checkpoint already contains the fast-replica gradient and
-        # any oversized trajectories completed by earlier recovery processes.
-        # Compute exactly one remaining trajectory per process. This bounds
-        # allocator/pinned-memory lifetime and makes every expensive backward
-        # independently resumable after a VM or process interruption.
+        # any oversized trajectories completed by an earlier recovery process.
+        # Commit after every trajectory, but keep the sharded model resident
+        # and continue through the remaining work in this process. This path
+        # never uses CPU activation offload, and the cleanup below releases the
+        # completed graph and CUDA caches before the next trajectory. Progress
+        # therefore remains independently resumable without repeatedly loading
+        # the complete checkpoint.
         ordered_examples = sorted(
             examples,
             key=lambda example: int(
@@ -5892,10 +5883,6 @@ def _train_durable_exact_spo_rs_overflow(
                 "trajectories remain",
                 flush=True,
             )
-            if remaining_count:
-                raise ExactOverflowProgressRestart(
-                    step_idx, key, remaining_count)
-
     # All sample gradients now live in one durable CPU checkpoint. Materialize
     # them on their owning parameter shards, clip the single global update once,
     # and take exactly one optimizer step.
@@ -15118,16 +15105,6 @@ def main():
                     flush=True,
                 )
                 break
-    except ExactOverflowProgressRestart as progress:
-        restart_for_exact_recovery = True
-        print(
-            f"[recovery] step {progress.step}: exact gradient for "
-            f"key={progress.completed_key} is durable; restarting a clean "
-            f"model-sharded process for the remaining {progress.remaining} "
-            "trajectory/trajectories. No rollout, evaluation, or completed "
-            "backward work will repeat",
-            flush=True,
-        )
     except ExactLongContextTrainingOOM as error:
         if getattr(cfg, "_exact_sharded_recovery_step", None) is not None:
             raise RuntimeError(
