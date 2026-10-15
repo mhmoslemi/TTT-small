@@ -9487,19 +9487,31 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 f"strategy chain {chain['chain_id']} received strategy "
                 f"{strategy_index} after {len(chain['strategies'])} records")
         raw_response = str(response_text or "")
+        normalize_response = getattr(
+            problem, "normalize_strategy_response", None)
+        accepted_response = (
+            str(normalize_response(raw_response))
+            if callable(normalize_response) else raw_response)
         save_strategy_response(
             exp_dir,
             step_idx,
             int(chain["parent_group"]),
             int(chain["fold_index"]),
             int(strategy_index),
-            raw_response,
+            accepted_response,
         )
-        strategy, extraction_issue = _extract_final_strategy(raw_response)
+        strategy, extraction_issue = _extract_final_strategy(accepted_response)
+        if extraction_issue is None:
+            validate_strategy = getattr(
+                problem, "strategy_output_issue", None)
+            if callable(validate_strategy):
+                extraction_issue = validate_strategy(strategy)
+                if extraction_issue is not None:
+                    strategy = _STRATEGY_FALLBACK
         if extraction_issue is not None:
             raise RuntimeError("cannot admit an invalid strategy into a dependent chain")
         chain["strategies"].append({
-            "response": raw_response,
+            "response": accepted_response,
             "strategy": strategy,
             "extraction_issue": extraction_issue,
         })
@@ -9522,10 +9534,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     def _handle_strategy_attempt(chain_index, strategy_index, response, attempt):
         chain = strategy_chains[int(chain_index)]
-        issue = _extract_final_strategy(response)[1]
+        raw_response = str(response or "")
+        normalize_response = getattr(
+            problem, "normalize_strategy_response", None)
+        checked_response = (
+            str(normalize_response(raw_response))
+            if callable(normalize_response) else raw_response)
+        strategy, issue = _extract_final_strategy(checked_response)
+        if issue is None:
+            validate_strategy = getattr(
+                problem, "strategy_output_issue", None)
+            if callable(validate_strategy):
+                issue = validate_strategy(strategy)
         save_strategy_response(
             exp_dir, step_idx, int(chain["parent_group"]),
-            int(chain["fold_index"]), int(strategy_index), response,
+            int(chain["fold_index"]), int(strategy_index), raw_response,
             attempt=int(attempt), extraction_issue=issue,
             prompt_text=strategy_attempt_prompts.pop(
                 (int(chain["chain_id"]), int(strategy_index), int(attempt))))

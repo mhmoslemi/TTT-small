@@ -11,6 +11,7 @@ Autocorrelation Inequalities (AC1 and AC2).
 from __future__ import annotations
 
 import inspect
+import re
 from typing import Any, List
 
 import numpy as np
@@ -25,6 +26,45 @@ from examples.ac_inequalities.prompt import (
     example_ae_program_random_init,
     thetaevolve_initial_program_prev_init,
 )
+
+
+def _ac_bytelevel_decoder_table():
+    """Inverse GPT-2/ByteLevel alphabet used only for AC plan recovery."""
+    byte_values = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    unicode_values = list(byte_values)
+    extra = 0
+    for value in range(256):
+        if value not in byte_values:
+            byte_values.append(value)
+            unicode_values.append(256 + extra)
+            extra += 1
+    return {
+        chr(character): value
+        for value, character in zip(byte_values, unicode_values)
+    }
+
+
+_AC_BYTELEVEL_DECODE = _ac_bytelevel_decoder_table()
+_AC_BYTELEVEL_MARKERS = ("\u0120", "\u010a", "\u0109", "\u010d")
+
+
+def _repair_ac_bytelevel_surface(text: str) -> str:
+    """Repair a serialized byte-token surface for AC strategy text only."""
+    original = str(text or "")
+    if not any(marker in original for marker in _AC_BYTELEVEL_MARKERS):
+        return original
+    payload = bytearray()
+    for character in original:
+        value = _AC_BYTELEVEL_DECODE.get(character)
+        if value is None:
+            payload.extend(character.encode("utf-8"))
+        else:
+            payload.append(value)
+    return payload.decode("utf-8", errors="replace")
 
 def evaluate_sequence(sequence: list) -> float:
     """
@@ -151,6 +191,11 @@ class ACInequalities(Problem):
             previous_strategies: List[str] | None = None) -> List[dict]:
         common = '''
 Autocorrelation-specific implementation constraints:
+- Write the final plan as normal, readable English prose with ordinary spaces
+  and line breaks. Never emit serialized tokenizer surfaces, escaped token
+  streams, tool/backend error messages, execution traces, or mixed-language
+  fragments. Before closing the block, confirm that all six requested sections
+  are present in order and readable independently of the reasoning transcript.
 - If a current construction exists, `height_sequence_1` is already supplied
   to the executed program as a one-dimensional NumPy array. Never copy,
   serialize, reconstruct, or hard-code that array. Plan a compact algorithm
@@ -211,6 +256,33 @@ AC2 mathematical checks for the final plan:
         staged = self._append_user_instruction(messages, common + mathematical)
         return super().build_strategy_messages(
             staged, previous_strategies=previous_strategies)
+
+    def strategy_output_issue(self, strategy: str) -> str | None:
+        """Reject corrupted AC plans before they reach another model.
+
+        DeepSeek/Qwen occasionally returns a syntactically valid strategy block
+        whose prose is still a byte-token surface or a collapsed backend-error
+        fragment.  Those strings are not useful exploration: the coder cannot
+        reliably interpret them.  This gate is deliberately AC-only and checks
+        text integrity rather than mathematical quality.
+        """
+        text = str(strategy or "")
+        byte_markers = sum(text.count(marker)
+                           for marker in ("\u0120", "\u010a", "\u0109", "\u010d"))
+        if byte_markers or "\ufffd" in text:
+            return "AC strategy contained tokenizer-decoding artifacts"
+        if re.search(r"\S{240,}", text):
+            return "AC strategy contained collapsed or unreadable text"
+        if re.search(
+                r"\bErrorMessage\s*:|\bError during execution\b|"
+                r"\bChatCoder\b|/opt/[^\s]+/project\b",
+                text, flags=re.IGNORECASE):
+            return "AC strategy contained backend error text"
+        return None
+
+    def normalize_strategy_response(self, response: str) -> str:
+        """Repair byte-token surfaces only for AC strategy generation."""
+        return _repair_ac_bytelevel_surface(response)
 
     def build_code_messages(self, messages: List[dict],
                             strategy: str) -> List[dict]:

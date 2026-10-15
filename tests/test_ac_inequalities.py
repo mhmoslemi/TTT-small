@@ -68,6 +68,7 @@ def test_two_stage_prompts_preserve_exact_math_and_compact_handoff(
 
     strategy_text = problem.build_strategy_messages(base)[-1]["content"]
     assert "full *linear* self-convolution" in strategy_text
+    assert "normal, readable English prose" in strategy_text
     assert "Never form a\n  dense n-by-n identity" in strategy_text
     assert "<strategy>" in strategy_text
     if problem_type == "ac1":
@@ -85,4 +86,29 @@ def test_two_stage_prompts_preserve_exact_math_and_compact_handoff(
     problem.two_stage_rollouts = False
     direct_text = problem.build_prompt(parent)[-1]["content"]
     assert "Return exactly one complete fenced Python code block" in direct_text
+
+
+@pytest.mark.parametrize("problem_type", ["ac1", "ac2"])
+def test_ac_strategy_integrity_gate_rejects_decoding_and_collapse(problem_type):
+    problem = make_problem(problem_type)
+    assert problem.strategy_output_issue(
+        "A detailed readable plan with formulas, dimensions, and validation.") is None
+    assert "tokenizer-decoding" in problem.strategy_output_issue(
+        "planĠwithĊbyteĠmarkers")
+    assert "tokenizer-decoding" in problem.strategy_output_issue(
+        "otherwise readable plan with one damaged character \ufffd")
+    assert "collapsed" in problem.strategy_output_issue("x" * 300)
+    assert "backend error" in problem.strategy_output_issue(
+        "Detailed plan followed by ErrorMessage: ChatCoder failed")
+
+
+@pytest.mark.parametrize("problem_type", ["ac1", "ac2"])
+def test_ac_strategy_normalizer_repairs_byte_surface_locally(problem_type):
+    problem = make_problem(problem_type)
+    surface = "<strategy>HelloĠworldĊAĠæ¢B</strategy>"
+    repaired = problem.normalize_strategy_response(surface)
+    assert repaired.startswith("<strategy>Hello world\nA ")
+    assert repaired.endswith("B</strategy>")
+    assert "Ġ" not in repaired and "Ċ" not in repaired
+    assert "\ufffd" in repaired
 

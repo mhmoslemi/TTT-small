@@ -532,6 +532,33 @@ class StrategyAttemptTests(unittest.TestCase):
             self.assertFalse(s["strategy_prompt_cache"])
             self.assertFalse(s["strategy_attempt_prompts"])
 
+    def test_problem_specific_strategy_integrity_issue_is_retried(self):
+        with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            s = self.scope(directory)
+            chain = s["strategy_chains"][0]
+            s["problem"].strategy_output_issue = (
+                lambda strategy: (
+                    "AC strategy contained tokenizer-decoding artifacts"
+                    if "Ġ" in strategy else None))
+            s["_strategy_prompt"](s["source_prompt_jobs"], chain, 0)
+            bad = "<strategy>" + ("corruptedĠplan " * 12) + "</strategy>"
+            self.assertTrue(s["_handle_strategy_attempt"](0, 0, bad, 0))
+            self.assertFalse(chain["strategies"])
+            meta = next((Path(directory) / "step00").glob("*_attempt00.meta.json"))
+            self.assertIn(
+                "tokenizer-decoding",
+                json.loads(meta.read_text())["extraction_issue"])
+
+            s["_strategy_prompt"](
+                s["source_prompt_jobs"], chain, 0, retry=1)
+            good_plan = (
+                "Readable complete strategy with mathematical definitions, "
+                "implementation steps, budget controls, fallback behavior, "
+                "and exact validation before returning the construction.")
+            good = f"<strategy>{good_plan}</strategy>"
+            self.assertFalse(s["_handle_strategy_attempt"](0, 0, good, 1))
+            self.assertEqual(chain["strategies"][0]["strategy"], good_plan)
+
     def test_api_batch_path_saves_at_arrival_and_obeys_same_retry_limit(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             s = self.scope(directory)
