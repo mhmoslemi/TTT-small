@@ -743,8 +743,9 @@ def _extract_final_strategy(response_text):
     the end of the response. An explicit final channel is preferred when the
     template exposes one, but is not required: preceding reasoning is harmless
     because it is never returned. A missing, empty, or unclosed final block is
-    retried by the caller; exhausting the configured limit stops the run.
-    The fallback string is only an extraction-error sentinel, never handed off.
+    retried by the caller. If every retry is malformed, the caller deliberately
+    hands the coder the explicit no-strategy fallback instead of aborting the
+    entire rollout step.
     """
     raw = final_answer_scope(response_text).strip()
     if not raw:
@@ -9536,6 +9537,29 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"{issue}; format retry {int(attempt) + 1}/"
                   f"{strategy_format_max_retries} with unchanged reasoning/sampling",
                   flush=True)
+        elif issue is not None:
+            # Preserve every malformed raw attempt above, but make the
+            # canonical strategy for this slot an explicit direct-solve
+            # instruction.  This keeps dependent stages and coder rollout
+            # counts intact without admitting malformed planner text.
+            fallback_response = (
+                f"<strategy>{_STRATEGY_FALLBACK}</strategy>")
+            _record_strategy_response(
+                chain, strategy_index, fallback_response)
+            chain["strategies"][-1].update({
+                "used_fallback": True,
+                "fallback_issue": issue,
+                "failed_attempts": int(attempt) + 1,
+            })
+            strategy_prompt_cache.pop(
+                (int(chain["chain_id"]), int(strategy_index)), None)
+            print(
+                f"[warn] strategy {strategy_index + 1}, chain "
+                f"{chain_index + 1}: {issue} after "
+                f"{int(attempt) + 1} attempts; continuing this slot without "
+                "a strategist plan",
+                flush=True,
+            )
         else:
             _record_strategy_response(chain, strategy_index, response)
             strategy_prompt_cache.pop((int(chain["chain_id"]), int(strategy_index)), None)
@@ -13067,7 +13091,8 @@ def main():
             "off (enable with --coder-retry)"
         )
         print(f"Output retries:     strategy up to {cfg.strategy_format_max_retries} "
-              f"(stop on exhaustion); coder {coder_retry_label}")
+              f"(direct-solve fallback on exhaustion); coder "
+              f"{coder_retry_label}")
         print(f"Strategy sampling:  max_new={cfg.strategy_max_new_tokens}, "
               f"max_seq={cfg.strategy_max_seq_length}, "
               f"temperature={cfg.strategy_temperature}, "

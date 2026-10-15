@@ -151,11 +151,12 @@ def coder_retry_prompt_job(
 
 
 def strategy_retry_needed(issue, attempt, max_retries, *, label):
+    """Retry malformed strategy output until the configured limit.
+
+    Exhaustion is not fatal.  The caller installs an explicit no-strategy
+    fallback for that slot so one malformed planner chain cannot abort the
+    rollout step.
+    """
     if issue is None:
         return False
-    if int(attempt) >= int(max_retries):
-        raise RuntimeError(
-            f"{label}: {issue} after {int(max_retries)} format retries "
-            f"({int(max_retries) + 1} attempts). All attempts were saved; "
-            "stopping instead of passing a fallback strategy downstream.")
-    return True
+    return int(attempt) < int(max_retries)

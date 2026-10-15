@@ -127,8 +127,7 @@ class OutputContractTests(unittest.TestCase):
         for attempt in range(3):
             self.assertTrue(strategy_retry_needed("missing", attempt, 3, label="s1"))
         self.assertFalse(strategy_retry_needed(None, 3, 3, label="s1"))
-        with self.assertRaisesRegex(RuntimeError, "3 format retries.*4 attempts"):
-            strategy_retry_needed("missing", 3, 3, label="s1")
+        self.assertFalse(strategy_retry_needed("missing", 3, 3, label="s1"))
 
     def test_each_strategy_attempt_and_prompt_survive_canonical_replacement(self):
         with TemporaryDirectory() as tmp:
@@ -495,18 +494,23 @@ class StrategyAttemptTests(unittest.TestCase):
                     self.assertNotIn("changed task", prompt)
                     self.assertTrue(prompt.startswith("HIGH:"))
                     self.assertEqual(prompt.count("Your previous attempt"), 1)
-                response = "bad" if attempt < 3 else "<think>reason</think><strategy>final plan</strategy>"
+                valid_plan = (
+                    "final plan with concrete implementation steps, numerical "
+                    "checks, validation rules, and a complete handoff to the coder")
+                response = (
+                    "bad" if attempt < 3 else
+                    f"<think>reason</think><strategy>{valid_plan}</strategy>")
                 retry = s["_handle_strategy_attempt"](0, 0, response, attempt)
                 self.assertEqual(retry, attempt < 3)
                 self.assertEqual(len(chain["strategies"]), int(attempt == 3))
-            self.assertEqual(chain["strategies"][0]["strategy"], "final plan")
+            self.assertEqual(chain["strategies"][0]["strategy"], valid_plan)
             files = list((Path(directory) / "step00").glob("*_attempt*.meta.json"))
             self.assertEqual(len(files), 4)
             self.assertEqual(sum(json.loads(p.read_text())["accepted"] for p in files), 1)
             self.assertFalse(s["strategy_prompt_cache"])
             self.assertFalse(s["strategy_attempt_prompts"])
 
-    def test_failed_last_attempt_saved_before_error_without_canonical_fallback(self):
+    def test_failed_last_attempt_uses_canonical_no_strategy_fallback(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             s = self.scope(directory)
             chain = s["strategy_chains"][0]
@@ -515,12 +519,18 @@ class StrategyAttemptTests(unittest.TestCase):
                 if attempt < 3:
                     self.assertTrue(s["_handle_strategy_attempt"](0, 0, "bad", attempt))
                 else:
-                    with self.assertRaisesRegex(RuntimeError, "4 attempts"):
-                        s["_handle_strategy_attempt"](0, 0, "bad", attempt)
+                    self.assertFalse(
+                        s["_handle_strategy_attempt"](0, 0, "bad", attempt))
             step = Path(directory) / "step00"
             self.assertEqual(len(list(step.glob("*_attempt*.meta.json"))), 4)
-            self.assertFalse((step / "step00_group00_fold00_strategy00.txt").exists())
-            self.assertEqual(chain["strategies"], [])
+            canonical = step / "step00_group00_fold00_strategy00.txt"
+            self.assertIn("No usable strategy was returned", canonical.read_text())
+            self.assertEqual(len(chain["strategies"]), 1)
+            self.assertTrue(chain["strategies"][0]["used_fallback"])
+            self.assertEqual(chain["strategies"][0]["failed_attempts"], 4)
+            self.assertIsNone(chain["strategies"][0]["extraction_issue"])
+            self.assertFalse(s["strategy_prompt_cache"])
+            self.assertFalse(s["strategy_attempt_prompts"])
 
     def test_api_batch_path_saves_at_arrival_and_obeys_same_retry_limit(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -559,6 +569,9 @@ class StrategyAttemptTests(unittest.TestCase):
                 _seed_local_generation=lambda *a: None,
                 backend=SimpleNamespace(disable_adapter=nullcontext)))
             seen = []
+            valid_plan = (
+                "first accepted strategy with concrete implementation steps, "
+                "numerical checks, validation rules, and a complete coder handoff")
             def generate(model, tokenizer, prompts, counts, cfg, **kw):
                 seen.append(prompts[0])
                 if len(seen) <= 3:
@@ -567,7 +580,7 @@ class StrategyAttemptTests(unittest.TestCase):
                     if len(seen) == 5:
                         self.assertIn("first accepted", prompts[0])
                         self.assertNotIn("bad", prompts[0])
-                    yield 0, [("<strategy>first accepted</strategy>", [])]
+                    yield 0, [(f"<strategy>{valid_plan}</strategy>", [])]
             s["generate_prompt_jobs"] = generate
             exec(compile(ast.Module(body=[block], type_ignores=[]), "local_strategy", "exec"), s)
             self.assertEqual(len(seen), 5)
