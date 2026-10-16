@@ -272,10 +272,9 @@ def _save_exact_spo_rs_overflow(
         "deferred_keys": deferred_keys,
         "remaining_keys": deferred_keys,
         "completed_keys": [],
-        # Replicated training reaches this checkpoint only after the bounded
-        # CPU-activation fallback has also failed for these keys. A resume can
-        # therefore route this residual tail straight to the final sharded
-        # lane instead of repeating an identical failed offload attempt.
+        # These keys need cooperative GPU memory: the legacy CPU fallback
+        # failed, or the warm path deliberately bypassed it. Do not replay
+        # a huge CPU activation graph when resuming this residual tail.
         "replica_offload_exhausted": True,
         "normal_stats": normal_stats,
         "overflow_stats": {
@@ -2546,6 +2545,14 @@ def load_config():
             merged.get("fast", False)
             and str(merged.get("training_layout", "")).lower()
             == "replicated")
+        from exact_overflow import supports_warm_overflow
+        warm_recovery = bool(
+            selective_overflow and replicated_layout
+            and supports_warm_overflow(SimpleNamespace(**{
+                **merged,
+                "num_training_gpus": int(merged.get("num_training_gpus") or
+                    len(_parse_gpu_ids(os.environ.get("AVAILABLE_GPUS", "0")))),
+            })))
         can_recover_on_replicas = bool(
             selective_overflow
             and replicated_layout
@@ -2554,7 +2561,12 @@ def load_config():
         can_capture_selectively = bool(
             not selective_overflow
             and replicated_layout)
-        if can_recover_on_replicas:
+        if warm_recovery:
+            merged["_exact_inprocess_recovery_step"] = int(
+                exact_sharded_recovery["step"])
+            print("[recovery] saved overflow gradients will finish on warm "
+                  "cooperative GPU groups; no job restart or model reload")
+        elif can_recover_on_replicas:
             merged["_exact_replica_recovery_step"] = int(
                 exact_sharded_recovery["step"])
             print(
@@ -2588,7 +2600,7 @@ def load_config():
             merged["fast"] = False
             merged["_exact_sharded_recovery_step"] = int(
                 exact_sharded_recovery["step"])
-        if selective_overflow and not can_recover_on_replicas:
+        if selective_overflow and not can_recover_on_replicas and not warm_recovery:
             print(
                 "[recovery] selective exact overflow will reuse completed "
                 "replica gradients and run only deferred trajectories with "
@@ -6021,6 +6033,21 @@ def _train_durable_exact_spo_rs_overflow(
                 "trajectories remain",
                 flush=True,
             )
+    for example in examples:
+        for cache_key in ("rank_old_logprobs", "rank_reference_logprob"):
+            example.pop(cache_key, None)
+    return _finalize_exact_spo_rs_overflow(
+        model, optimizer, cfg, step_idx, overflow_state,
+        completed_before=completed_before)
+
+
+def _finalize_exact_spo_rs_overflow(
+        model, optimizer, cfg, step_idx, overflow_state, *,
+        completed_before=(), label="durable exact overflow recovery"):
+    """Clip and apply the one full-batch update, never a partial overflow update."""
+    if overflow_state.get("remaining_keys"):
+        raise RuntimeError("cannot update the policy with unfinished trajectories")
+    original_keys = overflow_state.get("deferred_keys", ())
     # All sample gradients now live in one durable CPU checkpoint. Materialize
     # them on their owning parameter shards, clip the single global update once,
     # and take exactly one optimizer step.
@@ -6071,12 +6098,9 @@ def _train_durable_exact_spo_rs_overflow(
         f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
         f"clipped={totals['clipped_fraction']:.1%} "
         f"entropy examples={entropy_examples} OOM-quarantined=0 "
-        "(durable exact overflow recovery)",
+        f"({label})",
         flush=True,
     )
-    for example in examples:
-        for cache_key in ("rank_old_logprobs", "rank_reference_logprob"):
-            example.pop(cache_key, None)
     return {
         "rank_updates": history,
         "rank_train_seconds": (
@@ -7673,6 +7697,12 @@ class ProcessDistributedTrainer:
             return total * total + response * maximum_length
 
         copied = self._cpu_examples(examples)
+        overflow_floor = getattr(self, "_warm_overflow_min_tokens", None)
+        if overflow_floor is not None:
+            for example in copied:
+                example["_cooperative_overflow"] = bool(
+                    int(example["prompt_ids"].shape[1]
+                        + example["response_ids"].shape[1]) >= overflow_floor)
         # Packing response branches behind one shared prompt is exact for
         # ordinary transformer attention because the registered branch mask
         # isolates every response.  It is not valid for GPT-OSS (learned
@@ -8016,7 +8046,7 @@ class ProcessDistributedTrainer:
                     f"{len(queued_examples) - deferred_examples}/"
                     f"{len(queued_examples)} trajectories; routing only "
                     f"{deferred_examples} oversized trajectory/trajectories "
-                    "to one model sharded across all GPUs "
+                    "to cooperative GPU overflow "
                     f"(longest={longest} tokens, "
                     f"state={gradient_path.name}, marker={marker.name})",
                     flush=True,
@@ -8042,6 +8072,11 @@ class ProcessDistributedTrainer:
         if update_error is not None:
             raise update_error
         if overflow_error is not None:
+            from exact_overflow import supports_warm_overflow, complete_warm_overflow
+            if supports_warm_overflow(cfg):
+                return complete_warm_overflow(
+                    self, queued_examples, cfg, step_idx,
+                    _load_exact_spo_rs_overflow(self._exp_dir, step_idx))
             raise overflow_error
 
         for rank, stats in enumerate(rank_stats):
@@ -8109,15 +8144,22 @@ class ProcessDistributedTrainer:
 
     def recover_spo_rs_overflow(
             self, examples, cfg, step_idx, overflow_state):
-        """Finish saved SPO-RS overflow work on RAM-bounded GPU replicas.
+        """Finish saved SPO-RS overflow, preferably on warm cooperative groups.
 
-        The normal gradients already stored in ``overflow_state`` are never
+        The HF/BF16 path reuses the live workers without restarting. Legacy
+        backends retain the RAM-bounded replica recovery below.
+        Normal gradients already stored in ``overflow_state`` are never
         replayed. Remaining trajectories are work-stolen by all replicas. A
         trajectory that exhausts card memory may use the shared host-RAM
         admission gate; successful gradients are reduced once and atomically
         merged into the durable checkpoint. Only a trajectory that also fails
         that bounded fallback is left for the final model-sharded lane.
         """
+        from exact_overflow import supports_warm_overflow, complete_warm_overflow
+        if supports_warm_overflow(cfg):
+            return complete_warm_overflow(
+                self, examples, cfg, step_idx, overflow_state)
+
         import torch
         from fast_distributed import (
             broadcast_trainable_parameters, local_rank_update,
@@ -8695,6 +8737,7 @@ class ProcessDistributedTrainer:
             max_workers=1,
             thread_name_prefix="spo-rs-rank0-overlap")
         state = {
+            "overflow_examples": {},
             "step_idx": int(step_idx),
             "started_at": time.time(),
             "computed_at": None,
@@ -8739,6 +8782,8 @@ class ProcessDistributedTrainer:
             for example in queued)
         state["scheduled_keys"].update(
             example["_overlap_key"] for example in queued)
+        state["overflow_examples"].update(
+            (tuple(example["_overlap_key"]), example) for example in queued)
         return len(queued)
 
     def seal_spo_rs_overlap(self):
@@ -8826,8 +8871,8 @@ class ProcessDistributedTrainer:
                             f"{queued_examples - deferred_examples}/"
                             f"{queued_examples} trajectories; routing only "
                             f"{deferred_examples} oversized trajectory/"
-                            "trajectories to one model sharded across all "
-                            f"GPUs (longest={longest} tokens, "
+                            "trajectories to cooperative GPU overflow "
+                            f"(longest={longest} tokens, "
                             f"state={gradient_path.name}, "
                             f"marker={marker.name})",
                             flush=True,
@@ -8868,6 +8913,11 @@ class ProcessDistributedTrainer:
             self._spo_rs_overlap = None
 
         if overflow_error is not None:
+            from exact_overflow import supports_warm_overflow, complete_warm_overflow
+            if supports_warm_overflow(cfg):
+                return complete_warm_overflow(
+                    self, list(state["overflow_examples"].values()), cfg,
+                    step_idx, _load_exact_spo_rs_overflow(self._exp_dir, step_idx))
             raise overflow_error
 
         for rank, stats in enumerate(rank_stats):
@@ -10623,8 +10673,11 @@ def _resume_spo_rs_step_from_artifacts(
         flush=True,
     )
     if overflow_state is not None:
+        from exact_overflow import supports_warm_overflow
         recovery_lane = (
-            f"the {parallel_trainer.world_size}-GPU RAM-bounded replica lane"
+            ("warm cooperative GPU groups (no process restart)"
+             if supports_warm_overflow(cfg) else
+             f"the {parallel_trainer.world_size}-GPU RAM-bounded replica lane")
             if parallel_trainer is not None
             and hasattr(parallel_trainer, "recover_spo_rs_overflow")
             else "the model-sharded overflow lane"
@@ -15673,6 +15726,14 @@ def main():
                       flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
             step_plotter.submit(step)
+            if (stats.get("exact_overflow_inprocess", False)
+                    or getattr(cfg, "_exact_inprocess_recovery_step", None) == step):
+                # Keep partial gradients until the *full* optimizer/sampler
+                # checkpoint is durable. A crash before this point can resume
+                # the same update; a successful step needs no process restart.
+                _clear_exact_sharded_recovery(exp_dir)
+                if hasattr(cfg, "_exact_inprocess_recovery_step"):
+                    delattr(cfg, "_exact_inprocess_recovery_step")
             replica_capture_step = getattr(
                 cfg, "_exact_replica_capture_step", None)
             if replica_capture_step is not None:
@@ -15687,6 +15748,7 @@ def main():
                     "completed on the fast replicas; recovery marker removed",
                     flush=True,
                 )
+                delattr(cfg, "_exact_replica_capture_step")
             replica_recovery_step = getattr(
                 cfg, "_exact_replica_recovery_step", None)
             if replica_recovery_step is not None:
@@ -15701,6 +15763,7 @@ def main():
                     f"step {step} completed; recovery state removed",
                     flush=True,
                 )
+                delattr(cfg, "_exact_replica_recovery_step")
             recovery_step = getattr(
                 cfg, "_exact_sharded_recovery_step", None)
             if recovery_step is not None:

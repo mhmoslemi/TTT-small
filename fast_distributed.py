@@ -472,6 +472,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
     import train_multy_CVaR as training
     from host_memory import reclaim_unused_host_memory
     from model_backend import fused_long_attention_is_active
+    from exact_overflow import supports_warm_overflow
 
     if not 0.0 < float(memory_fraction) <= (
             MAX_STANDARD_TRAINING_MEMORY_FRACTION):
@@ -673,10 +674,12 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
             break
         forced_overflow_min_tokens = int(getattr(
             cfg, "_exact_replica_overflow_min_tokens", 0) or 0)
-        if defer_exact_oom and forced_overflow_min_tokens > 0:
+        if defer_exact_oom:
             retained = []
             for example in cpu_batch:
-                if example_length(example) >= forced_overflow_min_tokens:
+                if (bool(example.get("_cooperative_overflow", False))
+                        or (forced_overflow_min_tokens > 0
+                            and example_length(example) >= forced_overflow_min_tokens)):
                     record_deferred(example)
                 else:
                     retained.append(example)
@@ -838,6 +841,11 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                             False)),
                     activation_offload_semaphore=(
                         activation_offload_semaphore),
+                    # The warm cooperative lane supplies more GPU memory
+                    # without retaining an enormous host activation graph.
+                    # Other objectives/backends keep their existing policy.
+                    allow_activation_offload=not (
+                        defer_exact_oom and supports_warm_overflow(cfg)),
                     defer_exact_oom=bool(defer_exact_oom)))
             peak_allocated = int(torch.cuda.max_memory_allocated())
             peak_reserved = int(torch.cuda.max_memory_reserved())
@@ -1535,6 +1543,23 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     "event": "calibrated", "rank": int(rank),
                     "calibration": calibration,
                 })
+            elif kind == "overflow_backward":
+                if not offloaded:
+                    raise RuntimeError("cooperative overflow requires parked replicas")
+                from exact_overflow import compute_overflow_work
+
+                step_cfg = SimpleNamespace(**dict(command["step_cfg"]))
+                result = compute_overflow_work(
+                    backend, tokenizer, command["example"], step_cfg,
+                    command["gpu_ids"])
+                result_queue.put({
+                    "event": "overflow_computed", "rank": int(rank),
+                    "result": result,
+                })
+            elif kind == "sync_update":
+                broadcast_trainable_parameters(model, source_rank=0)
+                model.zero_grad(set_to_none=True)
+                result_queue.put({"event": "updated", "rank": int(rank)})
             elif kind == "finish_update":
                 gradient_scale = float(command.get("gradient_scale", 1.0))
                 apply_update = bool(command.get("apply_update", True))
