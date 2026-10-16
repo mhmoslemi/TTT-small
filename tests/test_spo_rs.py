@@ -3,6 +3,8 @@ import math
 import numpy as np
 import pytest
 
+from advantage import (adaptive_beta_spo_advantages,
+                       entropic_adaptive_advantages)
 from spo_rs import SPORSTracker
 
 
@@ -10,6 +12,29 @@ def _tracker(**overrides):
     options = dict(entropic_beta=2.0, d_half=0.06, rho_min=0.875, rho_max=0.96)
     options.update(overrides)
     return SPORSTracker(**options)
+
+
+def test_adaptive_beta_spo_reuses_entropic_kl_solution_and_spo_scaling():
+    rewards = np.asarray([0.0, 0.4, 1.1, 1.7, 2.0], dtype=np.float64)
+    entropic, expected_beta = entropic_adaptive_advantages(rewards)
+    advantages, beta, info = adaptive_beta_spo_advantages(
+        rewards, return_info=True)
+
+    assert beta == pytest.approx(expected_beta)
+    assert np.allclose(advantages, entropic / beta)
+    assert info["kl"] == pytest.approx(math.log(2), rel=1e-9)
+    assert info["gamma"] == pytest.approx(math.log(2))
+    assert info["weights"].sum() == pytest.approx(1.0)
+    assert info["adaptive_beta"] is True
+
+
+def test_adaptive_beta_spo_tied_parent_uses_every_rollout_with_zero_gradient():
+    advantages, beta, info = adaptive_beta_spo_advantages(
+        np.asarray([2.0, 2.0, 2.0]), return_info=True)
+    assert beta == 0.0
+    assert np.array_equal(advantages, np.zeros(3))
+    assert info["all_tied"] is True
+    assert info["ess"] == pytest.approx(3.0)
 
 
 def test_transformed_rewards_matches_exponential_reward_transform():

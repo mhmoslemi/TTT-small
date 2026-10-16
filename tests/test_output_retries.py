@@ -456,6 +456,47 @@ class RunnerRetryTests(unittest.TestCase):
         self.assertEqual(examples[0]["advantage"], 5.0)
         self.assertNotIn("_overlap_reward_future", examples[0])
 
+    def test_adaptive_spo_overlap_waits_for_complete_parent_and_uses_all_rewards(self):
+        group_futures = [Future() for _ in range(3)]
+        for future, reward in zip(group_futures, (1.0, 2.0, 4.0)):
+            future.set_result(SimpleNamespace(reward=reward))
+        examples = [
+            {
+                "rollout_index": index,
+                "_overlap_reward_future": group_futures[index],
+                "advantage": None,
+            }
+            for index in (0, 2)
+        ]
+        seen = []
+
+        def adaptive(rewards):
+            seen.append(list(rewards))
+            return [-0.5, 0.25, 1.5], 3.5, {"kl": math.log(2)}
+
+        fake_np = SimpleNamespace(
+            float64=float,
+            asarray=lambda values, dtype=None: list(values),
+        )
+        scope = {"np": fake_np, "_adaptive_spo_group_advantages": adaptive}
+        functions_from_file(
+            "train_multy_CVaR.py",
+            {"_complete_spo_rs_overlap_examples"},
+            scope,
+        )
+        completed = scope["_complete_spo_rs_overlap_examples"](
+            examples, adaptive_beta=True,
+            group_reward_futures=group_futures)
+
+        self.assertIs(completed, examples)
+        self.assertEqual(seen, [[1.0, 2.0, 4.0]])
+        self.assertEqual([example["advantage"] for example in examples],
+                         [-0.5, 1.5])
+        self.assertTrue(all("_overlap_reward_future" not in example
+                            for example in examples))
+        self.assertTrue(all(example["_spo_rs_adaptive_beta"] == 3.5
+                            for example in examples))
+
 
 class StrategyAttemptTests(unittest.TestCase):
     def scope(self, directory):

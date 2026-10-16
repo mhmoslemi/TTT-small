@@ -32,6 +32,7 @@ programs_per_strategy pilot_programs_per_strategy
 pilot_xhigh_programs_per_strategy strategy_archive_top_r
 num_seed_states learning_rate adam_beta1 adam_beta2 adam_epsilon weight_decay
 kl_penalty_coef grad_clip
+spo_rs_beta
 train_examples_per_microbatch logprob_chunk
 puct_c max_buffer_size topk_children_per_parent
 temperature top_p top_k thinking strategy_max_new_tokens
@@ -56,7 +57,8 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
-    "spo_rs_beta", "spo_rs_d_half", "spo_rs_rho_min", "spo_rs_rho_max",
+    "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
+    "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high",
 })
@@ -357,6 +359,12 @@ def validate_problem_config(
         _positive_number(data, "adam_epsilon", source)
     if "weight_decay" in data and float(data["weight_decay"]) < 0:
         raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
+    if "spo_rs_beta" in data:
+        _positive_number(data, "spo_rs_beta", source)
+    if ("spo_rs_adaptive_beta" in data
+            and not isinstance(data["spo_rs_adaptive_beta"], bool)):
+        raise ValueError(
+            f"{_label(source)}: spo_rs_adaptive_beta must be true or false")
     if "uct" in data and not isinstance(data["uct"], bool):
         raise ValueError(f"{_label(source)}: uct must be true or false")
     if "reward_workers" in data and int(data["reward_workers"]) < 0:

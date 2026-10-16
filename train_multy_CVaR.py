@@ -1632,6 +1632,7 @@ X_GRPO_CONTEXTS_PER_STEP_DEFAULT = 3
 X_GRPO_BASE_BUDGETS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 # X_GRPO_BASE_BUDGETS = (0.25, 0.5, 1.0, 2.0, 4.0)
 SPO_RS_BETA_DEFAULT = 2.0
+SPO_RS_ADAPTIVE_GAMMA = math.log(2.0)
 SPO_RS_D_HALF_DEFAULT = 0.06
 SPO_RS_RHO_MIN_DEFAULT = 0.875
 SPO_RS_RHO_MAX_DEFAULT = 0.96
@@ -1837,6 +1838,10 @@ def _resolve_spo_rs_options(merged):
         merged[name] = value
     if merged["spo_rs_beta"] <= 0.0:
         raise ValueError("spo_rs_beta must be positive")
+    adaptive_beta = merged.get("spo_rs_adaptive_beta", False)
+    if not isinstance(adaptive_beta, bool):
+        raise ValueError("spo_rs_adaptive_beta must be true or false")
+    merged["spo_rs_adaptive_beta"] = bool(adaptive_beta)
     if merged["spo_rs_d_half"] <= 0.0:
         raise ValueError("spo_rs_d_half must be positive")
     if not (0.0 < merged["spo_rs_rho_min"]
@@ -2071,6 +2076,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--x-grpo-entropy-coef", type=float, default=None,
                    help="X-GRPO: exploration coefficient for rejected-budget "
                         "or completely tied groups (default 0.001).")
+    beta_mode = p.add_mutually_exclusive_group()
+    beta_mode.add_argument(
+        "--adaptive-beta-spo", "--spo-rs-adaptive-beta",
+        dest="spo_rs_adaptive_beta", action="store_const", const=True,
+        default=None,
+        help="SPO-RS: choose one KL-budgeted beta per parent from all of its "
+             "rollouts (KL target log(2)).")
+    beta_mode.add_argument(
+        "--constant-beta-spo", "--spo-rs-fixed-beta",
+        dest="spo_rs_adaptive_beta", action="store_const", const=False,
+        default=None,
+        help="SPO-RS: use the fixed --spo-rs-beta/YAML value (default mode).")
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="SPO-RS: fixed entropic reward coefficient beta "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
@@ -2426,6 +2443,12 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
+    if (saved and args.spo_rs_adaptive_beta is not None
+            and bool(saved.get("spo_rs_adaptive_beta", False))
+            != bool(args.spo_rs_adaptive_beta)):
+        raise ValueError(
+            "cannot change fixed/adaptive SPO beta mode while resuming; "
+            "start a fresh run for a different objective")
     if args.rank_clip_epsilon is not None:
         if args.rank_clip_epsilon_low is None:
             merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
@@ -5448,20 +5471,52 @@ def _prepare_spo_rs_overlap_inputs(
     return prepared
 
 
-def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker):
-    """Attach exact SPO-RS advantages to reward-complete staged inputs."""
+def _adaptive_spo_group_advantages(rewards):
+    """Return the shared KL-budgeted SPO result for one complete parent."""
+    from advantage import adaptive_beta_spo_advantages
+
+    return adaptive_beta_spo_advantages(
+        np.asarray(rewards, dtype=np.float64),
+        gamma=SPO_RS_ADAPTIVE_GAMMA,
+        return_info=True,
+    )
+
+
+def _complete_spo_rs_overlap_examples(
+        examples, spo_rs_tracker=None, *, adaptive_beta=False,
+        group_reward_futures=None):
+    """Attach exact fixed- or adaptive-beta SPO advantages to staged inputs."""
     if not examples:
         return []
     futures = [example.get("_overlap_reward_future") for example in examples]
     if any(future is None or not future.done() for future in futures):
         raise RuntimeError(
             "SPO-RS overlap received an example before its reward completed")
-    rewards = [float(future.result().reward) for future in futures]
-    transformed = spo_rs_tracker.transformed_rewards(rewards)
-    advantages = spo_rs_tracker.normalized_advantages(transformed)
-    if advantages is None:
-        raise RuntimeError(
-            "SPO-RS overlap lost its frozen pre-step tracker baseline")
+    if adaptive_beta:
+        group_futures = list(group_reward_futures or ())
+        if not group_futures or any(not future.done() for future in group_futures):
+            raise RuntimeError(
+                "adaptive-beta SPO overlap requires the complete parent group")
+        group_rewards = [
+            float(future.result().reward) for future in group_futures]
+        group_advantages, beta, info = _adaptive_spo_group_advantages(
+            group_rewards)
+        advantages = np.asarray([
+            group_advantages[int(example["rollout_index"])]
+            for example in examples
+        ], dtype=np.float64)
+        for example in examples:
+            example["_spo_rs_adaptive_beta"] = float(beta)
+            example["_spo_rs_adaptive_kl"] = float(info["kl"])
+    else:
+        if spo_rs_tracker is None:
+            raise RuntimeError("fixed-beta SPO-RS overlap requires its tracker")
+        rewards = [float(future.result().reward) for future in futures]
+        transformed = spo_rs_tracker.transformed_rewards(rewards)
+        advantages = spo_rs_tracker.normalized_advantages(transformed)
+        if advantages is None:
+            raise RuntimeError(
+                "SPO-RS overlap lost its frozen pre-step tracker baseline")
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)
         # concurrent.futures.Future is not process-queue serializable and is
@@ -9889,11 +9944,18 @@ def _finalize_pending_spo_rs_artifacts(
     from problems.base import ParentContext, RewardResult
     from sampler import State
 
-    if gen_pool is None or cfg.generation_backend != "vllm":
+    adaptive_spo_beta = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
+
+    if cfg.generation_backend != "vllm":
         raise RuntimeError(
-            "generated-step SPO-RS recovery requires the configured vLLM "
-            "pool for exact consecutive-policy scoring")
-    if spo_rs_tracker is None or not spo_rs_tracker.initialized:
+            "generated-step SPO-RS recovery requires exact vLLM rollout "
+            "artifacts")
+    if not adaptive_spo_beta and gen_pool is None:
+        raise RuntimeError(
+            "fixed-beta generated-step SPO-RS recovery requires the "
+            "configured vLLM pool for exact consecutive-policy scoring")
+    if (not adaptive_spo_beta
+            and (spo_rs_tracker is None or not spo_rs_tracker.initialized)):
         raise RuntimeError(
             "generated-step SPO-RS recovery requires the restored pre-step "
             "tracker")
@@ -10017,36 +10079,41 @@ def _finalize_pending_spo_rs_artifacts(
             current_scores.append(item["behavior_logprobs"])
             context_ids.append(int(item["meta"]["parent_group"]))
 
-        previous_name = spo_rs_tracker.last_policy_adapter
-        if previous_name is None:
-            raise RuntimeError(
-                "generated-step recovery has no preceding SPO-RS adapter")
-        previous_adapter_path = Path(exp_dir) / previous_name
-        if not previous_adapter_path.is_dir():
-            raise FileNotFoundError(
-                "generated-step recovery cannot find the preceding policy "
-                f"adapter: {previous_adapter_path}")
-        if (previous_adapter_path.resolve()
-                == Path(sampling_adapter_path).resolve()):
-            previous_scores = current_scores
+        if adaptive_spo_beta:
+            divergence = 0.0
+            missing_scores = 0
+            context_divergences = {}
         else:
-            try:
-                previous_scores = gen_pool.score_token_logprobs(
-                    score_pairs, show_progress=True,
-                    adapter_path=str(previous_adapter_path),
-                    require_complete=True)
-            finally:
-                if getattr(gen_pool, "sequential", False):
-                    gen_pool.release()
+            previous_name = spo_rs_tracker.last_policy_adapter
+            if previous_name is None:
+                raise RuntimeError(
+                    "generated-step recovery has no preceding SPO-RS adapter")
+            previous_adapter_path = Path(exp_dir) / previous_name
+            if not previous_adapter_path.is_dir():
+                raise FileNotFoundError(
+                    "generated-step recovery cannot find the preceding policy "
+                    f"adapter: {previous_adapter_path}")
+            if (previous_adapter_path.resolve()
+                    == Path(sampling_adapter_path).resolve()):
+                previous_scores = current_scores
+            else:
+                try:
+                    previous_scores = gen_pool.score_token_logprobs(
+                        score_pairs, show_progress=True,
+                        adapter_path=str(previous_adapter_path),
+                        require_complete=True)
+                finally:
+                    if getattr(gen_pool, "sequential", False):
+                        gen_pool.release()
 
-        divergence, missing_scores, context_divergences = (
-            spo_rs_tracker.consecutive_policy_divergence(
-                current_scores, previous_scores, context_ids,
-                required_context_ids=range(int(cfg.groups_per_step))))
-        if missing_scores or not math.isfinite(divergence):
-            raise RuntimeError(
-                "generated-step recovery did not obtain every exact "
-                "consecutive-policy score")
+            divergence, missing_scores, context_divergences = (
+                spo_rs_tracker.consecutive_policy_divergence(
+                    current_scores, previous_scores, context_ids,
+                    required_context_ids=range(int(cfg.groups_per_step))))
+            if missing_scores or not math.isfinite(divergence):
+                raise RuntimeError(
+                    "generated-step recovery did not obtain every exact "
+                    "consecutive-policy score")
 
         eval_bar = make_progress_bar(
             len(evaluation_futures), desc="recovering evaluations")
@@ -10060,29 +10127,66 @@ def _finalize_pending_spo_rs_artifacts(
         evaluation_pool.shutdown(wait=True, cancel_futures=False)
 
     rewards = [float(result.reward) for result in results]
-    transformed = spo_rs_tracker.transformed_rewards(rewards)
-    advantages = spo_rs_tracker.normalized_advantages(transformed)
-    if advantages is None:
-        raise RuntimeError(
-            "generated-step recovery lost the pre-step SPO-RS baseline")
-    preview_tracker = deepcopy(spo_rs_tracker)
-    update = preview_tracker.update(
-        transformed, divergence=divergence,
-        policy_adapter=sampling_adapter_path, step=step_idx)
     prompt_indices = {}
     for item in artifacts:
         prompt_text = item["prompt_path"].read_text(
             encoding="utf-8", errors="replace")
         if prompt_text not in prompt_indices:
             prompt_indices[prompt_text] = len(prompt_indices)
-    update.update({
-        "groups": sorted({int(item["meta"]["group"])
-                          for item in artifacts}),
-        "prompt_jobs": list(range(len(prompt_indices))),
-        "contexts": sorted(set(context_ids)),
-        "context_divergences": context_divergences,
-        "missing_policy_scores": int(missing_scores),
-    })
+    if adaptive_spo_beta:
+        advantages = np.empty(len(artifacts), dtype=np.float64)
+        rollout_infos = [None] * len(artifacts)
+        beta_by_index = np.empty(len(artifacts), dtype=np.float64)
+        indices_by_group = {}
+        for index, item in enumerate(artifacts):
+            indices_by_group.setdefault(
+                int(item["meta"]["group"]), []).append(index)
+        for group, indices in sorted(indices_by_group.items()):
+            group_advantages, beta, group_info = (
+                _adaptive_spo_group_advantages(
+                    [rewards[index] for index in indices]))
+            weights = np.asarray(group_info.pop("weights"), dtype=np.float64)
+            update = {
+                **group_info,
+                "group": group,
+                "context": int(artifacts[indices[0]]["meta"]["parent_group"]),
+                "group_size": len(indices),
+                "policy_adapter": Path(sampling_adapter_path).name,
+                "step": int(step_idx),
+            }
+            for local_index, artifact_index in enumerate(indices):
+                advantages[artifact_index] = group_advantages[local_index]
+                beta_by_index[artifact_index] = beta
+                rollout_infos[artifact_index] = {
+                    **update,
+                    "tilt_weight": float(weights[local_index]),
+                    "used_for_policy_update": True,
+                }
+    else:
+        transformed = spo_rs_tracker.transformed_rewards(rewards)
+        advantages = spo_rs_tracker.normalized_advantages(transformed)
+        if advantages is None:
+            raise RuntimeError(
+                "generated-step recovery lost the pre-step SPO-RS baseline")
+        preview_tracker = deepcopy(spo_rs_tracker)
+        update = preview_tracker.update(
+            transformed, divergence=divergence,
+            policy_adapter=sampling_adapter_path, step=step_idx)
+        update.update({
+            "groups": sorted({int(item["meta"]["group"])
+                              for item in artifacts}),
+            "prompt_jobs": list(range(len(prompt_indices))),
+            "contexts": sorted(set(context_ids)),
+            "context_divergences": context_divergences,
+            "missing_policy_scores": int(missing_scores),
+        })
+        rollout_infos = [{
+            **update,
+            "transformed_reward": float(transformed[index]),
+            "used_for_policy_update": True,
+        } for index in range(len(artifacts))]
+        beta_by_index = np.full(
+            len(artifacts), float(cfg.spo_rs_beta), dtype=np.float64)
 
     save_ctor = bool(getattr(problem, "saves_construction", False))
     sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
@@ -10111,11 +10215,7 @@ def _finalize_pending_spo_rs_artifacts(
             raw_strategy = strategy_path.read_text(
                 encoding="utf-8", errors="replace")
             strategy, _issue = _extract_final_strategy(raw_strategy)
-        info = {
-            **update,
-            "transformed_reward": float(transformed[index]),
-            "used_for_policy_update": True,
-        }
+        info = rollout_infos[index]
         meta = {
             key: value for key, value in pending.items()
             if key != "status"
@@ -10134,9 +10234,9 @@ def _finalize_pending_spo_rs_artifacts(
             "msg": result.msg,
             "failure_kind": result.failure_kind,
             "advantage": float(advantages[index]),
-            "beta": float(cfg.spo_rs_beta),
+            "beta": float(beta_by_index[index]),
             "advantage_mode": "spo-rs",
-            "advantage_scale": float(cfg.spo_rs_beta),
+            "advantage_scale": float(beta_by_index[index]),
             "sandbox_stdout": (result.stdout or "")[:2000],
             "parent_value": (float(parent.value)
                              if parent.value is not None else None),
@@ -10177,8 +10277,10 @@ def _finalize_pending_spo_rs_artifacts(
 
     print(
         f"[resume] step {step_idx}: reused {len(artifacts)} exact generated "
-        "rollouts, recomputed their CPU rewards, and completed exact "
-        "consecutive-policy scoring; no policy sampling was repeated",
+        "rollouts, recomputed their CPU rewards, and completed "
+        + ("per-parent adaptive-beta advantages"
+           if adaptive_spo_beta else "exact consecutive-policy scoring")
+        + "; no policy sampling was repeated",
         flush=True,
     )
     completed = _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg)
@@ -10198,12 +10300,15 @@ def _resume_spo_rs_step_from_artifacts(
     from reward import extract_python_code
     from sampler import State
 
+    adaptive_spo_beta = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
+
     if (parallel_trainer is None
             and str(getattr(cfg, "training_layout", "")) != "sharded"):
         raise RuntimeError(
             "evaluated-step recovery requires either the configured fast "
             "distributed trainer or the automatic exact sharded trainer")
-    if spo_rs_tracker is None or not spo_rs_tracker.initialized:
+    if (not adaptive_spo_beta
+            and (spo_rs_tracker is None or not spo_rs_tracker.initialized)):
         raise RuntimeError(
             "evaluated-step recovery requires the pre-step SPO-RS tracker")
     if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
@@ -10255,19 +10360,9 @@ def _resume_spo_rs_step_from_artifacts(
         sampler.record_expansion(parent, count=int(cfg.group_size))
 
     rewards = [float(item["meta"]["reward"]) for item in artifacts]
-    transformed = spo_rs_tracker.transformed_rewards(rewards)
-    recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
     saved_advantages = np.asarray(
         [float(item["meta"]["advantage"]) for item in artifacts],
         dtype=np.float64)
-    if (recovered_advantages is None
-            or recovered_advantages.shape != saved_advantages.shape
-            or not np.allclose(recovered_advantages, saved_advantages,
-                               rtol=0.0, atol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery advantages do not match the restored "
-            "pre-step SPO-RS tracker; refusing an inexact update")
-
     spo_infos = [
         _literal_metadata_mapping(item["meta"].get("spo_rs"))
         for item in artifacts
@@ -10277,56 +10372,125 @@ def _resume_spo_rs_step_from_artifacts(
         raise RuntimeError(
             "evaluated-step recovery found a rollout that was not part of "
             "the saved SPO-RS policy update")
-    spo_info = spo_infos[0]
-    saved_value_before = spo_info.get("value_before")
-    if (saved_value_before is None
-            or not math.isclose(float(saved_value_before),
-                                float(spo_rs_tracker.baseline()),
-                                rel_tol=0.0, abs_tol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery does not match the saved pre-step "
-            "SPO-RS value")
-    if int(spo_info.get("group_size", -1)) != len(artifacts):
-        raise RuntimeError(
-            "evaluated-step recovery rollout count differs from the saved "
-            "SPO-RS update")
-    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(
-            sampling_adapter_path).name:
-        raise RuntimeError(
-            "evaluated-step recovery sampling adapter differs from the "
-            "saved SPO-RS update")
-    for index, (info, transformed_reward) in enumerate(
-            zip(spo_infos, transformed)):
-        saved_transformed = info.get("transformed_reward")
-        if (saved_transformed is None
-                or not math.isclose(float(saved_transformed),
-                                    float(transformed_reward),
+    recovery_updates = []
+    if adaptive_spo_beta:
+        recovered_advantages = np.empty(len(artifacts), dtype=np.float64)
+        indices_by_group = {}
+        for index, item in enumerate(artifacts):
+            indices_by_group.setdefault(
+                int(item["meta"]["group"]), []).append(index)
+        for group, indices in sorted(indices_by_group.items()):
+            group_advantages, beta, group_info = (
+                _adaptive_spo_group_advantages(
+                    [rewards[index] for index in indices]))
+            group_info.pop("weights")
+            saved_group_infos = [spo_infos[index] for index in indices]
+            if any(not bool(info.get("adaptive_beta", False))
+                   for info in saved_group_infos):
+                raise RuntimeError(
+                    "evaluated-step recovery expected adaptive-beta SPO metadata")
+            expected_context = int(
+                artifacts[indices[0]]["meta"].get("parent_group", group))
+            expected_adapter = Path(sampling_adapter_path).name
+            if any(
+                    int(info.get("group", -1)) != group
+                    or int(info.get("context", -1)) != expected_context
+                    or int(info.get("group_size", -1)) != len(indices)
+                    or int(info.get("step", -1)) != int(step_idx)
+                    or Path(str(info.get("policy_adapter", ""))).name
+                    != expected_adapter
+                    for info in saved_group_infos):
+                raise RuntimeError(
+                    f"evaluated-step recovery metadata differs for group "
+                    f"{group}")
+            if any(not math.isclose(
+                    float(info.get("beta", math.nan)), float(beta),
+                    rel_tol=0.0, abs_tol=1e-10)
+                   for info in saved_group_infos):
+                raise RuntimeError(
+                    f"evaluated-step recovery beta differs for group {group}")
+            if any(not math.isclose(
+                    float(artifacts[index]["meta"].get("beta", math.nan)),
+                    float(beta), rel_tol=0.0, abs_tol=1e-10)
+                   for index in indices):
+                raise RuntimeError(
+                    f"evaluated-step recovery top-level beta differs for "
+                    f"group {group}")
+            update = {
+                **group_info,
+                "group": group,
+                "context": expected_context,
+                "group_size": len(indices),
+                "policy_adapter": expected_adapter,
+                "step": int(step_idx),
+            }
+            recovery_updates.append(update)
+            for local_index, artifact_index in enumerate(indices):
+                recovered_advantages[artifact_index] = (
+                    group_advantages[local_index])
+        divergence = 0.0
+    else:
+        transformed = spo_rs_tracker.transformed_rewards(rewards)
+        recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
+        spo_info = spo_infos[0]
+        saved_value_before = spo_info.get("value_before")
+        if (saved_value_before is None
+                or not math.isclose(float(saved_value_before),
+                                    float(spo_rs_tracker.baseline()),
                                     rel_tol=0.0, abs_tol=1e-10)):
             raise RuntimeError(
-                "evaluated-step recovery transformed reward differs from "
-                f"the saved SPO-RS record at rollout {index}")
-    divergence = spo_info.get("divergence")
-    if divergence is None:
-        if bool(spo_info.get("divergence_missing", False)):
-            divergence = math.inf
-        else:
+                "evaluated-step recovery does not match the saved pre-step "
+                "SPO-RS value")
+        if int(spo_info.get("group_size", -1)) != len(artifacts):
             raise RuntimeError(
-                "evaluated-step recovery has no saved SPO-RS divergence")
-    divergence = float(divergence)
-    if math.isnan(divergence) or divergence < 0.0:
+                "evaluated-step recovery rollout count differs from the saved "
+                "SPO-RS update")
+        if Path(str(spo_info.get("policy_adapter", ""))).name != Path(
+                sampling_adapter_path).name:
+            raise RuntimeError(
+                "evaluated-step recovery sampling adapter differs from the "
+                "saved SPO-RS update")
+        for index, (info, transformed_reward) in enumerate(
+                zip(spo_infos, transformed)):
+            saved_transformed = info.get("transformed_reward")
+            if (saved_transformed is None
+                    or not math.isclose(float(saved_transformed),
+                                        float(transformed_reward),
+                                        rel_tol=0.0, abs_tol=1e-10)):
+                raise RuntimeError(
+                    "evaluated-step recovery transformed reward differs from "
+                    f"the saved SPO-RS record at rollout {index}")
+        divergence = spo_info.get("divergence")
+        if divergence is None:
+            if bool(spo_info.get("divergence_missing", False)):
+                divergence = math.inf
+            else:
+                raise RuntimeError(
+                    "evaluated-step recovery has no saved SPO-RS divergence")
+        divergence = float(divergence)
+        if math.isnan(divergence) or divergence < 0.0:
+            raise RuntimeError(
+                "evaluated-step recovery found an invalid SPO-RS divergence")
+        tracker_update = spo_rs_tracker.update(
+            transformed, divergence=divergence,
+            policy_adapter=sampling_adapter_path, step=step_idx)
+        recovery_updates = [tracker_update]
+        saved_after = spo_info.get("value_after")
+        if (saved_after is not None
+                and not math.isclose(float(saved_after),
+                                     float(tracker_update["value_after"]),
+                                     rel_tol=0.0, abs_tol=1e-10)):
+            raise RuntimeError(
+                "evaluated-step recovery produced a different SPO-RS tracker "
+                "value; refusing an inexact update")
+
+    if (recovered_advantages is None
+            or recovered_advantages.shape != saved_advantages.shape
+            or not np.allclose(recovered_advantages, saved_advantages,
+                               rtol=0.0, atol=1e-10)):
         raise RuntimeError(
-            "evaluated-step recovery found an invalid SPO-RS divergence")
-    tracker_update = spo_rs_tracker.update(
-        transformed, divergence=divergence,
-        policy_adapter=sampling_adapter_path, step=step_idx)
-    saved_after = spo_info.get("value_after")
-    if (saved_after is not None
-            and not math.isclose(float(saved_after),
-                                 float(tracker_update["value_after"]),
-                                 rel_tol=0.0, abs_tol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery produced a different SPO-RS tracker "
-            "value; refusing an inexact update")
+            "evaluated-step recovery advantages differ from the saved SPO "
+            "objective; refusing an inexact update")
 
     prompt_cache = {}
     prompt_job_ids = {}
@@ -10607,14 +10771,18 @@ def _resume_spo_rs_step_from_artifacts(
         "code_valid_fraction": (
             1.0 - sum(_metadata_is_code_failure(item["meta"])
                       for item in artifacts) / len(artifacts)),
-        "spo_rs_updates": [tracker_update],
-        "spo_rs_tracker_size": len(spo_rs_tracker),
+        "spo_rs_updates": recovery_updates,
+        "spo_rs_adaptive_beta": adaptive_spo_beta,
+        "spo_rs_tracker_size": (
+            0 if spo_rs_tracker is None else len(spo_rs_tracker)),
         "spo_rs_divergence": (
             None if not math.isfinite(divergence) else divergence),
-        "spo_rs_context_divergences": spo_info.get(
-            "context_divergences", {}),
+        "spo_rs_context_divergences": (
+            {} if adaptive_spo_beta else spo_info.get(
+                "context_divergences", {})),
         "spo_rs_missing_policy_scores": int(
-            spo_info.get("missing_policy_scores", 0) or 0),
+            0 if adaptive_spo_beta else
+            (spo_info.get("missing_policy_scores", 0) or 0)),
         "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
         "spo_rs_policy_updated": False,
         "recovered_evaluated_step": True,
@@ -10743,10 +10911,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     rank_mode = active_advantage_mode == "rank"
     x_grpo_mode = active_advantage_mode == "x-grpo"
     spo_rs_mode = active_advantage_mode == "spo-rs"
+    adaptive_spo_beta = bool(
+        spo_rs_mode and getattr(cfg, "spo_rs_adaptive_beta", False))
     binary_coder_mode = active_advantage_mode == "binary-coder"
-    if spo_rs_mode and spo_rs_tracker is None:
+    if spo_rs_mode and not adaptive_spo_beta and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
-    if spo_rs_mode and not spo_rs_tracker.initialized:
+    if (spo_rs_mode and not adaptive_spo_beta
+            and not spo_rs_tracker.initialized):
         raise ValueError(
             "SPO-RS tracker must be initialized from pre-step history before "
             "rollouts are sampled")
@@ -11141,7 +11312,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     spo_rs_context_divergences = {}
     spo_rs_missing_policy_scores = 0
     spo_rs_previous_adapter_path = None
-    if spo_rs_mode and spo_rs_tracker.initialized:
+    if (spo_rs_mode and not adaptive_spo_beta
+            and spo_rs_tracker.initialized):
         previous_name = spo_rs_tracker.last_policy_adapter
         if previous_name is not None:
             spo_rs_previous_adapter_path = Path(exp_dir) / previous_name
@@ -12751,18 +12923,28 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             )
                             rollout_io_futures.append(save_future)
                     previous_policy_scores = [None] * len(score_pairs)
-                    same_policy = bool(
-                        spo_rs_tracker.initialized
-                        and spo_rs_previous_adapter_path is not None
-                        and Path(adapter_path).resolve()
-                        == spo_rs_previous_adapter_path.resolve())
-                    if same_policy:
+                    same_policy = False
+                    if adaptive_spo_beta:
+                        # The KL-budgeted objective is parent-local and has no
+                        # run-wide retained-value statistic. Rollout-policy
+                        # scores above are still required by the clipped loss;
+                        # scoring the preceding adapter would be pure overhead.
+                        spo_rs_divergence = 0.0
+                        spo_rs_context_divergences = {}
+                    else:
+                        same_policy = bool(
+                            spo_rs_tracker.initialized
+                            and spo_rs_previous_adapter_path is not None
+                            and Path(adapter_path).resolve()
+                            == spo_rs_previous_adapter_path.resolve())
+                    if not adaptive_spo_beta and same_policy:
                         spo_rs_divergence = 0.0
                         spo_rs_context_divergences = {
                             int(record["context_id"]): 0.0
                             for record in vllm_logprob_records
                         }
-                    elif spo_rs_tracker.initialized:
+                    elif (not adaptive_spo_beta
+                          and spo_rs_tracker.initialized):
                         if (spo_rs_previous_adapter_path is None
                                 or not spo_rs_previous_adapter_path.is_dir()):
                             raise FileNotFoundError(
@@ -12825,7 +13007,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "off for SPO-RS" if spo_rs_mode else
                     "off for binary coder" if binary_coder_mode else
                     f"{reference_count}/{len(vllm_logprob_records)}")
-                if spo_rs_mode and not spo_rs_tracker.initialized:
+                if spo_rs_mode and adaptive_spo_beta:
+                    policy_label = ", adaptive beta per parent (policy KL skipped)"
+                elif spo_rs_mode and not spo_rs_tracker.initialized:
                     policy_label = ", SPO-RS policy KL=initialization"
                 elif spo_rs_mode and same_policy:
                     policy_label = ", SPO-RS policy KL=0 (same adapter)"
@@ -12888,14 +13072,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         all_futs = [f for g in range(num_groups) for f in reward_futures[g]]
         try:
-            # SPO-RS advantages are trajectory-local once the pre-step tracker
-            # baseline is frozen: A_i = (exp(beta*r_i) / v_t - 1) / beta.
-            # Therefore no cross-rollout reward statistic is needed. Build all
-            # reward-independent CPU tensors immediately, restore the same
-            # process-per-GPU trainer used by the ordinary --fast path, and
-            # stream each completed evaluation into its shared work queue.
-            # Parameters remain frozen and the optimizer step stays below the
-            # rollout-persistence barrier, preserving the exact objective.
+            # Fixed-beta SPO-RS can stream individual reward-complete
+            # trajectories against its frozen pre-step baseline. Adaptive-beta
+            # SPO waits only for one complete parent, estimates beta from all
+            # rollouts of that parent, then streams that group while later CPU
+            # evaluations continue. Parameters remain frozen and the optimizer
+            # step stays below the rollout-persistence barrier, preserving the
+            # exact objective in both modes.
             spo_rs_overlap_eligible = bool(
                 spo_rs_mode
                 and training_enabled
@@ -12914,49 +13097,95 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             tokenizer, group_responses, reward_futures,
                             prompt_jobs))
                     if staged_spo_rs_examples:
-                        pending_by_future = {
-                            example["_overlap_reward_future"]: example
-                            for example in staged_spo_rs_examples
-                        }
-                        if (len(pending_by_future)
-                                != len(staged_spo_rs_examples)):
-                            raise RuntimeError(
-                                "SPO-RS overlap found a reward future shared "
-                                "by multiple rollout records")
                         pending_before = sum(
                             not future.done() for future in all_futs)
-                        spo_rs_overlap_state = (
-                            parallel_trainer.begin_spo_rs_overlap(
-                                cfg, step_idx))
-                        print(
-                            f"[step {step_idx}] SPO-RS "
-                            "evaluation/training overlap started; "
-                            f"prepared {len(staged_spo_rs_examples)} exact "
-                            "training inputs; "
-                            f"{pending_before}/{len(all_futs)} CPU "
-                            "evaluations were pending before trainer restore",
-                            flush=True,
-                        )
+                        if adaptive_spo_beta:
+                            examples_by_group = {}
+                            for example in staged_spo_rs_examples:
+                                examples_by_group.setdefault(
+                                    int(example["group_id"]), []).append(example)
+                            pending_groups = set(examples_by_group)
+                            while pending_groups:
+                                ready_groups = [
+                                    group_id for group_id in sorted(pending_groups)
+                                    if all(future.done() for future in
+                                           reward_futures[group_id])
+                                ]
+                                if not ready_groups:
+                                    unfinished = [
+                                        future for group_id in pending_groups
+                                        for future in reward_futures[group_id]
+                                        if not future.done()
+                                    ]
+                                    wait(unfinished, return_when=FIRST_COMPLETED)
+                                    continue
+                                if spo_rs_overlap_state is None:
+                                    spo_rs_overlap_state = (
+                                        parallel_trainer.begin_spo_rs_overlap(
+                                            cfg, step_idx))
+                                    print(
+                                        f"[step {step_idx}] adaptive-beta SPO "
+                                        "evaluation/training overlap started; "
+                                        f"prepared {len(staged_spo_rs_examples)} "
+                                        "exact training inputs; "
+                                        f"{pending_before}/{len(all_futs)} CPU "
+                                        "evaluations were pending after "
+                                        "generation",
+                                        flush=True,
+                                    )
+                                for group_id in ready_groups:
+                                    ready_examples = examples_by_group[group_id]
+                                    _complete_spo_rs_overlap_examples(
+                                        ready_examples,
+                                        adaptive_beta=True,
+                                        group_reward_futures=(
+                                            reward_futures[group_id]),
+                                    )
+                                    parallel_trainer.queue_spo_rs_overlap(
+                                        ready_examples)
+                                    pending_groups.remove(group_id)
+                        else:
+                            pending_by_future = {
+                                example["_overlap_reward_future"]: example
+                                for example in staged_spo_rs_examples
+                            }
+                            if (len(pending_by_future)
+                                    != len(staged_spo_rs_examples)):
+                                raise RuntimeError(
+                                    "SPO-RS overlap found a reward future shared "
+                                    "by multiple rollout records")
+                            spo_rs_overlap_state = (
+                                parallel_trainer.begin_spo_rs_overlap(
+                                    cfg, step_idx))
+                            print(
+                                f"[step {step_idx}] SPO-RS "
+                                "evaluation/training overlap started; "
+                                f"prepared {len(staged_spo_rs_examples)} exact "
+                                "training inputs; "
+                                f"{pending_before}/{len(all_futs)} CPU "
+                                "evaluations were pending before trainer restore",
+                                flush=True,
+                            )
+                            while pending_by_future:
+                                ready_futures = [
+                                    future for future in pending_by_future
+                                    if future.done()
+                                ]
+                                if not ready_futures:
+                                    wait(tuple(pending_by_future),
+                                         return_when=FIRST_COMPLETED)
+                                    continue
+                                ready_examples = [
+                                    pending_by_future.pop(future)
+                                    for future in ready_futures
+                                ]
+                                _complete_spo_rs_overlap_examples(
+                                    ready_examples, spo_rs_tracker)
+                                parallel_trainer.queue_spo_rs_overlap(
+                                    ready_examples)
 
-                        while pending_by_future:
-                            ready_futures = [
-                                future for future in pending_by_future
-                                if future.done()
-                            ]
-                            if not ready_futures:
-                                wait(tuple(pending_by_future),
-                                     return_when=FIRST_COMPLETED)
-                                continue
-                            ready_examples = [
-                                pending_by_future.pop(future)
-                                for future in ready_futures
-                            ]
-                            _complete_spo_rs_overlap_examples(
-                                ready_examples, spo_rs_tracker)
-                            parallel_trainer.queue_spo_rs_overlap(
-                                ready_examples)
-
-                        parallel_trainer.seal_spo_rs_overlap()
+                        if spo_rs_overlap_state is not None:
+                            parallel_trainer.seal_spo_rs_overlap()
                         print(
                             f"[step {step_idx}] SPO-RS overlap queued "
                             f"{spo_rs_overlap_state['queued_examples']} "
@@ -13269,11 +13498,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "_spo_rs_current_score")
 
                 same_policy = bool(
-                    spo_rs_tracker.initialized
+                    not adaptive_spo_beta
+                    and spo_rs_tracker.initialized
                     and spo_rs_previous_adapter_path is not None
                     and Path(adapter_path).resolve()
                     == spo_rs_previous_adapter_path.resolve())
-                if same_policy:
+                if adaptive_spo_beta:
+                    spo_rs_divergence = 0.0
+                    spo_rs_context_divergences = {}
+                elif same_policy:
                     spo_rs_divergence = 0.0
                     spo_rs_context_divergences = {
                         int(record["context_id"]): 0.0
@@ -13315,7 +13548,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     record.pop("_spo_rs_current_score", None)
                     record.pop("_spo_rs_previous_score", None)
         divergence_label = (
-            "initialization" if not spo_rs_tracker.initialized
+            "adaptive-beta/not-used" if adaptive_spo_beta
+            else "initialization" if not spo_rs_tracker.initialized
             else ("missing" if not math.isfinite(spo_rs_divergence)
                   else f"{spo_rs_divergence:.6f}"))
         print(f"[step {step_idx}] SPO-RS local policy scoring: "
@@ -13331,10 +13565,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_code_failure_count = 0
     prompt_ids_by_job = {}
 
-    # Resolve every rollout against one immutable, run-wide pre-step tracker
-    # value. Only after all advantages are fixed does this step enter history.
+    # Fixed-beta SPO-RS resolves every rollout against one immutable, run-wide
+    # pre-step tracker value. Adaptive-beta SPO is resolved parent by parent in
+    # the group loop below and deliberately has no cross-parent value scale.
     spo_rs_prepared = {}
-    if spo_rs_mode:
+    if spo_rs_mode and not adaptive_spo_beta:
         samples = []
         for group_spec in group_specs:
             group_id = int(group_spec["group_id"])
@@ -13458,14 +13693,39 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     and float(rewards_np.max()) > float(cfg.fail_score)),
             }
         elif spo_rs_mode:
-            prepared = [spo_rs_prepared[(g, r_idx)]
-                        for r_idx in range(len(responses))]
-            advantages = np.asarray(
-                [item["advantage"] for item in prepared],
-                dtype=np.float64)
-            spo_rs_trainable = [item["trainable"] for item in prepared]
-            spo_rs_rollout_info = [item["info"] for item in prepared]
-            adv_scale = float(cfg.spo_rs_beta)
+            if adaptive_spo_beta:
+                advantages, beta, adaptive_info = (
+                    _adaptive_spo_group_advantages(rewards_np))
+                weights = np.asarray(
+                    adaptive_info.pop("weights"), dtype=np.float64)
+                update = {
+                    **adaptive_info,
+                    "group": g,
+                    "context": context_id,
+                    "fold": fold_index,
+                    "group_size": len(rewards),
+                    "policy_adapter": Path(adapter_path).name,
+                    "step": int(step_idx),
+                }
+                spo_rs_updates.append(update)
+                spo_rs_rollout_info = [
+                    {
+                        **update,
+                        "tilt_weight": float(weights[r_idx]),
+                        "used_for_policy_update": True,
+                    }
+                    for r_idx in range(len(responses))
+                ]
+                adv_scale = float(beta)
+            else:
+                prepared = [spo_rs_prepared[(g, r_idx)]
+                            for r_idx in range(len(responses))]
+                advantages = np.asarray(
+                    [item["advantage"] for item in prepared],
+                    dtype=np.float64)
+                spo_rs_trainable = [item["trainable"] for item in prepared]
+                spo_rs_rollout_info = [item["info"] for item in prepared]
+                adv_scale = float(cfg.spo_rs_beta)
             adv_scale_label = "beta"
             adv_info = {}
         elif binary_coder_mode:
@@ -14073,7 +14333,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
               "usable=+1, every rejection=-1", flush=True)
     elif spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
-        step_stats["spo_rs_tracker_size"] = len(spo_rs_tracker)
+        step_stats["spo_rs_adaptive_beta"] = adaptive_spo_beta
+        step_stats["spo_rs_tracker_size"] = (
+            0 if spo_rs_tracker is None else len(spo_rs_tracker))
         step_stats["spo_rs_divergence"] = (
             None if not math.isfinite(spo_rs_divergence)
             else float(spo_rs_divergence))
@@ -14552,9 +14814,13 @@ def main():
         print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
     if not binary_coder_cfg.enabled:
         if configured_advantage_mode == "spo-rs":
-            print(f"SPO-RS beta:        {cfg.spo_rs_beta}")
-            print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
-            print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
+            if bool(getattr(cfg, "spo_rs_adaptive_beta", False)):
+                print("SPO-RS beta:        adaptive per parent; "
+                      "KL(q||uniform)=log(2); all rollouts train")
+            else:
+                print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
+                print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
+                print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
             print(f"SPO-RS clip eps low/high: "
                   f"{cfg.spo_rs_clip_epsilon_low} / "
                   f"{cfg.spo_rs_clip_epsilon_high} "
@@ -14853,7 +15119,9 @@ def main():
         f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
-    if configured_advantage_mode == "spo-rs" and not binary_coder_cfg.enabled:
+    if (configured_advantage_mode == "spo-rs"
+            and not bool(getattr(cfg, "spo_rs_adaptive_beta", False))
+            and not binary_coder_cfg.enabled):
         from spo_rs import SPORSTracker
         spo_rs_tracker = SPORSTracker(
             entropic_beta=cfg.spo_rs_beta,
