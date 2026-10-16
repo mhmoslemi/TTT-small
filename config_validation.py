@@ -54,6 +54,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_api_concurrency", "strategy_api_timeout_s",
     "strategy_api_max_retries",
     "strategy_format_max_retries",
+    "strict_strategy_validation",
     "uct",
     "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
     "x_grpo_contexts_per_step",
@@ -215,6 +216,10 @@ def validate_problem_config(
             raise ValueError(
                 f"{_label(source)}: strategy_format_max_retries must be a "
                 "non-negative integer")
+    if ("strict_strategy_validation" in data
+            and not isinstance(data["strict_strategy_validation"], bool)):
+        raise ValueError(
+            f"{_label(source)}: strict_strategy_validation must be a boolean")
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

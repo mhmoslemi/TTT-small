@@ -1,4 +1,4 @@
-"""Run-wide KL-adaptive entropic value tracker for SPO-RS."""
+"""Historical SPO-RS trackers: exponential and bounded adaptive shaping."""
 
 from __future__ import annotations
 
@@ -50,6 +50,9 @@ class SPORSTracker:
 
     def baseline(self) -> float | None:
         return None if self._value is None else float(self._value)
+
+    def prepare_step(self) -> None:
+        """Freeze the historical baseline before any current-step rewards."""
 
     def transformed_rewards(self, rewards: Sequence[float]) -> np.ndarray:
         values = np.asarray(rewards, dtype=np.float64)
@@ -132,7 +135,7 @@ class SPORSTracker:
 
     def update(self, transformed_rewards: Sequence[float], *,
                divergence: float, policy_adapter: str | Path,
-               step: int) -> dict:
+               step: int, raw_rewards: Sequence[float] | None = None) -> dict:
         """Update once, after this step's advantages have been formed."""
         values = np.asarray(transformed_rewards, dtype=np.float64)
         if (values.ndim != 1 or values.size == 0
@@ -240,3 +243,179 @@ class SPORSTracker:
         self._last_policy_adapter = None if adapter is None else Path(adapter).name
         self._last_step = int(state.get("last_step", -1))
         self._updates = int(state.get("updates", int(self._value is not None)))
+
+
+BOUNDED_SHAPING_VERSION = "historical-arctan-1.25-v1"
+
+
+def validate_shaping_resume(saved: dict) -> None:
+    """Never silently reuse gradients from the replaced batch objective."""
+    if (saved.get("advantage_mode") == "spo-rs"
+            and saved.get("spo_rs_adaptive_beta", False)
+            and saved.get("spo_rs_reward_shaping") != BOUNDED_SHAPING_VERSION):
+        raise ValueError(
+            "this run used the retired adaptive-beta SPO objective, not the "
+            "historical bounded shaping; use the previous code to resume it "
+            "or start a fresh run with the new objective")
+
+
+class BoundedSPORSTracker(SPORSTracker):
+    """SPO's historical moving average with adaptive, bounded reward shaping.
+
+    At the start of a step, using only decayed *previous* rewards above the
+    failure score, b = Q90 and s = Q90 - Q75 (weighted inverse-CDF quantiles).
+    Freeze u(r) = 1/2 + atan((r-b)/s)/pi, g(r) = exp(beta * 1.25 * u(r)),
+    and v = weighted_mean(g(history)) for every parent and rollout this step.
+    A = (g/v - 1)/beta. Failures remain in v and the update; no rollout is
+    filtered out of training. This is a monotone upper-tail reward surrogate,
+    not the original exp(beta*r) objective or an exact maximum operator.
+
+    Raw scalar rewards and their decay weights are checkpointed so changing
+    b/s never mixes differently transformed rewards in the baseline. No
+    model tensors or rollout text are retained here.
+    """
+
+    VERSION = 3
+    WIDTH = 1.25
+
+    def __init__(self, *, fail_score=0.0, **options):
+        super().__init__(**options)
+        self.fail_score = float(fail_score)
+        if not math.isfinite(self.fail_score):
+            raise ValueError("SPO-RS fail_score must be finite")
+        # Avoid exponent overflow even for user-specified beta values.
+        if self.entropic_beta * self.WIDTH > math.log(np.finfo(float).max) - 2:
+            raise ValueError("SPO-RS beta is too large for bounded shaping")
+        self._history_rewards = np.empty(0, dtype=np.float64)
+        self._history_weights = np.empty(0, dtype=np.float64)
+        self._center: float | None = None
+        self._scale: float | None = None
+
+    @staticmethod
+    def _rewards(rewards):
+        values = np.asarray(rewards, dtype=np.float64)
+        if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+            raise ValueError("SPO-RS rewards must be a nonempty finite vector")
+        return values
+
+    def _calibrate(self, rewards, weights):
+        successful = (rewards > self.fail_score) & (weights > 0.0)
+        values, mass = rewards[successful], weights[successful]
+        if not values.size:
+            # All-failure history has no upper-tail scale. Retain any prior
+            # calibration; otherwise use a finite neutral initial scale.
+            if self._center is None:
+                self._center = self.fail_score
+                self._scale = max(1.0, abs(self.fail_score))
+            return
+        order = np.argsort(values, kind="stable")
+        values, mass = values[order], mass[order]
+        cumulative = np.cumsum(mass, dtype=np.float64)
+
+        def quantile(q):
+            index = min(int(np.searchsorted(cumulative, q * cumulative[-1],
+                                            side="left")), len(values) - 1)
+            return float(values[index])
+
+        self._center = quantile(0.90)
+        scale = self._center - quantile(0.75)
+        if scale <= 0.0:
+            # Ties must not create a zero denominator or a fixed precision
+            # floor that erases small but real improvements.
+            scale = self._scale or (quantile(0.75) - quantile(0.25))
+            if scale <= 0.0:
+                scale = float(values[-1] - values[0])
+            if scale <= 0.0:
+                scale = max(1.0, abs(self._center - self.fail_score))
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("invalid historical SPO-RS shaping scale")
+        self._scale = scale
+
+    def prepare_step(self) -> None:
+        if not self.initialized:
+            raise RuntimeError("bounded SPO-RS requires seed history first")
+        self._calibrate(self._history_rewards, self._history_weights)
+        values = self.transformed_rewards(self._history_rewards)
+        self._value = float(np.dot(values, self._history_weights)
+                            / self._history_weights.sum())
+
+    def transformed_rewards(self, rewards: Sequence[float]) -> np.ndarray:
+        values = self._rewards(rewards)
+        if self._center is None:
+            # The only pre-initialization call is the verified seed batch.
+            self._calibrate(values, np.ones(values.size, dtype=np.float64))
+        with np.errstate(over="ignore"):
+            utility = 0.5 + np.arctan(
+                (values - self._center) / self._scale) / math.pi
+        return np.exp(self.entropic_beta * self.WIDTH * utility)
+
+    def shaping_info(self) -> dict:
+        return {
+            "reward_shaping": BOUNDED_SHAPING_VERSION,
+            "shaping_width": self.WIDTH,
+            "shaping_center": self._center,
+            "shaping_scale": self._scale,
+            "shaping_history_count": int(self._history_rewards.size),
+            "beta": self.entropic_beta,
+        }
+
+    def update(self, transformed_rewards, *, divergence, policy_adapter,
+               step, raw_rewards=None) -> dict:
+        if raw_rewards is None:
+            raise ValueError("bounded SPO-RS update requires raw reward history")
+        rewards = self._rewards(raw_rewards)
+        transformed = np.asarray(transformed_rewards, dtype=np.float64)
+        if (transformed.shape != rewards.shape
+                or not np.array_equal(transformed, self.transformed_rewards(rewards))):
+            raise ValueError("bounded SPO-RS raw/transformed rewards do not match")
+        info = self.shaping_info()
+        result = super().update(
+            transformed, divergence=divergence,
+            policy_adapter=policy_adapter, step=step)
+        if result["initialized"]:
+            weights = np.full(rewards.size, 1.0 / (1.0 - self.rho_min))
+        else:
+            self._history_weights *= result["rho"]
+            weights = np.ones(rewards.size, dtype=np.float64)
+        self._history_rewards = np.concatenate((self._history_rewards, rewards))
+        self._history_weights = np.concatenate((self._history_weights, weights))
+        # Keep this step's calibration frozen until the *next* prepare_step.
+        return {**result, **info}
+
+    def state_dict(self) -> dict:
+        return {
+            **super().state_dict(), **self.shaping_info(),
+            "fail_score": self.fail_score,
+            "history_rewards": self._history_rewards.tolist(),
+            "history_weights": self._history_weights.tolist(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if (not isinstance(state, dict)
+                or state.get("reward_shaping") != BOUNDED_SHAPING_VERSION
+                or state.get("shaping_width") != self.WIDTH
+                or state.get("fail_score") != self.fail_score):
+            raise ValueError("incompatible bounded SPO-RS shaping checkpoint")
+        super().load_state_dict(state)
+        rewards = np.asarray(state.get("history_rewards"), dtype=np.float64)
+        weights = np.asarray(state.get("history_weights"), dtype=np.float64)
+        if (rewards.ndim != 1 or weights.shape != rewards.shape
+                or not np.isfinite(rewards).all()
+                or not np.isfinite(weights).all() or np.any(weights < 0.0)
+                or bool(rewards.size) != self.initialized
+                or not math.isclose(float(weights.sum()), self._effective_count,
+                                    rel_tol=1e-12, abs_tol=1e-12)):
+            raise ValueError("invalid bounded SPO-RS reward history")
+        self._history_rewards = rewards.copy()
+        self._history_weights = weights.copy()
+        self._center = state.get("shaping_center")
+        self._scale = state.get("shaping_scale")
+        if self.initialized:
+            if (self._center is None or not math.isfinite(self._center)
+                    or self._scale is None or not math.isfinite(self._scale)
+                    or self._scale <= 0.0):
+                raise ValueError("invalid saved SPO-RS shaping calibration")
+            expected = float(np.dot(self.transformed_rewards(rewards), weights)
+                             / weights.sum())
+            if not math.isclose(expected, self._value, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("bounded SPO-RS baseline/history mismatch")

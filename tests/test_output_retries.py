@@ -145,6 +145,8 @@ class OutputContractTests(unittest.TestCase):
     def test_strategy_retries_remain_configured_and_coder_retry_is_opt_in(self):
         for path in (ROOT / "configs").glob("*.yaml"):
             self.assertRegex(path.read_text(), r"(?m)^strategy_format_max_retries: 3$")
+            self.assertRegex(path.read_text(),
+                             r"(?m)^strict_strategy_validation: false$")
         source = (ROOT / "train_multy_CVaR.py").read_text()
         self.assertIn('"--strategy-format-max-retries"', source)
         self.assertIn('"--coder-retry"', source)
@@ -456,46 +458,6 @@ class RunnerRetryTests(unittest.TestCase):
         self.assertEqual(examples[0]["advantage"], 5.0)
         self.assertNotIn("_overlap_reward_future", examples[0])
 
-    def test_adaptive_spo_overlap_waits_for_complete_parent_and_uses_all_rewards(self):
-        group_futures = [Future() for _ in range(3)]
-        for future, reward in zip(group_futures, (1.0, 2.0, 4.0)):
-            future.set_result(SimpleNamespace(reward=reward))
-        examples = [
-            {
-                "rollout_index": index,
-                "_overlap_reward_future": group_futures[index],
-                "advantage": None,
-            }
-            for index in (0, 2)
-        ]
-        seen = []
-
-        def adaptive(rewards):
-            seen.append(list(rewards))
-            return [-0.5, 0.25, 1.5], 3.5, {"kl": math.log(2)}
-
-        fake_np = SimpleNamespace(
-            float64=float,
-            asarray=lambda values, dtype=None: list(values),
-        )
-        scope = {"np": fake_np, "_adaptive_spo_group_advantages": adaptive}
-        functions_from_file(
-            "train_multy_CVaR.py",
-            {"_complete_spo_rs_overlap_examples"},
-            scope,
-        )
-        completed = scope["_complete_spo_rs_overlap_examples"](
-            examples, adaptive_beta=True,
-            group_reward_futures=group_futures)
-
-        self.assertIs(completed, examples)
-        self.assertEqual(seen, [[1.0, 2.0, 4.0]])
-        self.assertEqual([example["advantage"] for example in examples],
-                         [-0.5, 1.5])
-        self.assertTrue(all("_overlap_reward_future" not in example
-                            for example in examples))
-        self.assertTrue(all(example["_spo_rs_adaptive_beta"] == 3.5
-                            for example in examples))
 
 
 class StrategyAttemptTests(unittest.TestCase):
@@ -506,7 +468,9 @@ class StrategyAttemptTests(unittest.TestCase):
                      strategy_retry_needed=strategy_retry_needed,
                      save_strategy_response=save_strategy_response,
                      strategy_prompt_cache={}, strategy_attempt_prompts={},
-                     strategy_format_max_retries=3, exp_dir=Path(directory), step_idx=0)
+                     strategy_format_max_retries=3,
+                     strict_strategy_validation=False,
+                     exp_dir=Path(directory), step_idx=0)
         constants = [node for node in tree.body if isinstance(node, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id in {
                          "_STRATEGY_FALLBACK", "_STRATEGY_BLOCK_RE", "_STRATEGY_FINAL_MARKERS"}
@@ -576,6 +540,7 @@ class StrategyAttemptTests(unittest.TestCase):
     def test_problem_specific_strategy_integrity_issue_is_retried(self):
         with TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             s = self.scope(directory)
+            s["strict_strategy_validation"] = True
             chain = s["strategy_chains"][0]
             s["problem"].strategy_output_issue = (
                 lambda strategy: (

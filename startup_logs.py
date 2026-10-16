@@ -172,6 +172,7 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
             row("Training memory cap"), row("Fused long attention"),
             row("MoE policy ratio"), row("Binary coder phase"), row("Binary coder clip"),
             row("CVaR alpha/lambda"), row("SPO-RS beta", "SPO-RS D_half"),
+            row("SPO-RS shaping"),
             row("SPO-RS rho min/max", "SPO-RS update epochs"),
             row("SPO-RS clip eps low/high"),
             row("Rank clip eps low/high", "Rank update epochs"),

@@ -133,9 +133,16 @@ def test_extract_final_strategy_prefers_final_channel_over_analysis_placeholder(
     assert "actual detailed strategy" in body
 
 
-def test_extract_final_strategy_rejects_short_block():
+def test_extract_final_strategy_default_accepts_short_complete_block():
     raw = "assistantfinal<strategy>too short</strategy>"
     body, reason = _extract_final_strategy(raw)
+    assert body == "too short"
+    assert reason is None
+
+
+def test_extract_final_strategy_strict_rejects_short_block():
+    raw = "assistantfinal<strategy>too short</strategy>"
+    body, reason = _extract_final_strategy(raw, strict=True)
     assert body == _STRATEGY_FALLBACK
     assert reason == "missing complete final strategy"
 
@@ -147,7 +154,7 @@ def test_extract_final_strategy_rejects_explicit_omission_placeholder():
         + "<...> (rest of long strategy here ...)"
         + "</strategy>"
     )
-    body, reason = _extract_final_strategy(raw)
+    body, reason = _extract_final_strategy(raw, strict=True)
     assert body == _STRATEGY_FALLBACK
     assert reason == "incomplete final strategy"
 
@@ -214,7 +221,7 @@ def test_extract_final_strategy_falls_back_to_earlier_clean_block():
         + " then it reconsiders and writes "
         + f"<strategy>{code_block}</strategy>"
     )
-    body, reason = _extract_final_strategy(raw)
+    body, reason = _extract_final_strategy(raw, strict=True)
     assert reason is None
     assert "first clean strategy" in body
 

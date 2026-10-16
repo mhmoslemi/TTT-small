@@ -1,40 +1,22 @@
+import ast
+from concurrent.futures import Future
+from copy import deepcopy
+import json
 import math
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from advantage import (adaptive_beta_spo_advantages,
-                       entropic_adaptive_advantages)
-from spo_rs import SPORSTracker
+from spo_rs import (BOUNDED_SHAPING_VERSION, BoundedSPORSTracker,
+                    SPORSTracker, validate_shaping_resume)
 
 
 def _tracker(**overrides):
     options = dict(entropic_beta=2.0, d_half=0.06, rho_min=0.875, rho_max=0.96)
     options.update(overrides)
     return SPORSTracker(**options)
-
-
-def test_adaptive_beta_spo_reuses_entropic_kl_solution_and_spo_scaling():
-    rewards = np.asarray([0.0, 0.4, 1.1, 1.7, 2.0], dtype=np.float64)
-    entropic, expected_beta = entropic_adaptive_advantages(rewards)
-    advantages, beta, info = adaptive_beta_spo_advantages(
-        rewards, return_info=True)
-
-    assert beta == pytest.approx(expected_beta)
-    assert np.allclose(advantages, entropic / beta)
-    assert info["kl"] == pytest.approx(math.log(2), rel=1e-9)
-    assert info["gamma"] == pytest.approx(math.log(2))
-    assert info["weights"].sum() == pytest.approx(1.0)
-    assert info["adaptive_beta"] is True
-
-
-def test_adaptive_beta_spo_tied_parent_uses_every_rollout_with_zero_gradient():
-    advantages, beta, info = adaptive_beta_spo_advantages(
-        np.asarray([2.0, 2.0, 2.0]), return_info=True)
-    assert beta == 0.0
-    assert np.array_equal(advantages, np.zeros(3))
-    assert info["all_tied"] is True
-    assert info["ess"] == pytest.approx(3.0)
 
 
 def test_transformed_rewards_matches_exponential_reward_transform():
@@ -182,3 +164,185 @@ def test_consecutive_policy_divergence_matches_eq12_equal_context_weighting():
     # Eq. 12 weights contexts equally (mean of 1.0 and 0.0 = 0.5), not by
     # rollout count (which would give (1.0+1.0+0.0)/3 = 0.667).
     assert divergence == pytest.approx(0.5)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def tracker(**options):
+    return BoundedSPORSTracker(**{
+        "entropic_beta": 2.0, "d_half": 0.06,
+        "rho_min": 0.875, "rho_max": 0.96, **options,
+    })
+
+
+def initialize(t, seeds=(1.0, 1.5, 1.8, 2.0, 2.1, 2.2, 2.3, 2.4)):
+    t.update(t.transformed_rewards(seeds), raw_rewards=seeds,
+             divergence=0.0, policy_adapter="adapter_initial", step=-1)
+    t.prepare_step()
+    return t
+
+
+def quantile(values, weights, q):
+    order = np.argsort(values, kind="stable")
+    index = np.searchsorted(np.cumsum(weights[order]), q * weights.sum())
+    return values[order[min(index, len(values) - 1)]]
+
+
+def test_bounded_transform_and_advantage_match_proposal():
+    t = initialize(tracker())
+    info = t.shaping_info()
+    assert info["shaping_center"] == 2.4
+    assert info["shaping_scale"] == pytest.approx(0.2)
+    rewards = np.array([0, 2.2, 2.4, 2.400001, 2.6, 3.0])
+    u = 0.5 + np.arctan((rewards - 2.4) / info["shaping_scale"]) / math.pi
+    g = np.exp(2.5 * u)
+    np.testing.assert_allclose(t.transformed_rewards(rewards), g, rtol=1e-14)
+    a = t.normalized_advantages(g)
+    np.testing.assert_allclose(a, (g / t.baseline() - 1) / 2)
+    assert np.all(np.diff(a) > 0)
+    assert np.all(a >= math.expm1(-2.5) / 2)
+    assert np.all(a <= math.expm1(2.5) / 2)
+
+
+def test_history_replay_uses_same_transform_and_all_rewards():
+    seeds = np.array([1, 1.5, 1.8, 2, 2.1, 2.2, 2.3, 2.4])
+    t = initialize(tracker(), seeds)
+    history, weights = seeds.copy(), np.full(len(seeds), 8.0)
+    for step in range(6):
+        t.prepare_step()
+        valid = history > 0
+        b = quantile(history[valid], weights[valid], 0.9)
+        s = b - quantile(history[valid], weights[valid], 0.75)
+        assert s > 0
+        transform = lambda r: np.exp(2.5 * (
+            0.5 + np.arctan((r - b) / s) / math.pi))
+        expected_v = np.dot(weights, transform(history)) / weights.sum()
+        assert t.baseline() == pytest.approx(expected_v, rel=1e-13)
+        rewards = np.array([0.0, 0.0, 2.1 + step * 0.1, 2.6 + step * 0.2])
+        a = t.normalized_advantages(t.transformed_rewards(rewards))
+        np.testing.assert_allclose(a, (transform(rewards) / expected_v - 1) / 2)
+        update = t.update(t.transformed_rewards(rewards), raw_rewards=rewards,
+                          divergence=0.02, policy_adapter=f"a{step}", step=step)
+        weights = np.r_[weights * update["rho"], np.ones(len(rewards))]
+        history = np.r_[history, rewards]
+        assert update["group_size"] == len(rewards)
+        assert update["effective_count_after"] == pytest.approx(weights.sum())
+        assert update["value_after"] == pytest.approx(
+            np.dot(weights, transform(history)) / weights.sum(), rel=1e-13)
+        assert len(t.state_dict()["history_rewards"]) == len(history)
+
+
+def test_step_baseline_is_global_frozen_not_parent_centered():
+    t = initialize(tracker())
+    before = t.state_dict()
+    groups = [np.array([0.0, 2.5]), np.array([2.7, 2.8, 2.9])]
+    a = [t.normalized_advantages(t.transformed_rewards(r)) for r in groups]
+    combined = t.normalized_advantages(t.transformed_rewards(np.concatenate(groups)))
+    np.testing.assert_array_equal(np.concatenate(a), combined)
+    assert not np.isclose(a[1].sum(), 0.0)  # No parent-wise recentering.
+    assert t.state_dict() == before
+
+
+@pytest.mark.parametrize("seeds", [[0, 0], [2, 2], [-1, -1], [1]])
+def test_tied_initial_history_and_all_failures_remain_finite(seeds):
+    t = initialize(tracker(), seeds)
+    for step in range(2):
+        r = np.array([0.0, 0.0, 1.0, 2.0])
+        g = t.transformed_rewards(r)
+        assert np.isfinite(t.normalized_advantages(g)).all()
+        t.update(g, raw_rewards=r, divergence=0, policy_adapter="a", step=step)
+        t.prepare_step()
+        assert t.shaping_info()["shaping_scale"] > 0
+
+
+def test_no_fixed_scale_floor_erases_small_improvements():
+    seeds = np.linspace(2.0, 2.0 + 1e-10, 20)
+    t = initialize(tracker(), seeds)
+    assert 0 < t.shaping_info()["shaping_scale"] < 1e-10
+    r = np.array([seeds[-1], seeds[-1] + 1e-11])
+    a = t.normalized_advantages(t.transformed_rewards(r))
+    assert a[1] > a[0] + 0.01
+
+
+def test_checkpoint_roundtrip_and_preview_do_not_double_update_history():
+    t = initialize(tracker())
+    for step in range(3):
+        t.prepare_step()
+        restored = tracker()
+        restored.load_state_dict(json.loads(json.dumps(t.state_dict())))
+        restored.prepare_step()
+        before = t.state_dict()
+        r = [0.0, 2.5 + step * 0.1, 2.6 + step * 0.2]
+        g = t.transformed_rewards(r)
+        np.testing.assert_array_equal(restored.transformed_rewards(r), g)
+        preview = deepcopy(t)
+        expected = preview.update(g, raw_rewards=r, divergence=0.04,
+                                  policy_adapter=f"a{step}", step=step)
+        assert t.state_dict() == before
+        actual = restored.update(g, raw_rewards=r, divergence=0.04,
+                                 policy_adapter=f"a{step}", step=step)
+        assert actual == expected
+        assert restored.state_dict() == preview.state_dict()
+        t = restored
+
+
+def test_corrupt_or_wrong_objective_checkpoint_is_rejected():
+    t = initialize(tracker())
+    state = t.state_dict()
+    for field, value in [("value", 999), ("shaping_width", 1),
+                         ("history_weights", [1]), ("shaping_scale", 0)]:
+        bad = deepcopy(state)
+        bad[field] = value
+        with pytest.raises(ValueError):
+            tracker().load_state_dict(bad)
+    with pytest.raises(ValueError):
+        SPORSTracker(entropic_beta=2, d_half=.06, rho_min=.875,
+                     rho_max=.96).load_state_dict(state)
+    with pytest.raises(ValueError):
+        t.update(t.transformed_rewards([1]), divergence=0,
+                 policy_adapter="a", step=0)
+
+
+def test_old_adaptive_runs_are_not_silently_reinterpreted():
+    old = {"advantage_mode": "spo-rs", "spo_rs_adaptive_beta": True}
+    with pytest.raises(ValueError, match="retired adaptive-beta"):
+        validate_shaping_resume(old)
+    validate_shaping_resume({**old, "spo_rs_adaptive_beta": False})
+    validate_shaping_resume({**old, "spo_rs_reward_shaping": BOUNDED_SHAPING_VERSION})
+
+
+def test_overlap_can_train_ready_examples_without_pending_rewards():
+    # Load just the pure completion helper, not the training program.
+    tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "_complete_spo_rs_overlap_examples")
+    scope = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "helper", "exec"), scope)
+    complete = scope[helper.name]
+    t = initialize(tracker())
+    ready, pending = Future(), Future()
+    ready.set_result(SimpleNamespace(reward=2.6))
+    example = {"_overlap_reward_future": ready}
+    expected = t.normalized_advantages(t.transformed_rewards([2.6]))[0]
+    assert complete([example], t)[0]["advantage"] == expected
+    assert not pending.done()
+    with pytest.raises(RuntimeError, match="before its reward"):
+        complete([{"_overlap_reward_future": pending}], t)
+
+
+def test_both_modes_share_overlap_and_every_update_supplies_raw_rewards():
+    tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+    updates = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "spo_rs_overlap_eligible"
+                for t in node.targets):
+            assert "adaptive_spo_beta" not in ast.unparse(node.value)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "update"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"spo_rs_tracker", "preview_tracker"}):
+            updates.append(node)
+            assert "raw_rewards" in {kw.arg for kw in node.keywords}
+    assert len(updates) == 5
