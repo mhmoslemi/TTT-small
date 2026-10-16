@@ -603,6 +603,7 @@ class VLLMBackendTests(unittest.TestCase):
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
 
         with (patch("torch.cuda.empty_cache"),
+              patch("host_memory.reclaim_unused_host_memory"),
               patch("torch.autograd.graph.save_on_cpu",
                     return_value=nullcontext()) as offload):
             result, effective, deferred = _run_oom_resilient_backward(
@@ -613,6 +614,64 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(effective, [])
         self.assertEqual(deferred, [example])
         offload.assert_not_called()
+
+    def test_strict_replica_uses_bounded_activation_offload_before_deferral(self):
+        import torch
+        from train_multy_CVaR import _run_oom_resilient_backward
+
+        model = torch.nn.Linear(2, 1)
+        model._ttt_strict_exact_long_training = True
+        example = {
+            "prompt_ids": torch.zeros((1, 5), dtype=torch.long),
+            "response_ids": torch.zeros((1, 7), dtype=torch.long),
+            "_overlap_key": (3, 11),
+        }
+        attempts = []
+
+        def attempt(_batches):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return "trained"
+
+        with (patch("torch.cuda.empty_cache"),
+              patch("host_memory.reclaim_unused_host_memory"),
+              patch("torch.autograd.graph.save_on_cpu",
+                    return_value=nullcontext()) as offload):
+            result, effective, deferred = _run_oom_resilient_backward(
+                model, [[example]], attempt, device_label="cuda:0",
+                defer_exact_oom=True,
+                activation_offload_semaphore=nullcontext())
+
+        self.assertEqual(result, "trained")
+        self.assertEqual(effective, [[example]])
+        self.assertEqual(deferred, [])
+        offload.assert_called_once()
+
+    def test_activation_offload_slots_reserve_node_memory(self):
+        from host_memory import GIB, automatic_activation_offload_slots
+
+        self.assertEqual(
+            automatic_activation_offload_slots(
+                8,
+                memory_info={"total": 1820 * GIB, "available": 1700 * GIB},
+            ),
+            3,
+        )
+        self.assertEqual(
+            automatic_activation_offload_slots(
+                8,
+                memory_info={"total": 1200 * GIB, "available": 1100 * GIB},
+            ),
+            2,
+        )
+        self.assertEqual(
+            automatic_activation_offload_slots(
+                8,
+                memory_info={"total": 1820 * GIB, "available": 400 * GIB},
+            ),
+            1,
+        )
 
     def test_strict_training_still_raises_without_selective_overflow(self):
         import torch

@@ -272,6 +272,11 @@ def _save_exact_spo_rs_overflow(
         "deferred_keys": deferred_keys,
         "remaining_keys": deferred_keys,
         "completed_keys": [],
+        # Replicated training reaches this checkpoint only after the bounded
+        # CPU-activation fallback has also failed for these keys. A resume can
+        # therefore route this residual tail straight to the final sharded
+        # lane instead of repeating an identical failed offload attempt.
+        "replica_offload_exhausted": True,
         "normal_stats": normal_stats,
         "overflow_stats": {
             "totals": {key: 0.0 for key in metric_keys},
@@ -297,6 +302,7 @@ def _save_exact_spo_rs_overflow(
         overflow_gradient_file=filename,
         deferred_keys=[list(key) for key in deferred_keys],
         normal_trained_examples=int(normal_stats["trained_examples"]),
+        replica_offload_exhausted=True,
     )
     return destination, marker, deferred_keys, normal_stats
 
@@ -453,21 +459,27 @@ def _write_exact_spo_rs_overflow_state(overflow_state):
         pass
 
 
-def _commit_exact_spo_rs_overflow_progress(
-        model, overflow_state, step_idx, trajectory_key, trajectory_stats,
+def _commit_exact_spo_rs_overflow_batch(
+        model, overflow_state, step_idx, trajectory_keys, batch_stats,
         *, training_seconds):
-    """Merge one finished oversized gradient and make it restart-durable.
+    """Merge one exact overflow batch and make its progress restart-durable.
 
     The base replica gradients and every previously completed oversized
-    trajectory remain in the CPU checkpoint.  The optimizer is deliberately
+    trajectory remain in the CPU checkpoint. ``model.grad`` is the already
+    reduced sum for exactly ``trajectory_keys``. The optimizer is deliberately
     untouched until *all* trajectories have been merged, preserving the one
-    global clipped SPO-RS update exactly.
+    global clipped SPO-RS update exactly while allowing a replicated recovery
+    wave to commit many trajectories at once.
     """
     import torch
 
     saved_gradients = _validate_precomputed_exact_gradients(
         model, overflow_state, step_idx)
-    trajectory_key = tuple(int(value) for value in trajectory_key)
+    trajectory_keys = {
+        tuple(int(value) for value in key) for key in trajectory_keys
+    }
+    if not trajectory_keys:
+        return len(overflow_state.get("remaining_keys", ()))
     remaining = {
         tuple(int(value) for value in key)
         for key in overflow_state.get("remaining_keys", ())
@@ -476,10 +488,11 @@ def _commit_exact_spo_rs_overflow_progress(
         tuple(int(value) for value in key)
         for key in overflow_state.get("completed_keys", ())
     }
-    if trajectory_key not in remaining or trajectory_key in completed:
+    invalid = trajectory_keys - remaining
+    if invalid or trajectory_keys & completed:
         raise RuntimeError(
-            "exact SPO-RS overflow trajectory progress is duplicated or "
-            f"out of order: {trajectory_key}")
+            "exact SPO-RS overflow batch progress is duplicated or out of "
+            f"order: {sorted(invalid or (trajectory_keys & completed))}")
 
     with torch.no_grad():
         for name, parameter in model.named_parameters():
@@ -497,24 +510,25 @@ def _commit_exact_spo_rs_overflow_progress(
         "ratio", "clipped_fraction",
     )
     overflow_stats = overflow_state["overflow_stats"]
-    totals = trajectory_stats["totals"]
+    totals = batch_stats["totals"]
     for key in metric_keys:
         overflow_stats["totals"][key] += float(totals[key])
     overflow_stats["max_ratio"] = max(
         float(overflow_stats["max_ratio"]),
-        float(trajectory_stats["max_ratio"]))
+        float(batch_stats["max_ratio"]))
     overflow_stats["max_prefix_ratio"] = max(
         float(overflow_stats["max_prefix_ratio"]),
-        float(trajectory_stats["max_prefix_ratio"]))
+        float(batch_stats["max_prefix_ratio"]))
     overflow_stats["entropy_examples"] += int(
-        trajectory_stats["entropy_examples"])
-    overflow_stats["trained_examples"] += 1
-    overflow_stats["backward_batches"] += 1
+        batch_stats["entropy_examples"])
+    overflow_stats["trained_examples"] += len(trajectory_keys)
+    overflow_stats["backward_batches"] += int(
+        batch_stats.get("backward_batches", len(trajectory_keys)))
     overflow_stats["training_seconds"] += max(
         0.0, float(training_seconds))
 
-    remaining.remove(trajectory_key)
-    completed.add(trajectory_key)
+    remaining.difference_update(trajectory_keys)
+    completed.update(trajectory_keys)
     overflow_state["version"] = 2
     overflow_state["remaining_keys"] = sorted(remaining)
     overflow_state["completed_keys"] = sorted(completed)
@@ -540,6 +554,15 @@ def _commit_exact_spo_rs_overflow_progress(
             flush=True,
         )
     return len(remaining)
+
+
+def _commit_exact_spo_rs_overflow_progress(
+        model, overflow_state, step_idx, trajectory_key, trajectory_stats,
+        *, training_seconds):
+    """Merge one finished oversized gradient and make it restart-durable."""
+    return _commit_exact_spo_rs_overflow_batch(
+        model, overflow_state, step_idx, [trajectory_key], trajectory_stats,
+        training_seconds=training_seconds)
 
 
 def _clip_sharded_grad_norm_(parameters, max_norm, *, error_if_nonfinite):
@@ -2465,19 +2488,35 @@ def load_config():
                 "be repeated")
     if exact_sharded_recovery is not None:
         # This marker is written only after a fully durable SPO-RS rollout
-        # batch proves that an exact trajectory cannot fit on a replicated
-        # trainer GPU. New markers retain the already-computed replica
-        # gradients and run only deferred trajectories on one model sharded
-        # across all GPUs. Legacy markers first replay only backward on the
-        # fast replicas so they can be upgraded to the same selective path.
+        # batch proves that an exact trajectory cannot fit in ordinary GPU
+        # memory. New markers retain the already-computed gradients and first
+        # run only the deferred trajectories on RAM-bounded replicas. The
+        # serial model-sharded lane is reserved for a trajectory that also
+        # exhausts that bounded fallback. Legacy markers first replay only
+        # backward on the fast replicas so they can be upgraded likewise.
         selective_overflow = bool(
             exact_sharded_recovery.get("overflow_gradient_file"))
-        can_capture_selectively = bool(
-            not selective_overflow
-            and merged.get("fast", False)
+        replicated_layout = bool(
+            merged.get("fast", False)
             and str(merged.get("training_layout", "")).lower()
             == "replicated")
-        if can_capture_selectively:
+        can_recover_on_replicas = bool(
+            selective_overflow
+            and replicated_layout
+            and not exact_sharded_recovery.get(
+                "replica_offload_exhausted", False))
+        can_capture_selectively = bool(
+            not selective_overflow
+            and replicated_layout)
+        if can_recover_on_replicas:
+            merged["_exact_replica_recovery_step"] = int(
+                exact_sharded_recovery["step"])
+            print(
+                "[recovery] selective exact overflow will reuse completed "
+                "gradients and dispatch only the remaining trajectories "
+                "across the fast GPU replicas with bounded host-RAM "
+                "activation offload")
+        elif can_capture_selectively:
             # A marker written by an older build has no saved partial
             # gradients. Recompute its already-evaluated update once on the
             # fast replicas; the new overflow path will retain all successful
@@ -2503,13 +2542,13 @@ def load_config():
             merged["fast"] = False
             merged["_exact_sharded_recovery_step"] = int(
                 exact_sharded_recovery["step"])
-        if selective_overflow:
+        if selective_overflow and not can_recover_on_replicas:
             print(
                 "[recovery] selective exact overflow will reuse completed "
                 "replica gradients and run only deferred trajectories with "
                 "one model sharded across all training GPUs; ordinary fast "
                 "replicated training resumes after this step")
-        elif not can_capture_selectively:
+        elif not selective_overflow and not can_capture_selectively:
             print(
                 "[recovery] exact long-context adapter update will use one "
                 "model sharded across all training GPUs; ordinary fast "
@@ -3951,6 +3990,7 @@ def _gradient_checkpointing_work_units(batches):
 def _run_oom_resilient_backward(
         model, batches, attempt, *, device_label, expand_memory=None,
         start_checkpointed=False, start_with_headroom=False,
+        start_activation_offload=False,
         activation_offload_semaphore=None, defer_exact_oom=False,
         allow_activation_offload=True):
     """Retry with checkpointing, smaller batches, and memory fallbacks.
@@ -3977,15 +4017,12 @@ def _run_oom_resilient_backward(
                              reclaim_unused_host_memory)
     from model_backend import set_gradient_checkpointing
 
-    # The selective SPO-RS overflow path already preserves the gradients from
-    # every replica-safe trajectory and sends only oversized singletons to one
-    # model sharded across all GPUs. Building a 100K+ token saved-activation
-    # graph on CPU before taking that path can consume hundreds of GiB per
-    # rank, OOM-kill worker processes, and lose the otherwise durable partial
-    # update. In defer mode, exhaust the exact GPU/headroom stages and defer
-    # directly; no sample is truncated, excluded, or assigned a different
-    # objective.
-    if defer_exact_oom:
+    # Saved-activation offload is safe in the replicated SPO-RS path only when
+    # every process shares a bounded node-wide admission gate.  Without that
+    # gate, several 100K+ token graphs can consume host RAM concurrently and
+    # OOM-kill the VM.  The model-sharded fallback deliberately supplies no
+    # gate and therefore continues to use GPU checkpointing/headroom only.
+    if defer_exact_oom and activation_offload_semaphore is None:
         allow_activation_offload = False
 
     active = [list(batch) for batch in batches if batch]
@@ -4062,8 +4099,9 @@ def _run_oom_resilient_backward(
     offload_min_work = profile.get(
         "activation_offload_min_work", configured_offload_min_work)
     if (allow_activation_offload
-            and offload_min_work is not None
-            and active_work >= int(offload_min_work)
+            and (bool(start_activation_offload)
+                 or (offload_min_work is not None
+                     and active_work >= int(offload_min_work)))
             and hasattr(torch.autograd.graph, "save_on_cpu")):
         activation_offload = True
 
@@ -7384,9 +7422,10 @@ class ProcessDistributedTrainer:
 
         if str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs":
             fallback_description = (
-                "oversized exact trajectories route directly to the "
-                "model-sharded overflow lane; replica CPU activation "
-                "offload disabled")
+                "oversized exact trajectories use RAM-bounded replica "
+                "activation offload on at most "
+                f"{self._activation_offload_slots}/{self._world_size} ranks; "
+                "only the residual tail routes to the model-sharded lane")
         else:
             fallback_description = (
                 "CPU activation offload admitted on at most "
@@ -7895,6 +7934,297 @@ class ProcessDistributedTrainer:
             "fast_peak_memory_fraction": peak_fractions,
             "fast_allocator_memory_fraction": allocator_fractions,
             "oom_quarantined_examples": quarantined_examples,
+        }
+
+    def recover_spo_rs_overflow(
+            self, examples, cfg, step_idx, overflow_state):
+        """Finish saved SPO-RS overflow work on RAM-bounded GPU replicas.
+
+        The normal gradients already stored in ``overflow_state`` are never
+        replayed. Remaining trajectories are work-stolen by all replicas. A
+        trajectory that exhausts card memory may use the shared host-RAM
+        admission gate; successful gradients are reduced once and atomically
+        merged into the durable checkpoint. Only a trajectory that also fails
+        that bounded fallback is left for the final model-sharded lane.
+        """
+        import torch
+        from fast_distributed import (
+            broadcast_trainable_parameters, local_rank_update,
+            reduce_trainable_gradients,
+        )
+
+        if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
+            raise ValueError("exact overflow recovery is SPO-RS-only")
+        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+            raise ValueError("exact overflow recovery requires one update epoch")
+        if self._closed or not self._workers_idle:
+            raise RuntimeError(
+                "process trainer is not idle for exact overflow recovery")
+        if self._offloaded:
+            print(
+                f"[{self._process_label}] restoring {self._world_size} "
+                "process trainers for exact overflow recovery",
+                flush=True,
+            )
+            self.restore_after_generation()
+
+        _validate_precomputed_exact_gradients(
+            self.model, overflow_state, step_idx)
+        requested_keys = {
+            tuple(int(value) for value in example["_overlap_key"])
+            for example in examples
+        }
+        remaining_keys = {
+            tuple(int(value) for value in key)
+            for key in overflow_state.get("remaining_keys", ())
+        }
+        if not requested_keys or requested_keys != remaining_keys:
+            raise RuntimeError(
+                "replicated exact-overflow inputs do not match the durable "
+                f"remaining keys: inputs={len(requested_keys)}, "
+                f"remaining={len(remaining_keys)}")
+
+        started = time.time()
+        recovery_cfg = SimpleNamespace(**dict(vars(cfg)))
+        recovery_cfg._exact_replica_force_activation_offload = True
+        queued_examples = self._queue_examples(examples)
+        print(
+            f"[recovery] step {step_idx}: dispatching "
+            f"{len(queued_examples)} saved oversized trajectories across "
+            f"{self._world_size} GPU replicas; CPU activation graphs are "
+            f"limited to {self._activation_offload_slots} concurrent "
+            "rank(s)",
+            flush=True,
+        )
+        self.model.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._workers_idle = False
+        for rank in range(1, self._world_size):
+            self._command_queues[rank].put({
+                "kind": "train_rank",
+                "step_cfg": dict(vars(recovery_cfg)),
+                "token_budget": self._token_budgets[rank],
+                "memory_fraction": self._memory_fraction,
+                "defer_exact_oom": True,
+            })
+
+        try:
+            local_stats = local_rank_update(
+                self.backend, self.model, self.tokenizer, (), recovery_cfg, 0,
+                self._token_budgets[0],
+                memory_fraction=self._memory_fraction,
+                work_queue=self._work_queue,
+                activation_offload_semaphore=(
+                    self._activation_offload_semaphore),
+                defer_exact_oom=True,
+            )
+            child_messages = self._collect_event(
+                "computed", range(1, self._world_size))
+            rank_stats = [local_stats] + [
+                child_messages[rank]["stats"]
+                for rank in range(1, self._world_size)
+            ]
+            accounted_examples = sum(
+                int(stats["trained_examples"])
+                + int(stats["quarantined_examples"])
+                + int(stats.get("deferred_examples", 0))
+                for stats in rank_stats
+            )
+            if accounted_examples != len(queued_examples):
+                raise RuntimeError(
+                    "replicated exact-overflow queue lost or duplicated "
+                    f"work: accounted for {accounted_examples}/"
+                    f"{len(queued_examples)} trajectories")
+
+            deferred_keys = {
+                (int(key[0]), int(key[1]))
+                for stats in rank_stats
+                for key in stats.get("deferred_keys", ())
+            }
+            deferred_count = sum(
+                int(stats.get("deferred_examples", 0))
+                for stats in rank_stats)
+            quarantined_count = sum(
+                int(stats["quarantined_examples"])
+                for stats in rank_stats)
+            trained_count = sum(
+                int(stats["trained_examples"]) for stats in rank_stats)
+            if (deferred_count != len(deferred_keys)
+                    or not deferred_keys.issubset(requested_keys)
+                    or quarantined_count):
+                raise RuntimeError(
+                    "replicated exact-overflow recovery produced invalid "
+                    "trajectory accounting: "
+                    f"trained={trained_count}, deferred={deferred_count}, "
+                    f"unique deferred={len(deferred_keys)}, "
+                    f"quarantined={quarantined_count}")
+            successful_keys = requested_keys - deferred_keys
+            if trained_count != len(successful_keys):
+                raise RuntimeError(
+                    "replicated exact-overflow successful-key accounting "
+                    f"changed: trained={trained_count}, "
+                    f"keys={len(successful_keys)}")
+            metric_keys = (
+                "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+                "ratio", "clipped_fraction",
+            )
+            wave_stats = {
+                "totals": {
+                    key: sum(float(stats["totals"][key])
+                             for stats in rank_stats)
+                    for key in metric_keys
+                },
+                "max_ratio": max(
+                    float(stats["max_ratio"]) for stats in rank_stats),
+                "max_prefix_ratio": max(
+                    float(stats["max_prefix_ratio"])
+                    for stats in rank_stats),
+                "entropy_examples": sum(
+                    int(stats["entropy_examples"]) for stats in rank_stats),
+                "backward_batches": sum(
+                    int(stats["backward_batches"]) for stats in rank_stats),
+            }
+
+            # Workers reduce their local sums into rank 0, then wait at the
+            # parameter broadcast while rank 0 commits or applies the update.
+            for command_queue in self._command_queues.values():
+                command_queue.put({"kind": "finish_update"})
+            reduce_trainable_gradients(self.model, destination_rank=0)
+
+            update_error = None
+            overflow_error = None
+            grad_norm = None
+            try:
+                if successful_keys:
+                    _commit_exact_spo_rs_overflow_batch(
+                        self.model, overflow_state, step_idx,
+                        successful_keys, wave_stats,
+                        training_seconds=time.time() - started,
+                    )
+
+                # The durable checkpoint is now authoritative. Clear the
+                # just-reduced wave before materializing the complete saved
+                # gradient, otherwise successful recovery work is doubled.
+                self.model.zero_grad(set_to_none=True)
+                if deferred_keys:
+                    overflow_state["replica_offload_exhausted"] = True
+                    _write_exact_spo_rs_overflow_state(overflow_state)
+                    marker = _read_exact_sharded_recovery(
+                        self._exp_dir) or {}
+                    _write_exact_sharded_recovery(
+                        self._exp_dir, step_idx,
+                        marker.get(
+                            "reason",
+                            "bounded replicated overflow recovery exhausted"),
+                        replica_offload_exhausted=True,
+                        remaining_deferred_keys=[
+                            list(key) for key in sorted(deferred_keys)],
+                    )
+                    overflow_error = ExactLongContextTrainingOOM(
+                        f"step {step_idx} retained "
+                        f"{len(successful_keys)} additional exact gradient(s) "
+                        f"but {len(deferred_keys)} trajectory/trajectories "
+                        "still exceed bounded replica activation offload")
+                else:
+                    _apply_precomputed_exact_gradients(
+                        self.model, overflow_state, step_idx)
+                    grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                        [parameter for parameter in self.model.parameters()
+                         if parameter.requires_grad],
+                        max_norm=cfg.grad_clip,
+                        error_if_nonfinite=True,
+                    )
+                    self.optimizer.step()
+                    grad_norm = float(grad_norm_tensor.item())
+            except BaseException as error:
+                update_error = error
+            finally:
+                self.model.zero_grad(set_to_none=True)
+                broadcast_trainable_parameters(self.model, source_rank=0)
+                self._collect_event("updated", range(1, self._world_size))
+                self._workers_idle = True
+            if update_error is not None:
+                raise update_error
+            if overflow_error is not None:
+                raise overflow_error
+        except BaseException:
+            if not self._workers_idle:
+                self._abort_workers()
+            raise
+
+        for rank, stats in enumerate(rank_stats):
+            self._token_budgets[rank] = max(
+                1, int(stats["token_budget"]))
+        normal_stats = overflow_state.get("normal_stats", {})
+        overflow_stats = overflow_state.get("overflow_stats", {})
+        normal_totals = normal_stats.get("totals", {})
+        overflow_totals = overflow_stats.get("totals", {})
+        totals = {
+            key: (float(normal_totals.get(key, 0.0))
+                  + float(overflow_totals.get(key, 0.0)))
+            for key in metric_keys
+        }
+        max_ratio = max(
+            float(normal_stats.get("max_ratio", 0.0)),
+            float(overflow_stats.get("max_ratio", 0.0)),
+        )
+        max_prefix_ratio = max(
+            float(normal_stats.get("max_prefix_ratio", 0.0)),
+            float(overflow_stats.get("max_prefix_ratio", 0.0)),
+        )
+        entropy_examples = (
+            int(normal_stats.get("entropy_examples", 0))
+            + int(overflow_stats.get("entropy_examples", 0))
+        )
+        trained_per_gpu = [
+            int(stats["trained_examples"]) for stats in rank_stats
+        ]
+        batches_per_gpu = [
+            int(stats["backward_batches"]) for stats in rank_stats
+        ]
+        history = [{
+            "epoch": 1,
+            **totals,
+            "ratio_max": max_ratio,
+            "prefix_ratio_max": max_prefix_ratio,
+            "entropy_examples": entropy_examples,
+            "oom_quarantined_examples": 0,
+            "grad_norm": grad_norm,
+        }]
+        print(
+            f"[{self._process_label}] exact overflow trained examples/GPU="
+            f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
+            f"final padded-token budgets/GPU={self._token_budgets}",
+            flush=True,
+        )
+        print(
+            f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
+            f"loss={totals['loss']:.6f} "
+            f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+            f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
+            f"clipped={totals['clipped_fraction']:.1%} "
+            f"entropy examples={entropy_examples} OOM-quarantined=0 "
+            "(RAM-bounded replicated exact overflow recovery)",
+            flush=True,
+        )
+        return {
+            "rank_updates": history,
+            "rank_train_seconds": (
+                float(normal_stats.get("training_seconds", 0.0))
+                + float(overflow_stats.get("training_seconds", 0.0))),
+            "training_parallel_gpus": self._world_size,
+            "training_fast": True,
+            "training_fast_processes": True,
+            "fast_trained_examples_per_gpu": trained_per_gpu,
+            "fast_backward_batches_per_gpu": batches_per_gpu,
+            "fast_padded_token_budgets": list(self._token_budgets),
+            "oom_quarantined_examples": 0,
+            "exact_overflow_reused_examples": int(
+                normal_stats.get("trained_examples", 0))
+                + len(overflow_state.get("completed_keys", ()))
+                - len(successful_keys),
+            "exact_overflow_replica_examples": len(successful_keys),
+            "exact_overflow_sharded_examples": 0,
         }
 
     def begin_entropic_overlap(self, cfg, step_idx,
@@ -9969,10 +10299,6 @@ def _resume_spo_rs_step_from_artifacts(
     recovery_examples = all_examples
     if overflow_state is not None:
         try:
-            if parallel_trainer is not None:
-                raise RuntimeError(
-                    "selective recovery did not load the model-sharded "
-                    "trainer")
             _validate_precomputed_exact_gradients(
                 model, overflow_state, step_idx)
             deferred_keys = {
@@ -10062,12 +10388,18 @@ def _resume_spo_rs_step_from_artifacts(
         flush=True,
     )
     if overflow_state is not None:
+        recovery_lane = (
+            f"the {parallel_trainer.world_size}-GPU RAM-bounded replica lane"
+            if parallel_trainer is not None
+            and hasattr(parallel_trainer, "recover_spo_rs_overflow")
+            else "the model-sharded overflow lane"
+        )
         print(
             f"[recovery] step {step_idx}: reusing exact fast-path gradients "
             f"for {len(all_examples) - len(recovery_examples)}/"
             f"{len(all_examples)} trajectories; only "
             f"{len(recovery_examples)} oversized trajectory/trajectories "
-            "will run through the model-sharded overflow lane",
+            f"will run through {recovery_lane}",
             flush=True,
         )
 
@@ -10125,7 +10457,12 @@ def _resume_spo_rs_step_from_artifacts(
         "recovered_rollouts": len(artifacts),
         "_entropy_observations": entropy_observations,
     }
-    if parallel_trainer is not None:
+    if (overflow_state is not None
+            and parallel_trainer is not None
+            and hasattr(parallel_trainer, "recover_spo_rs_overflow")):
+        stats.update(parallel_trainer.recover_spo_rs_overflow(
+            recovery_examples, cfg, step_idx, overflow_state))
+    elif parallel_trainer is not None:
         stats.update(parallel_trainer.train_rank(
             all_examples, cfg, step_idx))
     else:
@@ -15087,6 +15424,20 @@ def main():
                 print(
                     f"[recovery] legacy exact-OOM update for step {step} "
                     "completed on the fast replicas; recovery marker removed",
+                    flush=True,
+                )
+            replica_recovery_step = getattr(
+                cfg, "_exact_replica_recovery_step", None)
+            if replica_recovery_step is not None:
+                if int(replica_recovery_step) != int(step):
+                    raise RuntimeError(
+                        "exact replica recovery marker expected step "
+                        f"{int(replica_recovery_step)}, but completed step "
+                        f"{step}")
+                _clear_exact_sharded_recovery(exp_dir)
+                print(
+                    f"[recovery] RAM-bounded replicated overflow update for "
+                    f"step {step} completed; recovery state removed",
                     flush=True,
                 )
             recovery_step = getattr(

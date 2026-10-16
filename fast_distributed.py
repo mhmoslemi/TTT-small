@@ -827,6 +827,15 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                     expand_memory=expand_for_long_rollout,
                     start_checkpointed=fused_long_singleton,
                     start_with_headroom=fused_long_singleton,
+                    # Selectively resumed trajectories already exhausted the
+                    # complete GPU-only ladder in an earlier process. Enter
+                    # bounded offload immediately for this dispatch only;
+                    # ordinary later steps retain their GPU-first behavior.
+                    start_activation_offload=bool(
+                        defer_exact_oom and getattr(
+                            cfg,
+                            "_exact_replica_force_activation_offload",
+                            False)),
                     activation_offload_semaphore=(
                         activation_offload_semaphore),
                     defer_exact_oom=bool(defer_exact_oom)))

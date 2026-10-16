@@ -20,6 +20,8 @@ GIB = 1024 ** 3
 DEFAULT_PINNED_CACHE_LIMIT_BYTES = 16 * GIB
 DEFAULT_LOW_AVAILABLE_FRACTION = 0.18
 DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES = 384 * GIB
+DEFAULT_ACTIVATION_OFFLOAD_RESERVE_FRACTION = 0.35
+DEFAULT_ACTIVATION_OFFLOAD_FREE_RESERVE_BYTES = 128 * GIB
 
 
 def host_memory_info(meminfo_path="/proc/meminfo"):
@@ -51,22 +53,34 @@ def host_memory_info(meminfo_path="/proc/meminfo"):
 
 def automatic_activation_offload_slots(
         worker_count, *, memory_info=None,
-        bytes_per_slot=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES):
+        bytes_per_slot=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES,
+        reserve_fraction=DEFAULT_ACTIVATION_OFFLOAD_RESERVE_FRACTION,
+        free_reserve_bytes=DEFAULT_ACTIVATION_OFFLOAD_FREE_RESERVE_BYTES):
     """Bound concurrent saved-activation CPU offloads by physical RAM.
 
     Ordinary GPU-resident forwards remain fully parallel.  This limit applies
-    only after an exact long sequence has exhausted both GPU-headroom stages
-    and falls back to ``save_on_cpu``.  A 384-GiB admission unit leaves room
-    for resident trainer state and sleeping vLLM weight backups while still
-    allowing several long rollouts to train concurrently on large hosts.
+    only after an exact long sequence has exhausted all GPU-headroom stages
+    and falls back to ``save_on_cpu``.  Each admitted graph receives a
+    conservative 384-GiB budget.  Thirty-five percent of physical RAM remains
+    outside that budget for sleeping vLLM weights, process state, filesystem
+    cache, and allocator variance, and at least 128 GiB of currently available
+    memory is kept uncommitted. This makes admission parallel on large nodes
+    without allowing all replicas to fill host RAM at once.
     """
     worker_count = max(1, int(worker_count))
     bytes_per_slot = max(1, int(bytes_per_slot))
+    reserve_fraction = min(0.95, max(0.0, float(reserve_fraction)))
+    free_reserve_bytes = max(0, int(free_reserve_bytes))
     info = host_memory_info() if memory_info is None else memory_info
     if not info:
         return 1
     total = max(1, int(info.get("total", 0)))
-    return min(worker_count, max(1, total // bytes_per_slot))
+    available = max(0, int(info.get("available", total)))
+    offload_budget = min(
+        max(0, int(total * (1.0 - reserve_fraction))),
+        max(0, available - free_reserve_bytes),
+    )
+    return min(worker_count, max(1, offload_budget // bytes_per_slot))
 
 
 def process_rss_bytes(statm_path="/proc/self/statm"):
