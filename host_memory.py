@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import math
 import os
 from pathlib import Path
+import threading
 
 
 GIB = 1024 ** 3
@@ -22,6 +24,10 @@ DEFAULT_LOW_AVAILABLE_FRACTION = 0.18
 DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES = 384 * GIB
 DEFAULT_ACTIVATION_OFFLOAD_RESERVE_FRACTION = 0.35
 DEFAULT_ACTIVATION_OFFLOAD_FREE_RESERVE_BYTES = 128 * GIB
+DEFAULT_ACTIVATION_OFFLOAD_MIN_REQUEST_BYTES = 64 * GIB
+DEFAULT_ACTIVATION_OFFLOAD_UNIT_BYTES = 8 * GIB
+DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_SAMPLES = 2
+DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_MARGIN = 1.25
 
 
 def host_memory_info(meminfo_path="/proc/meminfo"):
@@ -51,36 +57,185 @@ def host_memory_info(meminfo_path="/proc/meminfo"):
     return None
 
 
+def automatic_activation_offload_budget_bytes(
+        *, memory_info=None,
+        reserve_fraction=DEFAULT_ACTIVATION_OFFLOAD_RESERVE_FRACTION,
+        free_reserve_bytes=DEFAULT_ACTIVATION_OFFLOAD_FREE_RESERVE_BYTES):
+    """Return the RAM budget available to concurrent activation offloads."""
+    reserve_fraction = min(0.95, max(0.0, float(reserve_fraction)))
+    free_reserve_bytes = max(0, int(free_reserve_bytes))
+    info = host_memory_info() if memory_info is None else memory_info
+    if not info:
+        return 0
+    total = max(1, int(info.get("total", 0)))
+    available = max(0, int(info.get("available", total)))
+    return min(
+        max(0, int(total * (1.0 - reserve_fraction))),
+        max(0, available - free_reserve_bytes),
+    )
+
+
 def automatic_activation_offload_slots(
         worker_count, *, memory_info=None,
         bytes_per_slot=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES,
         reserve_fraction=DEFAULT_ACTIVATION_OFFLOAD_RESERVE_FRACTION,
         free_reserve_bytes=DEFAULT_ACTIVATION_OFFLOAD_FREE_RESERVE_BYTES):
-    """Bound concurrent saved-activation CPU offloads by physical RAM.
+    """Return conservative full-context offload concurrency.
 
     Ordinary GPU-resident forwards remain fully parallel.  This limit applies
     only after an exact long sequence has exhausted all GPU-headroom stages
-    and falls back to ``save_on_cpu``.  Each admitted graph receives a
-    conservative 384-GiB budget.  Thirty-five percent of physical RAM remains
-    outside that budget for sleeping vLLM weights, process state, filesystem
-    cache, and allocator variance, and at least 128 GiB of currently available
-    memory is kept uncommitted. This makes admission parallel on large nodes
-    without allowing all replicas to fill host RAM at once.
+    and falls back to ``save_on_cpu``. This compatibility helper reports how
+    many worst-case, full-context graphs fit. Runtime admission below is
+    token-weighted, so shorter trajectories can use more ranks concurrently.
     """
     worker_count = max(1, int(worker_count))
     bytes_per_slot = max(1, int(bytes_per_slot))
-    reserve_fraction = min(0.95, max(0.0, float(reserve_fraction)))
-    free_reserve_bytes = max(0, int(free_reserve_bytes))
-    info = host_memory_info() if memory_info is None else memory_info
-    if not info:
-        return 1
-    total = max(1, int(info.get("total", 0)))
-    available = max(0, int(info.get("available", total)))
-    offload_budget = min(
-        max(0, int(total * (1.0 - reserve_fraction))),
-        max(0, available - free_reserve_bytes),
+    budget = automatic_activation_offload_budget_bytes(
+        memory_info=memory_info,
+        reserve_fraction=reserve_fraction,
+        free_reserve_bytes=free_reserve_bytes,
     )
-    return min(worker_count, max(1, offload_budget // bytes_per_slot))
+    return min(worker_count, max(1, budget // bytes_per_slot))
+
+
+class _ActivationOffloadReservation:
+    """One atomic weighted reservation from a shared admission gate."""
+
+    def __init__(self, gate, work):
+        self._gate = gate
+        self._work = max(1, int(work))
+        self._units = None
+        self._acquired = False
+
+    def __enter__(self):
+        self._units = self._gate._acquire(self._work)
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._acquired:
+            self._gate._release(self._units)
+            self._acquired = False
+        return False
+
+
+class TokenWeightedActivationOffloadGate:
+    """Atomically share a host-RAM budget according to trajectory length.
+
+    Admission begins with the existing conservative 384-GiB charge.  After
+    two longest-first jobs complete, workers share the measured high-water
+    activation bytes/token and reserve that estimate with a safety margin.
+    This opens additional ranks for shorter trajectories without guessing at
+    their footprint or weakening the node-wide RAM reserve. Reservations are
+    atomic, so workers cannot partially acquire the budget and deadlock.
+    """
+
+    def __init__(
+            self, multiprocessing_context, capacity_bytes, reference_work,
+            *, full_context_bytes=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES,
+            minimum_request_bytes=DEFAULT_ACTIVATION_OFFLOAD_MIN_REQUEST_BYTES,
+            unit_bytes=DEFAULT_ACTIVATION_OFFLOAD_UNIT_BYTES,
+            calibration_samples=DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_SAMPLES,
+            calibration_margin=DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_MARGIN):
+        self.capacity_bytes = max(0, int(capacity_bytes))
+        self.reference_work = max(1, int(reference_work))
+        self.full_context_bytes = max(1, int(full_context_bytes))
+        self.minimum_request_bytes = max(1, int(minimum_request_bytes))
+        self.unit_bytes = max(1, int(unit_bytes))
+        self.calibration_samples = max(1, int(calibration_samples))
+        self.calibration_margin = max(1.0, float(calibration_margin))
+        self.capacity_units = self.capacity_bytes // self.unit_bytes
+        self.minimum_request_units = int(math.ceil(
+            self.minimum_request_bytes / self.unit_bytes))
+        self.enabled = bool(
+            self.capacity_units >= self.minimum_request_units)
+        self._available_units = multiprocessing_context.Value(
+            "q", int(self.capacity_units), lock=False)
+        self._observations = multiprocessing_context.Value(
+            "q", 0, lock=False)
+        self._peak_bytes_per_work = multiprocessing_context.Value(
+            "d", 0.0, lock=False)
+        self._condition = multiprocessing_context.Condition(
+            multiprocessing_context.RLock())
+
+    @property
+    def full_context_concurrency(self):
+        units = self.request_units(self.reference_work)
+        if units is None:
+            return 0
+        return max(1, self.capacity_units // units)
+
+    def estimated_request_bytes(self, work):
+        work = max(1, int(work))
+        # Begin with the original worst-case 384-GiB charge. Once two real
+        # offloads have completed, every process sees the shared high-water
+        # bytes/token measurement and can safely admit more shorter jobs. The
+        # estimate retains a safety margin rather than assuming the original
+        # full-context estimate is an upper bound on every model/runtime.
+        if int(self._observations.value) < self.calibration_samples:
+            return self.full_context_bytes
+        scaled = int(math.ceil(
+            float(self._peak_bytes_per_work.value)
+            * self.calibration_margin * min(work, self.reference_work)))
+        return max(self.minimum_request_bytes, scaled)
+
+    def request_units(self, work):
+        if not self.enabled:
+            return None
+        units = int(math.ceil(
+            self.estimated_request_bytes(work) / self.unit_bytes))
+        # A completed calibration job proves that one such graph can finish
+        # on this host even if the added safety margin exceeds the allocatable
+        # budget. In that case reserve the entire budget and serialize it;
+        # never turn a successful measurement into a recovery failure.
+        return min(self.capacity_units, max(1, units))
+
+    def can_admit(self, work):
+        return self.request_units(work) is not None
+
+    def reservation(self, work):
+        units = self.request_units(work)
+        if units is None:
+            raise RuntimeError(
+                "activation-offload request exceeds the safe host-RAM budget")
+        return _ActivationOffloadReservation(self, work)
+
+    def observe(self, work, footprint_bytes):
+        """Publish one completed offload's retained host-memory high water."""
+        work = max(1, int(work))
+        footprint_bytes = max(0, int(footprint_bytes))
+        if footprint_bytes < GIB:
+            return
+        rate = float(footprint_bytes) / work
+        with self._condition:
+            self._peak_bytes_per_work.value = max(
+                float(self._peak_bytes_per_work.value), rate)
+            self._observations.value += 1
+            self._condition.notify_all()
+
+    def _acquire(self, work):
+        work = max(1, int(work))
+        with self._condition:
+            while True:
+                units = self.request_units(work)
+                if units is None:
+                    raise RuntimeError(
+                        "activation-offload request exceeds the safe "
+                        "host-RAM budget")
+                if int(self._available_units.value) >= units:
+                    self._available_units.value -= units
+                    return units
+                self._condition.wait()
+
+    def _release(self, units):
+        units = int(units)
+        with self._condition:
+            next_value = int(self._available_units.value) + units
+            if next_value > self.capacity_units:
+                raise RuntimeError(
+                    "activation-offload admission released excess capacity")
+            self._available_units.value = next_value
+            self._condition.notify_all()
 
 
 def process_rss_bytes(statm_path="/proc/self/statm"):
@@ -90,6 +245,63 @@ def process_rss_bytes(statm_path="/proc/self/statm"):
         return int(fields[1]) * int(os.sysconf("SC_PAGE_SIZE"))
     except (OSError, IndexError, TypeError, ValueError):
         return None
+
+
+class ProcessRSSPeakSampler:
+    """Measure a process's incremental RSS peak across one offloaded graph.
+
+    Saved tensors can be freed before the backward call returns, so comparing
+    RSS only at the two endpoints can miss the true live peak.  Sampling
+    ``/proc/self/statm`` from a tiny daemon thread captures that peak without
+    synchronizing CUDA or retaining any tensor.  The sampler is used only by
+    the exceptional CPU-activation-offload path.
+    """
+
+    def __init__(self, interval_seconds=0.05):
+        self.interval_seconds = max(0.01, float(interval_seconds))
+        self.baseline_bytes = None
+        self.peak_bytes = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _sample(self):
+        rss = process_rss_bytes()
+        if rss is None:
+            return
+        rss = int(rss)
+        if self.baseline_bytes is None:
+            self.baseline_bytes = rss
+        if self.peak_bytes is None or rss > self.peak_bytes:
+            self.peak_bytes = rss
+
+    def _run(self):
+        while not self._stop.wait(self.interval_seconds):
+            self._sample()
+
+    def __enter__(self):
+        self._sample()
+        if self.baseline_bytes is not None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name="ttt-activation-rss-sampler",
+                daemon=True,
+            )
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._sample()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, 2 * self.interval_seconds))
+        self._sample()
+        return False
+
+    @property
+    def footprint_bytes(self):
+        if self.baseline_bytes is None or self.peak_bytes is None:
+            return 0
+        return max(0, int(self.peak_bytes) - int(self.baseline_bytes))
 
 
 def _host_allocator_stats(torch_module):

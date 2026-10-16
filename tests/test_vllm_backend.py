@@ -89,7 +89,76 @@ def _fake_complete_yaml(stream):
     return values
 
 
+def _activation_gate_spawn_probe(gate, result_queue, work):
+    with gate.reservation(work):
+        result_queue.put(int(gate._available_units.value))
+
+
 class VLLMBackendTests(unittest.TestCase):
+    def test_exact_recovery_shutdown_never_enters_distributed_barrier(self):
+        with patch.dict(sys.modules, {
+                "numpy": types.ModuleType("numpy"),
+                "yaml": types.ModuleType("yaml"),
+        }):
+            from train_multy_CVaR import ProcessDistributedTrainer
+
+        events = []
+
+        class FakeProcess:
+            def __init__(self, rank):
+                self.rank = rank
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                events.append(("terminate", self.rank))
+                self.alive = False
+
+            def join(self, timeout=None):
+                events.append(("join", self.rank))
+
+            def kill(self):
+                events.append(("kill", self.rank))
+                self.alive = False
+
+        trainer = ProcessDistributedTrainer.__new__(
+            ProcessDistributedTrainer)
+        trainer._closed = False
+        trainer._dist_initialized = True
+        trainer._processes = {
+            rank: FakeProcess(rank) for rank in range(1, 4)
+        }
+        # A recovery restart must not inspect command queues or import/call
+        # torch.distributed; it tears down children before os.execvpe.
+        trainer._command_queues = None
+
+        trainer.shutdown(for_restart=True)
+
+        self.assertTrue(trainer._closed)
+        self.assertFalse(trainer._dist_initialized)
+        self.assertEqual(events, [
+            ("terminate", 1), ("terminate", 2), ("terminate", 3),
+            ("join", 1), ("join", 2), ("join", 3),
+        ])
+
+    def test_peak_rss_sampler_tracks_increment_over_baseline(self):
+        from host_memory import ProcessRSSPeakSampler
+
+        readings = iter([100, 180, 260, 220])
+        sampler = ProcessRSSPeakSampler(interval_seconds=10.0)
+        with patch(
+                "host_memory.process_rss_bytes",
+                side_effect=lambda: next(readings, 220)):
+            sampler._sample()
+            sampler._sample()
+            sampler._sample()
+            sampler._sample()
+        self.assertEqual(sampler.baseline_bytes, 100)
+        self.assertEqual(sampler.peak_bytes, 260)
+        self.assertEqual(sampler.footprint_bytes, 160)
+
     def test_qwen38_gated_norm_tiles_preserve_forward_and_gradients(self):
         if importlib.util.find_spec("torch") is None:
             self.skipTest(
@@ -649,14 +718,22 @@ class VLLMBackendTests(unittest.TestCase):
         offload.assert_called_once()
 
     def test_activation_offload_slots_reserve_node_memory(self):
-        from host_memory import GIB, automatic_activation_offload_slots
+        from host_memory import (
+            GIB, automatic_activation_offload_budget_bytes,
+            automatic_activation_offload_slots,
+        )
 
+        memory = {"total": 1820 * GIB, "available": 1700 * GIB}
         self.assertEqual(
             automatic_activation_offload_slots(
                 8,
-                memory_info={"total": 1820 * GIB, "available": 1700 * GIB},
+                memory_info=memory,
             ),
             3,
+        )
+        self.assertEqual(
+            automatic_activation_offload_budget_bytes(memory_info=memory),
+            int(1820 * GIB * 0.65),
         )
         self.assertEqual(
             automatic_activation_offload_slots(
@@ -671,6 +748,54 @@ class VLLMBackendTests(unittest.TestCase):
                 memory_info={"total": 1820 * GIB, "available": 400 * GIB},
             ),
             1,
+        )
+
+    def test_activation_offload_gate_scales_reservation_with_tokens(self):
+        import multiprocessing as mp
+        from host_memory import GIB, TokenWeightedActivationOffloadGate
+
+        gate = TokenWeightedActivationOffloadGate(
+            mp.get_context("spawn"), 896 * GIB, 262_144)
+
+        self.assertEqual(gate.capacity_units, 112)
+        # Before any empirical measurement, retain the original conservative
+        # full-context reservation for every admitted offload.
+        self.assertEqual(gate.request_units(138_000), 48)
+        self.assertEqual(gate.request_units(54_000), 48)
+        gate.observe(138_000, 162 * GIB)
+        self.assertEqual(gate.request_units(54_000), 48)
+        gate.observe(138_000, 162 * GIB)
+
+        long_units = gate.request_units(138_000)
+        short_units = gate.request_units(54_000)
+        self.assertEqual(long_units, 26)
+        self.assertEqual(short_units, 10)
+        self.assertGreater(long_units, short_units)
+        self.assertEqual(gate.full_context_concurrency, 2)
+        available = gate._available_units.value
+        with gate.reservation(138_000):
+            self.assertEqual(
+                gate._available_units.value, available - long_units)
+        self.assertEqual(gate._available_units.value, available)
+
+        result_queue = mp.get_context("spawn").Queue()
+        process = mp.get_context("spawn").Process(
+            target=_activation_gate_spawn_probe,
+            args=(gate, result_queue, 54_000),
+        )
+        process.start()
+        process.join(timeout=10.0)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(result_queue.get(timeout=1.0), available - short_units)
+        self.assertEqual(gate._available_units.value, available)
+
+        conservative = TokenWeightedActivationOffloadGate(
+            mp.get_context("spawn"), 512 * GIB, 262_144)
+        conservative.observe(100_000, 500 * GIB)
+        conservative.observe(100_000, 500 * GIB)
+        self.assertEqual(
+            conservative.request_units(100_000),
+            conservative.capacity_units,
         )
 
     def test_strict_training_still_raises_without_selective_overflow(self):

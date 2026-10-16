@@ -4013,17 +4013,35 @@ def _run_oom_resilient_backward(
     """
     import gc
     import torch
-    from host_memory import (host_cache_reclaim_supported,
+    from host_memory import (ProcessRSSPeakSampler,
+                             host_cache_reclaim_supported,
+                             process_rss_bytes,
                              reclaim_unused_host_memory)
     from model_backend import set_gradient_checkpointing
 
     # Saved-activation offload is safe in the replicated SPO-RS path only when
-    # every process shares a bounded node-wide admission gate.  Without that
+    # every process shares a bounded node-wide admission gate. Without that
     # gate, several 100K+ token graphs can consume host RAM concurrently and
-    # OOM-kill the VM.  The model-sharded fallback deliberately supplies no
+    # OOM-kill the VM. The model-sharded fallback deliberately supplies no
     # gate and therefore continues to use GPU checkpointing/headroom only.
     if defer_exact_oom and activation_offload_semaphore is None:
         allow_activation_offload = False
+
+    def offload_gate_can_admit(work):
+        if activation_offload_semaphore is None:
+            return True
+        checker = getattr(
+            activation_offload_semaphore, "can_admit", None)
+        return bool(checker(work)) if callable(checker) else True
+
+    def offload_admission(work):
+        if activation_offload_semaphore is None:
+            return nullcontext()
+        reservation = getattr(
+            activation_offload_semaphore, "reservation", None)
+        if callable(reservation):
+            return reservation(work)
+        return activation_offload_semaphore
 
     active = [list(batch) for batch in batches if batch]
     quarantined = []
@@ -4102,6 +4120,7 @@ def _run_oom_resilient_backward(
             and (bool(start_activation_offload)
                  or (offload_min_work is not None
                      and active_work >= int(offload_min_work)))
+            and offload_gate_can_admit(active_work)
             and hasattr(torch.autograd.graph, "save_on_cpu")):
         activation_offload = True
 
@@ -4148,16 +4167,18 @@ def _run_oom_resilient_backward(
             # from the CUDA device allocator.  Use pinned storage only when
             # this runtime exposes a way to return that cache to the OS.
             admission = (
-                activation_offload_semaphore
-                if activation_offload
-                and activation_offload_semaphore is not None
-                else nullcontext()
-            )
+                offload_admission(active_work)
+                if activation_offload else nullcontext())
             # Keep the admission token until inactive pinned blocks and libc
             # arenas have been returned. Otherwise the next trainer can begin
             # a large offload while this process still owns the prior batch's
             # host cache, recreating the node-wide RAM spike.
             with admission:
+                offload_rss_before = (
+                    process_rss_bytes() if activation_offload else None)
+                rss_sampler = (
+                    ProcessRSSPeakSampler()
+                    if activation_offload else nullcontext())
                 offload_context = (
                     torch.autograd.graph.save_on_cpu(
                         pin_memory=host_cache_reclaim_supported(torch))
@@ -4166,8 +4187,9 @@ def _run_oom_resilient_backward(
                     else nullcontext()
                 )
                 try:
-                    with offload_context:
-                        result = attempt(active)
+                    with rss_sampler as sampled_rss:
+                        with offload_context:
+                            result = attempt(active)
                 except BaseException:
                     # Clean the failed graph before releasing the shared
                     # admission slot. Otherwise another rank can begin a CPU
@@ -4184,8 +4206,32 @@ def _run_oom_resilient_backward(
                     raise
                 else:
                     if activation_offload:
-                        reclaim_unused_host_memory(
+                        cleanup = reclaim_unused_host_memory(
                             torch, cuda_devices=cuda_devices, force=True)
+                        # Forced cleanup records the pinned allocator and RSS
+                        # immediately before releasing the saved activations.
+                        # Publish the larger measurement while this rank still
+                        # owns its reservation; waiting ranks then recompute
+                        # their token-weighted request before they can enter.
+                        observer = getattr(
+                            activation_offload_semaphore, "observe", None)
+                        if callable(observer):
+                            footprint = int(
+                                cleanup.get("pinned_owned_before", 0) or 0)
+                            rss_at_cleanup = cleanup.get("rss_before")
+                            if (offload_rss_before is not None
+                                    and rss_at_cleanup is not None):
+                                footprint = max(
+                                    footprint,
+                                    max(0, int(rss_at_cleanup)
+                                        - int(offload_rss_before)),
+                                )
+                            footprint = max(
+                                footprint,
+                                int(getattr(
+                                    sampled_rss, "footprint_bytes", 0) or 0),
+                            )
+                            observer(active_work, footprint)
             if split_backoff and active:
                 successful_work = _gradient_checkpointing_work_units(active)
                 _remember_oom_profile_minimum(
@@ -4263,7 +4309,9 @@ def _run_oom_resilient_backward(
                     )
                     continue
             if (cuda_oom and allow_activation_offload
-                    and not activation_offload and hasattr(
+                    and not activation_offload
+                    and offload_gate_can_admit(active_work)
+                    and hasattr(
                     torch.autograd.graph, "save_on_cpu")):
                 activation_offload = True
                 offload_trigger_work = active_work
@@ -7347,11 +7395,22 @@ class ProcessDistributedTrainer:
         if self._world_size < 2:
             raise ValueError("process-distributed training requires two GPUs")
 
-        from host_memory import automatic_activation_offload_slots
+        from host_memory import (
+            GIB, TokenWeightedActivationOffloadGate,
+            automatic_activation_offload_budget_bytes,
+        )
+        self._activation_offload_budget_bytes = (
+            automatic_activation_offload_budget_bytes())
+        self._activation_offload_semaphore = (
+            TokenWeightedActivationOffloadGate(
+                self._context,
+                self._activation_offload_budget_bytes,
+                max(1, int(cfg.max_seq_length)),
+            ))
         self._activation_offload_slots = (
-            automatic_activation_offload_slots(self._world_size))
-        self._activation_offload_semaphore = self._context.BoundedSemaphore(
-            self._activation_offload_slots)
+            self._activation_offload_semaphore.full_context_concurrency)
+        self._activation_offload_budget_gib = (
+            self._activation_offload_budget_bytes / GIB)
 
         # Eight independent Python processes must not each create a full-sized
         # host thread pool. GPU 0 was loaded before this class is constructed;
@@ -7422,14 +7481,18 @@ class ProcessDistributedTrainer:
 
         if str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs":
             fallback_description = (
-                "oversized exact trajectories use RAM-bounded replica "
-                "activation offload on at most "
-                f"{self._activation_offload_slots}/{self._world_size} ranks; "
+                "oversized exact trajectories use token-weighted replica "
+                "activation offload from a "
+                f"{self._activation_offload_budget_gib:.0f}-GiB RAM budget "
+                f"({self._activation_offload_slots} full-context or up to "
+                f"{self._world_size} shorter ranks); "
                 "only the residual tail routes to the model-sharded lane")
         else:
             fallback_description = (
-                "CPU activation offload admitted on at most "
-                f"{self._activation_offload_slots}/{self._world_size} ranks")
+                "token-weighted CPU activation offload uses a "
+                f"{self._activation_offload_budget_gib:.0f}-GiB RAM budget "
+                f"({self._activation_offload_slots} full-context or up to "
+                f"{self._world_size} shorter ranks)")
         setting_log_only(
             f"[{self._process_label}] process-distributed trainer active on "
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
@@ -7543,7 +7606,9 @@ class ProcessDistributedTrainer:
             copied_examples.append(copied)
         return copied_examples
 
-    def _queue_examples(self, examples, *, seal=True, announce=True):
+    def _queue_examples(
+            self, examples, *, seal=True, announce=True,
+            weighted_offload=False):
         """Queue expensive examples first; idle ranks steal the next work."""
         import torch
 
@@ -7624,11 +7689,65 @@ class ProcessDistributedTrainer:
                 )
         else:
             ordered = sorted(copied, key=estimated_cost, reverse=True)
+            offload_waves = None
+            if weighted_offload:
+                # First-fit decreasing packs recovery trajectories into
+                # RAM-safe concurrent waves. Unlike the former fixed rank
+                # count, a wave can use every GPU when its shorter activation
+                # graphs fit the same node-wide budget. Flattening the waves
+                # retains asynchronous work stealing; the shared weighted
+                # gate remains the authoritative safety mechanism.
+                gate = self._activation_offload_semaphore
+                waves = []
+                for example in ordered:
+                    work = int(example["prompt_ids"].shape[1]) + int(
+                        example["response_ids"].shape[1])
+                    units = gate.request_units(work)
+                    if units is None:
+                        waves.append({
+                            "units": gate.capacity_units + 1,
+                            "items": [example],
+                        })
+                        continue
+                    placed = False
+                    for wave in waves:
+                        if (len(wave["items"]) < self._world_size
+                                and int(wave["units"]) + int(units)
+                                <= int(gate.capacity_units)):
+                            wave["items"].append(example)
+                            wave["units"] += int(units)
+                            placed = True
+                            break
+                    if not placed:
+                        waves.append({
+                            "units": int(units),
+                            "items": [example],
+                        })
+                ordered = [
+                    example for wave in waves for example in wave["items"]
+                ]
+                offload_waves = [
+                    len(wave["items"]) for wave in waves
+                ]
             for example in ordered:
                 self._work_queue.put(example)
             if announce:
-                print(f"[{self._process_label}] queued {len(ordered)} examples longest-first; "
-                      "each free GPU claims the next adaptive batch", flush=True)
+                if offload_waves is None:
+                    print(f"[{self._process_label}] queued {len(ordered)} "
+                          "examples longest-first; each free GPU claims the "
+                          "next adaptive batch", flush=True)
+                else:
+                    preview = ",".join(
+                        str(value) for value in offload_waves[:8])
+                    suffix = "..." if len(offload_waves) > 8 else ""
+                    print(
+                        f"[{self._process_label}] queued {len(ordered)} "
+                        "oversized examples longest-first; conservative "
+                        f"startup ranks/wave={preview}{suffix}, then measured "
+                        "token-weighted admission expands concurrency; idle "
+                        "ranks steal work as RAM capacity is freed",
+                        flush=True,
+                    )
         if seal:
             for _ in range(self._world_size):
                 self._work_queue.put(None)
@@ -7987,13 +8106,15 @@ class ProcessDistributedTrainer:
         started = time.time()
         recovery_cfg = SimpleNamespace(**dict(vars(cfg)))
         recovery_cfg._exact_replica_force_activation_offload = True
-        queued_examples = self._queue_examples(examples)
+        queued_examples = self._queue_examples(
+            examples, weighted_offload=True)
         print(
             f"[recovery] step {step_idx}: dispatching "
             f"{len(queued_examples)} saved oversized trajectories across "
-            f"{self._world_size} GPU replicas; CPU activation graphs are "
-            f"limited to {self._activation_offload_slots} concurrent "
-            "rank(s)",
+            f"{self._world_size} GPU replicas; CPU activation admission "
+            f"starts conservatively, measures real footprint, then shares "
+            f"its {self._activation_offload_budget_gib:.0f}-GiB RAM budget "
+            "across every rank whose current trajectory fits",
             flush=True,
         )
         self.model.zero_grad(set_to_none=True)
@@ -9018,10 +9139,53 @@ class ProcessDistributedTrainer:
                 pass
         self._dist_initialized = False
 
-    def shutdown(self):
+    def _terminate_workers_for_restart(self):
+        """Stop child ranks without entering another distributed collective.
+
+        Exact-overflow recovery is durable before its restart request is
+        raised.  At that point the current process will be replaced with
+        ``exec``, so a graceful NCCL barrier is both unnecessary and unsafe:
+        one child missing the matching barrier would prevent the recovery
+        process from ever starting.  Use one bounded deadline for all ranks,
+        then force-kill any child that ignored SIGTERM.  Deliberately leave
+        rank zero's process group intact; ``exec`` replaces the process and
+        releases that CUDA/NCCL state without another potentially blocking
+        distributed operation.
+        """
+        import time
+
+        for process in self._processes.values():
+            if process.is_alive():
+                process.terminate()
+
+        deadline = time.monotonic() + 10.0
+        for process in self._processes.values():
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        for process in self._processes.values():
+            if not process.is_alive():
+                continue
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+            else:
+                process.terminate()
+
+        deadline = time.monotonic() + 5.0
+        for process in self._processes.values():
+            if process.is_alive():
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+        self._dist_initialized = False
+
+    def shutdown(self, *, for_restart=False):
         if self._closed:
             return
         self._closed = True
+
+        if for_restart:
+            self._terminate_workers_for_restart()
+            return
+
         import torch.distributed as dist
 
         # A downstream save/evaluation exception can bypass the normal overlap
@@ -15511,7 +15675,9 @@ def main():
         if (parallel_trainer is not None
                 and hasattr(parallel_trainer, "shutdown")):
             print("[shutdown] stopping process-distributed trainer ...")
-            parallel_trainer.shutdown()
+            parallel_trainer.shutdown(for_restart=(
+                restart_for_exact_recovery
+                or restart_after_exact_recovery))
 
     if restart_for_exact_recovery or restart_after_exact_recovery:
         _restart_for_exact_resume(exp_dir)
