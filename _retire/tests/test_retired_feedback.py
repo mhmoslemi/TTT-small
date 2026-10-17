@@ -230,7 +230,7 @@ class FeedbackRetirementTests(unittest.TestCase):
                         self.assertEqual(scope["is_code_failure"](result), previous(result))
 
     def test_legacy_saved_and_yaml_feedback_settings_cannot_reactivate_feature(self):
-        from test_retired_batch_growth import FixedBatchConfigTests
+        from _retire.tests.test_retired_batch_growth import FixedBatchConfigTests
         helper = FixedBatchConfigTests()
         config = dict(helper.base_config(), feedback=True, feedback_lambda=10,
                       feedback_adaptive=True)

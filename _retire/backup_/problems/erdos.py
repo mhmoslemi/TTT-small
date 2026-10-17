@@ -1,0 +1,341 @@
+"""
+Erdos' Minimum Overlap Problem.
+
+Two changes from the original:
+
+  The prompt now specifies an output format. It previously ended with "Write
+  code to optimize this construction." and said nothing about structure, so the
+  model had no block to fill and no fence to reach and simply ran toward
+  max_new_tokens, and extract_python_code (which looks for ```python fences)
+  had nothing reliable to find.
+
+  The compute budget is config-driven. The prompt used to hardcode
+  "budget_s=1000", and the sandbox calls run() with NO arguments, so that
+  default is what actually executes: every rollout may burn 1000 seconds of
+  optimization. At 512 rollouts a step that is 4 to 70 hours depending on how
+  many evaluations run in parallel. `budget_s` in the problem config now sets
+  both the number in the prompt and the sandbox ceiling, so the two cannot
+  drift apart.
+"""
+
+from __future__ import annotations
+import inspect
+from typing import Any, List
+import numpy as np
+from problems.base import (
+    Problem, ParentContext, RewardResult, SeedState, render_state_context,
+)
+
+
+def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
+    if not isinstance(h_values, np.ndarray):
+        try:
+            h_values = np.array(h_values, dtype=np.float64)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Cannot convert h_values to numpy array: {e}")
+
+    if len(h_values.shape) != 1:
+        raise ValueError(f"h_values must be 1D array, got shape {h_values.shape}")
+
+    if h_values.shape[0] != n_points:
+        raise ValueError(f"Expected h shape ({n_points},), got {h_values.shape}")
+
+    if not np.all(np.isfinite(h_values)):
+        raise ValueError("h_values contain NaN or inf values")
+
+    if np.any(h_values < 0) or np.any(h_values > 1):
+        raise ValueError(f"h(x) is not in [0, 1]. Range: [{h_values.min()}, {h_values.max()}]")
+
+    n = n_points
+    target_sum = n / 2.0
+    current_sum = np.sum(h_values)
+
+    if current_sum != target_sum:
+        # Invalid candidates can have an all-zero or numerically tiny sum. The
+        # verifier rejects the resulting non-finite normalization below; keep
+        # NumPy from also emitting a noisy RuntimeWarning for that candidate.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            h_values = h_values * (target_sum / current_sum)
+        if not np.all(np.isfinite(h_values)):
+            raise ValueError("Normalization produced NaN or inf values")
+        if np.any(h_values < 0) or np.any(h_values > 1):
+            raise ValueError(f"After normalization, h(x) is not in [0, 1]. Range: [{h_values.min()}, {h_values.max()}]")
+
+    dx = 2.0 / n_points
+
+    j_values = 1.0 - h_values
+    correlation = np.correlate(h_values, j_values, mode="full") * dx
+    computed_c5 = np.max(correlation)
+
+    if not np.isfinite(computed_c5):
+        raise ValueError(f"Computed C5 is not finite: {computed_c5}")
+
+    if not np.isclose(computed_c5, c5_achieved, atol=1e-9, rtol=0.0):
+        raise ValueError(
+            f"C5 mismatch: reported {c5_achieved:.12f}, "
+            f"computed {computed_c5:.12f}")
+
+    return computed_c5
+
+
+def evaluate_erdos_solution(h_values: np.ndarray, c5_bound: float, n_points: int) -> float:
+    return float(verify_c5_solution(h_values, c5_bound, n_points))
+
+
+def verify_erdos_solution(result) -> bool:
+    try:
+        h_values, c5_bound, n_points = result
+        c5_bound = evaluate_erdos_solution(h_values, c5_bound, n_points)
+        if c5_bound <= 0 or np.isnan(c5_bound) or np.isinf(c5_bound):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+_VERIFIER_SRC = (
+    "import numpy as np\n\n"
+    + inspect.getsource(verify_c5_solution) + "\n\n"
+    + inspect.getsource(evaluate_erdos_solution) + "\n\n"
+)
+
+
+class ErdosMinOverlap(Problem):
+    two_stage_rollouts = True
+    name = "erdos"
+    entrypoint = "run"
+    metric_name = "C\u2085 bound"
+    maximize = False
+    # The h array is the solution and cannot be recovered by replay: the
+    # optimizer is stochastic and budget-bounded, and a mid-run rollout's parent
+    # array is not otherwise stored either. Save both.
+    saves_construction = True
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        if self.target is None:
+            self.target = 0.3808
+        # What the model is told it has, and what the sandbox actually allows.
+        # The sandbox gets headroom so a program that respects its budget is
+        # killed by its own clock rather than by the harness, which produces a
+        # returned best-so-far instead of a lost rollout.
+        self.budget_s = float(cfg.get("budget_s", 60.0))
+
+    @staticmethod
+    def _append_user_instruction(messages: List[dict], instruction: str
+                                 ) -> List[dict]:
+        staged = [dict(message) for message in messages]
+        if staged and staged[-1].get("role") == "user":
+            staged[-1]["content"] = (
+                str(staged[-1].get("content", "")).rstrip()
+                + "\n\n" + instruction.strip() + "\n"
+            )
+        else:
+            staged.append({"role": "user", "content": instruction.strip()})
+        return staged
+
+    def build_strategy_messages(
+            self, messages: List[dict],
+            previous_strategies: List[str] | None = None) -> List[dict]:
+        staged = self._append_user_instruction(messages, '''
+Erdos-specific implementation constraint: `initial_h_values`, when a current
+construction is available, is already supplied to the executed program as a
+NumPy array. Never plan to copy, serialize, reconstruct, or hard-code that
+array. Never propose a long explicit numeric table or an unrolled pattern.
+Describe compact algorithmic construction using NumPy operations, formulas,
+loops, interpolation, or seeded random generation. The eventual complete
+program must fit comfortably in a few hundred lines.
+
+Erdos mathematical checks for the final plan:
+- The authoritative objective is max(np.correlate(h, 1-h, mode="full")) *
+  (2.0 / n_points), over all 2*n_points-1 lags. This is linear correlation
+  with finite support, not circular correlation. Include both lag directions.
+- At a nonzero lag, the overlap covers only part of the interval. The sum of
+  h over that overlap is not generally its full integral of 1. Do not replace
+  the objective with 1 minus a minimum autocorrelation without a derivation
+  that preserves these boundary terms and exactly matches the evaluator.
+- Products of entries of h make this a generally nonconvex optimization
+  problem. A direct CVXPY call is not a solution unless the subproblem you
+  formulate satisfies its supported rules. For a convex subproblem or
+  relaxation, specify its derivation, candidate recovery, and exact-objective
+  acceptance check. Do not claim a global optimum from a local method.
+- State how every returned vector satisfies both 0 <= h[i] <= 1 and
+  sum(h) = n_points / 2. Clipping and rescaling in succession do not generally
+  enforce both constraints; give a valid joint feasibility mechanism.
+- Derive dimensions from runtime inputs. If changing resolution, describe how
+  to transfer the parent, restore feasibility, and compare exact scores.
+  Retain a validated parent as a fallback when one is supplied.''')
+        return super().build_strategy_messages(
+            staged, previous_strategies=previous_strategies)
+
+    def build_code_messages(self, messages: List[dict],
+                            strategy: str) -> List[dict]:
+        staged = super().build_code_messages(messages, strategy)
+        return self._append_user_instruction(staged, '''
+## Mandatory compact-source contract
+
+- `initial_h_values` is runtime input when a parent construction exists.
+  Reference it directly; NEVER assign to it, paste its values, serialize it,
+  or reconstruct it as a literal. If no parent construction was announced,
+  create a starting vector under a different name.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- Keep the complete source concise: at most 300 lines and about 12,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
+
+These are hard output constraints even if the proposed strategy suggests
+otherwise.''')
+
+    # ------------------------------------------------------------------
+    def build_prompt(self, parent: ParentContext) -> List[dict]:
+        state_ctx = render_state_context(self.metric_name, self.target, parent,
+                                         maximize=self.maximize)
+
+        construction_section = ""
+        if parent.construction is not None and len(parent.construction) > 0:
+            construction_section = f"""
+You may want to start your search from the current construction, which you can access through the `initial_h_values` global variable (n={len(parent.construction)} samples).
+You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
+"""
+
+        if parent.code and parent.code.strip():
+            code_section = '''Reason about how you could further improve this construction.
+Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
+Unless you make a meaningful improvement, you will not be rewarded.'''
+        else:
+            code_section = '''Write code to optimize this construction.'''
+
+        direct_output_section = ""
+        if not self.two_stage_rollouts:
+            direct_output_section = ''' 
+## Required output
+
+Return exactly one complete fenced Python code block, beginning with
+```python and ending with ```, and nothing else. Do not output a strategy,
+analysis, prose, notes, example usage, a second code block, or a partial
+snippet. Finish the program and close the fence well before the response-token
+limit.
+
+## Mandatory compact-source contract
+
+- `initial_h_values` is runtime input when a parent construction exists.
+  Reference it directly; NEVER assign to it, paste its values, serialize it,
+  or reconstruct it as a literal. If no parent construction was announced,
+  create a starting vector under a different name.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- Keep the complete source concise: at most 300 lines and about 12,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
+
+These are hard output constraints.'''
+
+        user = f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
+Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.
+
+## Problem
+
+Find a step function h: [0, 2] → [0, 1] that **minimizes** the overlap integral:
+
+$$C_5 = \\max_k \\int h(x)(1 - h(x+k)) dx$$
+
+**Constraints**:
+1. h(x) ∈ [0, 1] for all x
+2. ∫₀² h(x) dx = 1
+
+**Discretization**: Represent h as n_points samples over [0, 2].
+With dx = 2.0 / n_points:
+- 0 ≤ h[i] ≤ 1 for all i
+- sum(h) * dx = 1 (equivalently: sum(h) == n_points / 2 exactly)
+
+The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
+
+Smaller sequences with less than 1k samples are preferred - they are faster to optimize and evaluate.
+
+**Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
+
+## Budget & Resources
+- **Time budget**: {self.budget_s:.0f}s for your code to run
+- **CPUs**: {self.eval_cpus} available
+
+## Rules
+- Define `run(seed=42, budget_s={self.budget_s:.0f}, **kwargs)` that returns `(h_values, c5_bound, n_points)`
+- It is called with NO arguments, so your default for `budget_s` is the one that
+  runs. Respect it: track elapsed time and return your best solution before it
+  expires, rather than being killed with nothing to show
+- Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
+- Make all helper functions top level, no closures or lambdas
+- No filesystem or network IO
+- `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
+- When `initial_h_values` is available, use it directly. Never redefine it or
+  copy its entries into the response. Construct all large arrays
+  algorithmically; do not print long numeric literals or unrolled tables
+- Your function must complete within budget_s seconds and return the best solution found
+- The extracted block must define `run` at top level. The harness prepends the
+  pre-imported helpers and optional parent construction before execution; do
+  not copy those inputs into the block to make it standalone
+
+**Lower is better**. Current record: C₅ ≤ 0.38085. Our goal is to find a construction that shows C₅ ≤ 0.38085.
+
+{state_ctx}
+{construction_section}
+{code_section}
+{direct_output_section}
+
+'''
+
+        return [{"role": "user", "content": user}]
+
+    # ------------------------------------------------------------------
+    def preprocess(self, code: str, parent: ParentContext) -> str:
+        prelude = _VERIFIER_SRC
+        if parent.construction is not None:
+            prelude += f"initial_h_values = np.array({list(parent.construction)!r})\n\n"
+        return prelude + "# ---- model code below ----\n" + code
+
+    # ------------------------------------------------------------------
+    def score(self, output: Any, stdout: str) -> RewardResult:
+        res = RewardResult(reward=self.fail_score)
+        if not (isinstance(output, (tuple, list)) and len(output) == 3):
+            res.msg = "bad_return_shape"
+            res.failure_kind = "code"
+            return res
+        if not verify_erdos_solution(output):
+            res.msg = "Invalid solution."
+            return res
+        h_values, c5_bound, n_points = output
+        c5_bound = evaluate_erdos_solution(h_values, c5_bound, n_points)
+        res.valid = True
+        res.raw_score = float(c5_bound)
+        res.reward = float(1.0 / c5_bound)
+        res.construction = list(np.asarray(h_values).ravel())
+        res.msg = f"C5 bound: {c5_bound}"
+        return res
+
+    # ------------------------------------------------------------------
+    def seed_states(self) -> List[SeedState]:
+        seeds: List[SeedState] = []
+        for i in range(self.num_seed_states):
+            rng = np.random.default_rng(self.seed + i)
+            n_points = int(rng.integers(40, 100))
+            construction = np.ones(n_points) * 0.5
+            perturbation = rng.uniform(-0.4, 0.4, n_points)
+            perturbation = perturbation - np.mean(perturbation)
+            construction = construction + perturbation
+            dx = 2.0 / n_points
+            correlation = np.correlate(construction, 1 - construction, mode="full") * dx
+            c5_bound = float(np.max(correlation))
+            seeds.append(SeedState(
+                code="",
+                value=float(1.0 / c5_bound),
+                raw_score=c5_bound,
+                construction=list(construction),
+            ))
+        return seeds

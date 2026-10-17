@@ -37,7 +37,7 @@ def get_problem(name: str, cfg: dict):
         "erdos-c4", "erdos_c4", "c4", "uncertainty-ineq",
         "uncertainty_ineq", "uncertainty",
     ):
-        from problems.erdos_c4 import ErdosC4Uncertainty
+        from _retire.erdos_c4 import ErdosC4Uncertainty
         return ErdosC4Uncertainty(cfg)
 
     if key in ("ac1", "ac2", "ac_inequalities", "autocorrelation", "autocorrelation_inequalities"):

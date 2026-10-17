@@ -1,0 +1,162 @@
+"""Output-contract checks and immutable retry prompts (no model dependencies)."""
+
+from copy import deepcopy
+import re
+
+
+_CODER_RETRY_CONTEXT_MAX_CHARS = 48_000
+
+
+def final_answer_scope(response, *, require_final_marker=False):
+    text = str(response or "")
+    lowered = text.lower()
+    end = -1
+    for marker in ("<|channel|>final<|message|>", "assistantfinal",
+                   "</think>", "</analysis>", "</reasoning>"):
+        position = lowered.rfind(marker)
+        if position >= 0:
+            end = max(end, position + len(marker))
+    if end >= 0:
+        text = text[end:]
+    elif require_final_marker:
+        return ""
+    if re.search(r"<(?:think|analysis|reasoning)\b", text, re.IGNORECASE):
+        return ""
+    return text
+
+
+def coder_output_issue(response, *, require_final_marker=False):
+    """Check formatting only, never program quality, syntax, or reward."""
+    text = final_answer_scope(response, require_final_marker=require_final_marker)
+    openings = list(re.finditer(r"```python\b[^\S\n]*\n?", text, re.IGNORECASE))
+    if not openings:
+        return "missing final Python block"
+    start = openings[-1].end()
+    end = text.find("```", start)
+    if end < 0:
+        return "unclosed final Python block"
+    if not text[start:end].strip():
+        return "empty final Python block"
+    return None
+
+
+def output_retry_messages(messages, kind, *, failed_response=None):
+    """Add one reminder to the frozen original.
+
+    A coder recovery may retain the failed assistant turn so a reasoning model
+    can finish work it already performed instead of restarting the same long
+    derivation. Strategy retries deliberately remain fresh attempts: an
+    invalid strategy is never admitted into the dependent strategy chain.
+    """
+    if kind == "strategy":
+        contract = (
+            "one complete <strategy>...</strategy> block containing the full "
+            "detailed implementation plan requested above. Preserve the "
+            "mathematical specification, concrete algorithm, budget, and "
+            "validation needed by the coder; do not reduce it to a summary. "
+            "Only that block is handed to the next agent")
+    elif kind == "coder":
+        contract = (
+            "one complete fenced Python block starting with ```python and "
+            "ending with ```, containing the entire requested program. "
+            "Python snippets inside your reasoning are not the final answer")
+    else:
+        raise ValueError(f"unknown output contract: {kind}")
+    reminder = (
+        "Your previous attempt did not provide the required complete final "
+        "output. Retry the same task with all the requirements above unchanged. "
+        "You may reason as needed, but you MUST finish with " + contract + ". "
+        "Close the required block before the token limit and put nothing after it.")
+    result = deepcopy(messages)
+    if kind == "coder" and failed_response is not None:
+        failed_text = str(failed_response)
+        if len(failed_text) > _CODER_RETRY_CONTEXT_MAX_CHARS:
+            failed_text = (
+                "[Earlier failed reasoning omitted; the most recent work "
+                "follows.]\n" + failed_text[-_CODER_RETRY_CONTEXT_MAX_CHARS:])
+        result.append({"role": "assistant", "content": failed_text})
+        reminder = (
+            "The assistant attempt immediately above failed only because it "
+            "did not deliver the required complete final program. Continue "
+            "from that work; do not restart the mathematical derivation, do "
+            "not analyze toy cases, and do not repeat discarded alternatives. "
+            "Now produce " + contract + ". Put nothing after the closing fence.")
+        result.append({"role": "user", "content": reminder})
+    elif result and result[-1].get("role") == "user":
+        result[-1]["content"] = str(result[-1].get("content", "")) + "\n\n" + reminder
+    else:
+        result.append({"role": "user", "content": reminder})
+    return result
+
+
+def retry_metadata(record):
+    return {key: record.get(key) for key in (
+        "retry_attempt", "retry_of_group", "retry_of_rollout",
+        "output_format_issue", "counts_toward_allocation")}
+
+
+def coder_retry_gate(records):
+    """Return whether incomplete coder outputs need format recovery.
+
+    Recovery is intentionally a batch-level safety net, not a requirement that
+    every sample end in a complete block.  A batch triggers only when fewer
+    than half of its original rollouts contain complete final code blocks.
+    """
+    originals = [record for record in records
+                 if not record.get("retry_attempt", 0)]
+    total = len(originals)
+    missing = sum(
+        record.get("output_format_issue") is not None
+        for record in originals)
+    valid = total - missing
+    triggered = bool(total and missing and valid * 2 < total)
+    # Once recovery is necessary, aim ten percentage points above the trigger
+    # instead of trying to repair every malformed rollout.  ceil(0.60 * N) is
+    # computed exactly with integers.
+    target_valid = (3 * total + 4) // 5 if total else 0
+    retry_budget = (
+        min(missing, max(0, target_valid - valid)) if triggered else 0)
+    return triggered, total, valid, missing, retry_budget
+
+
+def coder_retry_prompt_job(
+        prompt_jobs, record, render, cache, *, reasoning_effort=None,
+        continue_from_failure=False):
+    """Separate prompt ID so generation, reference scoring and training agree."""
+    source_idx = int(record["job_idx"])
+    phase = record.get("strategy_rollout_phase")
+    retry_identity = (
+        (record.get("group_id"), record.get("rollout_index"))
+        if continue_from_failure else None)
+    key = (source_idx, phase, reasoning_effort, retry_identity)
+    if key not in cache:
+        source = prompt_jobs[source_idx]
+        messages = output_retry_messages(
+            source["messages"], "coder",
+            failed_response=(record.get("text")
+                             if continue_from_failure else None),
+        )
+        render_options = {"rollout_phase": phase}
+        if reasoning_effort is not None:
+            render_options["reasoning_effort"] = reasoning_effort
+        retry_job = {
+            **source, "messages": messages,
+            "prompt_text": render(messages, **render_options), "count": 0,
+        }
+        if reasoning_effort is not None:
+            retry_job["coder_reasoning_effort"] = reasoning_effort
+        cache[key] = len(prompt_jobs)
+        prompt_jobs.append(retry_job)
+    return cache[key]
+
+
+def strategy_retry_needed(issue, attempt, max_retries, *, label):
+    """Retry malformed strategy output until the configured limit.
+
+    Exhaustion is not fatal.  The caller installs an explicit no-strategy
+    fallback for that slot so one malformed planner chain cannot abort the
+    rollout step.
+    """
+    if issue is None:
+        return False
+    return int(attempt) < int(max_retries)
