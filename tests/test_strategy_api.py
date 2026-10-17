@@ -326,11 +326,11 @@ def config(monkeypatch):
 
 
 @pytest.mark.parametrize("filename", sorted(p.name for p in (ROOT / "configs").glob("*.yaml")))
-def test_yaml_activation_and_xhigh(config, filename):
+def test_yaml_activation_and_max_effort(config, filename):
     cfg, merged = config(filename=filename)
     assert cfg.api_strategy == "gpt-6-luna" and cfg.strategies
     assert cfg.strategy_backend == "api"
-    assert cfg.strategy_reasoning_effort == "xhigh" and cfg.strategy_thinking
+    assert cfg.strategy_reasoning_effort == "max" and cfg.strategy_thinking
     assert cfg.strategy_max_new_tokens == 128000
     assert cfg.strategy_api_base_url == "https://api.openai.com/v1"
     assert cfg.strategy_api_key_env == "OPENAI_API_KEY"
@@ -345,8 +345,8 @@ def test_empty_selector_disables_api_and_cli_overrides_effort(config, monkeypatc
     assert not cfg.strategies
     assert "DeepSeek-R1" in cfg.strategy_model_name
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-never-sent")
-    cfg, _ = config("--strategy-reasoning-effort", "max")
-    assert cfg.strategy_reasoning_effort == "max"
+    cfg, _ = config("--strategy-reasoning-effort", "high")
+    assert cfg.strategy_reasoning_effort == "high"
 
 
 def test_missing_credential_fails_early(config, monkeypatch, tmp_path):

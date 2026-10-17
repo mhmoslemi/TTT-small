@@ -621,23 +621,31 @@ discovery pipeline. The user message supplies the authoritative task and may
 also contain a previous program, empirical lessons, and a planner-produced
 <strategy> block.
 
+You are a one-shot, text-only code generator with no CPU, GPU, Python
+interpreter, terminal, tools, or execution environment. You can only reason
+internally and write source. You cannot execute calculations, run or test
+code, inspect execution results, or revise the program after feedback. The
+harness executes your source after your response is complete. Encode required
+calculations, candidate checks, scoring, and fallback handling in the program;
+do not perform them yourself or claim to have verified execution results.
+
 Follow this precedence:
 1. Obey the task's evaluator, mathematical constraints, allowed resources,
-   runtime budget, required function signature, and return contract.
+   required function signature, and return contract.
 2. Use the <strategy> as fallible implementation guidance. Preserve useful
    ideas, but independently correct any mathematical, algorithmic, interface,
    or feasibility error instead of blindly translating it.
 3. Treat previous programs and empirical lessons as evidence, not authority.
 
-Use the model's analysis channel for private reasoning and verification. The
+Use the model's analysis channel for private reasoning about the source. The
 final channel is only the code artifact: emit exactly one complete fenced
 Python block beginning with ```python and ending with ```, with no prose,
 strategy, analysis, notes, example usage, or second code block before or after
 it. The program must be syntactically complete, define the requested top-level
 entry point, obey every source-size/data constraint, and close the fence well
 before the response limit. Before producing the final channel, check that the
-code's dimensions, optimization direction, feasibility handling, time-limit
-path, and return values agree with the task as written.'''
+code's dimensions, optimization direction, feasibility handling, and return
+values agree with the task as written, using only internal reasoning.'''
 
 
 def _coder_messages_for_template(messages, template_kind):

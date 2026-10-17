@@ -1,28 +1,11 @@
-"""
-Erdos' Minimum Overlap Problem.
-
-Two changes from the original:
-
-  The prompt now specifies an output format. It previously ended with "Write
-  code to optimize this construction." and said nothing about structure, so the
-  model had no block to fill and no fence to reach and simply ran toward
-  max_new_tokens, and extract_python_code (which looks for ```python fences)
-  had nothing reliable to find.
-
-  The compute budget is config-driven. The prompt used to hardcode
-  "budget_s=1000", and the sandbox calls run() with NO arguments, so that
-  default is what actually executes: every rollout may burn 1000 seconds of
-  optimization. At 512 rollouts a step that is 4 to 70 hours depending on how
-  many evaluations run in parallel. `budget_s` in the problem config now sets
-  both the number in the prompt and the sandbox ceiling, so the two cannot
-  drift apart.
-"""
+"""Erdos' Minimum Overlap Problem and its exact evaluator."""
 
 from __future__ import annotations
 import inspect
 from typing import Any, List
 import numpy as np
 from problems.base import (
+    CODER_EXECUTION_CONTRACT,
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
@@ -115,10 +98,7 @@ class ErdosMinOverlap(Problem):
         super().__init__(cfg)
         if self.target is None:
             self.target = 0.3808
-        # What the model is told it has, and what the sandbox actually allows.
-        # The sandbox gets headroom so a program that respects its budget is
-        # killed by its own clock rather than by the harness, which produces a
-        # returned best-so-far instead of a lost rollout.
+        # Retained configuration; prompt text does not expose execution limits.
         self.budget_s = float(cfg.get("budget_s", 60.0))
 
     @staticmethod
@@ -240,6 +220,8 @@ These are hard output constraints.'''
         user = f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
 Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.
 
+{CODER_EXECUTION_CONTRACT}
+
 ## Problem
 
 Find a step function h: [0, 2] → [0, 1] that **minimizes** the overlap integral:
@@ -261,15 +243,12 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
-## Budget & Resources
-- **Time budget**: {self.budget_s:.0f}s for your code to run
-- **CPUs**: {self.eval_cpus} available
+## Execution environment
+- The harness can execute the generated program using up to {self.eval_cpus} CPUs.
 
 ## Rules
-- Define `run(seed=42, budget_s={self.budget_s:.0f}, **kwargs)` that returns `(h_values, c5_bound, n_points)`
-- It is called with NO arguments, so your default for `budget_s` is the one that
-  runs. Respect it: track elapsed time and return your best solution before it
-  expires, rather than being killed with nothing to show
+- Define `run(seed=42, **kwargs)` that returns `(h_values, c5_bound, n_points)`.
+- The harness calls `run()` with no arguments.
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
@@ -277,7 +256,8 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - When `initial_h_values` is available, use it directly. Never redefine it or
   copy its entries into the response. Construct all large arrays
   algorithmically; do not print long numeric literals or unrolled tables
-- Your function must complete within budget_s seconds and return the best solution found
+- Implement the exact score calculation inside the program and return the
+  selected solution; the coder does not calculate or verify that result itself.
 - The extracted block must define `run` at top level. The harness prepends the
   pre-imported helpers and optional parent construction before execution; do
   not copy those inputs into the block to make it standalone

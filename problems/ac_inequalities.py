@@ -17,6 +17,7 @@ from typing import Any, List
 import numpy as np
 
 from problems.base import (
+    CODER_EXECUTION_CONTRACT,
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
@@ -223,11 +224,9 @@ Autocorrelation-specific implementation constraints:
   coordinate. Those constructions have quadratic memory or evaluation count
   and are not feasible here. An LP is acceptable only with a genuinely sparse
   or matrix-free operator whose storage and solver behavior you spell out.
-- The exact evaluator itself performs the authoritative full convolution, so
-  exact acceptance calls are the scarce resource. Use cheap vectorized or FFT
-  surrogates to propose candidates if useful, then spend a bounded number of
-  exact calls on acceptance. Adapt that count from measured elapsed time and
-  retain enough headroom to return the fallback.
+- The exact evaluator itself performs the authoritative full convolution.
+  Vectorized or FFT surrogates may help propose candidates, but implement
+  acceptance using the exact evaluator and retain the best valid fallback.
 - Derive dimensions from runtime inputs. If changing resolution, specify the
   exact interpolation/resampling rule, normalization, validity checks, and how
   the new candidate is compared with the parent. Explain initialization when
@@ -303,8 +302,8 @@ AC2 mathematical checks for the final plan:
 - Keep the source concise: at most 300 lines and about 12,000 characters.
   Finish `{entrypoint}`, return a non-empty Python list of finite coefficients,
   and close the single Python fence well before the generation limit.
-- Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
-  best-so-far fallback and return it before the configured deadline.
+- Implement final acceptance using the supplied `evaluate_sequence` and
+  preserve a valid best-so-far fallback inside the generated program.
 - The expert plan has already done the mathematical design. Do not spend the
   response re-deriving the problem on toy lengths or narrating alternatives.
   Resolve only implementation details in private reasoning, then emit the
@@ -316,7 +315,6 @@ with them.''')
 
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = self._state_ctx(parent)
-        budget_s = self.budget_s
         if self.problem_type == "ac1":
             direction = "minimize"
             metric = "the AC1 upper bound"
@@ -361,6 +359,8 @@ before the response-token limit.'''
 inequalities, and numerical optimization. Write a compact search program whose
 returned nonnegative step-function heights {direction} {metric}.
 
+{CODER_EXECUTION_CONTRACT}
+
 ## Authoritative evaluator
 
 The evaluator below is read-only and is the only definition of the score:
@@ -372,18 +372,17 @@ The evaluator below is read-only and is the only definition of the score:
 
 ## Runtime contract and resources
 
-- Define `{entrypoint}(seed={self.seed}, budget_s={budget_s}, **kwargs)`.
+- Define `{entrypoint}(seed={self.seed}, **kwargs)`.
 - The harness invokes `{entrypoint}()` with no arguments, so those defaults are
   active. Return a non-empty Python list of finite real coefficients.
 - `evaluate_sequence` is pre-imported and may be called during search. Do not
   redefine or import it.
-- Time budget: {budget_s} seconds. Check the deadline inside expensive loops
-  and solver calls, preserve the best exact-scoring valid candidate, and return
-  it with headroom before the hard sandbox timeout.
+- Implement exact scoring and preservation of the best valid candidate inside
+  the generated program; the coder does not compute or verify the result itself.
 - Candidate failure receives the configured failure reward; do not hide an
   error by returning an empty or non-finite sequence.
-- You may use NumPy, SciPy, CVXPY, math, and the Python standard library. Use
-  at most {self.eval_cpus} CPUs.
+- The generated program may use NumPy, SciPy, CVXPY, math, and the Python
+  standard library. The harness provides up to {self.eval_cpus} CPUs for execution.
 - Make helper functions top-level. Do not use nested-function closures or
   lambda functions. Do not use filesystem or network I/O.
 - Construct large arrays algorithmically. Do not paste long numeric literals,
@@ -392,8 +391,8 @@ The evaluator below is read-only and is the only definition of the score:
   n-by-n matrices (including `np.eye(n)`), dense convolution/Toeplitz
   operators, or use one finite-difference evaluation per coordinate. Generated
   programs must keep auxiliary storage linear or near-linear in n. If using a
-  solver, use a truly sparse/matrix-free formulation and set an internal stop
-  condition that leaves time to return the saved fallback.
+  solver, use a truly sparse/matrix-free formulation with a defined convergence
+  or iteration-based stopping condition and preserve a valid fallback.
 
 {state_ctx}
 {construction_section}
@@ -456,7 +455,7 @@ parent/search program when one exists. {correction_instruction}
             if self.problem_type == "ac1":
                 raw = float(evaluate_sequence_ac1(construction))
                 value = float(1.0 / raw)
-                code = example_ae_program_random_init(self.budget_s)
+                code = example_ae_program_random_init()
             else:
                 raw = float(evaluate_sequence_ac2(construction))
                 value = raw

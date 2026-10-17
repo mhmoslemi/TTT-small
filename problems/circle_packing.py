@@ -12,6 +12,7 @@ from typing import Any, List
 import numpy as np
 
 from problems.base import (
+    CODER_EXECUTION_CONTRACT,
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
@@ -81,6 +82,8 @@ class CirclePacking(Problem):
 
 Your task is to pack {n} circles in a unit square [0,1]×[0,1] to maximize the sum of radii.
 
+{CODER_EXECUTION_CONTRACT}
+
 We will run the below validation function (read-only, do not modify this):
 ```python
 {_VALIDATOR_SRC}
@@ -93,7 +96,7 @@ Rules:
 - You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
 - Returns (centers, radii, sum_radii) where centers has shape ({n}, 2) and radii has shape ({n},).
 - You can use scientific libraries like scipy, numpy, cvxpy, math.
-- You can use up to {self.eval_cpus} CPUs.
+- The harness can execute the generated program using up to {self.eval_cpus} CPUs.
 - Centers must lie within [0,1]^2 and radii must be nonnegative.
 - The pair (centers, radii) must satisfy non-overlap and boundary constraints.
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.

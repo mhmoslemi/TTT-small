@@ -14,7 +14,9 @@ Single-Cell Analysis (scRNA-seq denoising).
 from __future__ import annotations
 from typing import Any, List
 import numpy as np
-from problems.base import Problem, ParentContext, RewardResult, SeedState
+from problems.base import (
+    CODER_EXECUTION_CONTRACT, Problem, ParentContext, RewardResult, SeedState,
+)
 
 
 BASELINES = {
@@ -96,7 +98,9 @@ Write code to implement a denoising algorithm.
 
         user = f"""{prompt}
 
-Evaluation resources: you can use up to {self.eval_cpus} CPUs.
+{CODER_EXECUTION_CONTRACT}
+
+The harness can execute the generated program using up to {self.eval_cpus} CPUs.
 {code_section}
 Write your improved `magic_denoise` function."""
         return [{"role": "user", "content": user}]

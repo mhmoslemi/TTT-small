@@ -1,7 +1,6 @@
-example_ae_program_random_init = (
-    lambda num_seconds: f'''
+def example_ae_program_random_init():
+    return '''
 import numpy as np
-import time
 
 
 def make_block_perturbation(base, rng):
@@ -17,10 +16,9 @@ def make_block_perturbation(base, rng):
     return np.clip(candidate, 0.0, 1000.0)
 
 
-def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
+def propose_candidate(seed=42, num_steps=1000, **kwargs):
     """Memory-bounded exact-evaluation local search with a valid fallback."""
     rng = np.random.default_rng(seed)
-    deadline = time.monotonic() + max(0.0, float(budget_s) - 3.0)
     parent = np.clip(
         np.asarray(height_sequence_1, dtype=np.float64), 0.0, 1000.0)
     if parent.ndim != 1 or parent.size == 0 or not np.isfinite(parent).all():
@@ -28,9 +26,8 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
     best = parent.copy()
     best_score = float(evaluate_sequence(best.tolist()))
 
-    # Each proposal uses O(n) auxiliary memory.  The exact evaluator remains
-    # authoritative, and timing naturally limits calls for longer sequences.
-    while time.monotonic() < deadline:
+    # Each proposal uses O(n) auxiliary memory and the exact evaluator.
+    for _ in range(num_steps):
         candidate = make_block_perturbation(best, rng)
         score = float(evaluate_sequence(candidate.tolist()))
         if np.isfinite(score) and score < best_score:
@@ -38,7 +35,7 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
             best_score = score
 
     return [float(x) for x in best]
-''')
+'''
 
 
 AC1_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encouraged to explore.
