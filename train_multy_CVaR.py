@@ -261,6 +261,9 @@ def _save_exact_spo_rs_overflow(
         # failed, or the warm path deliberately bypassed it. Do not replay
         # a huge CPU activation graph when resuming this residual tail.
         "replica_offload_exhausted": True,
+        "replica_checkpoint_groups_attempted": any(
+            hasattr(module, "_ttt_group_checkpoint_min_tokens")
+            for module in model.modules()),
         "normal_stats": normal_stats,
         "overflow_stats": {
             "totals": {key: 0.0 for key in metric_keys},
@@ -287,6 +290,9 @@ def _save_exact_spo_rs_overflow(
         deferred_keys=[list(key) for key in deferred_keys],
         normal_trained_examples=int(normal_stats["trained_examples"]),
         replica_offload_exhausted=True,
+        replica_checkpoint_groups_attempted=any(
+            hasattr(module, "_ttt_group_checkpoint_min_tokens")
+            for module in model.modules()),
     )
     return destination, marker, deferred_keys, normal_stats
 
@@ -2413,8 +2419,9 @@ def load_config():
         if warm_recovery:
             merged["_exact_inprocess_recovery_step"] = int(
                 exact_sharded_recovery["step"])
-            print("[recovery] saved overflow gradients will finish on warm "
-                  "cooperative GPU groups; no job restart or model reload")
+            print("[recovery] saved overflow gradients will finish in-process; "
+                  "Qwen checkpoint groups try all GPU replicas before "
+                  "cooperative overflow when the saved work predates that mode")
         elif can_recover_on_replicas:
             merged["_exact_replica_recovery_step"] = int(
                 exact_sharded_recovery["step"])
@@ -2433,7 +2440,8 @@ def load_config():
             failed_length = re.search(
                 r"(\d+)-token rollout",
                 str(exact_sharded_recovery.get("reason", "")))
-            if failed_length is not None:
+            if (failed_length is not None
+                    and merged.get("coder_model_profile") != "qwen3.8-27b"):
                 # Token sidecars are exact for current runs; the tiny margin
                 # also covers legacy text recovery restoring an EOS/control
                 # token without replaying the already-proven OOM workload.
@@ -3366,18 +3374,22 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
     if components is None:
         return None
     decoder, output_head = components
-    outputs = decoder(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        return_dict=True,
-    )
-    hidden = getattr(outputs, "last_hidden_state", None)
+    from training_checkpointing import grouped_qwen_hidden
+    hidden = (grouped_qwen_hidden(decoder, input_ids, attention_mask)
+              if with_grad else None)
     if hidden is None:
-        try:
-            hidden = outputs[0]
-        except (IndexError, KeyError, TypeError):
-            return None
+        outputs = decoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            try:
+                hidden = outputs[0]
+            except (IndexError, KeyError, TypeError):
+                return None
     scored = []
     entropies = []
     for row, ((start, end), targets) in enumerate(
@@ -6799,10 +6811,11 @@ class ProcessDistributedTrainer:
 
     def recover_spo_rs_overflow(
             self, examples, cfg, step_idx, overflow_state):
-        """Finish saved SPO-RS overflow, preferably on warm cooperative groups.
+        """Finish saved SPO-RS overflow without replaying completed gradients.
 
-        The HF/BF16 path reuses the live workers without restarting. Legacy
-        backends retain the RAM-bounded replica recovery below.
+        Older Qwen checkpoints first try grouped checkpointing on every GPU
+        replica. Work that exhausted that mode uses warm cooperative groups.
+        Legacy backends retain RAM-bounded replica recovery.
         Normal gradients already stored in ``overflow_state`` are never
         replayed. Remaining trajectories are work-stolen by all replicas. A
         trajectory that exhausts card memory may use the shared host-RAM
@@ -6811,7 +6824,13 @@ class ProcessDistributedTrainer:
         that bounded fallback is left for the final model-sharded lane.
         """
         from exact_overflow import supports_warm_overflow, complete_warm_overflow
-        if supports_warm_overflow(cfg):
+        grouped_recovery = bool(
+            overflow_state is not None
+            and overflow_state.get("remaining_keys")
+            and not overflow_state.get("replica_checkpoint_groups_attempted", False)
+            and any(hasattr(module, "_ttt_group_checkpoint_min_tokens")
+                    for module in self.model.modules()))
+        if supports_warm_overflow(cfg) and not grouped_recovery:
             return complete_warm_overflow(
                 self, examples, cfg, step_idx, overflow_state)
 
@@ -6854,18 +6873,31 @@ class ProcessDistributedTrainer:
 
         started = time.time()
         recovery_cfg = SimpleNamespace(**dict(vars(cfg)))
-        recovery_cfg._exact_replica_force_activation_offload = True
+        recovery_cfg._exact_replica_force_activation_offload = not grouped_recovery
+        if grouped_recovery:
+            # A saved OOM belongs to the old layer-checkpoint execution mode.
+            # Give every remaining trajectory the new GPU-only mode once.
+            recovery_cfg._exact_replica_overflow_min_tokens = 0
+            self.__dict__.pop("_warm_overflow_min_tokens", None)
+            examples = [{key: value for key, value in item.items()
+                         if key != "_cooperative_overflow"} for item in examples]
         queued_examples = self._queue_examples(
-            examples, weighted_offload=True)
-        print(
-            f"[recovery] step {step_idx}: dispatching "
-            f"{len(queued_examples)} saved oversized trajectories across "
-            f"{self._world_size} GPU replicas; CPU activation admission "
-            f"starts conservatively, measures real footprint, then shares "
-            f"its {self._activation_offload_budget_gib:.0f}-GiB RAM budget "
-            "across every rank whose current trajectory fits",
-            flush=True,
-        )
+            examples, weighted_offload=not grouped_recovery)
+        if grouped_recovery:
+            print(f"[recovery] step {step_idx}: dispatching {len(queued_examples)} "
+                  f"saved trajectories across all {self._world_size} GPU replicas "
+                  "with grouped GPU checkpoints; completed gradients retained",
+                  flush=True)
+        else:
+            print(
+                f"[recovery] step {step_idx}: dispatching "
+                f"{len(queued_examples)} saved oversized trajectories across "
+                f"{self._world_size} GPU replicas; CPU activation admission "
+                f"starts conservatively, measures real footprint, then shares "
+                f"its {self._activation_offload_budget_gib:.0f}-GiB RAM budget "
+                "across every rank whose current trajectory fits",
+                flush=True,
+            )
         self.model.zero_grad(set_to_none=True)
         self.optimizer.zero_grad(set_to_none=True)
         self._workers_idle = False
@@ -6977,6 +7009,8 @@ class ProcessDistributedTrainer:
                 # gradient, otherwise successful recovery work is doubled.
                 self.model.zero_grad(set_to_none=True)
                 if deferred_keys:
+                    if grouped_recovery:
+                        overflow_state["replica_checkpoint_groups_attempted"] = True
                     overflow_state["replica_offload_exhausted"] = True
                     _write_exact_spo_rs_overflow_state(overflow_state)
                     marker = _read_exact_sharded_recovery(
@@ -7016,6 +7050,9 @@ class ProcessDistributedTrainer:
             if update_error is not None:
                 raise update_error
             if overflow_error is not None:
+                if grouped_recovery and supports_warm_overflow(cfg):
+                    return complete_warm_overflow(
+                        self, examples, cfg, step_idx, overflow_state)
                 raise overflow_error
         except BaseException:
             if not self._workers_idle:
@@ -7074,7 +7111,8 @@ class ProcessDistributedTrainer:
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
             f"entropy examples={entropy_examples} OOM-quarantined=0 "
-            "(RAM-bounded replicated exact overflow recovery)",
+            + ("(grouped-checkpoint GPU replica recovery)" if grouped_recovery else
+             "(RAM-bounded replicated exact overflow recovery)"),
             flush=True,
         )
         return {
@@ -9322,7 +9360,11 @@ def _resume_spo_rs_step_from_artifacts(
     if overflow_state is not None:
         from exact_overflow import supports_warm_overflow
         recovery_lane = (
-            ("warm cooperative GPU groups (no process restart)"
+            ("grouped-checkpoint GPU replicas, then cooperative groups if needed"
+             if (not overflow_state.get("replica_checkpoint_groups_attempted", False)
+                 and any(hasattr(module, "_ttt_group_checkpoint_min_tokens")
+                         for module in model.modules())) else
+             "warm cooperative GPU groups (no process restart)"
              if supports_warm_overflow(cfg) else
              f"the {parallel_trainer.world_size}-GPU RAM-bounded replica lane")
             if parallel_trainer is not None

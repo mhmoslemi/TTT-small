@@ -896,7 +896,9 @@ def _install_exact_qwen38_gated_norm_chunking(model, cfg):
         if hasattr(module, "_ttt_exact_gated_norm_original_forward"):
             installed += 1
             continue
-        required = ("weight", "variance_epsilon", "activation")
+        # Older Transformers hard-code SiLU instead of exposing `activation`.
+        # Row tiling invokes the original forward, preserving either variant.
+        required = ("weight", "variance_epsilon")
         if not all(hasattr(module, name) for name in required):
             raise RuntimeError(
                 "Qwen3.8 gated RMSNorm no longer exposes the exact "
@@ -934,6 +936,11 @@ def _configure_exact_long_training(model, cfg):
         else int(cpu_offload_threshold))
     _install_exact_qwen38_mlp_chunking(model, cfg)
     _install_exact_qwen38_gated_norm_chunking(model, cfg)
+    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+        for module in model.modules():
+            if type(module).__name__ == "Qwen3_5TextModel":
+                module._ttt_group_checkpoint_min_tokens = int(getattr(
+                    cfg, "long_training_headroom_min_tokens", 32_768))
     offload_description = (
         "CPU activation offload only after a proven OOM"
         if model._ttt_activation_offload_min_work is None else

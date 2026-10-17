@@ -358,11 +358,7 @@ Use the task information and strategy above to produce the complete solution.
 Treat the strategy as planning guidance: preserve useful ideas, but correct any
 mistake or conflict with the task, required interface, or current parent
 construction. Do not output analysis, reasoning, a strategy, notes, or example
-usage. Implement every required calculation, candidate check, and scoring
-operation in the source; do not perform it while composing the response.
-Interpret execution-related steps in the plan as operations for the generated
-program, which the harness will run after your response is complete.
-Return only exactly one fenced Python code block, beginning with
+usage. Return only exactly one fenced Python code block, beginning with
 ```python and ending with ```."""
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (

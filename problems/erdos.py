@@ -5,7 +5,6 @@ import inspect
 from typing import Any, List
 import numpy as np
 from problems.base import (
-    CODER_EXECUTION_CONTRACT,
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
@@ -98,7 +97,6 @@ class ErdosMinOverlap(Problem):
         super().__init__(cfg)
         if self.target is None:
             self.target = 0.3808
-        # Retained configuration; prompt text does not expose execution limits.
         self.budget_s = float(cfg.get("budget_s", 60.0))
 
     @staticmethod
@@ -220,8 +218,6 @@ These are hard output constraints.'''
         user = f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
 Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.
 
-{CODER_EXECUTION_CONTRACT}
-
 ## Problem
 
 Find a step function h: [0, 2] → [0, 1] that **minimizes** the overlap integral:
@@ -243,12 +239,15 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
-## Execution environment
-- The harness can execute the generated program using up to {self.eval_cpus} CPUs.
+## Budget & Resources
+- **Time budget**: {self.budget_s:.0f}s for your code to run
+- **CPUs**: {self.eval_cpus} available
 
 ## Rules
-- Define `run(seed=42, **kwargs)` that returns `(h_values, c5_bound, n_points)`.
-- The harness calls `run()` with no arguments.
+- Define `run(seed=42, budget_s={self.budget_s:.0f}, **kwargs)` that returns `(h_values, c5_bound, n_points)`
+- It is called with NO arguments, so your default for `budget_s` is the one that
+  runs. Respect it: track elapsed time and return your best solution before it
+  expires, rather than being killed with nothing to show
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
@@ -256,8 +255,7 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - When `initial_h_values` is available, use it directly. Never redefine it or
   copy its entries into the response. Construct all large arrays
   algorithmically; do not print long numeric literals or unrolled tables
-- Implement the exact score calculation inside the program and return the
-  selected solution; the coder does not calculate or verify that result itself.
+- Your function must complete within budget_s seconds and return the best solution found
 - The extracted block must define `run` at top level. The harness prepends the
   pre-imported helpers and optional parent construction before execution; do
   not copy those inputs into the block to make it standalone
