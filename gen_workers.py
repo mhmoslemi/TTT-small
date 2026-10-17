@@ -2072,6 +2072,102 @@ class GenerationPool:
             if bar is not None:
                 bar.close()
 
+    def iter_ready_jobs(self, poll_jobs, *, total_expected, adapter_path,
+                        max_new_tokens, temperature, top_p,
+                        return_logprobs=False, full_policy_sampling=False,
+                        top_k=None, min_p=None, progress_desc="API coder rollouts"):
+        """Feed newly ready API-conditioned jobs to every available engine.
+
+        ``poll_jobs`` returns (new jobs, producer finished). Each job has a
+        unique ``key``, ``prompt_text``, ``count``, and ``step_idx``. It also
+        admits adaptive followups once their CPU pilot rewards are available.
+        Only this thread owns worker queues. Results keep the caller's job key.
+        """
+        pending = deque()
+        inflight = {rank: set() for rank in range(self.num_workers)}
+        requests = {}
+        seen_keys = set()
+        next_sample = 0
+        collected = 0
+        done = False
+        options = dict(
+            max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+            micro_batch=self.gen_micro_batch, return_logprobs=bool(return_logprobs),
+            full_policy_sampling=bool(full_policy_sampling), seed_rank=0)
+        if top_k is not None:
+            options["top_k"] = int(top_k)
+        if min_p is not None:
+            options["min_p"] = float(min_p)
+        if full_policy_sampling:
+            options.update(top_k=0, repetition_penalty=1.0)
+        bar = make_progress_bar(total_expected, desc=progress_desc)
+        try:
+            while not done or pending or any(inflight.values()):
+                jobs, done = poll_jobs()
+                for job in jobs:
+                    key, count = job["key"], int(job["count"])
+                    if key in seen_keys or count < 1:
+                        raise RuntimeError("duplicate or empty ready coder job")
+                    seen_keys.add(key)
+                    for ordinal in range(count):
+                        # Distinct per-sample IDs prevent repeated vLLM seeds
+                        # when one prompt is split across tasks or GPU engines.
+                        # The caller's stable key also removes arrival-order
+                        # and GPU-assignment dependence from these seeds.
+                        sample = int(key) * int(total_expected) + ordinal
+                        requests[sample] = key
+                        pending.append((sample, job["prompt_text"],
+                                        int(job["step_idx"])))
+                        next_sample += 1
+                    if next_sample > int(total_expected):
+                        raise RuntimeError("ready coder jobs exceeded rollout budget")
+
+                for rank in range(self.num_workers):
+                    if inflight[rank] or not pending:
+                        continue
+                    # Keep a backlog available for other engines instead of
+                    # assigning all remaining work to the first idle worker.
+                    count = max(1, (len(pending) + self.num_workers - 1)
+                                // self.num_workers)
+                    if self.gen_micro_batch > 0:
+                        count = min(count, self.gen_micro_batch)
+                    task_step = pending[0][2]
+                    batch = []
+                    while pending and len(batch) < count and pending[0][2] == task_step:
+                        sample, prompt, _step = pending.popleft()
+                        batch.append((sample, prompt, 1))
+                        inflight[rank].add(sample)
+                    self.task_queues[rank].put((
+                        task_step, adapter_path, batch, dict(options)))
+
+                if done and not pending and not any(inflight.values()):
+                    break
+                try:
+                    rank, sample, results = self.result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    dead = [(rank, None if proc is None else proc.exitcode)
+                            for rank, proc in enumerate(self.procs)
+                            if proc is None or proc.exitcode is not None]
+                    if dead:
+                        raise RuntimeError(f"coder worker(s) exited during API pipeline: {dead}")
+                    continue
+                if sample is None and isinstance(results, dict):
+                    raise RuntimeError(
+                        f"coder worker {rank} failed during API pipeline:\n"
+                        f"{results.get('error', 'unknown worker failure')}")
+                if (rank not in inflight or sample not in inflight[rank]
+                        or len(results) != 1):
+                    raise RuntimeError("unexpected, duplicate, or malformed pipelined coder result")
+                inflight[rank].remove(sample)
+                collected += 1
+                bar.update(1)
+                yield requests.pop(sample), results
+            if collected != int(total_expected):
+                raise RuntimeError(
+                    f"API coder pipeline returned {collected}/{total_expected} rollouts")
+        finally:
+            bar.close()
+
     def score_token_logprobs(self, prompt_response_pairs, show_progress=True,
                              adapter_path=None, require_complete=False,
                              max_retries=None):
@@ -2597,6 +2693,26 @@ class PhasedVLLMGenerationPool:
 
     def iter_group_jobs(self, *args, **kwargs):
         yield from self._ensure_started().iter_group_jobs(*args, **kwargs)
+
+    def prepare(self):
+        """Load/wake all configured coder engines while remote planning runs."""
+        self._ensure_started()
+
+    def iter_ready_jobs(self, *args, **kwargs):
+        pool = self._ensure_started()
+        try:
+            yield from pool.iter_ready_jobs(*args, **kwargs)
+        except BaseException:
+            # Pending requests must be terminated, not sent sleep commands:
+            # an API/worker failure can occur while other engines still run.
+            self._pool = None
+            self._awake = False
+            self._persistent = False
+            try:
+                pool.shutdown()
+            finally:
+                self._after_stop()
+            raise
 
     def run_sequential_chains(self, *args, **kwargs):
         pool = self._ensure_started()

@@ -6,6 +6,8 @@ import json
 import math
 from pathlib import Path
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -214,8 +216,9 @@ class CapturingTrainer:
 
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
-@pytest.mark.parametrize("allocation", [None, "rule_based", "bandit", "hurdle"])
-@pytest.mark.parametrize("remote_strategy,pooled_coder", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("allocation", [None, "fixed", "rule_based", "bandit", "hurdle"])
+@pytest.mark.parametrize("remote_strategy,pooled_coder", [
+    (False, False), (True, False), (True, True), (True, "live")])
 def test_complete_step_with_cpu_generation_and_evaluation(
         monkeypatch, tmp_path, load_config, mode, allocation, remote_strategy, pooled_coder):
     cfg, _ = load_config(mode)
@@ -223,9 +226,16 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     cfg.group_size = 4
     cfg.strategies_per_parent = 2
     cfg.programs_per_strategy = 2
-    cfg.pilot_programs_per_strategy = 1
+    cfg.pilot_programs_per_strategy = -1 if allocation == "fixed" else 1
     cfg.pilot_xhigh_programs_per_strategy = 0
-    cfg.phase2_allocation_method = allocation or "hurdle"
+    cfg.phase2_allocation_method = allocation if allocation not in {None, "fixed"} else "hurdle"
+    if pooled_coder == "live" and allocation not in {None, "fixed"}:
+        cfg.programs_per_strategy = 3
+        cfg.group_size = 6
+        cfg.pilot_programs_per_strategy = 2
+        cfg.pilot_xhigh_programs_per_strategy = 1
+        cfg.coder_template_kind = "qwen3.8"
+    expected_total = cfg.groups_per_step * cfg.group_size
     cfg.reward_workers = 2
     cfg.max_seq_length = 128
     cfg.max_new_tokens = 16
@@ -242,6 +252,9 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     problem.two_stage_rollouts = allocation is not None
     strategy_pool = None
     remote_prompts = []
+    api_started = threading.Event()
+    coder_started = threading.Event()
+    worker_prepared = threading.Event()
     if remote_strategy and allocation is not None:
         from strategy_prompts_openai import build_openai_strategy_messages
         cfg.api_strategy = "gpt-6-luna"
@@ -250,7 +263,12 @@ def test_complete_step_with_cpu_generation_and_evaluation(
 
         class RemotePool:
             def iter_group_jobs(self, prompts_by_group, **kwargs):
-                for i, prompt in reversed(list(enumerate(prompts_by_group))):
+                api_started.set()
+                for position, (i, prompt) in enumerate(reversed(list(enumerate(prompts_by_group)))):
+                    if pooled_coder == "live" and position == 1:
+                        # The very first coder rollout must happen before the
+                        # remaining API response can complete even round one.
+                        assert coder_started.wait(5), "coder waited for all API plans"
                     remote_prompts.append(json.loads(prompt[1]["content"]))
                     yield i, [(json.dumps({"plan": "Use an explicit search plan."}), [])]
 
@@ -298,6 +316,38 @@ def test_complete_step_with_cpu_generation_and_evaluation(
                 yield from generate(model, TinyTokenizer(), prompts_by_group,
                                     counts_by_group, cfg)
 
+        if pooled_coder == "live":
+            class LiveCoderPool(CoderPool):
+                def prepare(self):
+                    assert api_started.wait(5), "worker startup blocked API submission"
+                    assert not coder_started.is_set()
+                    worker_prepared.set()
+
+                def iter_ready_jobs(self, poll_jobs, **kwargs):
+                    assert worker_prepared.is_set()
+                    assert kwargs["adapter_path"] == str(adapter)
+                    expires = time.monotonic() + 5
+                    done = False
+                    while not done:
+                        assert time.monotonic() < expires, "pipeline stopped making progress"
+                        jobs, done = poll_jobs()
+                        for job in jobs:
+                            coder_started.set()
+                            for _, results in generate(
+                                    model, TinyTokenizer(), [job["prompt_text"]],
+                                    [job["count"]], cfg):
+                                yield job["key"], [(text, ids, [-.7] * len(ids))
+                                                  for text, ids in results]
+                        if not jobs and not done:
+                            threading.Event().wait(.001)
+
+                def score_token_logprobs(self, pairs, **kwargs):
+                    return [[-.7] * len(response_ids) for _, response_ids in pairs]
+
+            CoderPool = LiveCoderPool
+            if allocation:
+                cfg.generation_backend = "vllm"
+
         coder_pool = CoderPool()
         monkeypatch.setattr(training, "_save_adapter", lambda *args, **kwargs: str(adapter))
     stats = training.train_step(
@@ -305,31 +355,34 @@ def test_complete_step_with_cpu_generation_and_evaluation(
         problem, parallel_trainer=trainer, spo_rs_tracker=tracker,
         strategy_pool=strategy_pool, gen_pool=coder_pool,
         sampling_adapter_path=str(adapter) if tracker else None)
-    assert len(generated) == 8
+    assert len(generated) == expected_total
     assert len(trainer.calls) == 1
     assert trainer.calls[0][0] == mode
     examples = trainer.calls[0][1]
-    assert len(examples) == 8
+    assert len(examples) == expected_total
     assert math.isclose(sum(ex["sample_weight"] for ex in examples), 1.)
     assert all(not any(key.startswith(("rank_", "x_grpo_", "binary_")) for key in ex)
                for ex in examples)
     metadata = [json.loads(p.read_text()) for p in (tmp_path / "step00").glob("*rollout*.meta.json")]
-    assert len(metadata) == 8
+    assert len(metadata) == expected_total
     assert {row["advantage_mode"] for row in metadata} == {mode}
-    assert stats["planned_rollouts"] == 8
+    assert stats["planned_rollouts"] == expected_total
     if mode == "spo-rs":
         assert stats["spo_rs_policy_updated"]
         for row in metadata:
             expected = (math.exp(2 * row["reward"]) / math.exp(2) - 1) / 2
             assert row["advantage"] == pytest.approx(expected)
     if allocation:
-        assert len(stats["strategy_pilot_allocation"]) == 4
+        if allocation != "fixed":
+            assert len(stats["strategy_pilot_allocation"]) == 4
         assert len(list((tmp_path / "step00").glob("*fold00_strategy[0-9][0-9].txt"))) == 4
         if remote_strategy:
             assert len(remote_prompts) == 4
             assert [len(prompt["previous_strategies"]) for prompt in remote_prompts] == [0, 0, 1, 1]
             assert all(prompt["previous_strategies"] == ["Use an explicit search plan."]
                        for prompt in remote_prompts[2:])
+            if pooled_coder == "live":
+                assert worker_prepared.is_set() and coder_started.is_set()
 
 
 def test_behavior_cache_keeps_only_aligned_finite_scores():

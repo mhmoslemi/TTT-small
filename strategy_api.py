@@ -30,7 +30,8 @@ def strategy_api_key(api_key_env):
 
 
 def run_strategy_rounds(pool, *, num_parents, num_strategies, prompt_builder,
-                        result_handler, max_retries, generation_options):
+                        result_handler, max_retries, generation_options,
+                        stop_event=None):
     """One independent request per parent; finish a depth before advancing.
 
     result_handler admits only valid plans into its parent's history and
@@ -40,6 +41,8 @@ def run_strategy_rounds(pool, *, num_parents, num_strategies, prompt_builder,
     for strategy_index in range(num_strategies):
         pending = list(range(num_parents))
         for attempt in range(max_retries + 1):
+            if stop_event is not None and stop_event.is_set():
+                return
             prompts = [prompt_builder(parent, strategy_index, attempt)
                        for parent in pending]
             completed, retry_parents = set(), []
@@ -49,6 +52,8 @@ def run_strategy_rounds(pool, *, num_parents, num_strategies, prompt_builder,
                     progress_desc=f"strategy {strategy_index + 1}/{num_strategies}"
                                   + (f" retry {attempt}" if attempt else ""),
                     **generation_options):
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if not isinstance(index, int) or not 0 <= index < len(pending):
                     raise RuntimeError("strategy API returned an invalid parent index")
                 parent = pending[index]

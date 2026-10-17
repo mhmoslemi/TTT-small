@@ -9869,6 +9869,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             strategy_prompt_cache.pop((int(chain["chain_id"]), int(strategy_index)), None)
         return needs_retry
 
+    def _code_prompt_job(source_jobs, chain, strategy_index):
+        record = chain["strategies"][strategy_index]
+        source_job = source_jobs[chain["source_indices"][strategy_index]]
+        messages = problem.build_code_messages(
+            source_job["messages"], record["strategy"])
+        return {
+            **source_job, "messages": messages, "prompt_text": _render(messages),
+            "count": programs_per_strategy, "strategy": record["strategy"],
+            "strategy_response": record["response"],
+            "strategy_index": strategy_index,
+        }
+
     def _code_prompt_jobs(source_jobs, chains):
         extraction_failures = sum(
             record["extraction_issue"] is not None
@@ -9882,22 +9894,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"strategy chain {chain['chain_id']} expected "
                     f"{strategies_per_parent} strategies, received "
                     f"{len(chain['strategies'])}")
-            for strategy_index, strategy_record in enumerate(
-                    chain["strategies"]):
-                source_idx = chain["source_indices"][strategy_index]
-                source_job = source_jobs[source_idx]
-                strategy = strategy_record["strategy"]
-                messages = problem.build_code_messages(
-                    source_job["messages"], strategy)
-                code_jobs.append({
-                    **source_job,
-                    "messages": messages,
-                    "prompt_text": _render(messages),
-                    "count": programs_per_strategy,
-                    "strategy": strategy,
-                    "strategy_response": strategy_record["response"],
-                    "strategy_index": strategy_index,
-                })
+            for strategy_index in range(len(chain["strategies"])):
+                code_jobs.append(_code_prompt_job(
+                    source_jobs, chain, strategy_index))
         return code_jobs
 
     spo_rs_divergence = 0.0
@@ -10940,6 +10939,196 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 f"{dispatched}/{expected_followups}")
         return all_followup_counts
 
+    cap_state = {"value": int(getattr(cfg, '_local_generation_cap', 0) or 0)}
+
+    def _seed_local_generation(seed_step):
+        if cfg.deterministic:
+            torch.manual_seed((int(cfg.seed) * 1_000_003
+                               + int(seed_step) * 1009 + 13)
+                              % (2**31 - 1))
+
+    def _run_api_strategy_pipeline():
+        """Keep remote planning, all coder engines, and CPU rewards overlapped."""
+        nonlocal prompt_jobs
+        from strategy_api import run_strategy_rounds
+        from strategy_pipeline import StrategyArrivalStream, iter_ready_batches
+
+        if strategy_pool is None:
+            raise RuntimeError("API strategy mode requires its remote generation pool")
+        source_jobs = prompt_jobs
+        # Stable parent-major slots preserve strategy/allocation identities
+        # irrespective of API arrival order. Phase/retry prompts append later.
+        num_sources = len(strategy_chains) * strategies_per_parent
+        prompt_jobs = [{} for _ in range(num_sources)]
+        received = set()
+        requests = {}
+        pilot_records = {index: [] for index in range(num_sources)}
+        pending_followups = (set(range(len(strategy_chains)))
+                             if adaptive_strategy_pilots else set())
+        expected_counts = {}
+        completed_counts = {}
+
+        def produce(publish, stop):
+            def accept(parent, stage, response, attempt):
+                if stop.is_set():
+                    return False
+                retry = _handle_strategy_attempt(parent, stage, response, attempt)
+                if not retry:
+                    publish(parent, stage)
+                return retry
+
+            run_strategy_rounds(
+                strategy_pool, num_parents=len(strategy_chains),
+                num_strategies=strategies_per_parent,
+                prompt_builder=lambda parent, stage, retry: _strategy_prompt(
+                    source_jobs, strategy_chains[parent], stage, retry=retry),
+                result_handler=accept, max_retries=strategy_format_max_retries,
+                stop_event=stop,
+                generation_options={
+                    "max_new_tokens": int(cfg.strategy_max_new_tokens),
+                    "temperature": float(cfg.strategy_temperature),
+                    "top_p": float(cfg.strategy_top_p),
+                    "top_k": getattr(cfg, "strategy_sampling_top_k", None),
+                    "min_p": getattr(cfg, "strategy_sampling_min_p", None),
+                    "step_idx": int(step_idx) + 2_000_000,
+                })
+
+        def code_requests(indices, counts, phase, seed_offset):
+            jobs = []
+            variants = {}
+            for source_idx, count, effort in _coder_effort_entries(
+                    prompt_jobs, indices, counts, cfg, step_idx, phase):
+                prompt_idx = (_phase_coder_prompt_job(
+                    prompt_jobs, source_idx, phase, cfg, _render,
+                    phase_prompt_job_cache, effort=effort)
+                    if phase is not None else source_idx)
+                variant = variants.get(source_idx, 0)
+                variants[source_idx] = variant + 1
+                # Stable identities keep vLLM seeds independent of API arrival
+                # order and which engine becomes available first.
+                phase_id = 1 if phase == "adaptive" else 0
+                key = (phase_id * num_sources + source_idx) * 2 + variant
+                if key in requests:
+                    raise RuntimeError("API pipeline scheduled a coder job twice")
+                requests[key] = (source_idx, prompt_idx, phase)
+                expected_counts[key] = count
+                completed_counts[key] = 0
+                jobs.append({
+                    "key": key, "prompt_text": prompt_jobs[prompt_idx]["prompt_text"],
+                    "count": count, "step_idx": int(step_idx) + seed_offset,
+                })
+            return jobs
+
+        def poll_jobs():
+            arrivals, planning_done = arrivals_stream.poll()
+            jobs = []
+            for parent, stage in arrivals:
+                source_idx = parent * strategies_per_parent + stage
+                if source_idx in received:
+                    raise RuntimeError("API pipeline published a strategy twice")
+                prompt_jobs[source_idx] = _code_prompt_job(
+                    source_jobs, strategy_chains[parent], stage)
+                received.add(source_idx)
+                phase = "pilot" if adaptive_strategy_pilots else None
+                count = (pilot_programs_per_strategy if adaptive_strategy_pilots
+                         else programs_per_strategy)
+                jobs.extend(code_requests([source_idx], [count], phase, 0))
+                print(f"[step {step_idx}] API strategy ready: parent {parent}, "
+                      f"strategy {stage + 1}/{strategies_per_parent}; "
+                      f"queued {count} coder {phase or 'rollout'} sample(s)", flush=True)
+
+            # The allocator still sees every strategy and original pilot for
+            # this parent. Other parents and subsequent API rounds can continue.
+            for parent in sorted(pending_followups):
+                indices = list(range(parent * strategies_per_parent,
+                                     (parent + 1) * strategies_per_parent))
+                if any(index not in received or
+                       len(pilot_records[index]) != pilot_programs_per_strategy
+                       for index in indices):
+                    continue
+                records = [record for index in indices for record in pilot_records[index]]
+                if not all(record["_reward_future"].done() for record in records):
+                    continue
+                counts = _finish_strategy_pilots(
+                    records, indices, rewards_already_ready=True)
+                jobs.extend(code_requests(
+                    indices, counts, "adaptive", 4_000_000 + parent * 100_000))
+                pending_followups.remove(parent)
+            if planning_done and len(received) != num_sources:
+                raise RuntimeError(f"API pipeline received {len(received)}/{num_sources} strategies")
+            return jobs, planning_done and not pending_followups
+
+        options = dict(
+            adapter_path=adapter_path, max_new_tokens=cfg.max_new_tokens,
+            temperature=cfg.temperature, top_p=cfg.top_p,
+            top_k=getattr(cfg, "sampling_top_k", None),
+            min_p=getattr(cfg, "sampling_min_p", None),
+            full_policy_sampling=_uses_sequence_level_policy_ratio(cfg))
+        if cfg.generation_backend == "vllm":
+            options["return_logprobs"] = training_enabled
+
+        def run_batch(jobs):
+            prompts = [job["prompt_text"] for job in jobs]
+            counts = [job["count"] for job in jobs]
+            seed_step = jobs[0]["step_idx"]
+            if gen_pool is not None:
+                results = gen_pool.iter_group_jobs(
+                    prompts_by_group=prompts, counts_by_group=counts,
+                    group_size=max(counts), step_idx=seed_step,
+                    progress_desc="API coder rollouts", **options)
+            else:
+                _seed_local_generation(seed_step)
+                results = generate_prompt_jobs(
+                    model, tokenizer, prompts, counts, cfg, cap_state=cap_state)
+            for index, batch in results:
+                yield jobs[int(index)]["key"], batch
+
+        print(f"[step {step_idx}] API pipeline: {len(strategy_chains)} parents "
+              f"x {strategies_per_parent} rounds; coder startup and ready-plan "
+              "rollouts overlap remote planning on all configured rollout GPUs",
+              flush=True)
+        with StrategyArrivalStream(produce) as arrivals_stream:
+            # API requests begin first. GPU offload/startup/wake remains on
+            # this thread, so trainer and coder residency can never race.
+            prepare = getattr(gen_pool, "prepare", None)
+            if callable(prepare):
+                print(f"[step {step_idx}] loading/waking coder workers during "
+                      "API planning", flush=True)
+                prepare()
+            elif gen_pool is None:
+                backend.set_inference_mode()
+            live_jobs = getattr(gen_pool, "iter_ready_jobs", None)
+            stream = (live_jobs(poll_jobs, total_expected=total_rollouts, **options)
+                      if callable(live_jobs) else iter_ready_batches(poll_jobs, run_batch))
+            try:
+                for key, results in stream:
+                    source_idx, prompt_idx, phase = requests[key]
+                    completed_counts[key] += len(results)
+                    if completed_counts[key] > expected_counts[key]:
+                        raise RuntimeError("API coder pipeline duplicated rollouts")
+                    for result in results:
+                        record = _queue_rollout(
+                            prompt_idx, result[0], result[1],
+                            result[2] if len(result) > 2 else None,
+                            rollout_phase=phase,
+                            strategy_source_job_idx=(source_idx if phase else None))
+                        if phase is not None:
+                            _attach_strategy_plan(record, source_idx, phase)
+                        if phase == "pilot":
+                            pilot_records[source_idx].append(record)
+            finally:
+                # Closing a live scheduler on a consumer-side failure also
+                # aborts in-flight GPU work before phase cleanup/restoration.
+                stream.close()
+        if completed_counts != expected_counts:
+            raise RuntimeError("API coder pipeline did not complete every requested rollout")
+        if any(count != int(cfg.group_size) for count in queued_by_parent.values()):
+            raise RuntimeError("API coder pipeline changed the per-parent rollout budget")
+        # Recovery uses the complete planned set, after useful pipeline work.
+        _run_coder_format_retries(primary_rollout_records, seed_offset=0)
+        if gen_pool is None:
+            cfg._local_generation_cap = int(cap_state["value"])
+
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
     evaluation_trainer_offloaded = False
@@ -10948,32 +11137,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             api_planned = bool(two_stage_rollouts and
                                getattr(cfg, "strategy_backend", "local") == "api")
             if api_planned:
-                from strategy_api import run_strategy_rounds
-                if strategy_pool is None:
-                    raise RuntimeError("API strategy mode requires its remote generation pool")
-                source_prompt_jobs = prompt_jobs
-                setting_log_only(
-                    f"[step {step_idx}] API planning: {len(strategy_chains)} parents "
-                    f"x {strategies_per_parent} sequential rounds with "
-                    f"{_strategy_model_name(cfg)}", flush=True)
-                run_strategy_rounds(
-                    strategy_pool, num_parents=len(strategy_chains),
-                    num_strategies=strategies_per_parent,
-                    prompt_builder=lambda parent, stage, retry: _strategy_prompt(
-                        source_prompt_jobs, strategy_chains[parent], stage, retry=retry),
-                    result_handler=_handle_strategy_attempt,
-                    max_retries=strategy_format_max_retries,
-                    generation_options={
-                        "max_new_tokens": int(cfg.strategy_max_new_tokens),
-                        "temperature": float(cfg.strategy_temperature),
-                        "top_p": float(cfg.strategy_top_p),
-                        "top_k": getattr(cfg, "strategy_sampling_top_k", None),
-                        "min_p": getattr(cfg, "strategy_sampling_min_p", None),
-                        "step_idx": int(step_idx) + 2_000_000,
-                    },
-                )
-                prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
-            if gen_pool is not None:
+                _run_api_strategy_pipeline()
+            elif gen_pool is not None:
                 # Consume the generation stream (the adapter was already saved
                 # above). CPU rewards and rewards on a distinct evaluation GPU
                 # start immediately. A one-card GPU problem defers evaluation
@@ -11247,13 +11412,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # than draining one parent at a time. Ordinary CPU verification
                 # overlaps later batches; one-card GPU-mode verification waits.
                 backend.set_inference_mode()
-                cap_state = {"value": int(getattr(cfg, '_local_generation_cap', 0) or 0)}
-
-                def _seed_local_generation(seed_step):
-                    if cfg.deterministic:
-                        torch.manual_seed((int(cfg.seed) * 1_000_003
-                                           + int(seed_step) * 1009 + 13)
-                                          % (2**31 - 1))
 
                 if two_stage_rollouts and not api_planned:
                     source_prompt_jobs = prompt_jobs

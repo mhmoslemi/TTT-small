@@ -59,6 +59,9 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # strategy_api.py (one key, no quotes). Set api_strategy: '' for local planning.
 # API calls run in parallel across parents, one sequential strategy round at
 # a time; strategy_reasoning_effort selects the API reasoning level.
+# Coder workers load while API planning runs. Accepted plans start rollouts
+# on the configured GPU pool immediately; adaptive allocation still waits
+# for all pilot results belonging to the same parent.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
