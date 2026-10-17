@@ -44,8 +44,8 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # No extra model forwards; skipped/unscored examples have missing coverage.
 #   sh run.sh --measure-entropy
 # Opt into hierarchical rollouts. The frozen strategist runs first, is fully
-# offloaded, then the LoRA coder generates programs and trains. Without this
-# flag the coder uses the direct one-stage rollout path:
+# offloaded, then the LoRA coder generates programs and trains. With this flag
+# absent and api_strategy empty, the coder uses direct one-stage rollouts:
 #   sh run.sh --strategies
 # Retry a coder response missing its required final code block once. Coder
 # retries are off unless this flag is passed; strategy retries are unchanged:
@@ -53,7 +53,12 @@ config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # An OpenAI-compatible remote strategist can be selected without loading its
 # tokenizer or weights locally:
 #   export DEEPSEEK_API_KEY='...'
-#   sh run.sh --strategy-api --strategy-model-name deepseek-v4-pro
+#   sh run.sh --api-strategy '' --strategies --strategy-api --strategy-model-name deepseek-v4-pro
+# OpenAI strategy selection lives in YAML: api_strategy: gpt-6-luna.
+# Credentials: OPENAI_API_KEY or the Git-ignored .openai_api_key file beside
+# strategy_api.py (one key, no quotes). Set api_strategy: '' for local planning.
+# API calls run in parallel across parents, one sequential strategy round at
+# a time; strategy_reasoning_effort selects the API reasoning level.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 

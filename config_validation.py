@@ -48,7 +48,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "phase2_allocation_method",
     "min_p", "strategy_min_p",
     "strategy_vllm_persistent_workers",
-    "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
+    "api_strategy", "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
     "strategy_api_concurrency", "strategy_api_timeout_s",
     "strategy_api_max_retries",
     "strategy_format_max_retries",
@@ -313,10 +313,15 @@ def validate_problem_config(
             f"{_label(source)}: strategy_thinking must be true or false")
     if ("strategy_reasoning_effort" in data
             and str(data["strategy_reasoning_effort"]).lower()
-            not in {"low", "medium", "high"}):
+            not in {"none", "low", "medium", "high", "xhigh", "max"}):
         raise ValueError(
-            f"{_label(source)}: strategy_reasoning_effort must be low, "
-            "medium, or high")
+            f"{_label(source)}: strategy_reasoning_effort must be none, low, "
+            "medium, high, xhigh, or max")
+    if "api_strategy" in data:
+        if not isinstance(data["api_strategy"], str):
+            raise ValueError(f"{_label(source)}: api_strategy must be a model name or ''")
+        if data["api_strategy"].strip() not in {"", "gpt-6-luna"}:
+            raise ValueError(f"{_label(source)}: api_strategy supports gpt-6-luna or ''")
     if ("strategy_backend" in data
             and str(data["strategy_backend"]).lower() not in {"local", "api"}):
         raise ValueError(

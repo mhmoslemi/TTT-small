@@ -762,6 +762,11 @@ def _model_basename(model_name):
     return normalized.rsplit("/", 1)[-1].lower()
 
 
+def _strategy_model_name(cfg):
+    """Keep the configured local checkpoint available when the API is off."""
+    return getattr(cfg, "api_strategy", "") or cfg.strategy_model_name
+
+
 def _apply_strategy_model_profile(
         merged, model_name, explicit_keys=frozenset()):
     """Apply model-native strategist defaults below explicit configuration."""
@@ -1132,6 +1137,8 @@ def _dual_resident_qwen3_8b_strategy_coder_pools(config):
 def _extract_final_strategy(response_text, *, strict=False):
     """Extract only the final, complete strategy block.
 
+    Explicit JSON plans and named plan fences are normalized before extraction.
+
     GPT-OSS may expose a long analysis channel before its final answer. None of
     that text is allowed into a later strategist or coder prompt. We retain
     only the body of the last complete ``<strategy>...</strategy>`` block at
@@ -1142,7 +1149,8 @@ def _extract_final_strategy(response_text, *, strict=False):
     hands the coder the explicit no-strategy fallback instead of aborting the
     entire rollout step.
     """
-    raw = final_answer_scope(response_text).strip()
+    from strategy_prompts_openai import normalize_strategy_plan
+    raw = final_answer_scope(normalize_strategy_plan(response_text)).strip()
     if not raw:
         return _STRATEGY_FALLBACK, "empty response"
 
@@ -1827,6 +1835,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Base reasoning checkpoint used only to generate "
                         "strategies; it never receives or trains the LoRA.")
     p.add_argument(
+        "--api-strategy", default=None,
+        help="OpenAI strategy model (gpt-6-luna). A nonempty value enables "
+             "strategy rounds through the API; '' keeps local strategy selection.")
+    p.add_argument(
         "--strategy-backend", choices=["local", "api"], default=None,
         help="Run the frozen strategist through a local generation pool or "
              "an OpenAI-compatible remote API.")
@@ -1901,9 +1913,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-strategy-thinking", dest="strategy_thinking",
                    action="store_const", const=False)
     p.add_argument("--strategy-reasoning-effort",
-                   choices=["low", "medium", "high"], default=None,
-                   help="Reasoning effort passed to strategy-model chat "
-                        "templates that support it, including GPT-OSS.")
+                   choices=["none", "low", "medium", "high", "xhigh", "max"],
+                   default=None,
+                   help="API reasoning effort; local GPT-OSS supports low, "
+                        "medium, or high.")
     p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
@@ -2272,6 +2285,9 @@ def load_config():
             merged["phase2_allocation_method"] = "rule_based"
         merged["spo_rs_adaptive_beta"] = bool(
             saved.get("spo_rs_adaptive_beta", False))
+        # Introducing an API-enabled preset must not switch an older resumed
+        # run to a paid service. An explicit CLI selector can still opt in.
+        merged["api_strategy"] = saved.get("api_strategy", "")
         print(f"[config] resuming original configuration from "
               f"{resume_dir / 'config.json'}")
 
@@ -2298,10 +2314,19 @@ def load_config():
             merged["spo_rs_clip_epsilon_low"] = args.spo_rs_clip_epsilon
         if args.spo_rs_clip_epsilon_high is None:
             merged["spo_rs_clip_epsilon_high"] = args.spo_rs_clip_epsilon
-    # These modes are deliberately launch-scoped. Saved/YAML values must not
-    # silently change a later invocation's trainer or evaluator.
+    # Trainer/evaluator modes are launch-scoped. A nonempty API selector is
+    # also an explicit opt-in to the strategy hierarchy.
     merged["fast"] = bool(args.fast)
-    merged["strategies"] = bool(args.strategies)
+    api_strategy = merged.get("api_strategy", "")
+    if not isinstance(api_strategy, str):
+        raise ValueError("api_strategy must be a model name or ''")
+    merged["api_strategy"] = api_strategy.strip()
+    if merged["api_strategy"] not in {"", "gpt-6-luna"}:
+        raise ValueError("api_strategy supports gpt-6-luna or ''")
+    merged["strategies"] = bool(args.strategies) or bool(merged["api_strategy"])
+    if (saved.get("api_strategy") and args.api_strategy == ""
+            and args.strategy_backend is None):
+        merged["strategy_backend"] = ydict.get("strategy_backend", "local")
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged["measure_entropy"] = bool(args.measure_entropy)
     merged["no_train"] = bool(args.no_train)
@@ -2484,9 +2509,10 @@ def load_config():
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
-        _apply_strategy_model_profile(
-            merged, strategy_model_name, profile_explicit_keys)
-        strategy_backend = str(
+        if not merged["api_strategy"]:
+            _apply_strategy_model_profile(
+                merged, strategy_model_name, profile_explicit_keys)
+        strategy_backend = "api" if merged["api_strategy"] else str(
             merged.get("strategy_backend") or "local"
         ).strip().lower()
         if strategy_backend not in {"local", "api"}:
@@ -2500,6 +2526,12 @@ def load_config():
         ).strip().lower()
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
         strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
+        if merged["api_strategy"]:
+            from strategy_api import OPENAI_MAX_OUTPUT_TOKENS
+            if strategy_max_new_tokens > OPENAI_MAX_OUTPUT_TOKENS:
+                print(f"[config] OpenAI strategy output budget capped at "
+                      f"{OPENAI_MAX_OUTPUT_TOKENS} tokens (including reasoning)")
+                strategy_max_new_tokens = OPENAI_MAX_OUTPUT_TOKENS
         strategy_max_seq_length = int(merged["strategy_max_seq_length"])
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
@@ -2561,9 +2593,12 @@ def load_config():
         strategy_reasoning_effort = str(
             merged.get("strategy_reasoning_effort") or "high"
         ).strip().lower()
-        if strategy_reasoning_effort not in {"low", "medium", "high"}:
+        if strategy_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(
-                "strategy_reasoning_effort must be low, medium, or high")
+                "strategy_reasoning_effort must be none, low, medium, high, xhigh, or max")
+        if (strategy_backend == "local" and "gpt-oss" in strategy_model_name.lower()
+                and strategy_reasoning_effort not in {"low", "medium", "high"}):
+            raise ValueError("local GPT-OSS strategy reasoning supports low, medium, or high")
         merged["strategy_reasoning_effort"] = strategy_reasoning_effort
         merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
         merged["strategy_api_base_url"] = str(
@@ -2572,8 +2607,11 @@ def load_config():
         merged["strategy_api_key_env"] = str(
             merged.get("strategy_api_key_env")
             or "DEEPSEEK_API_KEY").strip()
+        if merged["api_strategy"]:
+            merged["strategy_api_base_url"] = "https://api.openai.com/v1"
+            merged["strategy_api_key_env"] = "OPENAI_API_KEY"
         merged["strategy_api_concurrency"] = int(
-            merged.get("strategy_api_concurrency") or 8)
+            merged.get("strategy_api_concurrency") or merged["groups_per_step"])
         merged["strategy_api_timeout_s"] = float(
             merged.get("strategy_api_timeout_s") or 1800.0)
         merged["strategy_api_max_retries"] = int(
@@ -2589,11 +2627,9 @@ def load_config():
             raise ValueError("strategy_api_timeout_s must be positive")
         if merged["strategy_api_max_retries"] < 0:
             raise ValueError("strategy_api_max_retries must be >= 0")
-        if (strategy_backend == "api"
-                and not os.environ.get(merged["strategy_api_key_env"], "")):
-            raise ValueError(
-                "strategy API mode requires environment variable "
-                f"{merged['strategy_api_key_env']} to be set")
+        if strategy_backend == "api":
+            from strategy_api import strategy_api_key
+            strategy_api_key(merged["strategy_api_key_env"])
         merged["group_size"] = effective_group_size
     # This ablation intentionally keeps two independent Qwen3-8B engines per
     # card resident together: a permanently base/no-LoRA strategist and a
@@ -9759,7 +9795,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                      for record in chain["strategies"]]))
         messages = deepcopy(strategy_prompt_cache[key])
         if retry:
-            messages = output_retry_messages(messages, "strategy")
+            if getattr(cfg, "api_strategy", ""):
+                from strategy_prompts_openai import openai_strategy_retry_messages
+                messages = openai_strategy_retry_messages(messages)
+            else:
+                messages = output_retry_messages(messages, "strategy")
         prompt = _render_strategy(messages, reasoning_effort=None)
         strategy_attempt_prompts[(*key, int(retry))] = prompt
         return prompt
@@ -10897,12 +10937,40 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     evaluation_trainer_offloaded = False
     try:
         try:
+            api_planned = bool(two_stage_rollouts and
+                               getattr(cfg, "strategy_backend", "local") == "api")
+            if api_planned:
+                from strategy_api import run_strategy_rounds
+                if strategy_pool is None:
+                    raise RuntimeError("API strategy mode requires its remote generation pool")
+                source_prompt_jobs = prompt_jobs
+                setting_log_only(
+                    f"[step {step_idx}] API planning: {len(strategy_chains)} parents "
+                    f"x {strategies_per_parent} sequential rounds with "
+                    f"{_strategy_model_name(cfg)}", flush=True)
+                run_strategy_rounds(
+                    strategy_pool, num_parents=len(strategy_chains),
+                    num_strategies=strategies_per_parent,
+                    prompt_builder=lambda parent, stage, retry: _strategy_prompt(
+                        source_prompt_jobs, strategy_chains[parent], stage, retry=retry),
+                    result_handler=_handle_strategy_attempt,
+                    max_retries=strategy_format_max_retries,
+                    generation_options={
+                        "max_new_tokens": int(cfg.strategy_max_new_tokens),
+                        "temperature": float(cfg.strategy_temperature),
+                        "top_p": float(cfg.strategy_top_p),
+                        "top_k": getattr(cfg, "strategy_sampling_top_k", None),
+                        "min_p": getattr(cfg, "strategy_sampling_min_p", None),
+                        "step_idx": int(step_idx) + 2_000_000,
+                    },
+                )
+                prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
             if gen_pool is not None:
                 # Consume the generation stream (the adapter was already saved
                 # above). CPU rewards and rewards on a distinct evaluation GPU
                 # start immediately. A one-card GPU problem defers evaluation
                 # until generation releases that same physical card.
-                if two_stage_rollouts:
+                if two_stage_rollouts and not api_planned:
                     source_prompt_jobs = prompt_jobs
                     planning_pool = strategy_pool or gen_pool
                     setting_log_only(f"[step {step_idx}] hierarchical planning: "
@@ -11002,7 +11070,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 progress_desc="strategies pipelined",
                             )
                         else:
-                            # API and legacy pools retain the compatible
+                            # Legacy local pools retain the compatible
                             # depth-batched path. Local vLLM pools use the
                             # dependency-pipelined scheduler above.
                             for strategy_index in range(
@@ -11179,7 +11247,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                            + int(seed_step) * 1009 + 13)
                                           % (2**31 - 1))
 
-                if two_stage_rollouts:
+                if two_stage_rollouts and not api_planned:
                     source_prompt_jobs = prompt_jobs
                     setting_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
@@ -12859,7 +12927,7 @@ def main():
         strategy_location = (
             "remote API; no local weights"
             if cfg.strategy_backend == "api" else "local; no LoRA")
-        print(f"Strategy model:     {cfg.strategy_model_name} "
+        print(f"Strategy model:     {_strategy_model_name(cfg)} "
               f"({strategy_location})")
     if cfg.training_model_name != cfg.model_name:
         print(f"Training model:     {cfg.training_model_name}")
@@ -13002,6 +13070,9 @@ def main():
               f"min_p={getattr(cfg, 'strategy_sampling_min_p', None)}, "
               f"thinking={'on' if cfg.strategy_thinking else 'off'}, "
               f"reasoning_effort={cfg.strategy_reasoning_effort}")
+        if getattr(cfg, "api_strategy", ""):
+            print("Strategy API:       text only; tools disabled; local sampling "
+                  "fields ignored; output budget includes reasoning")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         fused_attention_label = (
@@ -13317,7 +13388,7 @@ def main():
             and cfg.strategy_backend == "api"):
         from strategy_api import StrategyAPIGenerationPool
         strategy_pool = StrategyAPIGenerationPool(
-            model_name=cfg.strategy_model_name,
+            model_name=_strategy_model_name(cfg),
             base_url=cfg.strategy_api_base_url,
             api_key_env=cfg.strategy_api_key_env,
             concurrency=cfg.strategy_api_concurrency,
@@ -13325,9 +13396,10 @@ def main():
             max_retries=cfg.strategy_api_max_retries,
             thinking=cfg.strategy_thinking,
             reasoning_effort=cfg.strategy_reasoning_effort,
+            api_strategy=cfg.api_strategy,
         )
         print(f"[init] remote strategy API configured for "
-              f"{cfg.strategy_model_name}; no strategist tokenizer, weights, "
+              f"{_strategy_model_name(cfg)}; no strategist tokenizer, weights, "
               "or local generation pool loaded", flush=True)
     # vLLM forms exact TP/PP engines over every rollout card. Because those
     # cards also hold either training replicas or model shards, the two runtimes

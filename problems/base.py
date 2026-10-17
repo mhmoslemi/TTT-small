@@ -177,6 +177,9 @@ class Problem(ABC):
     def build_strategy_messages(
             self, messages: List[dict],
             previous_strategies: Optional[List[str]] = None) -> List[dict]:
+        if self.cfg.get("api_strategy"):
+            from strategy_prompts_openai import build_openai_strategy_messages
+            return build_openai_strategy_messages(messages, previous_strategies)
         staged = [dict(message) for message in messages]
         previous_strategies = list(previous_strategies or [])
         history = ""

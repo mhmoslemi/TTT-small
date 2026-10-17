@@ -36,7 +36,7 @@ def load_config(monkeypatch):
             "train_multy_CVaR.py", "--config", str(ROOT / "configs" / filename),
             "--backend", "hf", "--generation-backend", "hf",
             "--max-seq-length", "32768", "--max-new-tokens", "4096",
-            "--advantage-mode", mode, *extra,
+            "--advantage-mode", mode, "--api-strategy", "", *extra,
         ])
         return training.load_config()
 
@@ -215,8 +215,9 @@ class CapturingTrainer:
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
 @pytest.mark.parametrize("allocation", [None, "rule_based", "bandit", "hurdle"])
+@pytest.mark.parametrize("remote_strategy,pooled_coder", [(False, False), (True, False), (True, True)])
 def test_complete_step_with_cpu_generation_and_evaluation(
-        monkeypatch, tmp_path, load_config, mode, allocation):
+        monkeypatch, tmp_path, load_config, mode, allocation, remote_strategy, pooled_coder):
     cfg, _ = load_config(mode)
     cfg.groups_per_step = 2
     cfg.group_size = 4
@@ -239,6 +240,24 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     optimizer = torch.optim.SGD(model.parameters(), lr=.01)
     problem = TinyProblem()
     problem.two_stage_rollouts = allocation is not None
+    strategy_pool = None
+    remote_prompts = []
+    if remote_strategy and allocation is not None:
+        from strategy_prompts_openai import build_openai_strategy_messages
+        cfg.api_strategy = "gpt-6-luna"
+        cfg.strategy_backend = "api"
+        problem.build_strategy_messages = build_openai_strategy_messages
+
+        class RemotePool:
+            def iter_group_jobs(self, prompts_by_group, **kwargs):
+                for i, prompt in reversed(list(enumerate(prompts_by_group))):
+                    remote_prompts.append(json.loads(prompt[1]["content"]))
+                    yield i, [(json.dumps({"plan": "Use an explicit search plan."}), [])]
+
+            def release(self):
+                pass
+
+        strategy_pool = RemotePool()
     sampler = PUCTSampler(2, seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
     trainer = CapturingTrainer()
     adapter = tmp_path / "adapter_initial"
@@ -269,9 +288,22 @@ def test_complete_step_with_cpu_generation_and_evaluation(
 
     monkeypatch.setattr(training, "generate_prompt_jobs", generate)
     monkeypatch.setattr(training, "compute_batched_token_logprobs", scores)
+    coder_pool = None
+    if pooled_coder:
+        class CoderPool:
+            sequential = False
+
+            def iter_group_jobs(self, prompts_by_group, counts_by_group, **kwargs):
+                assert kwargs["adapter_path"] == str(adapter)
+                yield from generate(model, TinyTokenizer(), prompts_by_group,
+                                    counts_by_group, cfg)
+
+        coder_pool = CoderPool()
+        monkeypatch.setattr(training, "_save_adapter", lambda *args, **kwargs: str(adapter))
     stats = training.train_step(
         backend, model, TinyTokenizer(), sampler, optimizer, 0, cfg, tmp_path,
         problem, parallel_trainer=trainer, spo_rs_tracker=tracker,
+        strategy_pool=strategy_pool, gen_pool=coder_pool,
         sampling_adapter_path=str(adapter) if tracker else None)
     assert len(generated) == 8
     assert len(trainer.calls) == 1
@@ -293,6 +325,11 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     if allocation:
         assert len(stats["strategy_pilot_allocation"]) == 4
         assert len(list((tmp_path / "step00").glob("*fold00_strategy[0-9][0-9].txt"))) == 4
+        if remote_strategy:
+            assert len(remote_prompts) == 4
+            assert [len(prompt["previous_strategies"]) for prompt in remote_prompts] == [0, 0, 1, 1]
+            assert all(prompt["previous_strategies"] == ["Use an explicit search plan."]
+                       for prompt in remote_prompts[2:])
 
 
 def test_behavior_cache_keeps_only_aligned_finite_scores():
