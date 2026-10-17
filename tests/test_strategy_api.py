@@ -77,7 +77,47 @@ def test_openai_request_controls_and_budget(api_pool, effort):
     assert not ({"temperature", "top_p", "top_k", "min_p", "extra_body",
                  "thinking", "previous_response_id", "conversation"} & request.keys())
     assert json.loads(raw) == {"plan": "Detailed implementation plan"}
-    assert usage == dict(prompt=20, completion=30, total=50, reasoning=15)
+    assert usage == dict(prompt=20, cached=0, cache_write=0,
+                         completion=30, total=50, reasoning=15)
+
+
+@pytest.mark.parametrize("prompt,input_usd,output_usd", [
+    (10_000, .000665, .015),
+    (272_000, .026865, .015),
+    (272_001, .0537302, .0225),
+])
+def test_strategy_cost_cache_and_long_context(prompt, input_usd, output_usd):
+    usage = dict(prompt=prompt, cached=4000, cache_write=1000,
+                 completion=30_000, reasoning=25_000)
+    assert strategy_api._openai_strategy_cost(usage) == pytest.approx(
+        (input_usd, output_usd))
+
+
+def test_strategy_cost_printed_once_per_step_including_retries(api_pool, capsys):
+    result = response()
+    result.usage = SimpleNamespace(
+        input_tokens=10_000, output_tokens=30_000, total_tokens=40_000,
+        input_tokens_details=SimpleNamespace(cached_tokens=4000, cache_write_tokens=1000),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=25_000))
+    pool, calls = api_pool(create=lambda **kwargs: result)
+    for _ in range(2):
+        def accept(parent, stage, raw, attempt):
+            assert "estimated cost" not in capsys.readouterr().out
+            return (parent, stage, attempt) == (1, 0, 0)
+
+        run_strategy_rounds(
+            pool, num_parents=2, num_strategies=2,
+            prompt_builder=lambda p, s, a: "task", result_handler=accept,
+            max_retries=1,
+            generation_options=dict(max_new_tokens=40_000, temperature=1, top_p=1))
+        output = capsys.readouterr().out
+        assert output.count("estimated cost") == 1
+        assert "all 4 strategies complete" in output
+        assert "$0.078325 USD" in output
+        assert "requests=5 including format retries" in output
+        assert "input=50,000 cached=20,000 cache_write=5,000 output=150,000" in output
+        assert "includes reasoning=125,000" in output
+    assert len(calls) == 10
 
 
 def test_no_thinking_and_smaller_output_budget(api_pool):

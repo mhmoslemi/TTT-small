@@ -16,6 +16,24 @@ OPENAI_MAX_OUTPUT_TOKENS = 128_000
 OPENAI_KEY_FILE = Path(__file__).resolve().with_name(".openai_api_key")
 
 
+def _openai_strategy_cost(usage):
+    """Standard USD rates checked 2026-10-17, applied per request.
+
+    https://developers.openai.com/api/docs/models/gpt-6-luna
+    Cached reads and cache writes are subsets of input tokens. Reasoning is
+    already included in completion tokens and must not be charged twice.
+    """
+    prompt = usage.get("prompt", 0)
+    cached = usage.get("cached", 0)
+    writes = usage.get("cache_write", 0)
+    long_context = prompt > 272_000
+    input_usd = ((prompt - cached - writes) * 0.10
+                 + cached * 0.01 + writes * 0.125) / 1_000_000
+    output_usd = usage.get("completion", 0) * 0.50 / 1_000_000
+    return (input_usd * (2 if long_context else 1),
+            output_usd * (1.5 if long_context else 1))
+
+
 def strategy_api_key(api_key_env):
     """Resolve a credential without putting it into saved configuration."""
     key = os.environ.get(api_key_env, "").strip()
@@ -38,6 +56,9 @@ def run_strategy_rounds(pool, *, num_parents, num_strategies, prompt_builder,
     returns True when that slot needs a format retry. Successful slots are
     never requested twice, and pending retries cannot leak into the next round.
     """
+    usage_start = (pool.usage_snapshot()
+                   if isinstance(pool, StrategyAPIGenerationPool) and pool._openai
+                   else None)
     for strategy_index in range(num_strategies):
         pending = list(range(num_parents))
         for attempt in range(max_retries + 1):
@@ -69,6 +90,8 @@ def run_strategy_rounds(pool, *, num_parents, num_strategies, prompt_builder,
                 break
         if pending:
             raise RuntimeError("strategy retries exhausted without an accepted plan or fallback")
+    if usage_start is not None:
+        pool.print_cost_summary(usage_start, num_parents * num_strategies)
 
 
 def _message_text(value: Any) -> str:
@@ -139,6 +162,27 @@ class StrategyAPIGenerationPool:
             thread_name_prefix="strategy-api",
         )
         self._closed = False
+        # Updated only by the thread consuming iter_group_jobs, not HTTP workers.
+        self._usage_totals = dict(prompt=0, cached=0, cache_write=0, completion=0,
+                                 reasoning=0, requests=0, input_usd=0.0, output_usd=0.0)
+
+    def usage_snapshot(self):
+        return dict(self._usage_totals)
+
+    def print_cost_summary(self, start, num_strategies):
+        usage = {key: value - start[key] for key, value in self._usage_totals.items()}
+        total_usd = usage["input_usd"] + usage["output_usd"]
+        print(
+            f"[strategy-api] all {num_strategies} strategies complete; "
+            f"estimated cost for this step: ${total_usd:.6f} USD "
+            f"(input=${usage['input_usd']:.6f}, output=${usage['output_usd']:.6f}; "
+            f"{self.model_name} Standard rates); "
+            f"requests={usage['requests']} including format retries; "
+            f"tokens input={usage['prompt']:,} cached={usage['cached']:,} "
+            f"cache_write={usage['cache_write']:,} output={usage['completion']:,} "
+            f"(includes reasoning={usage['reasoning']:,})",
+            flush=True,
+        )
 
     @staticmethod
     def _messages(prompt):
@@ -247,8 +291,11 @@ class StrategyAPIGenerationPool:
             raise RuntimeError("OpenAI strategy returned no final plan")
         usage = response.usage
         details = getattr(usage, "output_tokens_details", None)
+        input_details = getattr(usage, "input_tokens_details", None)
         return final_text, {
             "prompt": int(getattr(usage, "input_tokens", 0) or 0),
+            "cached": int(getattr(input_details, "cached_tokens", 0) or 0),
+            "cache_write": int(getattr(input_details, "cache_write_tokens", 0) or 0),
             "completion": int(getattr(usage, "output_tokens", 0) or 0),
             "total": int(getattr(usage, "total_tokens", 0) or 0),
             "reasoning": int(getattr(details, "reasoning_tokens", 0) or 0),
@@ -309,6 +356,13 @@ class StrategyAPIGenerationPool:
                         f"({type(exc).__name__}{detail})") from None
                 for key in usage:
                     usage[key] += int(request_usage.get(key, 0))
+                if self._openai:
+                    for key in ("prompt", "cached", "cache_write", "completion", "reasoning"):
+                        self._usage_totals[key] += int(request_usage.get(key, 0))
+                    input_usd, output_usd = _openai_strategy_cost(request_usage)
+                    self._usage_totals["input_usd"] += input_usd
+                    self._usage_totals["output_usd"] += output_usd
+                    self._usage_totals["requests"] += 1
                 yield index, [(raw_response, [])]
         finally:
             for future in futures:
