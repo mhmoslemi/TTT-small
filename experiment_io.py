@@ -325,14 +325,15 @@ def save_rollout_artifacts(
 
 
 def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
-                           fold: int, strategy: int,
+                           strategy: int,
                            response_text: str, *, attempt=None,
                            prompt_text=None, extraction_issue=None) -> Path:
     """Persist one planning response immediately after generation returns."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
     step_dir.mkdir(exist_ok=True)
     suffix = "" if attempt is None else f"_attempt{int(attempt):02d}"
-    base = (f"step{step:02d}_group{parent_group:02d}_fold{fold:02d}_"
+    # Retain the existing filename layout for resumed two-stage runs.
+    base = (f"step{step:02d}_group{parent_group:02d}_fold00_"
             f"strategy{strategy:02d}{suffix}.txt")
     path = step_dir / base
     tmp = path.with_suffix(path.suffix + ".tmp")

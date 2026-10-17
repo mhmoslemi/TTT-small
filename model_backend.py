@@ -142,8 +142,6 @@ def _training_model_name(cfg):
 
 
 def _lora_rank(cfg):
-    if bool(getattr(cfg, "binary_coder_training", False)):
-        return int(getattr(cfg, "binary_coder_lora_rank"))
     return int(cfg.lora_rank)
 
 

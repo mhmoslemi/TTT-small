@@ -243,10 +243,6 @@ def reduce_trainable_gradients(model, destination_rank=0):
     del flat
 
 
-
-
-
-
 def _padded_token_count(batch):
     if not batch:
         return 0
@@ -280,190 +276,7 @@ def _move_examples(examples, logical_id):
     return moved
 
 
-def local_x_grpo_calibration(backend, model, tokenizer, examples, cfg,
-                             logical_id, *, context_group_ids,
-                             group_ids=None):
-    """Evaluate assigned groups while cross-fitting each context separately."""
-    import math
-    from tempfile import TemporaryDirectory
-    import torch
-    import torch.distributed as dist
-    import train_multy_CVaR as training
-
-    backend.set_training_mode()
-    set_total_memory_ceiling(logical_id, 0.80)
-    local_examples = _move_examples(list(examples), logical_id)
-    contexts = training._x_grpo_context_group_map(
-        (), context_group_ids=context_group_ids)
-    all_group_ids = {
-        group_id for ids in contexts.values() for group_id in ids
-    }
-    expected_group_ids = (
-        sorted({int(group_id) for group_id in group_ids})
-        if group_ids is not None else
-        sorted({int(example["group_id"]) for example in local_examples})
-    )
-    unexpected = set(expected_group_ids) - all_group_ids
-    if unexpected:
-        raise ValueError(
-            f"unexpected local X-GRPO groups: {sorted(unexpected)}")
-    local_groups = {group_id: [] for group_id in expected_group_ids}
-    context_for_group = {
-        group_id: context_id
-        for context_id, ids in contexts.items()
-        for group_id in ids
-    }
-    for example in local_examples:
-        group_id = int(example["group_id"])
-        if group_id not in local_groups:
-            raise ValueError(
-                f"unexpected local X-GRPO diagnostic group {group_id}")
-        example_context = int(example.get(
-            "x_grpo_context_id", context_for_group[group_id]))
-        if example_context != context_for_group[group_id]:
-            raise ValueError(
-                f"X-GRPO group {group_id} was assigned to context "
-                f"{context_for_group[group_id]} but contains context "
-                f"{example_context}")
-        local_groups[group_id].append(example)
-
-    parameters = trainable_parameters(model)
-    flat_count = sum(parameter.numel() for parameter in parameters)
-    if flat_count < 1:
-        raise RuntimeError("X-GRPO found no trainable parameters")
-    zero_gradient = torch.zeros(
-        flat_count, dtype=torch.float32, device="cpu")
-    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
-    selected = {group_id: 0.0 for group_id in local_groups}
-    diagnostics = {group_id: [] for group_id in local_groups}
-    quarantined_total = 0
-    batch_plans = {
-        group_id: training._training_microbatches(group_examples, cfg)
-        for group_id, group_examples in local_groups.items()
-    }
-    budget_indices = tuple(range(len(budgets)))
-    relative_error = float(cfg.x_grpo_relative_error)
-    device = torch.device(f"cuda:{int(logical_id)}")
-
-    try:
-        with TemporaryDirectory(prefix="x-grpo-gradients-") as cache_dir:
-            cached_by_group = {}
-            with training._rank_dropout_disabled(model):
-                for group_id in sorted(local_groups):
-                    cached, quarantined, effective = (
-                        training._x_grpo_cache_group_gradients(
-                            model, tokenizer, local_groups[group_id], cfg,
-                            budget_indices, group_id=group_id,
-                            cache_dir=cache_dir,
-                            device_label=str(device),
-                            batches=batch_plans[group_id],
-                            parameters=parameters))
-                    batch_plans[group_id] = effective
-                    quarantined_total += quarantined
-                    cached_by_group[group_id] = cached
-
-            for context_id, context_ids in contexts.items():
-                group_count = len(context_ids)
-                heldout_count = group_count - 1
-                error_denominator = heldout_count * (heldout_count - 1)
-                local_context_ids = tuple(
-                    group_id for group_id in context_ids
-                    if group_id in local_groups
-                )
-                context_caches = {
-                    group_id: cached_by_group[group_id]
-                    for group_id in local_context_ids
-                }
-                for budget_index, budget in enumerate(budgets):
-                    gradients = {
-                        group_id: training._x_grpo_load_cached_gradient(
-                            cached_by_group[group_id][budget_index],
-                            zero_gradient)
-                        for group_id in local_context_ids
-                    }
-                    gradient_squared_norms = {
-                        group_id: float(torch.dot(
-                            gradient, gradient).item())
-                        for group_id, gradient in gradients.items()
-                    }
-                    if gradients:
-                        local_sum = next(iter(gradients.values())).clone()
-                        for gradient in list(gradients.values())[1:]:
-                            local_sum.add_(gradient)
-                        local_squared_norms = sum(
-                            gradient_squared_norms.values())
-                    else:
-                        local_sum = torch.zeros(
-                            flat_count, dtype=torch.float32)
-                        local_squared_norms = 0.0
-
-                    with torch.cuda.device(int(logical_id)), torch.no_grad():
-                        total = local_sum.to(device, non_blocking=True)
-                        dist.all_reduce(total, op=dist.ReduceOp.SUM)
-                        squared_norms = torch.tensor(
-                            local_squared_norms, dtype=torch.float64,
-                            device=device)
-                        dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
-                        all_squared_norms = float(squared_norms.item())
-                        total_cpu = total.cpu()
-                        total_norm_squared = float(
-                            torch.dot(total_cpu, total_cpu).item())
-
-                    for group_id, gradient in gradients.items():
-                        gradient_norm_squared = gradient_squared_norms[group_id]
-                        heldout_sum = None
-                        if gradient_norm_squared == 0.0:
-                            heldout_sum_norm_squared = total_norm_squared
-                        else:
-                            heldout_sum = total_cpu - gradient
-                            heldout_sum_norm_squared = float(
-                                torch.dot(heldout_sum, heldout_sum).item())
-                        heldout_squared_norms = max(
-                            0.0, all_squared_norms - gradient_norm_squared)
-                        centered_sum = max(
-                            0.0,
-                            heldout_squared_norms
-                            - heldout_sum_norm_squared / heldout_count,
-                        )
-                        signal_squared = (
-                            heldout_sum_norm_squared / (heldout_count ** 2))
-                        error_squared = centered_sum / error_denominator
-                        accepted = bool(
-                            signal_squared > 0.0
-                            and error_squared
-                            <= relative_error ** 2 * signal_squared)
-                        signal_norm = math.sqrt(signal_squared)
-                        standard_error = math.sqrt(error_squared)
-                        diagnostics[group_id].append({
-                            "budget": budget,
-                            "gradient_norm": signal_norm,
-                            "standard_error": standard_error,
-                            "relative_error": (
-                                standard_error / signal_norm
-                                if signal_norm > 0.0 else None),
-                            "accepted": accepted,
-                        })
-                        if accepted:
-                            selected[group_id] = max(
-                                selected[group_id], budget)
-                        if heldout_sum is not None:
-                            del heldout_sum
-
-                    del gradients, gradient_squared_norms, local_sum
-                    del total, total_cpu, squared_norms
-                    training._x_grpo_delete_consumed_cache(
-                        context_caches, budget_index)
-    finally:
-        model.zero_grad(set_to_none=True)
-
-    return {
-        "selected_budgets": selected,
-        "groups": diagnostics,
-        "diagnostic_quarantined_examples": quarantined_total,
-    }
-
-
-def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
+def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                       token_budget, *, memory_fraction=0.80, work_queue=None,
                       activation_offload_semaphore=None,
                       defer_exact_oom=False):
@@ -484,7 +297,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         logical_id, float(memory_fraction))
     epsilon, epsilon_low, epsilon_high, kl_coef = (
         training._clipped_policy_options(cfg))
-    entropy_coef = training._rank_entropy_coefficient(cfg)
     parameters = trainable_parameters(model)
     gradient_accumulators = [None for _ in parameters]
     metric_keys = (
@@ -547,9 +359,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         deferred_keys.append((int(key[0]), int(key[1])))
         deferred_token_lengths.append(example_length(example))
 
-    def example_gate(example):
-        return bool(example["rank_entropy_gate"] and entropy_coef > 0.0)
-
     def needs_fused_long_singleton(example):
         return bool(
             fused_long_attention_is_active()
@@ -565,21 +374,12 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
 
     max_examples_per_batch = 64
     if work_queue is None:
-        partitions = {False: [], True: []}
-        for example in examples:
-            partitions[example_gate(example)].append(example)
-        for partition in partitions.values():
-            partition.sort(key=example_length)
+        pending = sorted(examples, key=example_length)
         max_examples_per_batch = min(64, max(1, len(examples)))
 
         def take_batch():
-            available = [key for key, value in partitions.items() if value]
-            if not available:
+            if not pending:
                 return []
-            partition_key = max(
-                available,
-                key=lambda key: example_length(partitions[key][-1]))
-            pending = partitions[partition_key]
             batch = [pending.pop()]
             maximum = example_length(batch[0])
             if needs_fused_long_singleton(batch[0]):
@@ -637,7 +437,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 return batch
             batch = [first]
             maximum = example_length(first)
-            gate = example_gate(first)
             if needs_fused_long_singleton(first):
                 return batch
             while (not queue_finished
@@ -657,8 +456,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 next_maximum = max(maximum, candidate_length)
                 next_padded_tokens = next_maximum * (len(batch) + 1)
                 pack_limit = fused_pack_limit()
-                if (example_gate(candidate) != gate
-                        or next_padded_tokens > budget
+                if (next_padded_tokens > budget
                         or (pack_limit is not None
                             and next_padded_tokens >= pack_limit)):
                     deferred = candidate
@@ -672,8 +470,7 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
         cpu_batch = take_batch()
         if not cpu_batch:
             break
-        forced_overflow_min_tokens = int(getattr(
-            cfg, "_exact_replica_overflow_min_tokens", 0) or 0)
+        forced_overflow_min_tokens = int(getattr(cfg, '_exact_replica_overflow_min_tokens', 0) or 0)
         if defer_exact_oom:
             retained = []
             for example in cpu_batch:
@@ -706,10 +503,10 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                 attempt_prefix_ratio_values = []
                 attempt_entropy_examples = 0
 
-                with training._rank_dropout_disabled(model):
+                with training._policy_dropout_disabled(model):
                     for batch in active_batches:
-                        missing_old, missing_reference = (
-                            training._initialize_rank_logprob_caches(batch))
+                        missing_old = (
+                            training._initialize_behavior_logprobs(batch))
                         for fallback_batch in (
                                 [example] for example in missing_old):
                             old_logprobs = training.compute_batched_token_logprobs(
@@ -722,66 +519,32 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                                     "nonfinite old-policy logprobs")
                             for example, old_lp in zip(
                                     fallback_batch, old_logprobs):
-                                example["rank_old_logprobs"] = old_lp.detach()
-
-                        if kl_coef and missing_reference:
-                            with backend.disable_adapter(), torch.no_grad():
-                                for fallback_batch in (
-                                        [example] for example in
-                                        missing_reference):
-                                    reference_logprobs = (
-                                        training.compute_batched_token_logprobs(
-                                            model, fallback_batch,
-                                            with_grad=False,
-                                            chunk=cfg.logprob_chunk,
-                                            pad_token_id=(
-                                                tokenizer.pad_token_id)))
-                                    if any(not torch.isfinite(value).all()
-                                           for value in reference_logprobs):
-                                        raise FloatingPointError(
-                                            "nonfinite reference-policy "
-                                            "logprobs")
-                                    for example, reference_lp in zip(
-                                            fallback_batch,
-                                            reference_logprobs):
-                                        example[
-                                            "rank_reference_logprob"
-                                        ] = reference_lp.detach()
+                                example["old_policy_logprobs"] = old_lp.detach()
 
 
-                        gate = bool(
-                            batch[0]["rank_entropy_gate"]
-                            and entropy_coef > 0.0)
                         result = training.compute_batched_token_logprobs(
                             model, batch, with_grad=True,
                             chunk=cfg.logprob_chunk,
-                            pad_token_id=tokenizer.pad_token_id,
-                            return_entropy=gate)
-                        if gate:
-                            current_logprobs, token_entropies = result
-                        else:
-                            current_logprobs = result
-                            token_entropies = [None] * len(batch)
+                            pad_token_id=tokenizer.pad_token_id)
+                        current_logprobs = result
 
                         weighted_losses = []
-                        for example, current_lp, token_entropy in zip(
-                                batch, current_logprobs, token_entropies):
+                        for example, current_lp in zip(
+                                batch, current_logprobs):
                             loss, metrics = training.clipped_policy_loss(
                                 cfg, current_lp,
-                                example["rank_old_logprobs"],
-                                example["rank_reference_logprob"],
+                                example["old_policy_logprobs"],
+                                None,
                                 example["advantage"],
                                 clip_epsilon=epsilon,
                                 clip_epsilon_low=epsilon_low,
                                 clip_epsilon_high=epsilon_high,
                                 kl_coef=kl_coef,
-                                entropy_coef=(entropy_coef if gate else 0.0),
-                                token_entropies=token_entropy,
                                 return_tensor_metrics=True)
                             weight = float(example["sample_weight"])
                             if not torch.isfinite(loss).all():
                                 raise FloatingPointError(
-                                    "nonfinite rank loss")
+                                    "nonfinite SPO-RS loss")
                             weighted_losses.append(weight * loss)
                             attempt_values["loss"].append(
                                 weight * loss.detach())
@@ -795,7 +558,6 @@ def local_rank_update(backend, model, tokenizer, examples, cfg, logical_id,
                             attempt_ratio_values.append(metrics["ratio"])
                             attempt_prefix_ratio_values.append(
                                 metrics["prefix_ratio_max"])
-                            attempt_entropy_examples += int(gate)
                         if weighted_losses:
                             sum(weighted_losses[1:],
                                 weighted_losses[0]).backward()
@@ -955,7 +717,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         memory_fraction=0.80, work_queue=None,
                         adaptive_batches=True,
                         activation_offload_semaphore=None):
-    """Accumulate one rank's exact entropic/GRPO/CVaR gradients.
+    """Accumulate one rank's exact entropic gradients.
 
     This is the process-per-GPU counterpart of
     ``ReplicatedDataParallelTrainer.train_policy``.  The global example count
@@ -1491,13 +1253,13 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                         torch, cuda_devices=(int(rank),), force=True)
                     offloaded = False
                 result_queue.put({"event": "restored", "rank": int(rank)})
-            elif kind == "train_rank":
+            elif kind == "train_spo_rs":
                 if offloaded:
                     raise RuntimeError(
                         "fast worker received training while offloaded")
                 step_cfg = SimpleNamespace(**dict(
                     command.get("step_cfg") or vars(cfg)))
-                stats = local_rank_update(
+                stats = local_spo_rs_update(
                     backend, model, tokenizer, (), step_cfg,
                     int(rank), command["token_budget"],
                     memory_fraction=command.get("memory_fraction", 0.80),
@@ -1529,19 +1291,6 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 result_queue.put({
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
-                })
-            elif kind == "calibrate_x_grpo":
-                if offloaded:
-                    raise RuntimeError(
-                        "fast worker received calibration while offloaded")
-                calibration = local_x_grpo_calibration(
-                    backend, model, tokenizer, command["examples"], cfg,
-                    int(rank),
-                    context_group_ids=command["context_group_ids"],
-                    group_ids=command["group_ids"])
-                result_queue.put({
-                    "event": "calibrated", "rank": int(rank),
-                    "calibration": calibration,
                 })
             elif kind == "overflow_backward":
                 if not offloaded:

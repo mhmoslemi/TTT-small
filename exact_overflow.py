@@ -201,31 +201,23 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
             for key in ("prompt_ids", "response_ids"):
                 item[key] = item[key].to(input_device)
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
-            entropy_coef = training._rank_entropy_coefficient(cfg)
-            missing_old, missing_ref = training._initialize_rank_logprob_caches([item])
-            with training._rank_dropout_disabled(model):
+            missing_old = training._initialize_behavior_logprobs([item])
+            with training._policy_dropout_disabled(model):
                 if missing_old:
-                    item["rank_old_logprobs"] = training.compute_batched_token_logprobs(
+                    item["old_policy_logprobs"] = training.compute_batched_token_logprobs(
                         model, [item], False, cfg.logprob_chunk)[0].detach()
-                if kl and missing_ref:
-                    with backend.disable_adapter():
-                        item["rank_reference_logprob"] = training.compute_batched_token_logprobs(
-                            model, [item], False, cfg.logprob_chunk)[0].detach()
 
                 def attempt(_batches):
-                    gate = bool(item["rank_entropy_gate"] and entropy_coef > 0)
                     result = training.compute_batched_token_logprobs(
                         model, [item], True, cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id,
-                        measure_entropy=True, return_entropy=gate)
-                    current, entropy = (result[0][0], result[1][0]) if gate else (result[0], None)
+                        measure_entropy=True)
+                    current = result[0]
                     loss, metrics = training.clipped_policy_loss(
-                        cfg, current, item["rank_old_logprobs"],
-                        item["rank_reference_logprob"], item["advantage"],
+                        cfg, current, item["old_policy_logprobs"],
+                        None, item["advantage"],
                         clip_epsilon=epsilon, clip_epsilon_low=low,
-                        clip_epsilon_high=high, kl_coef=kl,
-                        entropy_coef=entropy_coef if gate else 0,
-                        token_entropies=entropy)
+                        clip_epsilon_high=high, kl_coef=kl)
                     if not torch.isfinite(loss).all():
                         raise FloatingPointError("nonfinite overflow policy loss")
                     weight = float(item["sample_weight"])
@@ -236,7 +228,7 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                                   clipped_fraction=weight * float(metrics["clipped"]))
                     return dict(totals=totals, max_ratio=float(metrics["ratio"]),
                                 max_prefix_ratio=float(metrics["prefix_ratio_max"]),
-                                entropy_examples=int(gate), backward_batches=1)
+                                entropy_examples=0, backward_batches=1)
 
                 stages = iter((0.98, 0.99))
 
@@ -468,7 +460,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
             training_parallel_gpus=trainer.world_size, training_fast=True,
             training_fast_processes=True, exact_overflow_inprocess=True,
             exact_overflow_waves=waves, exact_overflow_completed_examples=initial_pending,
-            rank_train_seconds=float(state["normal_stats"]["training_seconds"])
+            training_seconds=float(state["normal_stats"]["training_seconds"])
                 + previous_overflow_seconds + time.time() - started)
         return result
     except BaseException:

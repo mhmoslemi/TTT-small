@@ -17,8 +17,6 @@ fail_score model_name training_model_name coder_model_name
 coder_training_model_name strategy_model_name backend load_in_4bit
 lora_rank lora_alpha
 lora_dropout target_modules
-binary_coder_training binary_coder_init_steps binary_coder_lora_rank
-binary_coder_clip_epsilon_low binary_coder_clip_epsilon_high
 training_gpu_id available_gpu_ids reserve_last_gpu_for_evaluation
 evaluation_gpu_id num_gpus gpu_ids sequential_generation
 evaluation_shares_generation
@@ -44,7 +42,7 @@ sandbox_timeout_s reward_workers print_responses max_saved_construction
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
-    "advantage_mode", "cvar_alpha", "cvar_lambda", "fast", "isolate_eval",
+    "advantage_mode", "fast", "isolate_eval",
     "fused_long_attention",
     "training_layout",
     "phase2_allocation_method",
@@ -56,12 +54,11 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_format_max_retries",
     "strict_strategy_validation",
     "uct",
-    "x_grpo_budgets", "x_grpo_relative_error", "x_grpo_entropy_coef",
-    "x_grpo_contexts_per_step",
     "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
     "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
-    "spo_rs_clip_epsilon_high",
+    "spo_rs_clip_epsilon_high", "spo_rs_update_epochs",
+    "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
 })
 
 # Compatibility filter only: these keys cannot activate any runtime behavior.
@@ -156,6 +153,11 @@ def validate_problem_config(
     if not isinstance(data, Mapping) or not data:
         raise ValueError(f"{_label(source)}: config must be a non-empty mapping")
 
+    obsolete = sorted(key for key in data if str(key).startswith(
+        ("rank_", "x_grpo_", "cvar_", "binary_coder_")))
+    if obsolete:
+        raise ValueError(f"{_label(source)}: removed objective options: {obsolete}")
+
     problem = str(data.get("problem", "")).strip().lower()
     if problem not in PROBLEM_REQUIRED_KEYS:
         raise ValueError(
@@ -207,7 +209,7 @@ def validate_problem_config(
                 "train_examples_per_microbatch", "strategies_per_parent",
                 "programs_per_strategy", "strategy_archive_top_r",
                 "strategy_max_new_tokens",
-                "strategy_max_seq_length", "binary_coder_lora_rank"):
+                "strategy_max_seq_length", "spo_rs_update_epochs"):
         if key in data:
             _positive_int(data, key, source)
     if "strategy_format_max_retries" in data:
@@ -275,22 +277,9 @@ def validate_problem_config(
                     or not 0.0 <= float(value) <= 1.0):
                 raise ValueError(
                     f"{_label(source)}: {key} must be in [0, 1]")
-    if "binary_coder_training" in data:
-        if not isinstance(data["binary_coder_training"], bool):
-            raise ValueError(
-                f"{_label(source)}: binary_coder_training must be true or false")
-        init_steps = data.get("binary_coder_init_steps")
-        if (isinstance(init_steps, bool) or not isinstance(init_steps, int)
-                or init_steps < 0):
-            raise ValueError(
-                f"{_label(source)}: binary_coder_init_steps must be a "
-                "nonnegative integer")
-        if data["binary_coder_training"] and init_steps < 1:
-            raise ValueError(
-                f"{_label(source)}: binary_coder_init_steps must be positive "
-                "when binary_coder_training is enabled")
-    for key in ("binary_coder_clip_epsilon_low",
-                "binary_coder_clip_epsilon_high"):
+    if "advantage_mode" in data and data["advantage_mode"] not in {"entropic", "spo-rs"}:
+        raise ValueError(f"{_label(source)}: advantage_mode must be entropic or spo-rs")
+    for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
         if key in data and not 0.0 < float(data[key]) < 1.0:
             raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
     if "eval_cpus" in data:

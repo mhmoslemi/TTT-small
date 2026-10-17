@@ -1,23 +1,8 @@
-"""
-TTT-Discover — multi-problem local runner.
+"""TTT-Discover multi-problem runner with entropic and SPO-RS training.
 
-Configuration: self-contained problem YAML < resumed config < CLI flags
-
-Rank-selection mode (the proposed local surrogate):
-    python train_multy_CVaR.py --problem erdos --advantage-mode rank
-
-It uses exact reward midranks, KL-budgeted selection weights, A_i = G*q_i - 1,
-token-level clipped ratios, a separate sampled reference KL, and sampled
-trajectory entropy on completely tied groups. Advantages and old/reference
-log-probabilities are frozen across --rank-update-epochs (default 1). No reward
-standardization, EVT fitting, or quantile cutoff is used in this mode.
-
-Rank mode sets rollout temperature=1 and top_p=1. Generation workers must use
-the synchronized policy with no additional top-k/repetition/logit filtering;
-vLLM workers return sampled-token behavior probabilities with the rollout.
-Missing values retain a compatibility fallback through the trainer.
-The built-in local generation path explicitly disables top-k sampling.
-Existing advantage modes retain their losses.
+Configuration: self-contained problem YAML < resumed config < CLI flags.
+Entropic training uses adaptive-beta, leave-one-out group advantages.
+SPO-RS uses a historical run-wide baseline and clipped policy updates.
 """
 
 import warnings
@@ -1116,7 +1101,7 @@ def _detached_behavior_importance_ratio(cfg, current_logprobs,
                                         behavior_logprobs):
     """Return the existing token ratios or the A3B trajectory ratio.
 
-    Standard entropic/GRPO/CVaR updates use a detached importance weight rather
+    Entropic updates use a detached importance weight rather
     than the differentiable clipped surrogate. Keep that objective unchanged
     except that plain Qwen3-30B-A3B receives one geometric-mean response weight
     instead of volatile individual-token MoE weights.
@@ -1629,22 +1614,9 @@ def _route_dependency_notices(log_path):
 # ======================================================================
 # CLI parsing + config loading (problem YAML < resumed config < CLI)
 # ======================================================================
-ADVANTAGE_MODES = ("entropic", "grpo", "cvar", "rank", "x-grpo", "spo-rs")
-CLIPPED_POLICY_MODES = frozenset(
-    ("rank", "x-grpo", "spo-rs", "binary-coder"))
-CVAR_ALPHA_DEFAULT = 0.2     # tail mass: cutoff at the 80th percentile
-CVAR_LAMBDA_DEFAULT = 0.5    # weight of the upper-tail term vs plain GRPO
-# RANK_GAMMA_DEFAULT = math.log(4) # cirlce pack
-RANK_GAMMA_DEFAULT = math.log(8) # erdos
-RANK_CLIP_EPSILON_DEFAULT = 0.2
-RANK_ENTROPY_COEF_DEFAULT = 0.001
-RANK_UPDATE_EPOCHS_DEFAULT = 1
-X_GRPO_RELATIVE_ERROR_DEFAULT = 0.99
-X_GRPO_ENTROPY_COEF_DEFAULT = 0.001
-# X_GRPO_CONTEXTS_PER_STEP_DEFAULT = 6
-X_GRPO_CONTEXTS_PER_STEP_DEFAULT = 3
-X_GRPO_BASE_BUDGETS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
-# X_GRPO_BASE_BUDGETS = (0.25, 0.5, 1.0, 2.0, 4.0)
+ADVANTAGE_MODES = ("entropic", "spo-rs")
+SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
+SPO_RS_UPDATE_EPOCHS_DEFAULT = 1
 SPO_RS_BETA_DEFAULT = 2.0
 SPO_RS_D_HALF_DEFAULT = 0.06
 SPO_RS_RHO_MIN_DEFAULT = 0.875
@@ -1655,186 +1627,76 @@ SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
 
 
 def _uses_clipped_policy_loss(mode):
-    return str(mode or "entropic").lower() in CLIPPED_POLICY_MODES
+    return str(mode or "entropic").lower() == "spo-rs"
 
 
-def _resolve_binary_coder_options(merged):
-    from problems.binary_coder import BinaryCoderConfig
-
-    resolved = BinaryCoderConfig.from_mapping(merged)
-    merged.update(resolved.as_dict())
-    if resolved.enabled:
-        if (float(merged["temperature"]) != 1.0
-                or float(merged["top_p"]) != 1.0):
-            print("[config] binary coder PPO sets temperature=1 and top_p=1 "
-                  "to match the policy likelihood used by the loss")
-        merged["temperature"] = 1.0
-        merged["top_p"] = 1.0
-        merged["sampling_top_k"] = 0
-        merged["sampling_min_p"] = 0.0
-        merged["qwen3_8b_thinking_sampling"] = False
-
-
-def compute_group_advantages(rewards_np, mode: str, cvar_alpha=None,
-                             cvar_lambda=None, *, rank_gamma=None,
-                             return_info=False):
-    """
-    Dispatch the per-group advantage estimator.
-
-    Returns (advantages, scale, scale_label). `scale` is the estimator's
-    scalar for logging: beta for entropic, reward std for grpo, and the
-    upper-VaR threshold q_{1-alpha} for cvar, or eta for rank (possibly +inf).
-    return_info=True appends a diagnostics dict (empty for legacy estimators).
-    """
-    mode = str(mode or "entropic").lower()
+def _normalize_saved_advantage_config(saved):
+    """Migrate retained policy controls without reactivating removed objectives."""
+    saved = dict(saved)
+    mode = str(saved.get("advantage_mode") or "entropic").lower()
+    if mode not in ADVANTAGE_MODES or saved.get("binary_coder_training", False):
+        raise ValueError("saved run uses an unsupported training objective; "
+                         "only entropic and spo-rs can be resumed")
+    if mode == "spo-rs" and "rank_update_epochs" in saved:
+        saved.setdefault("spo_rs_update_epochs", saved["rank_update_epochs"])
     if mode == "entropic":
-        from advantage import entropic_adaptive_advantages
-        adv, beta = entropic_adaptive_advantages(rewards_np)
-        result, info = (adv, beta, "beta"), {}
-    elif mode == "grpo":
-        from advantage import grpo_advantages
-        adv, std = grpo_advantages(rewards_np)
-        result, info = (adv, std, "std"), {}
-    elif mode == "cvar":
-        from advantage import upper_tail_advantages
-        alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
-        lam = CVAR_LAMBDA_DEFAULT if cvar_lambda is None else float(cvar_lambda)
-        adv, q = upper_tail_advantages(rewards_np, alpha=alpha, lam=lam)
-        result, info = (adv, q, "var"), {}
-    elif mode == "rank":
-        from advantage import rank_adaptive_advantages
-        gamma = RANK_GAMMA_DEFAULT if rank_gamma is None else float(rank_gamma)
-        adv, eta, info = rank_adaptive_advantages(
-            rewards_np, gamma=gamma, return_info=True)
-        result = (adv, eta, "eta")
-    else:
-        raise ValueError(f"unknown advantage_mode {mode!r}; expected one of {ADVANTAGE_MODES}")
-    return (*result, info) if return_info else result
+        for side in ("low", "high"):
+            value = saved.get(f"rank_clip_epsilon_{side}")
+            if value is None:
+                value = saved.get("rank_clip_epsilon")
+            if value is not None:
+                saved.setdefault(f"sequence_clip_epsilon_{side}", value)
+    for key in list(saved):
+        if key.startswith(("rank_", "x_grpo_", "cvar_", "binary_coder_")):
+            saved.pop(key)
+    return saved
 
 
-def _resolve_rank_options(merged):
-    """Resolve trainer-owned rank options after YAML/resume/CLI overlays."""
-    defaults = {
-        "rank_gamma": RANK_GAMMA_DEFAULT,
-        "rank_clip_epsilon": RANK_CLIP_EPSILON_DEFAULT,
-        "rank_entropy_coef": RANK_ENTROPY_COEF_DEFAULT,
-    }
-    for name, default in defaults.items():
-        value = merged.get(name)
-        value = default if value is None else float(value)
-        if not math.isfinite(value):
-            raise ValueError(f"{name} must be finite")
-        merged[name] = value
-    if merged["rank_gamma"] <= 0.0:
-        raise ValueError("rank_gamma must be positive")
-    if not 0.0 < merged["rank_clip_epsilon"] < 1.0:
-        raise ValueError("rank_clip_epsilon must be in (0, 1)")
+def compute_group_advantages(rewards_np):
+    """Return entropic group advantages and their adaptive beta.
+
+    SPO-RS obtains advantages from its frozen historical tracker instead.
+    """
+    from advantage import entropic_adaptive_advantages
+    return entropic_adaptive_advantages(rewards_np)
+
+
+def _resolve_policy_options(merged):
+    """Resolve full-policy sampling and the entropic MoE clipping bounds."""
     for side in ("low", "high"):
-        name = f"rank_clip_epsilon_{side}"
+        name = f"sequence_clip_epsilon_{side}"
         value = merged.get(name)
-        value = (merged["rank_clip_epsilon"] if value is None
-                 else float(value))
+        value = SEQUENCE_CLIP_EPSILON_DEFAULT if value is None else float(value)
         if not math.isfinite(value) or not 0.0 < value < 1.0:
             raise ValueError(f"{name} must be finite and in (0, 1)")
         merged[name] = value
-    if merged["rank_entropy_coef"] < 0.0:
-        raise ValueError("rank_entropy_coef must be nonnegative")
-    epochs = merged.get("rank_update_epochs")
-    epochs = RANK_UPDATE_EPOCHS_DEFAULT if epochs is None else epochs
-    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer))
-            or epochs < 1):
-        raise ValueError("rank_update_epochs must be a positive integer")
-    merged["rank_update_epochs"] = int(epochs)
     sequence_policy = _is_exact_qwen3_30b_a3b(merged.get("model_name"))
-    if (_uses_clipped_policy_loss(merged.get("advantage_mode"))
-            or sequence_policy):
+    if _uses_clipped_policy_loss(merged.get("advantage_mode")) or sequence_policy:
         if int(merged["group_size"]) < 2:
-            raise ValueError(
-                "sequence/clipped policy modes require group_size >= 2")
+            raise ValueError("sequence/clipped policy modes require group_size >= 2")
         kl_coef = float(merged["kl_penalty_coef"])
         if not math.isfinite(kl_coef) or kl_coef < 0.0:
-            raise ValueError(
-                "sequence/clipped policy modes require a finite nonnegative "
-                "kl_penalty_coef")
-        if (float(merged["temperature"]) != 1.0
-                or float(merged["top_p"]) != 1.0):
-            label = ("Qwen3-30B-A3B sequence-policy mode"
-                     if sequence_policy else "clipped-policy mode")
-            print(f"[config] {label} sets temperature=1 and top_p=1 "
-                  "to match the policy likelihood used by the loss")
+            raise ValueError("kl_penalty_coef must be finite and nonnegative")
+        if float(merged["temperature"]) != 1.0 or float(merged["top_p"]) != 1.0:
+            print("[config] sequence/clipped policy training sets temperature=1 "
+                  "and top_p=1 to match its policy likelihood")
         merged["temperature"] = 1.0
         merged["top_p"] = 1.0
         merged["sampling_top_k"] = 0
         merged["sampling_min_p"] = 0.0
         merged["qwen3_8b_thinking_sampling"] = False
-
-
-def _resolve_x_grpo_options(merged):
-    if merged.get("advantage_mode") != "x-grpo":
-        return
-
-    group_size = int(merged["group_size"])
-    contexts = merged.get("x_grpo_contexts_per_step")
-    contexts = (X_GRPO_CONTEXTS_PER_STEP_DEFAULT
-                if contexts is None else contexts)
-    if (isinstance(contexts, bool)
-            or not isinstance(contexts, (int, np.integer))
-            or contexts < 1):
-        raise ValueError("x_grpo_contexts_per_step must be a positive integer")
-    merged["x_grpo_contexts_per_step"] = int(contexts)
-
-    raw_budgets = merged.get("x_grpo_budgets")
-    if raw_budgets is None:
-        maximum = float(group_size - 1)
-        budgets = [value for value in X_GRPO_BASE_BUDGETS
-                   if value <= maximum]
-        if not budgets or budgets[-1] != maximum:
-            budgets.append(maximum)
-    elif isinstance(raw_budgets, str):
-        pieces = [piece.strip() for piece in raw_budgets.split(",")]
-        if not pieces or any(not piece for piece in pieces):
-            raise ValueError(
-                "x_grpo_budgets must be a comma-separated list of numbers")
-        budgets = [float(piece) for piece in pieces]
-    elif isinstance(raw_budgets, (list, tuple)):
-        budgets = [float(value) for value in raw_budgets]
-    else:
-        raise ValueError("x_grpo_budgets must be a sequence or comma-separated string")
-
-    budgets = sorted(set(budgets))
-    if not budgets:
-        raise ValueError("x_grpo_budgets must not be empty")
-    maximum = float(group_size - 1)
-    if any(not math.isfinite(value) or value <= 0.0 or value > maximum
-           for value in budgets):
-        raise ValueError(
-            f"x_grpo_budgets must be finite and in (0, {maximum}]")
-    merged["x_grpo_budgets"] = tuple(budgets)
-
-    relative_error = merged.get("x_grpo_relative_error")
-    relative_error = (X_GRPO_RELATIVE_ERROR_DEFAULT
-                      if relative_error is None else float(relative_error))
-    if not math.isfinite(relative_error) or not 0.0 < relative_error < 1.0:
-        raise ValueError("x_grpo_relative_error must be finite and in (0, 1)")
-    merged["x_grpo_relative_error"] = relative_error
-
-    entropy_coef = merged.get("x_grpo_entropy_coef")
-    entropy_coef = (X_GRPO_ENTROPY_COEF_DEFAULT
-                    if entropy_coef is None else float(entropy_coef))
-    if not math.isfinite(entropy_coef) or entropy_coef < 0.0:
-        raise ValueError("x_grpo_entropy_coef must be finite and nonnegative")
-    if merged.get("advantage_mode") == "x-grpo":
-        if int(merged["groups_per_step"]) < 3:
-            raise ValueError("X-GRPO requires groups_per_step >= 3")
-        if entropy_coef <= 0.0:
-            raise ValueError("X-GRPO requires x_grpo_entropy_coef > 0")
-    merged["x_grpo_entropy_coef"] = entropy_coef
 
 
 def _resolve_spo_rs_options(merged):
     if merged.get("advantage_mode") != "spo-rs":
         return
 
+    epochs = merged.get("spo_rs_update_epochs")
+    epochs = SPO_RS_UPDATE_EPOCHS_DEFAULT if epochs is None else epochs
+    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer))
+            or epochs < 1):
+        raise ValueError("spo_rs_update_epochs must be a positive integer")
+    merged["spo_rs_update_epochs"] = int(epochs)
     raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
     defaults = {
         "spo_rs_beta": SPO_RS_BETA_DEFAULT,
@@ -1996,11 +1858,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-steps", type=int, default=None,
                    help="Number of TTT-Discover steps (paper: 50)")
     p.add_argument("--groups-per-step", type=int, default=None,
-                   help="Parent states per step; in X-GRPO, K independent "
-                        "groups per fixed context (paper default: 8)")
+                   help='Parent states per step.')
     p.add_argument("--group-size", type=int, default=None,
-                   help="Rollouts per parent group; in X-GRPO, group size G "
-                        "(paper default: 64)")
+                   help='Rollouts per parent group.')
     p.add_argument("--strategies-per-parent", type=int, default=None,
                    help="Sequential diverse strategies generated per parent.")
     p.add_argument("--programs-per-strategy", type=int, default=None,
@@ -2053,52 +1913,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--kl-penalty-coef", type=float, default=None)
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
-                   help="Group advantage estimator: 'entropic' (adaptive-beta "
-                        "entropic objective, default), 'grpo' (mean/std "
-                        "normalized), or 'cvar' (grpo blended with an "
-                        "upper-tail term above the (1-alpha)-quantile), or "
-                        "'rank'/'x-grpo' (midrank objectives with clipped GRPO), "
-                        "or 'spo-rs' (KL-adaptive entropic value tracking with "
-                        "configurable asymmetric PPO clipping).")
-    p.add_argument("--rank-gamma", type=float, default=None,
-                   help="rank mode: selection KL budget (default log(2)); "
-                        "distinct from --kl-penalty-coef.")
-    p.add_argument("--rank-clip-epsilon", type=float, default=None,
-                   help="rank mode: symmetric token-ratio clipping width used "
-                        "for both sides unless a side-specific value is given "
-                        "(default 0.2).")
-    p.add_argument("--rank-clip-epsilon-low", type=float, default=None,
-                   help="rank mode: lower clipping distance, giving the bound "
-                        "1-epsilon-low (defaults to --rank-clip-epsilon).")
-    p.add_argument("--rank-clip-epsilon-high", type=float, default=None,
-                   help="rank mode: upper clipping distance, giving the bound "
-                        "1+epsilon-high (defaults to --rank-clip-epsilon).")
-    p.add_argument("--rank-entropy-coef", type=float, default=None,
-                   help="rank mode: entropy coefficient for fully tied groups "
-                        "(default 0.01; 0 disables entropy).")
-    p.add_argument("--rank-update-epochs", type=int, default=None,
-                   help="rank mode: updates per rollout batch using a frozen "
-                        "old policy (default 1); clipping becomes active after "
-                        "the first update when this is greater than 1.")
-    p.add_argument("--x-grpo-budgets", default=None,
-                   help="X-GRPO: comma-separated concentration-budget grid. "
-                        "Defaults to a geometric grid capped by group_size-1.")
-    p.add_argument("--x-grpo-contexts-per-step", type=int, default=None,
-                   help="X-GRPO: number P of independently conditioned parent "
-                        "contexts per step (default 1). groups_per_step is K "
-                        "cross-fit groups per context and group_size is G.")
-    p.add_argument("--x-grpo-relative-error", type=float, default=None,
-                   help="X-GRPO: tolerated leave-one-group-out relative "
-                        "gradient-estimation error c (default 0.5).")
-    p.add_argument("--x-grpo-entropy-coef", type=float, default=None,
-                   help="X-GRPO: exploration coefficient for rejected-budget "
-                        "or completely tied groups (default 0.001).")
+                   help="Objective: entropic (adaptive beta within each group, "
+                        "default) or spo-rs (historical entropic value tracking "
+                        "with asymmetric PPO clipping).")
+    p.add_argument("--spo-rs-update-epochs", type=int, default=None,
+                   help="SPO-RS updates per rollout batch with a frozen old "
+                        "policy (default 1; --fast requires 1).")
+    p.add_argument("--sequence-clip-epsilon-low", type=float, default=None,
+                   help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
+                        "below 1 (default 0.2).")
+    p.add_argument("--sequence-clip-epsilon-high", type=float, default=None,
+                   help="Entropic Qwen3-30B-A3B sequence-ratio clipping distance "
+                        "above 1 (default 0.2).")
     beta_mode = p.add_mutually_exclusive_group()
     beta_mode.add_argument(
         "--adaptive-beta-spo", "--spo-rs-adaptive-beta",
         dest="spo_rs_adaptive_beta", action="store_const", const=True,
         default=None,
-        help="SPO-RS: adaptive historical arctan reward shaping (25% wider), "
+        help="SPO-RS: adaptive historical arctan reward shaping (25%% wider), "
              "with the run-wide moving-average baseline and all rollouts.")
     beta_mode.add_argument(
         "--constant-beta-spo", "--spo-rs-fixed-beta",
@@ -2126,12 +1958,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spo-rs-clip-epsilon-high", type=float, default=None,
                    help="SPO-RS: distance above ratio 1 "
                         f"(default {SPO_RS_CLIP_EPSILON_HIGH_DEFAULT}).")
-    p.add_argument("--cvar-alpha", type=float, default=None,
-                   help="cvar mode: tail mass alpha in (0,1); cutoff is the "
-                        f"(1-alpha)-quantile (default {CVAR_ALPHA_DEFAULT}).")
-    p.add_argument("--cvar-lambda", type=float, default=None,
-                   help="cvar mode: mixing weight in [0,1] of the upper-tail "
-                        f"term; 0 = plain grpo (default {CVAR_LAMBDA_DEFAULT}).")
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument(
         "--train-examples-per-microbatch", type=int, default=None,
@@ -2371,7 +2197,8 @@ def load_config():
             raise FileNotFoundError(
                 f"--resume directory has no config.json: {resume_dir}"
             )
-        saved = json.loads(saved_config_path.read_text())
+        saved = _normalize_saved_advantage_config(
+            json.loads(saved_config_path.read_text()))
 
     # The launcher defaults to erdos. Direct Python calls use the same selection
     # when neither --config nor --problem is provided.
@@ -2434,11 +2261,6 @@ def load_config():
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
-        # Runs created before the binary coder phase existed must retain their
-        # original adapter rank/objective when resumed, even if the current
-        # problem preset now enables the new phase for fresh runs.
-        if "binary_coder_training" not in saved:
-            merged["binary_coder_training"] = False
         # A run saved before adaptive pilots existed must resume its original
         # one-pass rollout schedule even if today's YAML enables pilots.
         if "pilot_programs_per_strategy" not in saved:
@@ -2471,11 +2293,6 @@ def load_config():
     if saved:
         from spo_rs import validate_shaping_resume
         validate_shaping_resume(saved)
-    if args.rank_clip_epsilon is not None:
-        if args.rank_clip_epsilon_low is None:
-            merged["rank_clip_epsilon_low"] = args.rank_clip_epsilon
-        if args.rank_clip_epsilon_high is None:
-            merged["rank_clip_epsilon_high"] = args.rank_clip_epsilon
     if args.spo_rs_clip_epsilon is not None:
         if args.spo_rs_clip_epsilon_low is None:
             merged["spo_rs_clip_epsilon_low"] = args.spo_rs_clip_epsilon
@@ -2498,8 +2315,7 @@ def load_config():
         if args.model_name is None:
             merged["model_name"] = str(merged["coder_model_name"]).strip()
             if args.training_model_name is None:
-                merged["training_model_name"] = str(
-                    merged.get("coder_training_model_name") or "").strip()
+                merged["training_model_name"] = str(merged.get('coder_training_model_name') or '').strip()
 
     # Resolve after the hierarchy chooses its coder and before validating the
     # resulting training layout and precision.
@@ -2749,8 +2565,7 @@ def load_config():
             raise ValueError(
                 "strategy_reasoning_effort must be low, medium, or high")
         merged["strategy_reasoning_effort"] = strategy_reasoning_effort
-        merged["strategy_vllm_quantization"] = str(
-            merged.get("strategy_vllm_quantization") or "").strip()
+        merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
         merged["strategy_api_base_url"] = str(
             merged.get("strategy_api_base_url")
             or "https://api.deepseek.com").strip().rstrip("/")
@@ -2787,31 +2602,18 @@ def load_config():
     # existing alternating-pool behavior.
     merged["dual_resident_qwen3_8b_strategy_coder_pools"] = (
         _dual_resident_qwen3_8b_strategy_coder_pools(merged))
-    cvar_alpha = merged.get("cvar_alpha")
-    cvar_alpha = CVAR_ALPHA_DEFAULT if cvar_alpha is None else float(cvar_alpha)
-    if not (0.0 < cvar_alpha < 1.0):
-        raise ValueError("cvar_alpha must be in (0, 1)")
-    merged["cvar_alpha"] = cvar_alpha
-    cvar_lambda = merged.get("cvar_lambda")
-    cvar_lambda = CVAR_LAMBDA_DEFAULT if cvar_lambda is None else float(cvar_lambda)
-    if not (0.0 <= cvar_lambda <= 1.0):
-        raise ValueError("cvar_lambda must be in [0, 1]")
-    merged["cvar_lambda"] = cvar_lambda
     # This profile is derived after coder/strategist selection. Clipped-policy
     # resolvers below remain authoritative when they require full-policy
     # sampling for an exact likelihood ratio.
     _apply_qwen3_8b_thinking_sampling(merged, profile_explicit_keys)
-    _resolve_binary_coder_options(merged)
-    _resolve_rank_options(merged)
-    _resolve_x_grpo_options(merged)
+    _resolve_policy_options(merged)
     _resolve_spo_rs_options(merged)
     train_microbatch = int(merged["train_examples_per_microbatch"])
     if train_microbatch < 1:
         raise ValueError("train_examples_per_microbatch must be >= 1")
     merged["train_examples_per_microbatch"] = train_microbatch
     raw_tp = merged["vllm_tensor_parallel_size"]
-    tp = (0 if str(raw_tp or "").strip().lower() in ("", "auto")
-          else int(raw_tp))
+    tp = (0 if str(raw_tp or '').strip().lower() in ('', 'auto') else int(raw_tp))
     pp = int(merged["vllm_pipeline_parallel_size"] or 1)
     if tp < 0 or pp < 1:
         raise ValueError("vLLM TP must be >= 0 and PP must be >= 1")
@@ -2853,9 +2655,9 @@ def load_config():
         inventory_value = (args.available_gpu_ids
                            if args.available_gpu_ids is not None
                            else merged.get("available_gpu_ids"))
-        if not str(inventory_value or "").strip():
+        if not str(inventory_value or '').strip():
             inventory_value = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        if not str(inventory_value or "").strip():
+        if not str(inventory_value or '').strip():
             inventory_value = str(int(merged.get("training_gpu_id", 0)))
         print("[config] warning: AVAILABLE_GPUS is unset; use run.sh so the "
               "ordered physical inventory is authoritative")
@@ -2868,7 +2670,7 @@ def load_config():
             raise ValueError(
                 "--isolate-eval is for CPU sandbox problems; gpu_mode uses "
                 "its dedicated serialized GPU benchmark evaluator")
-        if int(merged.get("reward_workers", 0) or 0) < 1:
+        if int(merged.get('reward_workers', 0) or 0) < 1:
             raise ValueError(
                 "--isolate-eval requires reward_workers >= 1; in this mode "
                 "reward_workers is the concurrent process count per CPU")
@@ -2919,11 +2721,11 @@ def load_config():
         roles.gpu_problem and evaluation_gpu_id != training_gpu_id)
 
     if roles.gpu_problem:
-        if not str(merged.get("gpu_type") or "").strip():
+        if not str(merged.get('gpu_type') or '').strip():
             merged["gpu_type"] = "H100"
             print("[config] gpu_mode gpu_type not set; defaulting explicitly to H100")
         merged["kernel_gpu_id"] = evaluation_gpu_id
-        if int(merged.get("reward_workers") or 0) != 1:
+        if int(merged.get('reward_workers') or 0) != 1:
             print("[config] gpu_mode forces reward_workers=1 for serialized, "
                   "stable benchmark measurements")
         merged["reward_workers"] = 1
@@ -3005,11 +2807,10 @@ def load_config():
 
     if merged["fast"] and not merged["no_train"]:
         fast_clipped_policy = bool(
-            merged["binary_coder_training"]
-            or _uses_clipped_policy_loss(merged["advantage_mode"])
+            _uses_clipped_policy_loss(merged['advantage_mode'])
         )
         if (fast_clipped_policy
-                and int(merged["rank_update_epochs"]) != 1):
+                and int(merged["spo_rs_update_epochs"]) != 1):
             raise ValueError("--fast requires one clipped-policy update epoch")
         fast_backend_supported = bool(
             merged["backend"] == "hf"
@@ -3115,13 +2916,10 @@ def load_config():
             memory_strategy_layout = derive_vllm_parallel_layout(
                 strategy_layout_cfg, roles, memory, strategy_heads)
             # Strategies inside one parent are sequential, so the number of
-            # parents/folds—not strategies_per_parent—is the largest live
+            # parents, rather than strategies_per_parent, is the largest live
             # request frontier. Fold replicas above it into TP/PP ranks rather
             # than leaving their GPUs idle for every dependent stage.
             strategy_frontier = int(merged["groups_per_step"])
-            if str(merged.get("advantage_mode", "")).lower() == "x-grpo":
-                strategy_frontier *= int(
-                    merged.get("x_grpo_contexts_per_step", 1))
             strategy_layout = align_vllm_layout_to_concurrency(
                 strategy_layout_cfg,
                 memory_strategy_layout,
@@ -3193,21 +2991,21 @@ def load_config():
     # keys have passed their ownership contract.
     merged["target_modules"] = tuple(merged["target_modules"])
     cfg = SimpleNamespace(**merged)
-    if cfg.generation_backend == "vllm" and int(cfg.num_gpus or 0) < 1:
+    if cfg.generation_backend == 'vllm' and int(cfg.num_gpus or 0) < 1:
         raise ValueError("vLLM generation requires num_gpus >= 1")
     if cfg.generation_backend == "vllm":
         resolved_tp = int(cfg.vllm_tensor_parallel_size or 0)
         pp = int(cfg.vllm_pipeline_parallel_size)
         if resolved_tp == 0:
-            if int(cfg.num_gpus) % pp:
+            if int(cfg.num_gpus or 0) % pp:
                 raise ValueError("vLLM generation GPU count must be divisible by PP")
-            resolved_tp = int(cfg.num_gpus) // pp
+            resolved_tp = int(cfg.num_gpus or 0) // pp
         engine_gpus = resolved_tp * pp
-        if engine_gpus < 1 or int(cfg.num_gpus) % engine_gpus:
+        if engine_gpus < 1 or int(cfg.num_gpus or 0) % engine_gpus:
             raise ValueError(
                 f"num_gpus={cfg.num_gpus} cannot form complete vLLM groups of "
                 f"TP={resolved_tp} * PP={pp}")
-        print(f"[config] vLLM engines: {int(cfg.num_gpus) // engine_gpus} "
+        print(f"[config] vLLM engines: {int(cfg.num_gpus or 0) // engine_gpus} "
               f"replica(s), TP={resolved_tp}, PP={pp}, "
               f"{engine_gpus} GPU(s)/engine")
     print(f"[config] rollout thinking: "
@@ -3386,17 +3184,17 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         # This local path owns its sampling arguments, including top_k=0.
         # Use the existing per-prompt OOM-aware micro-batcher instead of an
         # external HF helper that may inherit a top-k generation default.
-        rank_cfg = SimpleNamespace(**vars(cfg))
-        rank_cfg.temperature = 1.0
-        rank_cfg.top_p = 1.0
-        rank_cfg.sampling_top_k = 0
-        rank_cfg.sampling_min_p = 0.0
+        policy_cfg = SimpleNamespace(**vars(cfg))
+        policy_cfg.temperature = 1.0
+        policy_cfg.top_p = 1.0
+        policy_cfg.sampling_top_k = 0
+        policy_cfg.sampling_min_p = 0.0
         if max_new_tokens is not None:
-            rank_cfg.max_new_tokens = int(max_new_tokens)
+            policy_cfg.max_new_tokens = int(max_new_tokens)
         for group_idx, (prompt, count) in enumerate(zip(prompts_by_group, counts_by_group)):
             if int(count) > 0:
                 responses, _ = generate_responses(
-                    model, tokenizer, prompt, int(count), rank_cfg)
+                    model, tokenizer, prompt, int(count), policy_cfg)
                 yield group_idx, responses
         return
 
@@ -3413,7 +3211,7 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         "temperature": float(temperature if temperature is not None
                              else cfg.temperature),
         "top_p": float(top_p if top_p is not None else cfg.top_p),
-        "micro_batch": int(getattr(cfg, "gen_micro_batch", 0) or 0),
+        "micro_batch": int(getattr(cfg, 'gen_micro_batch', 0) or 0),
     }
     resolved_top_k = (top_k if top_k is not None
                       else getattr(cfg, "sampling_top_k", None))
@@ -3872,7 +3670,7 @@ def _exceeds_fused_long_pack(cfg, packed_tokens):
     )
 
 
-def _training_microbatches(examples, cfg, *, partition_key=None):
+def _training_microbatches(examples, cfg):
     """Length-bucket examples into real model batches.
 
     train_examples_per_microbatch is an example-count ceiling.  The padded-token
@@ -3880,52 +3678,46 @@ def _training_microbatches(examples, cfg, *, partition_key=None):
     configured value such as 64 is useful for short responses without forcing
     64 long contexts into memory together.
     """
-    example_cap = int(getattr(cfg, "train_examples_per_microbatch", 1) or 0)
+    example_cap = int(getattr(cfg, 'train_examples_per_microbatch', 1) or 0)
     if example_cap < 1:
         raise ValueError("train_examples_per_microbatch must be >= 1")
     token_cap = max(1, int(getattr(cfg, "max_seq_length", 1) or 1))
 
-    partitions = {}
-    for example in examples:
-        key = partition_key(example) if partition_key is not None else None
-        partitions.setdefault(key, []).append(example)
-
     batches = []
-    for partition in partitions.values():
-        ordered = sorted(
-            partition,
-            key=lambda example: int(
-                example["prompt_ids"].shape[1]
-                + example["response_ids"].shape[1]),
-            reverse=True,
-        )
-        current = []
-        current_max = 0
-        for example in ordered:
-            length = int(example["prompt_ids"].shape[1]
-                         + example["response_ids"].shape[1])
-            if _requires_fused_long_singleton(cfg, length):
-                if current:
-                    batches.append(current)
-                    current = []
-                    current_max = 0
-                batches.append([example])
-                continue
-            next_max = max(current_max, length)
-            exceeds_tokens = bool(
-                current and next_max * (len(current) + 1) > token_cap)
-            exceeds_fused_pack = bool(
-                current and _exceeds_fused_long_pack(
-                    cfg, next_max * (len(current) + 1)))
-            if current and (len(current) >= example_cap or exceeds_tokens
-                            or exceeds_fused_pack):
+    ordered = sorted(
+        examples,
+        key=lambda example: int(
+            example["prompt_ids"].shape[1]
+            + example["response_ids"].shape[1]),
+        reverse=True,
+    )
+    current = []
+    current_max = 0
+    for example in ordered:
+        length = int(example["prompt_ids"].shape[1]
+                     + example["response_ids"].shape[1])
+        if _requires_fused_long_singleton(cfg, length):
+            if current:
                 batches.append(current)
                 current = []
                 current_max = 0
-            current.append(example)
-            current_max = max(current_max, length)
-        if current:
+            batches.append([example])
+            continue
+        next_max = max(current_max, length)
+        exceeds_tokens = bool(
+            current and next_max * (len(current) + 1) > token_cap)
+        exceeds_fused_pack = bool(
+            current and _exceeds_fused_long_pack(
+                cfg, next_max * (len(current) + 1)))
+        if current and (len(current) >= example_cap or exceeds_tokens
+                        or exceeds_fused_pack):
             batches.append(current)
+            current = []
+            current_max = 0
+        current.append(example)
+        current_max = max(current_max, length)
+    if current:
+        batches.append(current)
     return batches
 
 
@@ -4464,33 +4256,23 @@ def _valid_example_token_logprobs(example, key):
     )
 
 
-def _initialize_rank_logprob_caches(examples):
-    """Use vLLM rollout/reference scores and identify any HF fallbacks."""
-    missing_old = []
-    missing_reference = []
+def _initialize_behavior_logprobs(examples):
+    """Cache frozen rollout scores and return trajectories needing HF scoring."""
+    missing = []
     for example in examples:
-        old = example.get("behavior_logprobs")
         if _valid_example_token_logprobs(example, "behavior_logprobs"):
-            example["rank_old_logprobs"] = old.detach()
+            example["old_policy_logprobs"] = example["behavior_logprobs"].detach()
         else:
-            example["rank_old_logprobs"] = None
-            missing_old.append(example)
-
-        reference = example.get("reference_logprobs")
-        if _valid_example_token_logprobs(example, "reference_logprobs"):
-            example["rank_reference_logprob"] = reference.detach()
-        else:
-            example["rank_reference_logprob"] = None
-            missing_reference.append(example)
-    return missing_old, missing_reference
+            example["old_policy_logprobs"] = None
+            missing.append(example)
+    return missing
 
 
-def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
-                   advantage, *, clip_epsilon=RANK_CLIP_EPSILON_DEFAULT,
-                   clip_epsilon_low=None, clip_epsilon_high=None,
-                   kl_coef=0.0, entropy_coef=0.0, token_entropies=None,
-                   sequence_level_ratio=False,
-                   return_tensor_metrics=False):
+def clipped_surrogate_loss(
+        current_logprobs, old_logprobs, reference_logprob,
+        advantage, *, clip_epsilon=SEQUENCE_CLIP_EPSILON_DEFAULT,
+        clip_epsilon_low=None, clip_epsilon_high=None, kl_coef=0.0,
+        sequence_level_ratio=False, return_tensor_metrics=False):
     """One trajectory's loss; callers average equally within each parent.
 
     Normally, per-token rho = exp(current_lp - old_lp) is differentiable. For
@@ -4501,21 +4283,13 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     the same centered log-probability correction as entropic mode:
         d = log pi_theta - log pi_ref
         A_KL = kl_coef * (mean(d) - d).
-    Its policy-gradient surrogate is kept separate from the rank PPO surrogate
-    so rank advantages and asymmetric clipping retain their existing behavior.
+    Its policy-gradient surrogate is kept separate from the clipped PPO surrogate
+    so SPO-RS advantages and asymmetric clipping retain their existing behavior.
     Clipping is asymmetric when requested: [1 - epsilon_low,
     1 + epsilon_high]. The legacy clip_epsilon remains the fallback for both.
 
-    If enabled, trajectory entropy is estimated by the chain rule:
-        H_hat = sum_l rho_prefix(l) * H(pi_theta(. | x, y_<l)).
-    Prefix ratios exclude token l and remain differentiable, accounting for
-    policy-dependent prefix probabilities. Thus entropy is not implemented as
-    -mean(sampled logprobs) on fixed old-policy samples. The vocabulary entropy
-    also supplies a gradient when all sampled completions are identical.
-
-    Reward clipping does not clip the separate KL/entropy terms. Accumulation
-    and exponentiation use float64, and nonfinite ratios fail explicitly rather
-    than silently changing the objective with a log-ratio clamp.
+    Accumulation and exponentiation use float64, and nonfinite ratios fail
+    explicitly rather than silently clamping the objective.
     """
     import torch
 
@@ -4528,9 +4302,8 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
             or not math.isfinite(epsilon_high)
             or not 0.0 < epsilon_high < 1.0):
         raise ValueError("clip epsilon low/high must be finite and in (0, 1)")
-    if (not math.isfinite(float(kl_coef)) or kl_coef < 0.0
-            or not math.isfinite(float(entropy_coef)) or entropy_coef < 0.0):
-        raise ValueError("KL and entropy coefficients must be finite and nonnegative")
+    if not math.isfinite(float(kl_coef)) or kl_coef < 0.0:
+        raise ValueError("KL coefficient must be finite and nonnegative")
     cur = current_logprobs.to(dtype=torch.float64)
     old = torch.as_tensor(old_logprobs, dtype=cur.dtype, device=cur.device).detach()
     if cur.ndim != 1 or old.shape != cur.shape or cur.numel() == 0:
@@ -4539,7 +4312,7 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
     if adv.numel() != 1 or not torch.isfinite(adv).all():
         raise ValueError("policy advantage must be a finite scalar")
     if not torch.isfinite(cur).all() or not torch.isfinite(old).all():
-        raise ValueError("rank policy logprobs must be finite")
+        raise ValueError("policy logprobs must be finite")
 
     log_ratios = cur - old
     if sequence_level_ratio:
@@ -4579,15 +4352,7 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
 
     entropy_estimate = cur.new_zeros(())
     prefix_ratio_max = cur.new_ones(())
-    if entropy_coef:
-        if token_entropies is None or token_entropies.shape != cur.shape:
-            raise ValueError("matching token entropies are required for entropy updates")
-        prefix_log_ratios = torch.cat((cur.new_zeros(1), log_ratios.cumsum(0)[:-1]))
-        prefix_ratios = prefix_log_ratios.exp()
-        entropy_estimate = (prefix_ratios * token_entropies.to(cur.dtype)).sum()
-        prefix_ratio_max = prefix_ratios.max()
-
-    loss = policy_loss + kl_policy_loss - entropy_coef * entropy_estimate
+    loss = policy_loss + kl_policy_loss
     if not torch.isfinite(loss).all() or not torch.isfinite(ratio).all():
         raise FloatingPointError(
             "nonfinite clipped objective/trajectory ratio; reduce learning "
@@ -4610,7 +4375,7 @@ def rank_grpo_loss(current_logprobs, old_logprobs, reference_logprob,
 
 
 @contextmanager
-def _rank_dropout_disabled(model):
+def _policy_dropout_disabled(model):
     """Disable dropout while retaining training/checkpointing mode."""
     import torch
     changed = []
@@ -4633,24 +4398,8 @@ def _rank_dropout_disabled(model):
             setattr(module, name, value)
 
 
-def _rank_entropy_coefficient(cfg):
-    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
-        return 0.0
-    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
-        return 0.0
-    if getattr(cfg, "advantage_mode", "entropic") == "x-grpo":
-        return float(getattr(
-            cfg, "x_grpo_entropy_coef", X_GRPO_ENTROPY_COEF_DEFAULT))
-    return float(getattr(
-        cfg, "rank_entropy_coef", RANK_ENTROPY_COEF_DEFAULT))
-
-
 def _clipped_policy_options(cfg):
     """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
-    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
-        low = float(cfg.binary_coder_clip_epsilon_low)
-        high = float(cfg.binary_coder_clip_epsilon_high)
-        return low, low, high, 0.0
     if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
         epsilon = float(getattr(
             cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
@@ -4661,50 +4410,24 @@ def _clipped_policy_options(cfg):
             cfg, "spo_rs_clip_epsilon_high",
             SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
         return epsilon, epsilon_low, epsilon_high, 0.0
-    epsilon = float(getattr(
-        cfg, "rank_clip_epsilon", RANK_CLIP_EPSILON_DEFAULT))
-    epsilon_low = float(getattr(cfg, "rank_clip_epsilon_low", epsilon))
-    epsilon_high = float(getattr(cfg, "rank_clip_epsilon_high", epsilon))
+    epsilon = SEQUENCE_CLIP_EPSILON_DEFAULT
+    epsilon_low = float(getattr(cfg, "sequence_clip_epsilon_low", epsilon))
+    epsilon_high = float(getattr(cfg, "sequence_clip_epsilon_high", epsilon))
     return epsilon, epsilon_low, epsilon_high, float(cfg.kl_penalty_coef)
 
 
-def _clipped_reference_count(cfg, supplied, total):
-    if getattr(cfg, "advantage_mode", "entropic") in (
-            "spo-rs", "binary-coder"):
-        return "off"
-    return f"{int(supplied)}/{int(total)}"
-
-
-def _clipped_reference_metric(cfg, value):
-    if getattr(cfg, "advantage_mode", "entropic") in (
-            "spo-rs", "binary-coder"):
-        return "reference=off"
-    return f"avg logpi_theta-logpi_base={float(value):.6f}"
-
-
 def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
-                        reference_logprob, advantage, *,
-                        clip_epsilon, clip_epsilon_low,
-                        clip_epsilon_high, kl_coef=0.0,
-                        entropy_coef=0.0, token_entropies=None,
-                        return_tensor_metrics=False):
+                       reference_logprob, advantage, *,
+                       clip_epsilon, clip_epsilon_low,
+                       clip_epsilon_high, kl_coef=0.0,
+                       return_tensor_metrics=False):
     """Dispatch the shared fast trainer to the active clipped objective."""
-    if getattr(cfg, "advantage_mode", "entropic") == "binary-coder":
-        from problems.binary_coder import binary_coder_clipped_loss
-        return binary_coder_clipped_loss(
-            current_logprobs, old_logprobs, advantage,
-            clip_epsilon_low=clip_epsilon_low,
-            clip_epsilon_high=clip_epsilon_high,
-            sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
-            return_tensor_metrics=return_tensor_metrics)
-    return rank_grpo_loss(
+    return clipped_surrogate_loss(
         current_logprobs, old_logprobs, reference_logprob, advantage,
         clip_epsilon=clip_epsilon,
         clip_epsilon_low=clip_epsilon_low,
         clip_epsilon_high=clip_epsilon_high,
         kl_coef=kl_coef,
-        entropy_coef=entropy_coef,
-        token_entropies=token_entropies,
         sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
         return_tensor_metrics=return_tensor_metrics)
 
@@ -4712,9 +4435,9 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
 def _a3b_sequence_clipped_standard_loss(
         cfg, current_logprobs, behavior_logprobs, reference_logprobs,
         advantage):
-    """Apply the A3B sequence surrogate inside standard advantage modes.
+    """Apply the A3B sequence surrogate inside entropic training.
 
-    Entropic, GRPO, and CVaR retain their existing advantages, centered
+    Entropic training retains its existing advantages, centered
     current/reference correction and sample normalization. Only the
     reward-policy importance ratio and clipping unit become one
     length-normalized response ratio. The helper is deliberately unavailable
@@ -4735,622 +4458,6 @@ def _a3b_sequence_clipped_standard_loss(
         kl_coef=kl_coef,
         return_tensor_metrics=True)
     return loss, metrics
-
-
-def _x_grpo_batched_autograd_unavailable(error):
-    """Whether PyTorch cannot vectorize per-example VJPs on this model."""
-    message = str(error).lower()
-    markers = (
-        "is_grads_batched",
-        "batched grad",
-        "batching rule",
-        "batchingrule",
-        "inside of vmap",
-        "functorch",
-        "vmap",
-        "vmap-incompatible",
-        "vmap incompatible",
-    )
-    return any(marker in message for marker in markers)
-
-
-def _x_grpo_scalar_parameter_gradients(scores, parameters, *, vectorized):
-    """Differentiate scalar score aggregates through one shared graph."""
-    import torch
-
-    if scores.ndim != 1 or scores.numel() < 1:
-        raise ValueError("X-GRPO rollout scores must be a nonempty vector")
-    count = int(scores.numel())
-    if count == 1:
-        gradients = torch.autograd.grad(
-            scores[0], parameters, allow_unused=True)
-        return tuple(
-            None if gradient is None else gradient.unsqueeze(0)
-            for gradient in gradients)
-
-    if vectorized:
-        basis = torch.eye(count, dtype=scores.dtype, device=scores.device)
-        return torch.autograd.grad(
-            scores, parameters, grad_outputs=basis,
-            is_grads_batched=True, allow_unused=True)
-
-    rows = [[] for _ in parameters]
-    for row_index in range(count):
-        gradients = torch.autograd.grad(
-            scores[row_index], parameters, allow_unused=True,
-            retain_graph=row_index + 1 < count)
-        for parameter_index, (parameter, gradient) in enumerate(
-                zip(parameters, gradients)):
-            rows[parameter_index].append(
-                torch.zeros_like(parameter) if gradient is None else gradient)
-    return tuple(torch.stack(parameter_rows, dim=0)
-                 for parameter_rows in rows)
-
-
-def _x_grpo_cache_group_gradients(model, tokenizer, examples, cfg,
-                                  budget_indices, *, group_id, cache_dir,
-                                  device_label, batches=None,
-                                  parameters=None):
-    """Cache budget gradients from shared advantage-stratum derivatives."""
-    import torch
-
-    group_examples = list(examples)
-    indices = tuple(int(index) for index in budget_indices)
-    if not indices:
-        raise ValueError("X-GRPO diagnostic budgets must not be empty")
-    if len(set(indices)) != len(indices) or min(indices) < 0:
-        raise ValueError("X-GRPO diagnostic budget indices must be unique and nonnegative")
-    parameters = (
-        tuple(parameter for parameter in model.parameters()
-              if parameter.requires_grad)
-        if parameters is None else tuple(parameters))
-    flat_count = sum(parameter.numel() for parameter in parameters)
-    if flat_count < 1:
-        raise RuntimeError("X-GRPO found no trainable parameters")
-    cache_root = Path(cache_dir)
-    cache_root.mkdir(parents=True, exist_ok=True)
-    empty_cache = {index: None for index in indices}
-    if not group_examples:
-        model.zero_grad(set_to_none=True)
-        return empty_cache, 0, []
-    group_sizes = {int(example["x_grpo_group_size"])
-                   for example in group_examples}
-    if len(group_sizes) != 1:
-        raise ValueError("X-GRPO examples disagree about their sampled group size")
-    sampled_group_size = group_sizes.pop()
-    if sampled_group_size < 2:
-        raise ValueError("X-GRPO sampled group size must be at least two")
-
-    advantage_vectors = {}
-    representative_for = {}
-    representatives = []
-    for index in indices:
-        vector = tuple(
-            float(example["x_grpo_trial_advantages"][index])
-            for example in group_examples)
-        if not all(math.isfinite(value) for value in vector):
-            raise ValueError("X-GRPO diagnostic advantages must be finite")
-        if not any(value != 0.0 for value in vector):
-            representative_for[index] = None
-            continue
-        representative = advantage_vectors.get(vector)
-        if representative is None:
-            representative = index
-            advantage_vectors[vector] = index
-            representatives.append(index)
-        representative_for[index] = representative
-
-    if not representatives:
-        model.zero_grad(set_to_none=True)
-        planned = (_training_microbatches(group_examples, cfg)
-                   if batches is None else [list(batch) for batch in batches])
-        return empty_cache, 0, planned
-
-    planned_batches = (
-        _training_microbatches(group_examples, cfg)
-        if batches is None else [list(batch) for batch in batches])
-    representative_rows = {
-        index: row for row, index in enumerate(representatives)}
-    vectorized = True
-
-    def attempt(active_batches):
-        accumulator_count = len(representatives)
-        accumulators = [
-            torch.zeros(
-                (accumulator_count, *parameter.shape),
-                dtype=parameter.dtype, device=parameter.device)
-            for parameter in parameters
-        ]
-        for batch in active_batches:
-            current_logprobs = compute_batched_token_logprobs(
-                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
-                pad_token_id=tokenizer.pad_token_id)
-            scores = torch.stack(
-                [current_lp.mean() for current_lp in current_logprobs])
-            strata = {}
-            for row, example in enumerate(batch):
-                signature = tuple(
-                    float(example["x_grpo_trial_advantages"][index])
-                    for index in representatives)
-                if any(value != 0.0 for value in signature):
-                    strata.setdefault(signature, []).append(row)
-            if not strata:
-                model.zero_grad(set_to_none=True)
-                del current_logprobs, scores
-                continue
-
-            signatures = tuple(strata)
-            stratum_scores = torch.stack([
-                scores[rows].sum() for rows in strata.values()
-            ])
-            stratum_gradients = _x_grpo_scalar_parameter_gradients(
-                stratum_scores, parameters, vectorized=vectorized)
-            weights = scores.new_tensor(signatures).transpose(0, 1)
-            weights.div_(sampled_group_size)
-            with torch.no_grad():
-                weights_by_device_dtype = {}
-                for accumulator, gradient in zip(
-                        accumulators, stratum_gradients):
-                    if gradient is None:
-                        continue
-                    weight_key = (gradient.device, gradient.dtype)
-                    dtype_weights = weights_by_device_dtype.get(weight_key)
-                    if dtype_weights is None:
-                        dtype_weights = weights.to(
-                            device=gradient.device, dtype=gradient.dtype)
-                        weights_by_device_dtype[weight_key] = dtype_weights
-                    accumulator.reshape(accumulator_count, -1).addmm_(
-                        dtype_weights, gradient.detach().reshape(
-                            len(signatures), -1))
-            model.zero_grad(set_to_none=True)
-            del accumulator, gradient
-            del current_logprobs, scores, stratum_scores, stratum_gradients
-            del signatures, strata, weights
-            del weights_by_device_dtype
-
-        cached = {}
-        for index in representatives:
-            row = representative_rows[index]
-            flat = torch.cat([
-                accumulator[row].detach().reshape(-1).float().cpu()
-                for accumulator in accumulators
-            ])
-            if flat.numel() != flat_count or not torch.isfinite(flat).all():
-                raise FloatingPointError(
-                    "nonfinite X-GRPO diagnostic gradient")
-            cache_path = cache_root / (
-                f"group-{int(group_id)}-budget-{int(index)}.pt")
-            torch.save(flat, cache_path)
-            cached[index] = str(cache_path)
-            del flat
-        return cached
-
-    retry_without_vectorized_autograd = False
-    try:
-        result, effective, quarantined = _run_oom_resilient_backward(
-            model, planned_batches, attempt, device_label=device_label)
-    except (RuntimeError, TypeError) as error:
-        if not vectorized or not _x_grpo_batched_autograd_unavailable(error):
-            raise
-        vectorized = False
-        retry_without_vectorized_autograd = True
-    if retry_without_vectorized_autograd:
-        model.zero_grad(set_to_none=True)
-        print(f"[X-GRPO] {device_label}: batched diagnostic autograd is "
-              "unavailable; retrying with one backward per distinct "
-              "advantage stratum within each shared forward", flush=True)
-        result, effective, quarantined = _run_oom_resilient_backward(
-            model, planned_batches, attempt, device_label=device_label)
-    model.zero_grad(set_to_none=True)
-    if result is None:
-        result = {index: None for index in representatives}
-    cached = {}
-    for index in indices:
-        representative = representative_for[index]
-        cached[index] = (None if representative is None
-                         else result[representative])
-    return cached, len(quarantined), effective
-
-
-def _x_grpo_load_cached_gradient(cache_path, zero_gradient):
-    """Load one self-generated aggregate and validate its exact layout."""
-    import torch
-
-    if cache_path is None:
-        return zero_gradient
-    try:
-        gradient = torch.load(
-            cache_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        gradient = torch.load(cache_path, map_location="cpu")
-    if (not torch.is_tensor(gradient)
-            or gradient.device.type != "cpu"
-            or gradient.dtype != torch.float32
-            or gradient.ndim != 1
-            or gradient.numel() != zero_gradient.numel()
-            or not torch.isfinite(gradient).all()):
-        raise RuntimeError("invalid cached X-GRPO diagnostic gradient")
-    return gradient
-
-
-def _x_grpo_delete_consumed_cache(cached_by_group, budget_index):
-    """Unlink aggregates once no later budget aliases the same cache file."""
-    current_paths = {
-        cache[budget_index]
-        for cache in cached_by_group.values()
-        if cache.get(budget_index) is not None
-    }
-    future_paths = {
-        cache[index]
-        for cache in cached_by_group.values()
-        for index in cache
-        if index > budget_index and cache[index] is not None
-    }
-    for cache_path in current_paths - future_paths:
-        Path(cache_path).unlink(missing_ok=True)
-
-
-def _x_grpo_crossfit_metrics(gradients, relative_error):
-    """Return leave-one-group-out precision diagnostics for one trial budget."""
-    import torch
-
-    group_ids = sorted(gradients)
-    group_count = len(group_ids)
-    if group_count < 3:
-        raise ValueError("X-GRPO calibration requires at least three groups")
-    total = gradients[group_ids[0]].clone()
-    gradient_squared_norms = {
-        group_id: float(torch.dot(gradient, gradient).item())
-        for group_id, gradient in gradients.items()
-    }
-    total_squared_norms = gradient_squared_norms[group_ids[0]]
-    for group_id in group_ids[1:]:
-        gradient = gradients[group_id]
-        total.add_(gradient)
-        total_squared_norms += gradient_squared_norms[group_id]
-    total_norm_squared = float(torch.dot(total, total).item())
-
-    heldout_count = group_count - 1
-    denominator = heldout_count * (heldout_count - 1)
-    results = {}
-    for group_id in group_ids:
-        gradient = gradients[group_id]
-        gradient_norm_squared = gradient_squared_norms[group_id]
-        heldout_sum = None
-        if gradient_norm_squared == 0.0:
-            heldout_sum_norm_squared = total_norm_squared
-        else:
-            heldout_sum = total - gradient
-            heldout_sum_norm_squared = float(
-                torch.dot(heldout_sum, heldout_sum).item())
-        heldout_squared_norms = max(
-            0.0, total_squared_norms - gradient_norm_squared)
-        centered_sum = max(
-            0.0,
-            heldout_squared_norms
-            - heldout_sum_norm_squared / heldout_count,
-        )
-        signal_squared = heldout_sum_norm_squared / (heldout_count ** 2)
-        error_squared = centered_sum / denominator
-        accepted = bool(
-            signal_squared > 0.0
-            and error_squared
-            <= float(relative_error) ** 2 * signal_squared)
-        signal_norm = math.sqrt(signal_squared)
-        standard_error = math.sqrt(error_squared)
-        results[group_id] = {
-            "gradient_norm": signal_norm,
-            "standard_error": standard_error,
-            "relative_error": (
-                standard_error / signal_norm if signal_norm > 0.0
-                else None),
-            "accepted": accepted,
-        }
-        if heldout_sum is not None:
-            del heldout_sum
-    return results
-
-
-def _x_grpo_context_group_map(examples, *, context_group_ids=None,
-                              group_ids=None):
-    if context_group_ids is not None and group_ids is not None:
-        raise ValueError(
-            "pass X-GRPO context groups or flat group ids, not both")
-
-    examples = list(examples)
-    if context_group_ids is None:
-        allowed = (
-            {int(group_id) for group_id in group_ids}
-            if group_ids is not None else
-            {int(example["group_id"]) for example in examples}
-        )
-        inferred = {}
-        for example in examples:
-            group_id = int(example["group_id"])
-            if group_id not in allowed:
-                raise ValueError(
-                    f"unexpected X-GRPO diagnostic group {group_id}")
-            context_id = int(example.get("x_grpo_context_id", 0))
-            inferred.setdefault(context_id, set()).add(group_id)
-        missing = allowed - {
-            group_id for ids in inferred.values() for group_id in ids
-        }
-        if missing:
-            if len(inferred) > 1:
-                raise ValueError(
-                    "cannot infer the context of empty X-GRPO groups; pass "
-                    "context_group_ids")
-            context_id = next(iter(inferred), 0)
-            inferred.setdefault(context_id, set()).update(missing)
-        context_group_ids = inferred
-
-    normalized = {}
-    owners = {}
-    for context_id, ids in context_group_ids.items():
-        context_id = int(context_id)
-        ordered = tuple(sorted({int(group_id) for group_id in ids}))
-        if len(ordered) < 3:
-            raise ValueError(
-                f"X-GRPO context {context_id} requires at least three groups")
-        for group_id in ordered:
-            previous = owners.get(group_id)
-            if previous is not None:
-                raise ValueError(
-                    f"X-GRPO group {group_id} belongs to contexts "
-                    f"{previous} and {context_id}")
-            owners[group_id] = context_id
-        normalized[context_id] = ordered
-    if not normalized:
-        raise ValueError("X-GRPO calibration requires at least one context")
-    return dict(sorted(normalized.items()))
-
-
-def _calibrate_x_grpo_local(backend, model, tokenizer, examples, cfg, step_idx,
-                            *, context_group_ids=None, group_ids=None):
-    """Serial calibration path for a single/model-parallel training model."""
-    from tempfile import TemporaryDirectory
-    import torch
-
-    examples = list(examples)
-    contexts = _x_grpo_context_group_map(
-        examples, context_group_ids=context_group_ids, group_ids=group_ids)
-    expected_group_ids = sorted(
-        group_id for ids in contexts.values() for group_id in ids
-    )
-    groups = {group_id: [] for group_id in expected_group_ids}
-    context_for_group = {
-        group_id: context_id
-        for context_id, ids in contexts.items()
-        for group_id in ids
-    }
-    for example in examples:
-        group_id = int(example["group_id"])
-        if group_id not in groups:
-            raise ValueError(
-                f"unexpected X-GRPO diagnostic group {group_id}")
-        example_context = int(example.get(
-            "x_grpo_context_id", context_for_group[group_id]))
-        if example_context != context_for_group[group_id]:
-            raise ValueError(
-                f"X-GRPO group {group_id} was assigned to context "
-                f"{context_for_group[group_id]} but contains context "
-                f"{example_context}")
-        groups[group_id].append(example)
-
-    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
-    selected = {group_id: 0.0 for group_id in groups}
-    diagnostics = {group_id: [] for group_id in groups}
-    quarantined_total = 0
-    parameters = tuple(
-        parameter for parameter in model.parameters() if parameter.requires_grad)
-    flat_count = sum(parameter.numel() for parameter in parameters)
-    if flat_count < 1:
-        raise RuntimeError("X-GRPO found no trainable parameters")
-    zero_gradient = torch.zeros(
-        flat_count, dtype=torch.float32, device="cpu")
-    batch_plans = {
-        group_id: _training_microbatches(group_examples, cfg)
-        for group_id, group_examples in groups.items()
-    }
-    budget_indices = tuple(range(len(budgets)))
-    backend.set_training_mode()
-    print(f"[step {step_idx}] X-GRPO calibration: {len(contexts)} contexts, "
-          f"{len(groups)} groups x {len(budgets)} budgets on the primary "
-          "trainer; identical advantage strata share one aggregate backward",
-          flush=True)
-    try:
-        with TemporaryDirectory(prefix="x-grpo-gradients-") as cache_dir:
-            cached_by_group = {}
-            with _rank_dropout_disabled(model):
-                for group_id in sorted(groups):
-                    cached, quarantined, effective = (
-                        _x_grpo_cache_group_gradients(
-                            model, tokenizer, groups[group_id], cfg,
-                            budget_indices, group_id=group_id,
-                            cache_dir=cache_dir,
-                            device_label=str(model.device),
-                            batches=batch_plans[group_id],
-                            parameters=parameters))
-                    batch_plans[group_id] = effective
-                    quarantined_total += quarantined
-                    cached_by_group[group_id] = cached
-
-            for context_id, context_ids in contexts.items():
-                context_caches = {
-                    group_id: cached_by_group[group_id]
-                    for group_id in context_ids
-                }
-                for budget_index, budget in enumerate(budgets):
-                    gradients = {
-                        group_id: _x_grpo_load_cached_gradient(
-                            cached_by_group[group_id][budget_index],
-                            zero_gradient)
-                        for group_id in context_ids
-                    }
-                    trial = _x_grpo_crossfit_metrics(
-                        gradients, cfg.x_grpo_relative_error)
-                    for group_id, metrics in trial.items():
-                        diagnostics[group_id].append({
-                            "budget": budget, **metrics})
-                        if metrics["accepted"]:
-                            selected[group_id] = max(
-                                selected[group_id], budget)
-                    accepted_count = sum(
-                        item["accepted"] for item in trial.values())
-                    print(f"[step {step_idx}] X-GRPO context {context_id} "
-                          f"budget {budget:g}: accepted for "
-                          f"{accepted_count}/{len(context_ids)} held-out "
-                          "groups", flush=True)
-                    del gradients
-                    _x_grpo_delete_consumed_cache(
-                        context_caches, budget_index)
-    finally:
-        model.zero_grad(set_to_none=True)
-    return {
-        "selected_budgets": selected,
-        "groups": diagnostics,
-        "diagnostic_quarantined_examples": quarantined_total,
-        "distributed": False,
-    }
-
-
-def _apply_x_grpo_calibration(examples, group_data, calibration, cfg):
-    from advantage import x_grpo_advantages
-
-    budgets = tuple(float(value) for value in cfg.x_grpo_budgets)
-    budget_indices = {value: index for index, value in enumerate(budgets)}
-    selected = {
-        int(group_id): float(value)
-        for group_id, value in calibration["selected_budgets"].items()
-    }
-    expected_groups = set(group_data)
-    if set(selected) != expected_groups:
-        raise RuntimeError(
-            "X-GRPO calibration did not return every sampled group: "
-            f"expected {sorted(expected_groups)}, got {sorted(selected)}")
-
-    final_by_group = {}
-    summaries = []
-    for group_id in sorted(group_data):
-        data = group_data[group_id]
-        selected_budget = selected[group_id]
-        if selected_budget == 0.0:
-            final_advantages, _cutoff, final_info = x_grpo_advantages(
-                data["rewards"], 0.0, return_info=True)
-        else:
-            budget_index = budget_indices[selected_budget]
-            final_advantages = data["trial_advantages"][budget_index]
-            final_info = data["trial_info"][budget_index]
-        entropy_gate = bool(
-            (selected_budget == 0.0 or final_info["all_tied"])
-            and data["entropy_eligible"])
-        final_by_group[group_id] = (
-            final_advantages, entropy_gate, final_info)
-        serializable_info = {
-            key: value for key, value in final_info.items()
-            if key not in ("ranks", "weights")
-        }
-        summaries.append({
-            "group": group_id,
-            "context": int(data["context"]),
-            "fold": int(data["fold"]),
-            "selected_budget": selected_budget,
-            "entropy_gate": entropy_gate,
-            **serializable_info,
-            "calibration": calibration["groups"][group_id],
-        })
-
-    for example in examples:
-        group_id = int(example["group_id"])
-        rollout_index = int(example["rollout_index"])
-        advantages, entropy_gate, _info = final_by_group[group_id]
-        example["advantage"] = float(advantages[rollout_index])
-        example["rank_entropy_gate"] = entropy_gate
-
-    return summaries
-
-
-def _prepare_binary_overlap_examples(
-        model, tokenizer, group_responses, reward_futures, prompt_jobs,
-        parents):
-    """Build the binary-coder tensors before the CPU rewards are available.
-
-    Generation already supplied the frozen behavior log-probabilities.  The
-    prompt/response tensors and the denominator of the step-wide mean therefore
-    do not depend on reward.  Each prepared example retains only its aligned
-    reward future; the future is resolved *after* that microbatch's policy
-    forward, keeping at most one autograd graph alive while CPU verification
-    continues.
-    """
-    import torch
-
-    prompt_ids_by_job = {}
-    prepared = []
-    submission_index = 0
-    for group_id in sorted(group_responses):
-        responses = group_responses[group_id]
-        futures = reward_futures[group_id]
-        if len(responses) != len(futures):
-            raise RuntimeError(
-                f"binary overlap group {group_id} has {len(responses)} "
-                f"responses but {len(futures)} reward futures")
-        for rollout_index, (record, reward_future) in enumerate(
-                zip(responses, futures)):
-            token_ids = list(record.get("token_ids") or ())
-            behavior_values = record.get("behavior_logprobs")
-            if (not token_ids or behavior_values is None
-                    or len(behavior_values) != len(token_ids)):
-                submission_index += 1
-                continue
-            job_idx = int(record["job_idx"])
-            if job_idx not in prompt_ids_by_job:
-                prompt_ids_by_job[job_idx] = tokenizer(
-                    prompt_jobs[job_idx]["prompt_text"],
-                    return_tensors="pt").input_ids.to(model.device)
-            response_ids = torch.tensor(
-                [token_ids], dtype=torch.long, device=model.device)
-            behavior_logprobs = torch.as_tensor(
-                behavior_values, dtype=torch.float32,
-                device=model.device)
-            if not torch.isfinite(behavior_logprobs).all():
-                submission_index += 1
-                continue
-            parent_group = int(record["parent_group"])
-            example = {
-                "prompt_ids": prompt_ids_by_job[job_idx],
-                "response_ids": response_ids,
-                # Filled from the verified RewardResult after the forward.
-                "_entropy_measurement": record.get("_entropy_measurement"),
-                "advantage": None,
-                "behavior_logprobs": behavior_logprobs,
-                "reference_logprobs": None,
-                "reward_constant": False,
-                "rank_entropy_gate": False,
-                "group_id": int(group_id),
-                "x_grpo_context_id": int(record["context_id"]),
-                "x_grpo_fold_index": int(record["fold_index"]),
-                "rollout_index": int(rollout_index),
-                "prompt_job_id": job_idx,
-                "x_grpo_group_size": len(responses),
-                "x_grpo_all_tied": False,
-                "x_grpo_trial_advantages": (),
-                "sample_weight": 0.0,
-                "_overlap_key": (int(group_id), int(rollout_index)),
-                "_overlap_submission_index": int(submission_index),
-                "_overlap_reward_future": reward_future,
-                "_overlap_parent": parents[parent_group],
-            }
-            # Reuse these exact tensors in the later save/accounting pass.  This
-            # avoids tokenizing and allocating every long prompt a second time.
-            record["_binary_overlap_example"] = example
-            prepared.append(example)
-            submission_index += 1
-
-    if prepared:
-        weight = 1.0 / len(prepared)
-        for example in prepared:
-            example["sample_weight"] = weight
-    return prepared
 
 
 def _prepare_entropic_overlap_group(
@@ -5381,8 +4488,7 @@ def _prepare_entropic_overlap_group(
     )
     if rewards.size == 0:
         return []
-    advantages, _beta, _label, _info = compute_group_advantages(
-        rewards, "entropic", return_info=True)
+    advantages, _beta = compute_group_advantages(rewards)
     constant = float(rewards.max() - rewards.min()) < 1e-12
     if constant:
         return []
@@ -5418,15 +4524,9 @@ def _prepare_entropic_overlap_group(
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": reference_logprobs,
             "reward_constant": False,
-            "rank_entropy_gate": False,
             "group_id": int(group_id),
-            "x_grpo_context_id": int(record["context_id"]),
-            "x_grpo_fold_index": int(record["fold_index"]),
             "rollout_index": int(rollout_index),
             "prompt_job_id": job_idx,
-            "x_grpo_group_size": len(responses),
-            "x_grpo_all_tied": False,
-            "x_grpo_trial_advantages": (),
             "sample_weight": 1.0 / (int(num_groups) * len(responses)),
             "_overlap_key": (int(group_id), int(rollout_index)),
         }
@@ -5488,15 +4588,9 @@ def _prepare_spo_rs_overlap_inputs(
                     behavior_array, dtype=torch.float32).cpu(),
                 "reference_logprobs": None,
                 "reward_constant": False,
-                "rank_entropy_gate": False,
                 "group_id": int(group_id),
-                "x_grpo_context_id": int(record["context_id"]),
-                "x_grpo_fold_index": int(record["fold_index"]),
                 "rollout_index": int(rollout_index),
                 "prompt_job_id": job_idx,
-                "x_grpo_group_size": len(responses),
-                "x_grpo_all_tied": False,
-                "x_grpo_trial_advantages": (),
                 "sample_weight": 0.0,
                 "_overlap_key": (int(group_id), int(rollout_index)),
                 "_overlap_reward_future": reward_future,
@@ -5532,219 +4626,6 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
         # Futures cannot be sent through the process trainer's work queues.
         example.pop("_overlap_reward_future", None)
     return examples
-
-
-def _precompute_binary_coder_backward(
-        backend, model, tokenizer, optimizer, examples, cfg, step_idx):
-    """Run the exact one-epoch binary backward while rewards finish on CPU.
-
-    No parameter is updated here.  Every forward sees the same frozen policy as
-    the ordinary post-evaluation implementation.  A microbatch's reward futures
-    are read only after its differentiable forward has been launched; its fixed
-    +/-1 labels are then applied and the loss is backpropagated immediately.
-    The caller performs the single optimizer step only after all evaluations and
-    rollout artifacts have completed.
-    """
-    import torch
-    from problems.binary_coder import verified_usability
-
-    if str(getattr(cfg, "advantage_mode", "")) != "binary-coder":
-        raise ValueError("evaluation-overlapped backward is binary-coder only")
-    epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
-    if epochs != 1:
-        raise ValueError(
-            "evaluation-overlapped binary training requires exactly one "
-            "clipped-policy update epoch")
-    if not examples:
-        return None
-
-    backend.set_training_mode()
-    started = time.time()
-    update_batches = _training_microbatches(examples, cfg)
-    largest_batch = max((len(batch) for batch in update_batches), default=0)
-    print(f"[train-overlap] binary coder LoRA microbatches="
-          f"{len(update_batches)}; configured max="
-          f"{int(cfg.train_examples_per_microbatch)}, effective max="
-          f"{largest_batch}, padded-token cap={int(cfg.max_seq_length)}",
-          flush=True)
-
-    missing_old, _missing_reference = _initialize_rank_logprob_caches(examples)
-    if missing_old:
-        raise RuntimeError(
-            "binary overlap received examples without complete frozen "
-            "behavior log-probabilities")
-    print(f"[step {step_idx}] binary-coder logprobs: vLLM supplied old="
-          f"{len(examples)}/{len(examples)}, reference=off; starting policy "
-          "forward/backward while CPU evaluation is active", flush=True)
-
-    epsilon, epsilon_low, epsilon_high, kl_coef = (
-        _clipped_policy_options(cfg))
-    if kl_coef != 0.0:
-        raise RuntimeError("binary coder overlap unexpectedly enabled KL")
-    metric_keys = (
-        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
-        "ratio", "clipped_fraction",
-    )
-    reward_wait_seconds = 0.0
-    optimizer.zero_grad(set_to_none=True)
-    model.zero_grad(set_to_none=True)
-
-    def attempt(active_batches):
-        nonlocal reward_wait_seconds
-        totals = {key: 0.0 for key in metric_keys}
-        max_ratio = 0.0
-        max_prefix_ratio = 0.0
-        entropy_examples = 0
-        pending_batches = list(active_batches)
-        while pending_batches:
-            # Re-evaluate readiness after every backward.  Evaluation continues
-            # concurrently, so a batch that was pending when this attempt began
-            # may be ready now.  If none is ready, choose the batch whose latest
-            # submitted rollout is earliest in the executor's FIFO queue.
-            ready_indices = [
-                index for index, candidate in enumerate(pending_batches)
-                if all(ex["_overlap_reward_future"].done()
-                       for ex in candidate)
-            ]
-            if ready_indices:
-                batch_index = ready_indices[0]
-            else:
-                batch_index = min(
-                    range(len(pending_batches)),
-                    key=lambda index: max(
-                        ex["_overlap_submission_index"]
-                        for ex in pending_batches[index]),
-                )
-            batch = pending_batches.pop(batch_index)
-            # This is the expensive reward-independent part.  CUDA kernels can
-            # continue executing while the host waits below for this batch's
-            # CPU verifier results.
-            current_logprobs = compute_batched_token_logprobs(
-                model, batch, with_grad=True, chunk=cfg.logprob_chunk,
-                pad_token_id=tokenizer.pad_token_id)
-            weighted_losses = []
-            for example, current_lp in zip(batch, current_logprobs):
-                wait_started = time.time()
-                result = example["_overlap_reward_future"].result()
-                reward_wait_seconds += time.time() - wait_started
-                usable, _reason = verified_usability(
-                    result, example["_overlap_parent"],
-                    fail_score=cfg.fail_score)
-                advantage = 1.0 if usable else -1.0
-                example["advantage"] = advantage
-                loss, metrics = clipped_policy_loss(
-                    cfg, current_lp, example["rank_old_logprobs"], None,
-                    advantage, clip_epsilon=epsilon,
-                    clip_epsilon_low=epsilon_low,
-                    clip_epsilon_high=epsilon_high, kl_coef=0.0,
-                    entropy_coef=0.0, token_entropies=None)
-                weight = float(example["sample_weight"])
-                if not torch.isfinite(loss).all():
-                    raise FloatingPointError(
-                        "nonfinite evaluation-overlapped binary coder loss")
-                weighted_losses.append(weight * loss)
-                totals["loss"] += weight * float(loss.detach().item())
-                for key in ("policy_loss", "kl_estimate",
-                            "entropy_estimate", "ratio"):
-                    totals[key] += weight * metrics[key]
-                totals["clipped_fraction"] += (
-                    weight * float(metrics["clipped"]))
-                max_ratio = max(max_ratio, metrics["ratio"])
-                max_prefix_ratio = max(
-                    max_prefix_ratio, metrics["prefix_ratio_max"])
-            if weighted_losses:
-                sum(weighted_losses[1:], weighted_losses[0]).backward()
-        return totals, max_ratio, max_prefix_ratio, entropy_examples
-
-    with _rank_dropout_disabled(model):
-        result, effective_batches, quarantined = (
-            _run_oom_resilient_backward(
-                model, update_batches, attempt,
-                device_label=str(model.device)))
-    if result is None:
-        result = (
-            {key: 0.0 for key in metric_keys}, 0.0, 0.0, 0)
-    totals, max_ratio, max_prefix_ratio, entropy_examples = result
-    trained_keys = {
-        example["_overlap_key"]
-        for batch in effective_batches for example in batch
-    }
-    scheduled_keys = {example["_overlap_key"] for example in examples}
-    wall_seconds = time.time() - started
-    return {
-        "examples": examples,
-        "scheduled_keys": scheduled_keys,
-        "trained_keys": trained_keys,
-        "totals": totals,
-        "max_ratio": max_ratio,
-        "max_prefix_ratio": max_prefix_ratio,
-        "entropy_examples": entropy_examples,
-        "quarantined_examples": len(quarantined),
-        "wall_seconds": wall_seconds,
-        "reward_wait_seconds": reward_wait_seconds,
-        "active_seconds": max(0.0, wall_seconds - reward_wait_seconds),
-    }
-
-
-def _finish_binary_coder_overlap_update(
-        model, optimizer, cfg, step_idx, state):
-    """Apply the one optimizer step after overlapped gradients are complete."""
-    import torch
-
-    finish_started = time.time()
-    update_error = None
-    grad_norm = None
-    try:
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-            [parameter for parameter in model.parameters()
-             if parameter.requires_grad],
-            max_norm=cfg.grad_clip, error_if_nonfinite=True)
-        optimizer.step()
-        grad_norm = float(grad_norm_tensor.item())
-    except BaseException as error:
-        update_error = error
-    finally:
-        model.zero_grad(set_to_none=True)
-        optimizer.zero_grad(set_to_none=True)
-    if update_error is not None:
-        raise update_error
-
-    totals = state["totals"]
-    history = [{
-        "epoch": 1,
-        **totals,
-        "ratio_max": state["max_ratio"],
-        "prefix_ratio_max": state["max_prefix_ratio"],
-        "entropy_examples": state["entropy_examples"],
-        "oom_quarantined_examples": state["quarantined_examples"],
-        "grad_norm": grad_norm,
-    }]
-    print(f"[step {step_idx}] binary-coder epoch 1/1: "
-          f"loss={totals['loss']:.6f} reference=off "
-          f"ratio={totals['ratio']:.6f} max={state['max_ratio']:.6f} "
-          f"clipped={totals['clipped_fraction']:.1%} entropy examples=0 "
-          f"OOM-quarantined={state['quarantined_examples']} "
-          f"(forward/backward overlapped CPU evaluation)", flush=True)
-    training_seconds = (
-        float(state.get("restore_seconds", 0.0))
-        + float(state["active_seconds"])
-        + (time.time() - finish_started)
-    )
-    for example in state["examples"]:
-        for key in (
-                "rank_old_logprobs", "rank_reference_logprob",
-                "_overlap_reward_future",
-                "_overlap_parent"):
-            example.pop(key, None)
-    return {
-        "rank_updates": history,
-        "rank_train_seconds": training_seconds,
-        "binary_train_overlap_wall_seconds": float(state["wall_seconds"]),
-        "binary_train_overlap_reward_wait_seconds": float(
-            state["reward_wait_seconds"]),
-        "binary_train_overlap_active_seconds": float(state["active_seconds"]),
-        "oom_quarantined_examples": int(state["quarantined_examples"]),
-    }
 
 
 def _validate_precomputed_exact_gradients(model, overflow_state, step_idx):
@@ -5826,13 +4707,12 @@ def _train_durable_exact_spo_rs_overflow(
             "exact SPO-RS overflow checkpoint is outside the active run or "
             "belongs to a different step")
 
-    epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
+    epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
     if epochs != 1:
         raise RuntimeError(
             "selective exact SPO-RS overflow requires one optimizer update")
     epsilon, epsilon_low, epsilon_high, kl_coef = (
         _clipped_policy_options(cfg))
-    entropy_coef = _rank_entropy_coefficient(cfg)
     backend.set_training_mode()
     cuda_devices = sorted({
         parameter.device.index
@@ -5866,19 +4746,17 @@ def _train_durable_exact_spo_rs_overflow(
             f"remaining keys: examples={sorted(example_by_key)}, "
             f"remaining={sorted(remaining_keys)}")
 
-    missing_old, missing_reference = _initialize_rank_logprob_caches(examples)
-    reference_fallback = missing_reference if kl_coef else []
-    supplied_reference = len(examples) - len(reference_fallback)
+    missing_old = _initialize_behavior_logprobs(examples)
     print(
         f"[step {step_idx}] {cfg.advantage_mode} overflow logprobs: vLLM "
         f"supplied old={len(examples) - len(missing_old)}/{len(examples)}, "
-        f"reference={_clipped_reference_count(cfg, supplied_reference, len(examples))}; "
+        f"reference=off; "
         f"HF fallback old={len(missing_old)}, reference="
-        f"{('off' if cfg.advantage_mode in ('spo-rs', 'binary-coder') else len(reference_fallback))}",
+        f"off",
         flush=True,
     )
 
-    with _rank_dropout_disabled(model):
+    with _policy_dropout_disabled(model):
         for batch in ([example] for example in missing_old):
             old_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=False, chunk=cfg.logprob_chunk,
@@ -5887,22 +4765,7 @@ def _train_durable_exact_spo_rs_overflow(
                    for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
             for example, old_lp in zip(batch, old_logprobs):
-                example["rank_old_logprobs"] = old_lp.detach()
-        if reference_fallback:
-            with backend.disable_adapter(), torch.no_grad():
-                for batch in ([example] for example in reference_fallback):
-                    reference_logprobs = compute_batched_token_logprobs(
-                        model, batch, with_grad=False,
-                        chunk=cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id)
-                    if any(not torch.isfinite(value).all()
-                           for value in reference_logprobs):
-                        raise FloatingPointError(
-                            "nonfinite reference-policy logprobs")
-                    for example, reference_lp in zip(
-                            batch, reference_logprobs):
-                        example["rank_reference_logprob"] = (
-                            reference_lp.detach())
+                example["old_policy_logprobs"] = old_lp.detach()
 
         # The durable checkpoint already contains the fast-replica gradient and
         # any oversized trajectories completed by an earlier recovery process.
@@ -5951,34 +4814,25 @@ def _train_durable_exact_spo_rs_overflow(
                 max_prefix_ratio = 0.0
                 entropy_examples = 0
                 for batch in active_batches:
-                    gate = bool(batch[0]["rank_entropy_gate"]
-                                and entropy_coef > 0.0)
                     result = compute_batched_token_logprobs(
                         model, batch, with_grad=True,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id,
-                        measure_entropy=True,
-                        return_entropy=gate)
-                    if gate:
-                        current_logprobs, token_entropies = result
-                    else:
-                        current_logprobs = result
-                        token_entropies = [None] * len(batch)
+                        measure_entropy=True)
+                    current_logprobs = result
                     weighted_losses = []
-                    for item, current_lp, token_entropy in zip(
-                            batch, current_logprobs, token_entropies):
+                    for item, current_lp in zip(
+                            batch, current_logprobs):
                         loss, metrics = clipped_policy_loss(
-                            cfg, current_lp, item["rank_old_logprobs"],
-                            item["rank_reference_logprob"], item["advantage"],
+                            cfg, current_lp, item["old_policy_logprobs"],
+                            None, item["advantage"],
                             clip_epsilon=epsilon,
                             clip_epsilon_low=epsilon_low,
                             clip_epsilon_high=epsilon_high,
-                            kl_coef=kl_coef,
-                            entropy_coef=(entropy_coef if gate else 0.0),
-                            token_entropies=token_entropy)
+                            kl_coef=kl_coef)
                         weight = float(item["sample_weight"])
                         if not torch.isfinite(loss).all():
-                            raise FloatingPointError("nonfinite rank loss")
+                            raise FloatingPointError("nonfinite SPO-RS loss")
                         weighted_losses.append(weight * loss)
                         totals["loss"] += weight * float(loss.detach().item())
                         for metric_name in (
@@ -5990,7 +4844,6 @@ def _train_durable_exact_spo_rs_overflow(
                         max_ratio = max(max_ratio, metrics["ratio"])
                         max_prefix_ratio = max(
                             max_prefix_ratio, metrics["prefix_ratio_max"])
-                        entropy_examples += int(gate)
                     if weighted_losses:
                         sum(weighted_losses[1:],
                             weighted_losses[0]).backward()
@@ -6034,7 +4887,7 @@ def _train_durable_exact_spo_rs_overflow(
                 flush=True,
             )
     for example in examples:
-        for cache_key in ("rank_old_logprobs", "rank_reference_logprob"):
+        for cache_key in ("old_policy_logprobs",):
             example.pop(cache_key, None)
     return _finalize_exact_spo_rs_overflow(
         model, optimizer, cfg, step_idx, overflow_state,
@@ -6094,7 +4947,7 @@ def _finalize_exact_spo_rs_overflow(
     print(
         f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
         f"loss={totals['loss']:.6f} "
-        f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+        f"reference=off "
         f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
         f"clipped={totals['clipped_fraction']:.1%} "
         f"entropy examples={entropy_examples} OOM-quarantined=0 "
@@ -6102,8 +4955,8 @@ def _finalize_exact_spo_rs_overflow(
         flush=True,
     )
     return {
-        "rank_updates": history,
-        "rank_train_seconds": (
+        "policy_updates": history,
+        "training_seconds": (
             float(normal_stats.get("training_seconds", 0.0))
             + float(overflow_stats.get("training_seconds", 0.0))
             + (time.time() - finalize_started)),
@@ -6116,10 +4969,10 @@ def _finalize_exact_spo_rs_overflow(
     }
 
 
-def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
-                         cfg, step_idx, *, precomputed_gradient_state=None,
-                         exact_overflow_run_dir=None):
-    """Cache the old/reference policies, then update the rank surrogate."""
+def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
+                           cfg, step_idx, *, precomputed_gradient_state=None,
+                           exact_overflow_run_dir=None):
+    """Freeze behavior logprobs, then optimize the SPO-RS clipped surrogate."""
     import torch
 
     if precomputed_gradient_state is not None:
@@ -6130,38 +4983,26 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
             backend, model, tokenizer, optimizer, examples, cfg, step_idx,
             precomputed_gradient_state, exact_overflow_run_dir)
 
-    epochs = int(getattr(cfg, "rank_update_epochs", RANK_UPDATE_EPOCHS_DEFAULT))
+    epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
     epsilon, epsilon_low, epsilon_high, kl_coef = (
         _clipped_policy_options(cfg))
-    entropy_coef = _rank_entropy_coefficient(cfg)
     backend.set_training_mode()
     started = time.time()
-    update_batches = _training_microbatches(
-        examples, cfg,
-        partition_key=lambda example: bool(
-            example["rank_entropy_gate"] and entropy_coef > 0.0))
+    update_batches = _training_microbatches(examples, cfg)
     largest_batch = max((len(batch) for batch in update_batches), default=0)
     print(f"[train] LoRA microbatches={len(update_batches)}; "
           f"configured max={int(cfg.train_examples_per_microbatch)}, "
           f"effective max={largest_batch}, "
           f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
-    missing_old, missing_reference = _initialize_rank_logprob_caches(examples)
-    reference_fallback = missing_reference if kl_coef else []
-    supplied_reference = len(examples) - len(reference_fallback)
-    reference_label = _clipped_reference_count(
-        cfg, supplied_reference, len(examples))
-    fallback_reference_label = (
-        "off" if cfg.advantage_mode in ("spo-rs", "binary-coder")
-        else str(len(reference_fallback)))
+    missing_old = _initialize_behavior_logprobs(examples)
     print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: vLLM supplied old="
-          f"{len(examples) - len(missing_old)}/{len(examples)}, reference="
-          f"{reference_label}; HF fallback old={len(missing_old)}, "
-          f"reference={fallback_reference_label} before {epochs} update(s)",
+          f"{len(examples) - len(missing_old)}/{len(examples)}, reference=off; "
+          f"HF fallback old={len(missing_old)} before {epochs} update(s)",
           flush=True)
 
-    with _rank_dropout_disabled(model):
-        # Usually both loops are empty because vLLM supplied the frozen values.
-        # They retain exact compatibility with HF generation and with any vLLM
+    with _policy_dropout_disabled(model):
+        # Usually this loop is empty because vLLM supplied the frozen values.
+        # It retains exact compatibility with HF generation and with any vLLM
         # sequence whose logprob payload was incomplete.
         # Missing vLLM payloads are exceptional. Score them singly so one
         # padded fallback batch cannot select an incompatible attention path
@@ -6174,20 +5015,7 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                    for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
             for ex, old_lp in zip(batch, old_logprobs):
-                ex["rank_old_logprobs"] = old_lp.detach()
-        if reference_fallback:
-            with backend.disable_adapter(), torch.no_grad():
-                for batch in ([example] for example in reference_fallback):
-                    reference_logprobs = compute_batched_token_logprobs(
-                        model, batch, with_grad=False,
-                        chunk=cfg.logprob_chunk,
-                        pad_token_id=tokenizer.pad_token_id)
-                    if any(not torch.isfinite(value).all()
-                           for value in reference_logprobs):
-                        raise FloatingPointError(
-                            "nonfinite reference-policy logprobs")
-                    for ex, ref_lp in zip(batch, reference_logprobs):
-                        ex["rank_reference_logprob"] = ref_lp.detach()
+                ex["old_policy_logprobs"] = old_lp.detach()
 
         history = []
         for epoch in range(epochs):
@@ -6200,35 +5028,26 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                 max_prefix_ratio = 0.0
                 entropy_examples = 0
                 for batch in active_batches:
-                    gate = bool(batch[0]["rank_entropy_gate"]
-                                and entropy_coef > 0.0)
                     result = compute_batched_token_logprobs(
                         model, batch, with_grad=True,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id,
-                        measure_entropy=(epoch == 0),
-                        return_entropy=gate)
-                    if gate:
-                        current_logprobs, token_entropies = result
-                    else:
-                        current_logprobs = result
-                        token_entropies = [None] * len(batch)
+                        measure_entropy=(epoch == 0))
+                    current_logprobs = result
                     weighted_losses = []
-                    for ex, cur_lp, token_entropy in zip(
-                            batch, current_logprobs, token_entropies):
+                    for ex, cur_lp in zip(
+                            batch, current_logprobs):
                         loss, metrics = clipped_policy_loss(
-                            cfg, cur_lp, ex["rank_old_logprobs"],
-                            ex["rank_reference_logprob"], ex["advantage"],
+                            cfg, cur_lp, ex["old_policy_logprobs"],
+                            None, ex["advantage"],
                             clip_epsilon=epsilon,
                             clip_epsilon_low=epsilon_low,
                             clip_epsilon_high=epsilon_high,
-                            kl_coef=kl_coef,
-                            entropy_coef=(entropy_coef if gate else 0.0),
-                            token_entropies=token_entropy)
+                            kl_coef=kl_coef)
                         weight = float(ex["sample_weight"])
                         if not torch.isfinite(loss).all():
                             raise FloatingPointError(
-                                "nonfinite rank loss")
+                                "nonfinite SPO-RS loss")
                         weighted_losses.append(weight * loss)
                         totals["loss"] += (
                             weight * float(loss.detach().item()))
@@ -6240,7 +5059,6 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
                         max_ratio = max(max_ratio, metrics["ratio"])
                         max_prefix_ratio = max(
                             max_prefix_ratio, metrics["prefix_ratio_max"])
-                        entropy_examples += int(gate)
                     if weighted_losses:
                         sum(weighted_losses[1:],
                             weighted_losses[0]).backward()
@@ -6289,20 +5107,20 @@ def _train_rank_examples(backend, model, tokenizer, optimizer, examples,
             print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
                   f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+                  f"reference=off "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
                   f"OOM-quarantined={len(quarantined)}", flush=True)
     for ex in examples:
-        for key in ("rank_old_logprobs", "rank_reference_logprob"):
+        for key in ("old_policy_logprobs",):
             ex.pop(key, None)
     recovery_seconds = float(
         (precomputed_gradient_state or {}).get(
             "normal_stats", {}).get("training_seconds", 0.0))
     return {
-        "rank_updates": history,
-        "rank_train_seconds": recovery_seconds + (time.time() - started),
+        "policy_updates": history,
+        "training_seconds": recovery_seconds + (time.time() - started),
         "oom_quarantined_examples": sum(
             item["oom_quarantined_examples"] for item in history),
         "exact_overflow_reused_examples": int(
@@ -6583,8 +5401,8 @@ class ReplicatedDataParallelTrainer:
             for example in batch
         ) * len(batch)
 
-    def _train_rank_fast(self, examples, cfg, step_idx):
-        """Adaptive, work-stealing rank update selected only by --fast.
+    def _train_spo_rs_fast(self, examples, cfg, step_idx):
+        """Adaptive, work-stealing SPO-RS update selected only by --fast.
 
         Each replica repeatedly claims a length-bucketed batch from one shared
         CPU queue. Its padded-token budget is learned from real peak allocator
@@ -6601,37 +5419,29 @@ class ReplicatedDataParallelTrainer:
                   "replicas for the update", flush=True)
             self.restore_after_generation()
 
-        epochs = int(getattr(cfg, "rank_update_epochs",
-                             RANK_UPDATE_EPOCHS_DEFAULT))
+        epochs = int(getattr(cfg, "spo_rs_update_epochs",
+                             SPO_RS_UPDATE_EPOCHS_DEFAULT))
         if epochs != 1:
             raise ValueError("--fast requires one clipped-policy update epoch")
         epsilon, epsilon_low, epsilon_high, kl_coef = (
             _clipped_policy_options(cfg))
-        entropy_coef = _rank_entropy_coefficient(cfg)
 
         cpu_examples = self._cpu_examples(examples)
         supplied_old = sum(
             _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in cpu_examples)
-        supplied_reference = sum(
-            _valid_example_token_logprobs(example, "reference_logprobs")
-            for example in cpu_examples) if kl_coef else len(cpu_examples)
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(cpu_examples)}, reference="
-              f"{_clipped_reference_count(cfg, supplied_reference, len(cpu_examples))}; "
+              f"off; "
               "HF fallback runs only "
               "for missing values", flush=True)
 
-        partitions = {False: [], True: []}
-        for example in cpu_examples:
-            gate = bool(example["rank_entropy_gate"] and entropy_coef > 0.0)
-            partitions[gate].append(example)
-        for partition in partitions.values():
-            partition.sort(
-                key=lambda example: int(
-                    example["prompt_ids"].shape[1]
-                    + example["response_ids"].shape[1]))
+        pending = sorted(
+            cpu_examples,
+            key=lambda example: int(
+                example["prompt_ids"].shape[1]
+                + example["response_ids"].shape[1]))
 
         queue_lock = threading.Lock()
         # A token budget is the real memory controller. This loose count guard
@@ -6640,15 +5450,8 @@ class ReplicatedDataParallelTrainer:
 
         def take_batch(token_budget):
             with queue_lock:
-                available = [key for key, value in partitions.items() if value]
-                if not available:
+                if not pending:
                     return []
-                partition_key = max(
-                    available,
-                    key=lambda key: int(
-                        partitions[key][-1]["prompt_ids"].shape[1]
-                        + partitions[key][-1]["response_ids"].shape[1]))
-                pending = partitions[partition_key]
                 batch = [pending.pop()]
                 maximum = int(
                     batch[0]["prompt_ids"].shape[1]
@@ -6726,10 +5529,10 @@ class ReplicatedDataParallelTrainer:
                         attempt_prefix_ratio_values = []
                         attempt_entropy_examples = 0
 
-                        with _rank_dropout_disabled(model):
+                        with _policy_dropout_disabled(model):
                             for batch in active_batches:
-                                missing_old, missing_reference = (
-                                    _initialize_rank_logprob_caches(batch))
+                                missing_old = (
+                                    _initialize_behavior_logprobs(batch))
                                 for fallback_batch in (
                                         [example] for example in missing_old):
                                     old_logprobs = (
@@ -6745,71 +5548,33 @@ class ReplicatedDataParallelTrainer:
                                             "nonfinite old-policy logprobs")
                                     for example, old_lp in zip(
                                             fallback_batch, old_logprobs):
-                                        example["rank_old_logprobs"] = (
+                                        example["old_policy_logprobs"] = (
                                             old_lp.detach())
 
-                                if kl_coef and missing_reference:
-                                    with backend.disable_adapter(), torch.no_grad():
-                                        for fallback_batch in (
-                                                [example] for example in
-                                                missing_reference):
-                                            reference_logprobs = (
-                                                compute_batched_token_logprobs(
-                                                    model, fallback_batch,
-                                                    with_grad=False,
-                                                    chunk=cfg.logprob_chunk,
-                                                    pad_token_id=(
-                                                        tokenizer.pad_token_id)))
-                                            if any(
-                                                    not torch.isfinite(value).all()
-                                                    for value in
-                                                    reference_logprobs):
-                                                raise FloatingPointError(
-                                                    "nonfinite reference-policy "
-                                                    "logprobs")
-                                            for example, reference_lp in zip(
-                                                    fallback_batch,
-                                                    reference_logprobs):
-                                                example[
-                                                    "rank_reference_logprob"
-                                                ] = reference_lp.detach()
 
-
-                                gate = bool(
-                                    batch[0]["rank_entropy_gate"]
-                                    and entropy_coef > 0.0)
                                 result = compute_batched_token_logprobs(
                                     model, batch, with_grad=True,
                                     chunk=cfg.logprob_chunk,
-                                    pad_token_id=tokenizer.pad_token_id,
-                                    return_entropy=gate)
-                                if gate:
-                                    current_logprobs, token_entropies = result
-                                else:
-                                    current_logprobs = result
-                                    token_entropies = [None] * len(batch)
+                                    pad_token_id=tokenizer.pad_token_id)
+                                current_logprobs = result
 
                                 weighted_losses = []
-                                for example, current_lp, token_entropy in zip(
-                                        batch, current_logprobs,
-                                        token_entropies):
+                                for example, current_lp in zip(
+                                        batch, current_logprobs):
                                     loss, metrics = clipped_policy_loss(
                                         cfg, current_lp,
-                                        example["rank_old_logprobs"],
-                                        example["rank_reference_logprob"],
+                                        example["old_policy_logprobs"],
+                                        None,
                                         example["advantage"],
                                         clip_epsilon=epsilon,
                                         clip_epsilon_low=epsilon_low,
                                         clip_epsilon_high=epsilon_high,
                                         kl_coef=kl_coef,
-                                        entropy_coef=(entropy_coef
-                                                      if gate else 0.0),
-                                        token_entropies=token_entropy,
                                         return_tensor_metrics=True)
                                     weight = float(example["sample_weight"])
                                     if not torch.isfinite(loss).all():
                                         raise FloatingPointError(
-                                            "nonfinite rank loss")
+                                            "nonfinite SPO-RS loss")
                                     weighted_losses.append(weight * loss)
                                     attempt_values["loss"].append(
                                         weight * loss.detach())
@@ -6825,7 +5590,6 @@ class ReplicatedDataParallelTrainer:
                                         metrics["ratio"])
                                     attempt_prefix_ratio_values.append(
                                         metrics["prefix_ratio_max"])
-                                    attempt_entropy_examples += int(gate)
                                 if weighted_losses:
                                     sum(weighted_losses[1:],
                                         weighted_losses[0]).backward()
@@ -6994,14 +5758,14 @@ class ReplicatedDataParallelTrainer:
               f"{peak_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+              f"reference=off "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
               f"OOM-quarantined={quarantined_examples}", flush=True)
         return {
-            "rank_updates": history,
-            "rank_train_seconds": time.time() - started,
+            "policy_updates": history,
+            "training_seconds": time.time() - started,
             "training_parallel_gpus": self.world_size,
             "training_fast": True,
             "fast_trained_examples_per_gpu": trained_per_gpu,
@@ -7012,9 +5776,9 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def train_rank(self, examples, cfg, step_idx):
+    def train_spo_rs(self, examples, cfg, step_idx):
         if bool(getattr(cfg, "fast", False)):
-            return self._train_rank_fast(
+            return self._train_spo_rs_fast(
                 examples, cfg, step_idx)
 
         import torch
@@ -7024,17 +5788,13 @@ class ReplicatedDataParallelTrainer:
             print(f"[train-parallel] restoring {self.world_size} trainer "
                   "replicas for the update", flush=True)
             self.restore_after_generation()
-        epochs = int(getattr(cfg, "rank_update_epochs",
-                             RANK_UPDATE_EPOCHS_DEFAULT))
+        epochs = int(getattr(cfg, "spo_rs_update_epochs",
+                             SPO_RS_UPDATE_EPOCHS_DEFAULT))
         epsilon, epsilon_low, epsilon_high, kl_coef = (
             _clipped_policy_options(cfg))
-        entropy_coef = _rank_entropy_coefficient(cfg)
         local_shards = self._prepare_shards(examples)
         update_batches = [
-            _training_microbatches(
-                shard, cfg,
-                partition_key=lambda example: bool(
-                    example["rank_entropy_gate"] and entropy_coef > 0.0))
+            _training_microbatches(shard, cfg)
             for shard in local_shards
         ]
         largest_batch = max(
@@ -7048,13 +5808,10 @@ class ReplicatedDataParallelTrainer:
         supplied_old = sum(
             _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in examples)
-        supplied_reference = sum(
-            _valid_example_token_logprobs(example, "reference_logprobs")
-            for example in examples) if kl_coef else len(examples)
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
-              f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}; "
+              f"off; "
               "HF fallback runs only "
               f"for missing values before {epochs} update(s)", flush=True)
 
@@ -7062,9 +5819,9 @@ class ReplicatedDataParallelTrainer:
             replica_index, shard = item
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             backend.set_training_mode()
-            with torch.cuda.device(logical_id), _rank_dropout_disabled(model):
-                missing_old, missing_reference = (
-                    _initialize_rank_logprob_caches(shard))
+            with torch.cuda.device(logical_id), _policy_dropout_disabled(model):
+                missing_old = (
+                    _initialize_behavior_logprobs(shard))
                 # vLLM normally fills these caches. Singleton fallback keeps a
                 # rare incomplete payload from destabilizing all eight replicas.
                 for batch in ([example] for example in missing_old):
@@ -7077,23 +5834,7 @@ class ReplicatedDataParallelTrainer:
                         raise FloatingPointError(
                             "nonfinite old-policy logprobs")
                     for example, old_lp in zip(batch, old_logprobs):
-                        example["rank_old_logprobs"] = old_lp.detach()
-                if kl_coef and missing_reference:
-                    with backend.disable_adapter(), torch.no_grad():
-                        for batch in (
-                                [example] for example in missing_reference):
-                            reference_logprobs = compute_batched_token_logprobs(
-                                model, batch, with_grad=False,
-                                chunk=cfg.logprob_chunk,
-                                pad_token_id=tokenizer.pad_token_id)
-                            if any(not torch.isfinite(value).all()
-                                   for value in reference_logprobs):
-                                raise FloatingPointError(
-                                    "nonfinite reference-policy logprobs")
-                            for example, reference_lp in zip(
-                                    batch, reference_logprobs):
-                                example["rank_reference_logprob"] = (
-                                    reference_lp.detach())
+                        example["old_policy_logprobs"] = old_lp.detach()
                 torch.cuda.synchronize(logical_id)
 
         self._run_replicas(
@@ -7112,41 +5853,30 @@ class ReplicatedDataParallelTrainer:
                     max_ratio = 0.0
                     max_prefix_ratio = 0.0
                     entropy_examples = 0
-                    with _rank_dropout_disabled(model):
+                    with _policy_dropout_disabled(model):
                         for batch in active_batches:
-                            gate = bool(batch[0]["rank_entropy_gate"]
-                                        and entropy_coef > 0.0)
                             result = compute_batched_token_logprobs(
                                 model, batch, with_grad=True,
                                 chunk=cfg.logprob_chunk,
                                 pad_token_id=tokenizer.pad_token_id,
-                                measure_entropy=(epoch == 0),
-                                return_entropy=gate)
-                            if gate:
-                                current_logprobs, token_entropies = result
-                            else:
-                                current_logprobs = result
-                                token_entropies = [None] * len(batch)
+                                measure_entropy=(epoch == 0))
+                            current_logprobs = result
                             weighted_losses = []
-                            for example, current_lp, token_entropy in zip(
-                                    batch, current_logprobs,
-                                    token_entropies):
+                            for example, current_lp in zip(
+                                    batch, current_logprobs):
                                 loss, metrics = clipped_policy_loss(
                                     cfg, current_lp,
-                                    example["rank_old_logprobs"],
-                                    example["rank_reference_logprob"],
+                                    example["old_policy_logprobs"],
+                                    None,
                                     example["advantage"],
                                     clip_epsilon=epsilon,
                                     clip_epsilon_low=epsilon_low,
                                     clip_epsilon_high=epsilon_high,
-                                    kl_coef=kl_coef,
-                                    entropy_coef=(entropy_coef
-                                                  if gate else 0.0),
-                                    token_entropies=token_entropy)
+                                    kl_coef=kl_coef)
                                 weight = float(example["sample_weight"])
                                 if not torch.isfinite(loss).all():
                                     raise FloatingPointError(
-                                        "nonfinite rank loss")
+                                        "nonfinite SPO-RS loss")
                                 weighted_losses.append(weight * loss)
                                 totals["loss"] += (
                                     weight * float(loss.detach().item()))
@@ -7160,7 +5890,6 @@ class ReplicatedDataParallelTrainer:
                                 max_prefix_ratio = max(
                                     max_prefix_ratio,
                                     metrics["prefix_ratio_max"])
-                                entropy_examples += int(gate)
                             if weighted_losses:
                                 sum(weighted_losses[1:],
                                     weighted_losses[0]).backward()
@@ -7202,15 +5931,15 @@ class ReplicatedDataParallelTrainer:
             print(f"[step {step_idx}] {cfg.advantage_mode} epoch "
                   f"{epoch + 1}/{epochs}: "
                   f"loss={totals['loss']:.6f} "
-                  f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+                  f"reference=off "
                   f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
                   f"clipped={totals['clipped_fraction']:.1%} "
                   f"entropy examples={entropy_examples} "
                   f"OOM-quarantined={quarantined_examples}", flush=True)
 
         return {
-            "rank_updates": history,
-            "rank_train_seconds": time.time() - started,
+            "policy_updates": history,
+            "training_seconds": time.time() - started,
             "training_parallel_gpus": self.world_size,
             "oom_quarantined_examples": sum(
                 item["oom_quarantined_examples"] for item in history),
@@ -7836,129 +6565,17 @@ class ProcessDistributedTrainer:
         return ordered
 
 
-    def calibrate_x_grpo(self, examples, cfg, step_idx, *,
-                         context_group_ids=None, group_ids=None):
-        from fast_distributed import local_x_grpo_calibration
-
-        if self._offloaded:
-            print(f"[train-fast] restoring {self._world_size} process "
-                  "trainers for X-GRPO calibration", flush=True)
-            self.restore_after_generation()
-
-        cpu_examples = self._cpu_examples(examples)
-        contexts = _x_grpo_context_group_map(
-            cpu_examples, context_group_ids=context_group_ids,
-            group_ids=group_ids)
-        expected_group_ids = sorted(
-            group_id for ids in contexts.values() for group_id in ids
-        )
-        groups = {group_id: [] for group_id in expected_group_ids}
-        context_for_group = {
-            group_id: context_id
-            for context_id, ids in contexts.items()
-            for group_id in ids
-        }
-        for example in cpu_examples:
-            group_id = int(example["group_id"])
-            if group_id not in groups:
-                raise ValueError(
-                    f"unexpected X-GRPO diagnostic group {group_id}")
-            example_context = int(example.get(
-                "x_grpo_context_id", context_for_group[group_id]))
-            if example_context != context_for_group[group_id]:
-                raise ValueError(
-                    f"X-GRPO group {group_id} was assigned to context "
-                    f"{context_for_group[group_id]} but contains context "
-                    f"{example_context}")
-            groups[group_id].append(example)
-
-        shards = [[] for _ in range(self._world_size)]
-        shard_group_ids = [[] for _ in range(self._world_size)]
-        loads = [0 for _ in range(self._world_size)]
-        group_items = []
-        for group_id, group_examples in groups.items():
-            cost = sum(
-                int(example["prompt_ids"].shape[1]
-                    + example["response_ids"].shape[1])
-                for example in group_examples)
-            group_items.append((cost, group_id, group_examples))
-        for cost, group_id, group_examples in sorted(
-                group_items, reverse=True):
-            rank = min(range(self._world_size), key=lambda item: loads[item])
-            shards[rank].extend(group_examples)
-            shard_group_ids[rank].append(group_id)
-            loads[rank] += cost
-
-        print(f"[step {step_idx}] X-GRPO distributed calibration: "
-              f"{len(contexts)} contexts, {len(groups)} groups x "
-              f"{len(cfg.x_grpo_budgets)} budgets in one dispatch; "
-              f"group-token loads/GPU={loads}; rollout LoRA gradients are "
-              "collapsed by identical advantage stratum and temporary "
-              "aggregates are deleted after use", flush=True)
-        self._workers_idle = False
-        for rank in range(1, self._world_size):
-            self._command_queues[rank].put({
-                "kind": "calibrate_x_grpo",
-                "examples": shards[rank],
-                "group_ids": shard_group_ids[rank],
-                "context_group_ids": contexts,
-            })
-
-        local = local_x_grpo_calibration(
-            self.backend, self.model, self.tokenizer, shards[0], cfg, 0,
-            context_group_ids=contexts, group_ids=shard_group_ids[0])
-        child_messages = self._collect_event(
-            "calibrated", range(1, self._world_size))
-        self._workers_idle = True
-        parts = [local] + [
-            child_messages[rank]["calibration"]
-            for rank in range(1, self._world_size)
-        ]
-        selected = {}
-        diagnostics = {}
-        quarantined = 0
-        for part in parts:
-            selected.update({
-                int(group_id): float(value)
-                for group_id, value in part["selected_budgets"].items()
-            })
-            diagnostics.update({
-                int(group_id): values
-                for group_id, values in part["groups"].items()
-            })
-            quarantined += int(
-                part.get("diagnostic_quarantined_examples", 0))
-        if set(selected) != set(groups):
-            raise RuntimeError(
-                "distributed X-GRPO calibration lost a group: "
-                f"expected {sorted(groups)}, got {sorted(selected)}")
-        for context_id, context_ids in contexts.items():
-            for budget_index, budget in enumerate(cfg.x_grpo_budgets):
-                accepted = sum(
-                    bool(diagnostics[group_id][budget_index]["accepted"])
-                    for group_id in context_ids)
-                print(f"[step {step_idx}] X-GRPO context {context_id} "
-                      f"budget {float(budget):g}: accepted for "
-                      f"{accepted}/{len(context_ids)} held-out groups",
-                      flush=True)
-        return {
-            "selected_budgets": selected,
-            "groups": diagnostics,
-            "diagnostic_quarantined_examples": quarantined,
-            "distributed": True,
-        }
-
-    def train_rank(self, examples, cfg, step_idx):
+    def train_spo_rs(self, examples, cfg, step_idx):
         import torch
         from fast_distributed import (broadcast_trainable_parameters,
-                                      local_rank_update,
+                                      local_spo_rs_update,
                                       reduce_trainable_gradients)
 
         if self._offloaded:
             print(f"[train-fast] restoring {self._world_size} process "
                   "trainers for the update", flush=True)
             self.restore_after_generation()
-        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+        if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("--fast requires one clipped-policy update epoch")
 
         started = time.time()
@@ -7966,16 +6583,10 @@ class ProcessDistributedTrainer:
         supplied_old = sum(
             _valid_example_token_logprobs(example, "behavior_logprobs")
             for example in queued_examples)
-        _epsilon, _epsilon_low, _epsilon_high, policy_kl_coef = (
-            _clipped_policy_options(cfg))
-        supplied_reference = (sum(
-            _valid_example_token_logprobs(example, "reference_logprobs")
-            for example in queued_examples)
-            if policy_kl_coef else len(examples))
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
-              f"{_clipped_reference_count(cfg, supplied_reference, len(examples))}",
+              f"off",
               flush=True)
         print(f"[train-fast] one process/GPU; memory ceiling="
               f"{self._memory_percentage:g}%; "
@@ -7988,14 +6599,14 @@ class ProcessDistributedTrainer:
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
-                "kind": "train_rank",
+                "kind": "train_spo_rs",
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": self._memory_fraction,
                 "defer_exact_oom": defer_exact_oom,
             })
 
-        local_stats = local_rank_update(
+        local_stats = local_spo_rs_update(
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
@@ -8123,14 +6734,14 @@ class ProcessDistributedTrainer:
               f"{allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+              f"reference=off "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
               f"OOM-quarantined={quarantined_examples}", flush=True)
         return {
-            "rank_updates": history,
-            "rank_train_seconds": time.time() - started,
+            "policy_updates": history,
+            "training_seconds": time.time() - started,
             "training_parallel_gpus": self._world_size,
             "training_fast": True,
             "training_fast_processes": True,
@@ -8162,13 +6773,13 @@ class ProcessDistributedTrainer:
 
         import torch
         from fast_distributed import (
-            broadcast_trainable_parameters, local_rank_update,
+            broadcast_trainable_parameters, local_spo_rs_update,
             reduce_trainable_gradients,
         )
 
         if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
             raise ValueError("exact overflow recovery is SPO-RS-only")
-        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+        if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("exact overflow recovery requires one update epoch")
         if self._closed or not self._workers_idle:
             raise RuntimeError(
@@ -8216,7 +6827,7 @@ class ProcessDistributedTrainer:
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
-                "kind": "train_rank",
+                "kind": "train_spo_rs",
                 "step_cfg": dict(vars(recovery_cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": self._memory_fraction,
@@ -8224,7 +6835,7 @@ class ProcessDistributedTrainer:
             })
 
         try:
-            local_stats = local_rank_update(
+            local_stats = local_spo_rs_update(
                 self.backend, self.model, self.tokenizer, (), recovery_cfg, 0,
                 self._token_budgets[0],
                 memory_fraction=self._memory_fraction,
@@ -8415,7 +7026,7 @@ class ProcessDistributedTrainer:
         print(
             f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
             f"loss={totals['loss']:.6f} "
-            f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+            f"reference=off "
             f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
             f"clipped={totals['clipped_fraction']:.1%} "
             f"entropy examples={entropy_examples} OOM-quarantined=0 "
@@ -8423,8 +7034,8 @@ class ProcessDistributedTrainer:
             flush=True,
         )
         return {
-            "rank_updates": history,
-            "rank_train_seconds": (
+            "policy_updates": history,
+            "training_seconds": (
                 float(normal_stats.get("training_seconds", 0.0))
                 + float(overflow_stats.get("training_seconds", 0.0))),
             "training_parallel_gpus": self._world_size,
@@ -8702,11 +7313,11 @@ class ProcessDistributedTrainer:
     def begin_spo_rs_overlap(self, cfg, step_idx):
         """Start exact clipped SPO-RS backward while CPU evaluation runs."""
         from concurrent.futures import ThreadPoolExecutor
-        from fast_distributed import local_rank_update
+        from fast_distributed import local_spo_rs_update
 
         if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
             raise ValueError("streaming clipped overlap is SPO-RS-only")
-        if int(getattr(cfg, "rank_update_epochs", 1)) != 1:
+        if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("streaming SPO-RS requires one update epoch")
         if self._closed or not self._workers_idle:
             raise RuntimeError(
@@ -8726,7 +7337,7 @@ class ProcessDistributedTrainer:
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
-                "kind": "train_rank",
+                "kind": "train_spo_rs",
                 "step_cfg": dict(vars(cfg)),
                 "token_budget": self._token_budgets[rank],
                 "memory_fraction": self._memory_fraction,
@@ -8749,7 +7360,7 @@ class ProcessDistributedTrainer:
             "sealed": False,
         }
         future = executor.submit(
-            local_rank_update,
+            local_spo_rs_update,
             self.backend, self.model, self.tokenizer, (), cfg, 0,
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
@@ -8971,15 +7582,15 @@ class ProcessDistributedTrainer:
               f"{allocator_percentages}%", flush=True)
         print(f"[step {step_idx}] {cfg.advantage_mode} epoch 1/1: "
               f"loss={totals['loss']:.6f} "
-              f"{_clipped_reference_metric(cfg, totals['kl_estimate'])} "
+              f"reference=off "
               f"ratio={totals['ratio']:.6f} max={max_ratio:.6f} "
               f"clipped={totals['clipped_fraction']:.1%} "
               f"entropy examples={entropy_examples} "
               f"OOM-quarantined={quarantined_examples} "
               "(forward/backward overlapped CPU evaluation)", flush=True)
         return {
-            "rank_updates": history,
-            "rank_train_seconds": elapsed,
+            "policy_updates": history,
+            "training_seconds": elapsed,
             "training_parallel_gpus": self._world_size,
             "training_fast": True,
             "training_fast_processes": True,
@@ -10505,10 +9116,8 @@ def _resume_spo_rs_step_from_artifacts(
         restored_terminal_tokens += int(restored_terminal)
         canonical_recovery_responses += int(
             recovery.get("source") == "canonical-text")
-        unavailable_original_tokens += int(
-            recovery.get("unavailable_original_tokens", 0) or 0)
-        canonical_extra_tokens += int(
-            recovery.get("canonical_extra_tokens", 0) or 0)
+        unavailable_original_tokens += int(recovery.get('unavailable_original_tokens', 0) or 0)
+        canonical_extra_tokens += int(recovery.get('canonical_extra_tokens', 0) or 0)
         if prompt_text not in prompt_cache:
             prompt_cache[prompt_text] = tokenizer(
                 prompt_text, return_tensors="pt").input_ids
@@ -10534,15 +9143,9 @@ def _resume_spo_rs_step_from_artifacts(
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": None,
                 "reward_constant": False,
-                "rank_entropy_gate": False,
                 "group_id": group,
-                "x_grpo_context_id": group,
-                "x_grpo_fold_index": 0,
                 "rollout_index": int(meta["rollout"]),
                 "prompt_job_id": prompt_job_ids[prompt_text],
-                "x_grpo_group_size": group_sizes[group],
-                "x_grpo_all_tied": False,
-                "x_grpo_trial_advantages": (),
                 "sample_weight": 0.0,
                 "_overlap_key": (group, int(meta["rollout"])),
             })
@@ -10707,7 +9310,7 @@ def _resume_spo_rs_step_from_artifacts(
             bool(item["meta"].get("counts_toward_allocation", True))
             for item in artifacts),
         "coder_format_retries": sum(
-            int(item["meta"].get("retry_attempt", 0) or 0) > 0
+            int(item['meta'].get('retry_attempt', 0) or 0) > 0
             for item in artifacts),
         "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
         "result_metric_name": str(problem.metric_name),
@@ -10738,8 +9341,7 @@ def _resume_spo_rs_step_from_artifacts(
         "spo_rs_divergence": (
             None if not math.isfinite(divergence) else divergence),
         "spo_rs_context_divergences": spo_info.get("context_divergences", {}),
-        "spo_rs_missing_policy_scores": int(
-            spo_info.get("missing_policy_scores", 0) or 0),
+        "spo_rs_missing_policy_scores": int(spo_info.get('missing_policy_scores', 0) or 0),
         "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
         "spo_rs_policy_updated": False,
         "recovered_evaluated_step": True,
@@ -10752,7 +9354,7 @@ def _resume_spo_rs_step_from_artifacts(
         stats.update(parallel_trainer.recover_spo_rs_overflow(
             recovery_examples, cfg, step_idx, overflow_state))
     elif parallel_trainer is not None:
-        stats.update(parallel_trainer.train_rank(
+        stats.update(parallel_trainer.train_spo_rs(
             all_examples, cfg, step_idx))
     else:
         try:
@@ -10769,7 +9371,7 @@ def _resume_spo_rs_step_from_artifacts(
             f"{int(cfg.num_training_gpus)} GPUs",
             flush=True,
         )
-        stats.update(_train_rank_examples(
+        stats.update(_train_spo_rs_examples(
             backend, model, tokenizer, optimizer, recovery_examples,
             cfg, step_idx,
             precomputed_gradient_state=overflow_state,
@@ -10865,12 +9467,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         entropy_directory = begin_step(exp_dir, step_idx)
     active_advantage_mode = str(
         getattr(cfg, "advantage_mode", "entropic")).lower()
-    rank_mode = active_advantage_mode == "rank"
-    x_grpo_mode = active_advantage_mode == "x-grpo"
     spo_rs_mode = active_advantage_mode == "spo-rs"
     adaptive_spo_beta = bool(
         spo_rs_mode and getattr(cfg, "spo_rs_adaptive_beta", False))
-    binary_coder_mode = active_advantage_mode == "binary-coder"
     if spo_rs_mode and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
     if (spo_rs_mode and (not spo_rs_tracker.initialized)):
@@ -10880,11 +9479,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if spo_rs_mode:
         spo_rs_tracker.prepare_step()
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
-    x_grpo_groups_per_context = (
-        int(cfg.groups_per_step) if x_grpo_mode else 1)
     requested_parent_contexts = (
-        int(cfg.x_grpo_contexts_per_step)
-        if x_grpo_mode else int(cfg.groups_per_step))
+        int(cfg.groups_per_step))
     parents = sampler.sample_states(requested_parent_contexts)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
@@ -10913,11 +9509,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     training_enabled = not bool(getattr(cfg, "no_train", False))
 
     all_examples = []
-    rank_group_stats = []
-    x_grpo_groups = {}
     spo_rs_updates = []
-    binary_coder_diagnostics = []
-    binary_overlap_state = None
     entropic_overlap_state = None
     spo_rs_overlap_state = None
     all_children = []
@@ -10931,7 +9523,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     for g, parent in enumerate(parents):
         sampler.record_expansion(
             parent,
-            count=int(cfg.group_size) * x_grpo_groups_per_context)
+            count=int(cfg.group_size))
         pc = ParentContext(
             code=parent.code,
             value=parent.value if parent.value is not None else 0.0,
@@ -10956,11 +9548,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if not Path(adapter_path).is_dir():
                 raise FileNotFoundError(
                     f"SPO-RS sampling adapter not found: {adapter_path}")
-    elif binary_coder_mode and sampling_adapter_path is not None:
-        adapter_path = str(Path(sampling_adapter_path))
-        if not Path(adapter_path).is_dir():
-            raise FileNotFoundError(
-                f"binary coder sampling adapter not found: {adapter_path}")
     elif gen_pool is not None:
         adapter_path = _save_adapter(
             model, exp_dir, step_idx, cfg.model_name)
@@ -11047,8 +9634,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     phase_prompt_job_cache = {}
     for g, _parent in enumerate(parents):
         messages = base_messages[g]
-        count = (int(cfg.group_size) * x_grpo_groups_per_context
-                 if x_grpo_mode else int(cfg.group_size))
+        count = int(cfg.group_size)
         prompt_jobs.append({
             "parent_group": g,
             "messages": messages,
@@ -11120,21 +9706,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if two_stage_rollouts:
         for parent_group in range(len(parents)):
             schedule = _source_schedule(parent_group)
-            for fold_index in range(x_grpo_groups_per_context):
-                strategy_chains.append({
-                    "chain_id": len(strategy_chains),
-                    "parent_group": parent_group,
-                    "fold_index": fold_index,
-                    "source_indices": list(schedule),
-                    "strategies": [],
-                })
+            strategy_chains.append({
+                "chain_id": len(strategy_chains),
+                "parent_group": parent_group,
+                "source_indices": list(schedule),
+                "strategies": [],
+            })
     def _record_strategy_response(chain, strategy_index, response_text):
         """Save and register a strategy at stream-arrival time."""
         if len(chain["strategies"]) != int(strategy_index):
             raise RuntimeError(
                 f"strategy chain {chain['chain_id']} received strategy "
                 f"{strategy_index} after {len(chain['strategies'])} records")
-        raw_response = str(response_text or "")
+        raw_response = str(response_text or '')
         normalize_response = getattr(
             problem, "normalize_strategy_response", None)
         accepted_response = (
@@ -11144,7 +9728,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             exp_dir,
             step_idx,
             int(chain["parent_group"]),
-            int(chain["fold_index"]),
             int(strategy_index),
             accepted_response,
         )
@@ -11183,7 +9766,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     def _handle_strategy_attempt(chain_index, strategy_index, response, attempt):
         chain = strategy_chains[int(chain_index)]
-        raw_response = str(response or "")
+        raw_response = str(response or '')
         normalize_response = getattr(
             problem, "normalize_strategy_response", None)
         checked_response = (
@@ -11198,7 +9781,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 issue = validate_strategy(strategy)
         save_strategy_response(
             exp_dir, step_idx, int(chain["parent_group"]),
-            int(chain["fold_index"]), int(strategy_index), raw_response,
+            int(strategy_index), raw_response,
             attempt=int(attempt), extraction_issue=issue,
             prompt_text=strategy_attempt_prompts.pop(
                 (int(chain["chain_id"]), int(strategy_index), int(attempt))))
@@ -11266,7 +9849,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "strategy": strategy,
                     "strategy_response": strategy_record["response"],
                     "strategy_index": strategy_index,
-                    "assigned_fold_index": int(chain["fold_index"]),
                 })
         return code_jobs
 
@@ -11281,13 +9863,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     group_specs = []
     for parent_group in range(len(parents)):
-        for fold_index in range(x_grpo_groups_per_context):
-            group_specs.append({
-                "group_id": len(group_specs),
-                "parent_group": parent_group,
-                "context_id": parent_group,
-                "fold_index": fold_index,
-            })
+        group_specs.append({
+            "group_id": len(group_specs),
+            "parent_group": parent_group,
+            "context_id": parent_group,
+        })
     num_groups = len(group_specs)
     total_rollouts = num_groups * cfg.group_size
 
@@ -11440,26 +10020,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
         if retry_of is not None:
-            fold_index = int(retry_of["fold_index"])
             group_id = int(retry_of["group_id"])
-        elif x_grpo_mode:
-            maximum = x_grpo_groups_per_context * int(cfg.group_size)
-            if parent_ordinal >= maximum:
-                raise RuntimeError(
-                    "X-GRPO generation returned more than K*G rollouts for "
-                    f"context {parent_group}")
-            fold_index = int(job.get(
-                "assigned_fold_index",
-                parent_ordinal // int(cfg.group_size),
-            ))
-            group_id = (
-                parent_group * x_grpo_groups_per_context + fold_index)
-            if planned_by_group[group_id] >= int(cfg.group_size):
-                raise RuntimeError(
-                    "X-GRPO generation returned more than G rollouts for "
-                    f"context {parent_group} fold {fold_index}")
         else:
-            fold_index = 0
             group_id = parent_group
         rollout_index = int(queued_by_group[group_id])
         if retry_of is None:
@@ -11471,7 +10033,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "parent_group": parent_group,
             "group_id": int(group_id),
             "context_id": parent_group,
-            "fold_index": int(fold_index),
             "rollout_index": rollout_index,
             "text": text,
             "token_ids": token_ids,
@@ -11698,7 +10259,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     def _finish_strategy_pilots(
             pilot_records, source_job_indices, *, rewards_already_ready=False):
-        """Finish one or more ready parent/fold pilot sets exactly."""
+        """Finish one or more ready parent pilot sets exactly."""
         expected_pilots = (
             len(source_job_indices) * pilot_programs_per_strategy)
         if len(pilot_records) != expected_pilots:
@@ -11734,9 +10295,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # remainder as soon as the pilot statistic has consumed the result
             # so completed futures cannot retain hundreds of MiB of diagnostic
             # output while phase 2 is generated.
-            if len(result.stdout or "") > 4096:
+            if len(result.stdout or '') > 4096:
                 result.stdout = (
-                    (result.stdout or "")[:4096]
+                    (result.stdout or '')[:4096]
                     + "\n[... sandbox output truncated ...]")
             reward = float(result.reward)
             if not math.isfinite(reward):
@@ -11758,19 +10319,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         chains = {}
         for source_idx in source_job_indices:
             job = prompt_jobs[int(source_idx)]
-            key = (int(job["parent_group"]),
-                   int(job.get("assigned_fold_index", 0)))
+            key = int(job["parent_group"])
             chains.setdefault(key, []).append(int(source_idx))
 
         followup_counts = {int(source_idx): 0
                            for source_idx in source_job_indices}
-        for (parent_group, fold_index), chain_indices in sorted(
+        for parent_group, chain_indices in sorted(
                 chains.items()):
             chain_indices.sort(
                 key=lambda index: int(prompt_jobs[index]["strategy_index"]))
             if len(chain_indices) != strategies_per_parent:
                 raise RuntimeError(
-                    f"parent {parent_group} fold {fold_index} has "
+                    f"parent {parent_group} has "
                     f"{len(chain_indices)} strategy jobs; expected "
                     f"{strategies_per_parent}")
 
@@ -11801,7 +10361,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     int(cfg.seed) * 1_000_003
                     + (int(step_idx) + 1) * 1009
                     + (int(parent_group) + 1) * 9176
-                    + (int(fold_index) + 1) * 131
+                    + 131
                 ) % (2 ** 32)
                 reward_groups = [rewards_by_source[index]
                                  for index in chain_indices]
@@ -11843,7 +10403,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         if bandit_summary['gain_estimate_available'] else "unavailable")
                 print(
                     f"[step {step_idx}] rollout pilot parent {parent_group}"
-                    f"/fold {fold_index}: {allocation_label}; "
+                    f": {allocation_label}; "
                     f"{baseline_label}"
                     f"pilot best reward="
                     f"{float(bandit_summary['pilot_best_reward']):.9f}, "
@@ -11940,7 +10500,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     floor_label = ""
                 print(
                     f"[step {step_idx}] rollout pilot parent {parent_group}"
-                    f"/fold {fold_index}: mean threshold="
+                    f": mean threshold="
                     f"{mean_threshold:.9f}, variance threshold="
                     f"{variance_threshold:.9f}; allocating {remaining} "
                     "phase-2 rollouts"
@@ -11963,7 +10523,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 )
                 diagnostic = {
                     "parent_group": int(parent_group),
-                    "fold_index": int(fold_index),
                     "strategy_index": int(job["strategy_index"]),
                     "pilot_count": int(pilot_programs_per_strategy),
                     "pilot_reward_mean": float(mean),
@@ -12100,11 +10659,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
         diagnostics_by_chain = {}
         for diagnostic in strategy_pilot_diagnostics:
-            key = (int(diagnostic["parent_group"]),
-                   int(diagnostic["fold_index"]))
+            key = int(diagnostic["parent_group"])
             diagnostics_by_chain.setdefault(key, []).append(diagnostic)
 
-        for (parent_group, fold_index), diagnostics in sorted(
+        for parent_group, diagnostics in sorted(
                 diagnostics_by_chain.items()):
             diagnostics.sort(key=lambda item: int(item["strategy_index"]))
             allocation_method = str(diagnostics[0].get(
@@ -12117,7 +10675,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     else "posterior expected-best bandit")
                 print(
                     f"[step {step_idx}] rollout phase 2 complete parent "
-                    f"{parent_group}/fold {fold_index}: {allocation_label}; "
+                    f"{parent_group}: {allocation_label}; "
                     f"evaluated {phase2_total} "
                     "phase-2 rollouts",
                     flush=True,
@@ -12128,7 +10686,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     diagnostics[0]["variance_threshold"])
                 print(
                     f"[step {step_idx}] rollout phase 2 complete parent "
-                    f"{parent_group}/fold {fold_index}: mean threshold="
+                    f"{parent_group}: mean threshold="
                     f"{mean_threshold:.9f}, variance threshold="
                     f"{variance_threshold:.9f}; evaluated {phase2_total} "
                     "phase-2 rollouts",
@@ -12217,7 +10775,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         """Allocate and generate each parent as soon as its pilots finish.
 
         The selected allocator sees all strategies and every pilot for that
-        same parent/fold. There is no global all-parent reward barrier: a ready
+        same parent. There is no global all-parent reward barrier: a ready
         parent keeps the rollout GPUs occupied while slow CPU sandboxes
         belonging to other parents continue in parallel.
         """
@@ -12243,8 +10801,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         pending_chains = {}
         for source_idx in source_job_indices:
             job = prompt_jobs[source_idx]
-            key = (int(job["parent_group"]),
-                   int(job.get("assigned_fold_index", 0)))
+            key = int(job["parent_group"])
             pending_chains.setdefault(key, []).append(source_idx)
         for key, chain_indices in pending_chains.items():
             chain_indices.sort(
@@ -12252,7 +10809,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     prompt_jobs[index]["strategy_index"]))
             if len(chain_indices) != strategies_per_parent:
                 raise RuntimeError(
-                    f"parent {key[0]} fold {key[1]} has "
+                    f"parent {key} has "
                     f"{len(chain_indices)} strategy jobs; expected "
                     f"{strategies_per_parent}")
 
@@ -12412,7 +10969,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             if completed != set(chain_indices):
                                 raise RuntimeError(
                                     "strategy generation did not return every "
-                                    "parent/fold chain")
+                                    "parent chain")
                             return responses
 
                         if hasattr(planning_pool, "run_sequential_chains"):
@@ -12614,8 +11171,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # than draining one parent at a time. Ordinary CPU verification
                 # overlaps later batches; one-card GPU-mode verification waits.
                 backend.set_inference_mode()
-                cap_state = {"value": int(
-                    getattr(cfg, "_local_generation_cap", 0) or 0)}
+                cap_state = {"value": int(getattr(cfg, '_local_generation_cap', 0) or 0)}
 
                 def _seed_local_generation(seed_step):
                     if cfg.deterministic:
@@ -12679,7 +11235,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 finally:
                                     strategy_bar.close()
                                 if completed_chains != set(pending_chains):
-                                    raise RuntimeError("strategy generation omitted a parent/fold chain")
+                                    raise RuntimeError("strategy generation omitted a parent chain")
                                 pending_chains = sorted(retry_chains)
                                 if not pending_chains:
                                     break
@@ -12799,20 +11355,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     _run_coder_format_retries(primary_rollout_records, seed_offset=0)
                     cfg._local_generation_cap = int(cap_state["value"])
 
-            if x_grpo_mode:
-                expected_per_context = (
-                    x_grpo_groups_per_context * int(cfg.group_size))
-                incomplete = {
-                    context_id: count
-                    for context_id, count in queued_by_parent.items()
-                    if count != expected_per_context
-                }
-                if incomplete:
-                    raise RuntimeError(
-                        "X-GRPO requires exactly K*G rollouts from every fixed "
-                        f"context; expected {expected_per_context}, got "
-                        f"{incomplete}")
-            elif adaptive_strategy_pilots:
+            if adaptive_strategy_pilots:
                 incomplete = {
                     parent_group: count
                     for parent_group, count in queued_by_parent.items()
@@ -12926,9 +11469,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     "SPO-RS exact consecutive-policy scoring "
                                     "completed without a usable score for "
                                     f"{spo_rs_missing_policy_scores} rollout(s)")
-                elif binary_coder_mode:
-                    reference_scores = [None] * len(score_pairs)
-                    current_policy_scores = [None] * len(score_pairs)
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
@@ -12949,15 +11489,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     record["reference_logprobs"] is not None
                     for record in vllm_logprob_records)
                 reference_hf_fallbacks = (
-                    0 if spo_rs_mode or binary_coder_mode else
-                    len(vllm_logprob_records) - reference_count)
+                    0 if spo_rs_mode else len(vllm_logprob_records) - reference_count)
                 eval_done_after = sum(
                     future.done() for futures in reward_futures.values()
                     for future in futures)
                 reference_label = (
-                    "off for SPO-RS" if spo_rs_mode else
-                    "off for binary coder" if binary_coder_mode else
-                    f"{reference_count}/{len(vllm_logprob_records)}")
+                    'off for SPO-RS' if spo_rs_mode else f'{reference_count}/{len(vllm_logprob_records)}')
                 if spo_rs_mode and not spo_rs_tracker.initialized:
                     policy_label = ", SPO-RS policy KL=initialization"
                 elif spo_rs_mode and same_policy:
@@ -13030,7 +11567,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and parallel_trainer is not None
                 and hasattr(parallel_trainer, "begin_spo_rs_overlap")
                 and cfg.generation_backend == "vllm"
-                and int(getattr(cfg, "rank_update_epochs", 1)) == 1
+                and int(getattr(cfg, "spo_rs_update_epochs", 1)) == 1
                 and not deferred_rollouts
                 and not evaluation_trainer_offloaded
             )
@@ -13237,81 +11774,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         flush=True,
                     )
 
-            # Binary usability is a per-rollout label and the fast objective
-            # has one update epoch, no KL, and no entropy regularizer. On the
-            # sharded trainer we can therefore launch each policy forward while
-            # CPU rewards are outstanding, attach the +/-1 label when that
-            # microbatch's future resolves, and backpropagate without changing
-            # the policy. The single optimizer step remains below the artifact-
-            # persistence barrier.
-            overlap_eligible = bool(
-                binary_coder_mode
-                and training_enabled
-                and parallel_trainer is None
-                and ensure_trainer_ready is not None
-                and cfg.generation_backend == "vllm"
-                and int(getattr(cfg, "rank_update_epochs", 1)) == 1
-                and not deferred_rollouts
-                and not evaluation_trainer_offloaded
-            )
-            if overlap_eligible:
-                pending_before = sum(not future.done() for future in all_futs)
-                restore_started = time.time()
-                overlap_examples = None
-                try:
-                    ensure_trainer_ready()
-                    restore_seconds = time.time() - restore_started
-                    overlap_examples = _prepare_binary_overlap_examples(
-                        model, tokenizer, group_responses, reward_futures,
-                        prompt_jobs, parents)
-                    if overlap_examples:
-                        print(
-                            f"[step {step_idx}] binary coder "
-                            "evaluation/training overlap: "
-                            f"{len(overlap_examples)} examples; "
-                            f"{pending_before}/{len(all_futs)} CPU "
-                            "evaluations were still pending when trainer "
-                            "restore began",
-                            flush=True,
-                        )
-                        binary_overlap_state = (
-                            _precompute_binary_coder_backward(
-                                backend, model, tokenizer, optimizer,
-                                overlap_examples, cfg, step_idx))
-                        if binary_overlap_state is not None:
-                            binary_overlap_state["restore_seconds"] = (
-                                restore_seconds)
-                            pending_after = sum(
-                                not future.done() for future in all_futs)
-                            print(
-                                f"[step {step_idx}] binary coder backward "
-                                "ready; optimizer step deferred until rollout "
-                                "artifacts are saved; CPU evaluations still "
-                                f"pending: {pending_after}/{len(all_futs)}",
-                                flush=True,
-                            )
-                except Exception as error:
-                    # The ordinary post-evaluation path is the correctness
-                    # fallback. Clear every partial gradient and discard only
-                    # temporary tensor records; completed rewards are reused.
-                    model.zero_grad(set_to_none=True)
-                    optimizer.zero_grad(set_to_none=True)
-                    for responses in group_responses.values():
-                        for record in responses:
-                            record.pop("_binary_overlap_example", None)
-                    overlap_examples = None
-                    binary_overlap_state = None
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    print(
-                        f"[warn] binary evaluation/training overlap was "
-                        f"disabled for this step ({type(error).__name__}: "
-                        f"{error}); falling back to the unchanged "
-                        "post-evaluation update",
-                        flush=True,
-                    )
-
             # If training finished first, wait only for the remaining reward
             # tail. If rewards finished first, this returns immediately.  Do
             # not consume exceptions here: the aligned per-group result() call
@@ -13389,7 +11851,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     example["_spo_rs_record"][field_name] = (
                         score.detach().cpu())
 
-        with _rank_dropout_disabled(model):
+        with _policy_dropout_disabled(model):
             try:
                 _score_local_policy("_spo_rs_current_score")
                 for record in current_records:
@@ -13534,7 +11996,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         g = int(group_spec["group_id"])
         parent_group = int(group_spec["parent_group"])
         context_id = int(group_spec["context_id"])
-        fold_index = int(group_spec["fold_index"])
         parent = parents[parent_group]
         responses = group_responses[g]          # streamed mutable rollout records
         futs = reward_futures[g]                 # aligned RewardResult futures
@@ -13546,7 +12007,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         for r_idx, record in enumerate(responses):
             res = futs[r_idx].result()           # already computed (or finishes now)
             rewards.append(res.reward)
-            codes.append(res.code or "")
+            codes.append(res.code or '')
             valids.append(res.valid)
             outs.append(res)
 
@@ -13554,40 +12015,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if rewards_np.size == 0:
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
-        if x_grpo_mode and planned_by_group[g] != int(cfg.group_size):
-            raise RuntimeError(
-                f"X-GRPO context {context_id} fold {fold_index} returned "
-                f"{planned_by_group[g]} planned rollouts; expected G={int(cfg.group_size)}")
         adv_mode = active_advantage_mode
-        x_trial_advantages = None
-        x_trial_info = None
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
-        if x_grpo_mode:
-            from advantage import x_grpo_advantages
-            x_trial_advantages = []
-            x_trial_info = []
-            for budget in cfg.x_grpo_budgets:
-                trial_advantages, _cutoff, trial_info = x_grpo_advantages(
-                    rewards_np, budget, return_info=True)
-                x_trial_advantages.append(trial_advantages)
-                x_trial_info.append(trial_info)
-            advantages = np.zeros_like(rewards_np)
-            adv_scale = float(len(cfg.x_grpo_budgets))
-            adv_scale_label = "trial_budgets"
-            adv_info = x_trial_info[0]
-            x_grpo_groups[g] = {
-                "group": g,
-                "context": context_id,
-                "fold": fold_index,
-                "rewards": rewards_np,
-                "trial_advantages": x_trial_advantages,
-                "trial_info": x_trial_info,
-                "entropy_eligible": bool(
-                    any(valids)
-                    and float(rewards_np.max()) > float(cfg.fail_score)),
-            }
-        elif spo_rs_mode:
+        if spo_rs_mode:
             prepared = [spo_rs_prepared[(g, r_idx)]
                         for r_idx in range(len(responses))]
             advantages = np.asarray(
@@ -13597,67 +12028,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             spo_rs_rollout_info = [item["info"] for item in prepared]
             adv_scale = float(cfg.spo_rs_beta)
             adv_scale_label = "beta"
-            adv_info = {}
-        elif binary_coder_mode:
-            from problems.binary_coder import binary_coder_advantages
-            advantages, group_binary_diagnostics = binary_coder_advantages(
-                outs, parent, fail_score=cfg.fail_score)
-            binary_coder_diagnostics.extend({
-                "group": g,
-                "rollout": r_idx,
-                **diagnostic,
-            } for r_idx, diagnostic in enumerate(
-                group_binary_diagnostics))
-            adv_scale = 1.0
-            adv_scale_label = "binary"
-            adv_info = {}
         else:
-            advantages, adv_scale, adv_scale_label, adv_info = (
-                compute_group_advantages(
-                    rewards_np, adv_mode,
-                    cvar_alpha=getattr(cfg, "cvar_alpha", None),
-                    cvar_lambda=getattr(cfg, "cvar_lambda", None),
-                    rank_gamma=getattr(cfg, "rank_gamma", None),
-                    return_info=True))
+            advantages, adv_scale = compute_group_advantages(rewards_np)
+            adv_scale_label = "beta"
         constant = (
-            bool(adv_info["all_tied"])
-            if rank_mode or x_grpo_mode else
             float(rewards_np.max() - rewards_np.min()) < 1e-12)
-        rank_entropy_gate = bool(
-            rank_mode
-            and constant
-            and any(valids)
-            and float(rewards_np.max()) > float(cfg.fail_score)
-        )
-        if rank_mode:
-            rank_diagnostics = {
-                k: v for k, v in adv_info.items() if k not in ("ranks", "weights")
-            }
-            rank_group_stats.append({
-                "group": g, **rank_diagnostics,
-                "entropy_gate": rank_entropy_gate,
-            })
 
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
         step_code_failure_count += sum(is_code_failure(res) for res in outs)
 
-        group_label = (f"context {context_id} fold {fold_index}"
-                       if x_grpo_mode else f"group {g}")
-        print(f"  {group_label}: rewards min={rewards_np.min():.9f} "
+        print(f"  group {g}: rewards min={rewards_np.min():.9f} "
               f"mean={rewards_np.mean():.9f} max={rewards_np.max():.9f}  "
               f"valid={sum(valids)}/{len(valids)}  "
               f"{adv_scale_label}={adv_scale:.9f}")
-        if rank_mode:
-            print(f"    rank KL={adv_info['kl']:.6f} "
-                  f"ESS={adv_info['ess']:.2f}/{len(rewards)} "
-                  f"top ties={adv_info['top_count']} "
-                  f"saturated={adv_info['saturated']} "
-                  f"entropy gate={rank_entropy_gate}")
-        elif x_grpo_mode:
-            print(f"    X-GRPO candidates={list(cfg.x_grpo_budgets)} "
-                  f"top ties={adv_info['top_count']} "
-                  f"all tied={adv_info['all_tied']}")
 
         # Save every rollout (response + meta) to disk for debugging
         for r_idx, record in enumerate(responses):
@@ -13716,7 +12100,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
-                "sandbox_stdout": (res.stdout or "")[:2000],
+                "sandbox_stdout": (res.stdout or '')[:2000],
                 "parent_value": float(parent.value) if parent.value is not None else None,
                 "parent_raw_score": (float(parent.raw_score)
                                      if parent.raw_score is not None else None),
@@ -13787,22 +12171,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "strategy_allocated_programs": record.get(
                         "strategy_allocated_programs"),
                 })
-            if rank_mode:
-                meta["rank_selection"] = {
-                    **rank_diagnostics,
-                    "score": float(adv_info["ranks"][r_idx]),
-                    "weight": float(adv_info["weights"][r_idx]),
-                }
-            elif x_grpo_mode:
-                meta["x_grpo_context"] = context_id
-                meta["x_grpo_fold"] = fold_index
-                meta["x_grpo_rank"] = float(adv_info["ranks"][r_idx])
-                meta["x_grpo_trial_advantages"] = [
-                    float(values[r_idx]) for values in x_trial_advantages]
-            elif spo_rs_mode:
+            if spo_rs_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
-            elif binary_coder_mode:
-                meta["binary_coder"] = group_binary_diagnostics[r_idx]
             if entropy_directory is not None:
                 entropy_observations.append(rollout_observation(
                     record.get("_entropy_measurement"), meta, res.code))
@@ -13814,10 +12184,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                          artifacts_already_saved=True)
             saved_rollouts += 1
 
-        # Standard group-centered objectives skip constant-reward groups.
-        # Rank mode uses exact equality and retains fully tied groups for
-        # reference updates. Entropy is gated separately above: an all-failure
-        # tie at fail_score must not receive an entropy update.
+        # Entropic training skips constant groups. SPO-RS compares every
+        # rollout with its historical baseline, so tied groups can still learn.
         if constant and not clipped_policy_mode:
             continue
 
@@ -13832,8 +12200,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             if len(token_ids) == 0:
                 continue
             prepared = (
-                record.get("_binary_overlap_example")
-                or record.get("_entropic_overlap_example")
+                record.get("_entropic_overlap_example")
                 or record.get("_spo_rs_overlap_example"))
             res = outs[r_idx]
             if prepared is not None:
@@ -13844,8 +12211,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 prepared.update({
                     "advantage": float(adv),
                     "reward_constant": constant,
-                    "rank_entropy_gate": rank_entropy_gate,
-                    "x_grpo_group_size": len(responses),
                     "sample_weight": 1.0 / (num_groups * len(responses)),
                 })
                 all_examples.append(prepared)
@@ -13875,24 +12240,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "behavior_logprobs": behavior_logprobs,
                 "reference_logprobs": reference_logprobs,
                 "reward_constant": constant,
-                "rank_entropy_gate": rank_entropy_gate,
                 "group_id": g,
-                "x_grpo_context_id": context_id,
-                "x_grpo_fold_index": fold_index,
                 "rollout_index": r_idx,
                 "prompt_job_id": job_idx,
-                "x_grpo_group_size": len(responses),
-                "x_grpo_all_tied": bool(constant) if x_grpo_mode else False,
-                "x_grpo_trial_advantages": (
-                    tuple(float(values[r_idx])
-                          for values in x_trial_advantages)
-                    if x_grpo_mode else ()),
                 "sample_weight": 1.0 / (num_groups * len(responses)),
             })
 
     # Persistence barrier: every response/prompt/meta file is on disk before the
-    # optimizer can mutate the adapter. Binary coder, streamed entropic mode,
-    # and streamed SPO-RS may already have accumulated exact gradients during
+    # optimizer can mutate the adapter. Streamed entropic and SPO-RS training
+    # may already have accumulated exact gradients during
     # CPU evaluation, but their single update is deliberately deferred until
     # this barrier.
     # stepXX.summary.json remains the completion marker and is written only
@@ -13912,7 +12268,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         all_examples = [ex for ex in all_examples if not ex["reward_constant"]]
 
     if clipped_policy_mode and cfg.generation_backend == "vllm":
-        # Rank/PPO requires the frozen behavior probability. A malformed vLLM
+        # SPO-RS requires the frozen behavior probability. A malformed vLLM
         # payload cannot be reconstructed safely after the adapter changes and
         # must never force a full-context HF cache pass. Rollouts remain saved;
         # only an unusable training record is omitted.
@@ -13928,39 +12284,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"{unusable} rollout(s); saved them but excluded only those "
                   "records from the clipped-policy update", flush=True)
 
-    if (spo_rs_mode or binary_coder_mode) and all_examples:
+    if spo_rs_mode and all_examples:
         trajectory_weight = 1.0 / len(all_examples)
         for example in all_examples:
             example["sample_weight"] = trajectory_weight
 
-    if binary_overlap_state is not None:
-        actual_keys = {
-            example.get("_overlap_key") for example in all_examples
-            if example.get("_overlap_key") is not None
-        }
-        labels_complete = all(
-            example.get("advantage") in (-1.0, 1.0)
-            for example in all_examples
-        )
-        labels_match = not any(
-            example.get("_overlap_label_mismatch", False)
-            for example in all_examples
-        )
-        if (actual_keys != binary_overlap_state["scheduled_keys"]
-                or not labels_complete or not labels_match):
-            # Never apply a partial or differently normalized gradient.  The
-            # complete, ordinary training path below remains exact.
-            model.zero_grad(set_to_none=True)
-            optimizer.zero_grad(set_to_none=True)
-            print(
-                f"[warn] discarding precomputed binary gradients because the "
-                f"final training set changed "
-                f"({len(actual_keys)}/"
-                f"{len(binary_overlap_state['scheduled_keys'])} records); "
-                "using the unchanged post-evaluation update",
-                flush=True,
-            )
-            binary_overlap_state = None
 
     if entropic_overlap_state is not None:
         actual_keys = {
@@ -14022,8 +12350,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       if training_enabled else "disabled")
     rollout_phase_label = (
         "rollout+eval+overlapped-backward wall time"
-        if (binary_overlap_state is not None
-            or entropic_overlap_state is not None
+        if (entropic_overlap_state is not None
             or spo_rs_overlap_state is not None)
         else "rollout+eval time")
     print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
@@ -14179,29 +12506,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if adaptive_strategy_pilots:
         step_stats["strategy_pilot_allocation"] = (
             strategy_pilot_diagnostics)
-    if rank_mode:
-        step_stats["rank_groups"] = rank_group_stats
-    elif binary_coder_mode:
-        usable_count = sum(
-            bool(item["usable"]) for item in binary_coder_diagnostics)
-        reason_counts = {}
-        for item in binary_coder_diagnostics:
-            reason = str(item["reason"])
-            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
-        step_stats["binary_coder"] = {
-            "usable": int(usable_count),
-            "failed": int(len(binary_coder_diagnostics) - usable_count),
-            "total": int(len(binary_coder_diagnostics)),
-            "reasons": reason_counts,
-            "usable_fraction": (
-                float(usable_count / len(binary_coder_diagnostics))
-                if binary_coder_diagnostics else 0.0),
-        }
-        print(f"[step {step_idx}] binary coder verified usability: "
-              f"{usable_count}/{len(binary_coder_diagnostics)} "
-              f"({step_stats['binary_coder']['usable_fraction']:.1%}); "
-              "usable=+1, every rejection=-1", flush=True)
-    elif spo_rs_mode:
+    if spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
         step_stats["spo_rs_adaptive_beta"] = adaptive_spo_beta
         step_stats["spo_rs_tracker_size"] = (
@@ -14232,69 +12537,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # A model-parallel trainer can remain on CPU throughout every vLLM phase
     # and all reward processing. Restore its shards only when this step has a
-    # real calibration/backward update to perform.
+    # real backward update to perform.
     if ensure_trainer_ready is not None:
         ensure_trainer_ready()
 
-    if x_grpo_mode:
-        calibration_t0 = time.time()
-        group_ids_by_context = {}
-        for group_id, group_data in x_grpo_groups.items():
-            group_ids_by_context.setdefault(
-                int(group_data["context"]), []).append(int(group_id))
-        for context_id in sorted(group_ids_by_context):
-            group_ids_by_context[context_id] = tuple(sorted(
-                group_ids_by_context[context_id]))
-            if (len(group_ids_by_context[context_id])
-                    != x_grpo_groups_per_context):
-                raise RuntimeError(
-                    f"X-GRPO context {context_id} has "
-                    f"{len(group_ids_by_context[context_id])} groups; expected "
-                    f"K={x_grpo_groups_per_context}")
-        if (parallel_trainer is not None
-                and hasattr(parallel_trainer, "calibrate_x_grpo")):
-            calibration = parallel_trainer.calibrate_x_grpo(
-                all_examples, cfg, step_idx,
-                context_group_ids=group_ids_by_context)
-        else:
-            if (parallel_trainer is not None
-                    and parallel_trainer.is_offloaded):
-                parallel_trainer.restore_after_generation()
-            calibration = _calibrate_x_grpo_local(
-                backend, model, tokenizer, all_examples, cfg, step_idx,
-                context_group_ids=group_ids_by_context)
-        x_grpo_group_stats = _apply_x_grpo_calibration(
-            all_examples, x_grpo_groups, calibration, cfg)
-        selected_label = ", ".join(
-            f"p{item['context']}/k{item['fold']}="
-            f"{item['selected_budget']:g}"
-            for item in x_grpo_group_stats)
-        calibration_seconds = time.time() - calibration_t0
-        print(f"[step {step_idx}] X-GRPO selected budgets: "
-              f"{selected_label}  (calibration: {calibration_seconds:.1f}s)",
-              flush=True)
-        step_stats["x_grpo_groups"] = x_grpo_group_stats
-        step_stats["x_grpo_calibration_distributed"] = bool(
-            calibration.get("distributed", False))
-        step_stats["x_grpo_diagnostic_quarantined_examples"] = int(
-            calibration.get("diagnostic_quarantined_examples", 0))
-        step_stats["x_grpo_contexts"] = len(group_ids_by_context)
-        step_stats["x_grpo_groups_per_context"] = (
-            x_grpo_groups_per_context)
 
     if clipped_policy_mode:
-        if binary_overlap_state is not None:
-            step_stats.update(_finish_binary_coder_overlap_update(
-                model, optimizer, cfg, step_idx, binary_overlap_state))
-        elif spo_rs_overlap_state is not None:
+        if spo_rs_overlap_state is not None:
             step_stats.update(parallel_trainer.finish_spo_rs_overlap(
                 cfg, step_idx, len(all_examples), apply_update=True))
             spo_rs_overlap_state = None
         elif parallel_trainer is not None:
-            step_stats.update(parallel_trainer.train_rank(
+            step_stats.update(parallel_trainer.train_spo_rs(
                 all_examples, cfg, step_idx))
         else:
-            step_stats.update(_train_rank_examples(
+            step_stats.update(_train_spo_rs_examples(
                 backend, model, tokenizer, optimizer, all_examples, cfg,
                 step_idx))
         if spo_rs_mode:
@@ -14464,9 +12721,6 @@ def main():
     startup_log = StartupLog(time_offset=_LOG_TIME_OFFSET_SECONDS)
     with startup_log.capture():
         cfg, merged = load_config()
-        from problems.binary_coder import (
-            BINARY_CODER_MODE, BinaryCoderConfig)
-        binary_coder_cfg = BinaryCoderConfig.from_mapping(merged)
         # This must precede every import path that can initialize CUDA. Worker
         # and evaluation children set their own physical groups before import.
         _pin_training_process(cfg.training_gpu_ids)
@@ -14557,15 +12811,14 @@ def main():
         and cfg.generation_backend == "vllm"
         and cfg.training_layout != "sharded"
     )
-    # Standard entropic/GRPO/CVaR updates use isolated GPU processes even
+    # Entropic updates use isolated GPU processes even
     # without --fast.  The former same-interpreter threaded replicas are not a
     # safe execution boundary for concurrent autograd.  --fast remains an
     # optional scheduling choice: it enables adaptive batches; without it the
     # configured microbatch ceiling is honored.  Clipped-policy modes retain
     # their existing default trainer unless --fast is explicitly requested.
     standard_policy_objective = not bool(
-        binary_coder_cfg.enabled
-        or _uses_clipped_policy_loss(cfg.advantage_mode))
+        _uses_clipped_policy_loss(cfg.advantage_mode))
     use_process_distributed_training = bool(
         use_replicated_training
         and (cfg.fast or standard_policy_objective
@@ -14647,70 +12900,38 @@ def main():
     print(f"Search selection:   {'UCT' if cfg.uct else 'PUCT'} "
           f"(c={cfg.puct_c})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
-    if configured_advantage_mode == "x-grpo":
-        print(f"X-GRPO contexts P:  {cfg.x_grpo_contexts_per_step}")
-        print(f"X-GRPO groups K:    {cfg.groups_per_step} per context")
-        print(f"X-GRPO group size G: {cfg.group_size}")
-        print(f"Total rollouts/step: "
-              f"{cfg.x_grpo_contexts_per_step * cfg.groups_per_step * cfg.group_size}")
-    else:
-        print(f"Groups per step:    {cfg.groups_per_step}")
-        print(f"Group size:         {cfg.group_size}")
-        print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
+    print(f"Groups per step:    {cfg.groups_per_step}")
+    print(f"Group size:         {cfg.group_size}")
+    print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
     print(f"LR:                 {cfg.learning_rate}")
-    if binary_coder_cfg.enabled:
-        print("Reference KL:        off (binary coder PPO objective)")
-    elif configured_advantage_mode == "spo-rs":
+    if configured_advantage_mode == "spo-rs":
         print("Reference KL:        off (SPO-RS PPO objective)")
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
     print(f"Advantage mode:     "
-          f"{'binary-coder' if binary_coder_cfg.enabled else getattr(cfg, 'advantage_mode', 'entropic')}")
+          f"{getattr(cfg, 'advantage_mode', 'entropic')}")
     if _uses_sequence_level_policy_ratio(cfg):
         print("MoE policy ratio:    sequence-level geometric mean "
               "(Qwen3-30B-A3B only; existing asymmetric low/high bounds)")
-    if binary_coder_cfg.enabled:
-        print(f"Binary coder phase: steps 0-{binary_coder_cfg.init_steps - 1}; "
-              f"verified +/-1 advantages, LoRA rank "
-              f"{binary_coder_cfg.lora_rank}")
-        print(f"Binary coder clip:  low/high "
-              f"{binary_coder_cfg.clip_epsilon_low} / "
-              f"{binary_coder_cfg.clip_epsilon_high} "
-              f"(bounds {1.0 - binary_coder_cfg.clip_epsilon_low:.4f} / "
-              f"{1.0 + binary_coder_cfg.clip_epsilon_high:.4f}); "
-              "adapter remains active and freezes afterward")
-    if (not binary_coder_cfg.enabled
-            and getattr(cfg, "advantage_mode", "entropic") == "cvar"):
-        print(f"CVaR alpha/lambda:  {cfg.cvar_alpha} / {cfg.cvar_lambda}")
-    if not binary_coder_cfg.enabled:
-        if configured_advantage_mode == "spo-rs":
-            if bool(getattr(cfg, "spo_rs_adaptive_beta", False)):
-                print(f"SPO-RS shaping:     historical arctan, width=1.25; "
-                      f"beta={cfg.spo_rs_beta}; all rollouts train")
-            else:
-                print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
-            print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
-            print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
-            print(f"SPO-RS clip eps low/high: "
-                  f"{cfg.spo_rs_clip_epsilon_low} / "
-                  f"{cfg.spo_rs_clip_epsilon_high} "
-                  f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
-                  f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
-            print(f"SPO-RS update epochs: {cfg.rank_update_epochs}")
-        elif _uses_clipped_policy_loss(configured_advantage_mode):
-            print(f"Rank clip eps low/high: "
-                  f"{cfg.rank_clip_epsilon_low} / {cfg.rank_clip_epsilon_high} "
-                  f"(bounds {1.0 - cfg.rank_clip_epsilon_low:.4f} / "
-                  f"{1.0 + cfg.rank_clip_epsilon_high:.4f})")
-            print(f"Rank update epochs: {cfg.rank_update_epochs}")
-    if not binary_coder_cfg.enabled and configured_advantage_mode == "rank":
-        print(f"Rank gamma:         {cfg.rank_gamma}")
-        print(f"Rank entropy coef:  {cfg.rank_entropy_coef} (fully tied groups)")
-    elif (not binary_coder_cfg.enabled
-          and configured_advantage_mode == "x-grpo"):
-        print(f"X-GRPO budgets:     {list(cfg.x_grpo_budgets)}")
-        print(f"X-GRPO rel. error:  {cfg.x_grpo_relative_error}")
-        print(f"X-GRPO entropy:     {cfg.x_grpo_entropy_coef}")
+    if configured_advantage_mode == "spo-rs":
+        if bool(getattr(cfg, "spo_rs_adaptive_beta", False)):
+            print(f"SPO-RS shaping:     historical arctan, width=1.25; "
+                  f"beta={cfg.spo_rs_beta}; all rollouts train")
+        else:
+            print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
+        print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
+        print(f"SPO-RS rho min/max: {cfg.spo_rs_rho_min} / {cfg.spo_rs_rho_max}")
+        print(f"SPO-RS clip eps low/high: "
+              f"{cfg.spo_rs_clip_epsilon_low} / "
+              f"{cfg.spo_rs_clip_epsilon_high} "
+              f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
+              f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
+        print(f"SPO-RS update epochs: {cfg.spo_rs_update_epochs}")
+    elif _uses_sequence_level_policy_ratio(cfg):
+        print(f"Sequence clip eps low/high: "
+              f"{cfg.sequence_clip_epsilon_low} / {cfg.sequence_clip_epsilon_high} "
+              f"(bounds {1.0 - cfg.sequence_clip_epsilon_low:.4f} / "
+              f"{1.0 + cfg.sequence_clip_epsilon_high:.4f})")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
         base_effort = _coder_effort_for_rollout_phase(cfg)
@@ -14993,8 +13214,7 @@ def main():
         f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
-    if (configured_advantage_mode == "spo-rs"
-            and not binary_coder_cfg.enabled):
+    if (configured_advantage_mode == 'spo-rs'):
         from spo_rs import BoundedSPORSTracker, SPORSTracker
         bounded_shaping = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
         tracker_class = BoundedSPORSTracker if bounded_shaping else SPORSTracker
@@ -15090,7 +13310,6 @@ def main():
     gen_pool = None
     strategy_pool = None
     ensure_trainer_ready = None
-    # Unlike cfg.no_train, this can change after the binary-coder bootstrap.
     # Generation callbacks consult it so all later steps follow the genuine
     # no-training residency path instead of waiting for a nonexistent update.
     runtime_training_active = {"value": not bool(cfg.no_train)}
@@ -15148,8 +13367,7 @@ def main():
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
-            lora_rank=(binary_coder_cfg.lora_rank
-                       if binary_coder_cfg.enabled else cfg.lora_rank),
+            lora_rank=(cfg.lora_rank),
             vllm_gpu_memory_utilization=generation_utilization,
             vllm_enforce_eager=cfg.vllm_enforce_eager,
             vllm_enable_prefix_caching=cfg.vllm_enable_prefix_caching,
@@ -15496,10 +13714,7 @@ def main():
             append_step_result(
                 exp_dir, completed_step, completed_summary)
         cumulative_training_seconds += float(
-            completed_summary.get(
-                "training_seconds",
-                completed_summary.get("rank_train_seconds", 0.0),
-            ) or 0.0)
+            completed_summary.get("training_seconds", 0.0) or 0.0)
     if cumulative_training_seconds:
         print(f"[resume] prior cumulative training time: "
               f"{cumulative_training_seconds:.1f}s")
@@ -15512,37 +13727,8 @@ def main():
         for step in range(start_step, cfg.num_steps):
             active_step = int(step)
             step_cfg = cfg
-            if binary_coder_cfg.enabled:
-                step_cfg = SimpleNamespace(**vars(cfg))
-                step_cfg.advantage_mode = BINARY_CODER_MODE
-                if binary_coder_cfg.active(step):
-                    step_cfg.no_train = bool(cfg.no_train)
-                    print(f"[step {step}] binary coder initialization "
-                          f"{step + 1}/{binary_coder_cfg.init_steps}: "
-                          "training the verified-usability adapter", flush=True)
-                else:
-                    step_cfg.no_train = True
-                    step_cfg._training_disabled_reason = (
-                        "binary coder initialization complete; full "
-                        "--no-train execution with frozen adapter")
-                    print(f"[step {step}] binary coder initialization is "
-                          "complete; using --no-train execution with the "
-                          "frozen coder adapter", flush=True)
             runtime_training_active["value"] = not bool(step_cfg.no_train)
-            if configured_advantage_mode == "x-grpo":
-                rollout_count = (
-                    int(cfg.x_grpo_contexts_per_step)
-                    * cfg.groups_per_step * cfg.group_size)
-                hierarchy = (
-                    f"{cfg.strategies_per_parent} strategies x "
-                    f"{cfg.programs_per_strategy} programs/group; "
-                    if getattr(problem, "two_stage_rollouts", False) else "")
-                setting_log_only(
-                    f"[step {step}] batch: "
-                    f"P={cfg.x_grpo_contexts_per_step} "
-                    f"K={cfg.groups_per_step} G={cfg.group_size} "
-                    f"({hierarchy}{rollout_count} rollouts)", flush=True)
-            elif getattr(problem, "two_stage_rollouts", False):
+            if getattr(problem, "two_stage_rollouts", False):
                 setting_log_only(
                     f"[step {step}] batch: parents={cfg.groups_per_step} "
                     f"strategies/parent={cfg.strategies_per_parent} "
@@ -15604,17 +13790,13 @@ def main():
                     parallel_trainer=parallel_trainer,
                     spo_rs_tracker=spo_rs_tracker,
                     sampling_adapter_path=(
-                        current_policy_adapter_path
-                        if (binary_coder_cfg.enabled
-                            or configured_advantage_mode == "spo-rs")
-                        else None),
+                        current_policy_adapter_path if configured_advantage_mode == 'spo-rs' else None),
                     ensure_trainer_ready=ensure_trainer_ready)
 
             stats = stats or {}
             entropy_observations = stats.pop("_entropy_observations", [])
             step_training_seconds = float(
-                stats.get("training_seconds",
-                          stats.get("rank_train_seconds", 0.0)) or 0.0)
+                stats.get("training_seconds", 0.0) or 0.0)
             cumulative_training_seconds += step_training_seconds
             stats["training_seconds"] = step_training_seconds
             stats["cumulative_training_seconds"] = cumulative_training_seconds
@@ -15626,16 +13808,7 @@ def main():
             # Version the adapter first, then atomically advance the state
             # pointer. A crash during either write leaves the previous pair
             # valid.
-            if binary_coder_cfg.enabled:
-                if (runtime_training_active["value"]
-                        or current_policy_adapter_path is None):
-                    adapter_path = _save_adapter(
-                        model, exp_dir, step, cfg.model_name)
-                else:
-                    # No weights change after the bootstrap. Reuse its final
-                    # adapter rather than writing an identical copy per step.
-                    adapter_path = Path(current_policy_adapter_path)
-            elif configured_advantage_mode == "spo-rs":
+            if configured_advantage_mode == "spo-rs":
                 if stats.get("spo_rs_policy_updated", False):
                     adapter_path = _save_adapter(
                         model, exp_dir, step, cfg.model_name)

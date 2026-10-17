@@ -28,8 +28,8 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # Opt into the process-per-GPU adaptive trainer. Omitting --fast keeps the
 # current training implementation exactly as the default:
 #   sh run.sh --fast
-# Set asymmetric rank clipping as distances below/above 1, for example:
-#   sh run.sh --fast --rank-clip-epsilon-low 0.1 --rank-clip-epsilon-high 0.3
+# Set asymmetric SPO-RS clipping as distances below/above 1, for example:
+#   sh run.sh --fast --spo-rs-clip-epsilon-low 0.1 --spo-rs-clip-epsilon-high 0.3
 # Isolate every candidate on one CPU. In this mode reward_workers from the
 # selected YAML is the number of concurrent candidate processes per CPU:
 #   sh run.sh --isolate-eval
@@ -57,7 +57,6 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
-# exec python3 train_multy_CVaR.py --config "$config_path" --backend hf "$@" --advantage-mode rank entropic spo-rs --fast
 exec python3 train_multy_CVaR.py --config "$config_path" --backend hf --advantage-mode spo-rs --fast --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
     --isolate-eval --fused-long-attention "$@"
