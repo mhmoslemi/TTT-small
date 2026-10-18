@@ -132,7 +132,9 @@ def test_bounded_repack_rejects_changed_storage_contract_before_overwriting():
     assert torch.all(weight == 1)
 
 
-def test_custom_worker_scopes_repacking_to_startup(monkeypatch):
+@pytest.mark.parametrize("fail", [False, True])
+def test_custom_worker_scopes_repacking_and_allocator_to_startup(monkeypatch, fail):
+    from contextlib import contextmanager
     from types import SimpleNamespace
 
     def original(weight, size_n, size_k, perm, is_a_8bit):
@@ -144,17 +146,38 @@ def test_custom_worker_scopes_repacking_to_startup(monkeypatch):
         SimpleNamespace(marlin_utils_fp4=marlin))
 
     class Worker:
+        split_limit = 20
+
+        @contextmanager
+        def _scoped_allocator_max_split(self, max_split_size_mb):
+            previous = self.split_limit
+            self.split_limit = max_split_size_mb
+            try:
+                yield
+            finally:
+                self.split_limit = previous
+
         def load_model(self, *, load_dummy_weights=False):
-            assert marlin._repack_marlin_experts is not original
-            assert load_dummy_weights
-            raise RuntimeError("startup failed")
+            # Match the allocator context entered by vLLM 0.28's loader.
+            with self._scoped_allocator_max_split(max_split_size_mb=20):
+                assert marlin._repack_marlin_experts is not original
+                assert load_dummy_weights
+                assert self.split_limit > 20
+                if fail:
+                    raise RuntimeError("startup failed")
+                return "loaded"
 
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker",
                         SimpleNamespace(Worker=Worker))
     from vllm_compat.gpt_oss_worker import GptOssWorker
     try:
-        with pytest.raises(RuntimeError, match="startup failed"):
-            GptOssWorker().load_model(load_dummy_weights=True)
+        worker = GptOssWorker()
+        if fail:
+            with pytest.raises(RuntimeError, match="startup failed"):
+                worker.load_model(load_dummy_weights=True)
+        else:
+            assert worker.load_model(load_dummy_weights=True) == "loaded"
+        assert worker.split_limit == 20
         assert marlin._repack_marlin_experts is original
     finally:
         sys.modules.pop("vllm_compat.gpt_oss_worker", None)
@@ -175,4 +198,46 @@ def test_cuda_marlin_packing_matches_installed_vllm():
     actual = repack_experts_in_place(
         weight.clone(), 256, 128, perm, False, repack=original)
     torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+
+
+def test_cuda_gpt_oss_scratch_reuse_and_sleep_wake():
+    """Exercise real expert sizes and the private allocator on the GPU host.
+
+    With vLLM's original 20 MiB split limit, cached conversion segments grow
+    every iteration. Repeated conversions must instead reuse bounded scratch,
+    produce identical packed weights, and survive the normal sleep/wake path.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("private-pool memory regression requires the GPU host")
+    from vllm.device_allocator.cumem import CuMemAllocator
+    from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4
+    from vllm_compat.gpt_oss_repack import repack_experts_in_place
+    from vllm_compat.gpt_oss_worker import GptOssWorker
+
+    # GPT-OSS-120B gate/up expert dimensions, large enough to use the 20 MiB
+    # allocator segments that caused the production OOM (tiny tensors miss it).
+    weight = torch.randint(0, 256, (3, 5760, 1440),
+                           dtype=torch.uint8, device="cuda")
+    perm = torch.empty(0, dtype=torch.int32, device="cuda")
+    original = marlin_utils_fp4._repack_marlin_experts
+    expected = original(weight, 5760, 2880, perm, False)
+    allocator = CuMemAllocator.get_instance()
+    worker = object.__new__(GptOssWorker)
+    tag = "gpt_oss_repack_test"
+    with (allocator.use_memory_pool(tag=tag),
+          worker._scoped_allocator_max_split(max_split_size_mb=20)):
+        storage = weight.clone()
+        before = allocator.get_current_usage()
+        for _ in range(32):
+            storage.copy_(weight)
+            actual = repack_experts_in_place(
+                storage, 5760, 2880, perm, False, repack=original)
+        torch.cuda.synchronize()
+        assert allocator.get_current_usage() - before < 128 * 1024**2
+    assert torch.equal(actual, expected)
+    allocator.sleep(offload_tags=(tag,))
+    allocator.wake_up(tags=[tag])
     assert torch.equal(actual, expected)
