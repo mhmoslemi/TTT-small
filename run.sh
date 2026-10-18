@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+# Always run the code/configs beside this launcher, even when invoked from
+# another checkout. Updating files cannot update an already-running Python.
+ttt_project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ttt_project_dir"
+
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3,4,5,6,7}"
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"

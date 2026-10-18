@@ -31,6 +31,44 @@ DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_SAMPLES = 2
 DEFAULT_ACTIVATION_OFFLOAD_CALIBRATION_MARGIN = 1.25
 
 
+def validate_memory_handoff_runtime(training_file):
+    """Reject mixed checkouts before loading models; identify the actual files."""
+    import hashlib
+    import inspect
+    import gen_workers
+    from vllm_compat import sleep_memory
+
+    root = Path(training_file).resolve().parent
+    components = {
+        "train_multy_CVaR.py": Path(training_file).resolve(),
+        "host_memory.py": Path(__file__).resolve(),
+        "gen_workers.py": Path(gen_workers.__file__).resolve(),
+        "vllm_compat/sleep_memory.py": Path(sleep_memory.__file__).resolve(),
+    }
+    for name, loaded_path in components.items():
+        if loaded_path != root / name:
+            raise RuntimeError(
+                f"mixed training checkout: {name} loaded from {loaded_path}; "
+                f"expected {root / name}. Launch a fresh process from the "
+                "updated checkout.")
+    sleep_parameters = inspect.signature(gen_workers.GenerationPool.sleep).parameters
+    if (not {"after_sleep", "host_admission"}.issubset(sleep_parameters)
+            or not callable(getattr(gen_workers.PhasedVLLMGenerationPool,
+                                    "release_for_training", None))
+            or not callable(getattr(sleep_memory.SleepMemoryExtension,
+                                    "ttt_host_memory", None))):
+        raise RuntimeError(
+            "incomplete memory-handoff update: update train_multy_CVaR.py, "
+            "gen_workers.py, host_memory.py and vllm_compat/sleep_memory.py "
+            "together, then launch a fresh process")
+    return {
+        "checkout": str(root),
+        "files": {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for name, path in components.items()},
+        "memory_handoff": "pageable backups; bounded transfers; incremental trainer restore",
+    }
+
+
 def host_memory_info(meminfo_path="/proc/meminfo"):
     """Return Linux total/available memory in bytes, or ``None`` off Linux."""
     try:

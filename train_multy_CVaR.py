@@ -12894,6 +12894,16 @@ def main():
     print = startup_log.print
     terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
     terminal_log.bind(terminal_log_path)
+    if cfg.generation_backend == "vllm":
+        from host_memory import validate_memory_handoff_runtime
+        runtime = validate_memory_handoff_runtime(__file__)
+        with (Path(exp_dir) / "runtime.json").open("w", encoding="utf-8") as handle:
+            json.dump(runtime, handle, indent=2)
+        runtime_message = (
+            f"[runtime] checkout={runtime['checkout']}; "
+            f"memory handoff: {runtime['memory_handoff']}")
+        console_print(runtime_message, flush=True)
+        setting_log_only(runtime_message, flush=True)
     print(f"[logs] terminal output: {terminal_log_path}", flush=True)
     result_log_path = Path(exp_dir).resolve() / "result.txt"
     result_log_path.touch(exist_ok=True)
