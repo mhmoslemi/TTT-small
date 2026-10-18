@@ -1058,11 +1058,10 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
         merged, "training_memory_fraction",
         float(profile.get("training_memory_fraction", 0.80)), explicit_keys)
 
-    # On the 95+ GiB cards used by this project, the exact checkpoint/KV model
-    # admits one full-context engine per card. The model profile leaves the
-    # measured amount of memory outside vLLM's KV cache for CUDA/NCCL and the
-    # bounded exact-token projection. Qwen3.8 needs more than the other
-    # profiles because its vocabulary projection is materially larger.
+    # The model profile leaves memory outside vLLM's KV cache for CUDA/NCCL
+    # and the bounded exact-token projection. The layout planner also accounts
+    # for startup weight conversion before choosing the smallest fitting TP
+    # group. Qwen3.8 needs a larger projection reserve than the other profiles.
     _profile_default(
         merged, "vllm_gpu_memory_utilization", 0.965, explicit_keys)
     _profile_default(merged, "vllm_quantization", "", explicit_keys)
@@ -1072,11 +1071,10 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     merged["vllm_runtime_reserve_override_gib"] = float(
         profile["vllm_runtime_reserve_gib"])
     _profile_default(merged, "vllm_staged_loading", True, explicit_keys)
-    # Final TP=1 admission is decided after nvidia-smi identifies the cards.
-    # Blackwell can consume GPT-OSS's native MXFP4 layout directly; older
-    # architectures may need a large transient Marlin repack and must retain
-    # the conservative TP>=2 startup guard in gpu_runtime.py.
-    merged["allow_gpt_oss_tp1"] = False
+    # Discard the obsolete hardware-name bypass, including resumed runs.
+    # Admission now depends on the bounded-conversion worker contract in
+    # gpu_runtime.py, rather than assuming a backend from the GPU's name.
+    merged.pop("allow_gpt_oss_tp1", None)
 
     # Exact long-context training policy. This does not shorten, approximate,
     # or discard a trajectory. It selects exact memory-saving execution modes
@@ -1103,8 +1101,8 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
         f"[model-profile] {profile['name']}: context limit="
         f"{merged['max_seq_length']}, max generated tokens="
         f"{merged['max_new_tokens']}, reasoning="
-        f"{reasoning_label}, rollout target=one "
-        "TP=1 engine/GPU; training layout="
+        f"{reasoning_label}, rollout target=maximum memory-safe replicas; "
+        "training layout="
         f"{merged['training_layout']}; {precedence_note}; exact "
         "long-context training enabled",
         flush=True,
@@ -2784,26 +2782,6 @@ def load_config():
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
-
-    if merged.get("coder_model_profile") == "gpt-oss-120b":
-        generation_cards = [
-            memory[gpu_id] for gpu_id in gpu_ids if gpu_id in memory]
-        native_mxfp4_cards = bool(generation_cards) and all(
-            ("blackwell" in card.name.lower()
-             or "rtx pro 6000" in card.name.lower())
-            for card in generation_cards
-        )
-        # A CPU-only configuration inspection has no device evidence, so keep
-        # the conservative guard. On the target RTX PRO 6000 Blackwell host,
-        # this admits eight independent TP=1 engines over eight cards.
-        merged["allow_gpt_oss_tp1"] = native_mxfp4_cards
-        if native_mxfp4_cards:
-            print("[model-profile] GPT-OSS native MXFP4 Blackwell path: "
-                  "TP=1 rollout engines admitted")
-        else:
-            print("[model-profile] GPT-OSS TP=1 native-MXFP4 support was not "
-                  "confirmed on every rollout GPU; retaining automatic "
-                  "TP sharding")
 
     merged["training_model_name"] = _resolve_training_model_name(
         merged.get("model_name", ""), merged.get("training_model_name"),

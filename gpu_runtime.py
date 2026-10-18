@@ -312,6 +312,13 @@ def _effective_vllm_budget_gib(cfg: dict, total_gib: float,
                max(0.0, float(total_gib) - reserve))
 
 
+def uses_bounded_gpt_oss_repack(model_name, quantization=None) -> bool:
+    """Single contract shared by layout admission and the actual worker."""
+    return ("gpt-oss-120b" in str(model_name).lower()
+            and str(quantization or "").strip().lower()
+            in ("", "auto", "none", "mxfp4", "gpt_oss_mxfp4"))
+
+
 def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
     parallel_size = max(1, int(parallel_size))
     model_name = cfg.get("model_name", "")
@@ -322,16 +329,20 @@ def _minimum_vllm_gib_per_gpu(cfg: dict, parallel_size: int) -> float:
     required = weight_gib + 4.0 + kv_gib
 
     # GPT-OSS-120B's native MXFP4 checkpoint can reside on a 95-GiB card once
-    # loaded, but a TP=1 vLLM startup is not viable there: conversion to the
+    # loaded, but the unmodified TP=1 loader exhausted memory: conversion to the
     # Marlin MoE layout transiently reached more than 94 GiB before the final
     # expert was repacked.  This peak is specific to the unsharded conversion;
     # TP>=2 partitions both expert weights and repacking scratch.  Account for
     # it in the automatic layout rather than discovering it after a full model
-    # download/load.  Cards with at least 100 GiB of usable vLLM budget may
-    # still select TP=1.
+    # download/load. This also occurs on RTX PRO 6000 Blackwell with vLLM
+    # 0.28: the GPU name does not guarantee a repack-free MXFP4 backend.
+    # The dedicated GPT-OSS worker removes the full-expert duplicate by
+    # packing in place. Only admit the smaller peak when that worker will
+    # actually be installed; a saved hardware-name bypass is not sufficient.
     if ("gpt-oss-120b" in str(model_name).lower()
             and parallel_size == 1
-            and not bool(cfg.get("allow_gpt_oss_tp1", False))):
+            and not uses_bounded_gpt_oss_repack(
+                model_name, cfg.get("vllm_quantization"))):
         required = max(required, 100.0)
     return required
 
@@ -409,11 +420,16 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # max_model_len for every request.  Basing it on full-context requests
         # serialized long-thinking jobs (for example, two active Qwen3.8
         # requests despite a ~580k-token paged-KV pool).  Plan against a
-        # conservative 64k active sequence instead.  vLLM owns the fixed paged
+        # shorter active sequence instead. vLLM owns the fixed paged
         # KV allocation and exactly preempts/recomputes unusually long requests
         # before that pool can overflow, so this raises throughput without
         # shortening or approximating any rollout.
-        active_tokens = min(max_len, 65_536)
+        # Use a 16k target for GPT-OSS to admit more simultaneous requests,
+        # retaining the 64k target for other models. This is a scheduler
+        # estimate, not an output/context cap.
+        active_target = (16_384 if using_vllm and uses_bounded_gpt_oss_repack(
+            cfg.get("model_name"), cfg.get("vllm_quantization")) else 65_536)
+        active_tokens = min(max_len, active_target)
         kv_gib_per_active_seq_gpu = (
             _kv_bytes_per_token(cfg.get("model_name", "")) * active_tokens
             / parallel_size / (1024.0 ** 3)

@@ -66,6 +66,7 @@ import traceback
 import multiprocessing as mp
 
 from gpu_runtime import (
+    uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
 import terminal_output as _terminal_output
@@ -606,6 +607,10 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         # disables the eager network-filesystem prefetch without changing the
         # weights or quantization used by vLLM.
         kwargs["safetensors_load_strategy"] = "lazy"
+        if uses_bounded_gpt_oss_repack(model_name, quantization):
+            # Loaded inside each engine process (also under spawn/TP), so the
+            # bounded conversion runs where the weights are actually loaded.
+            kwargs["worker_cls"] = "vllm_compat.gpt_oss_worker.GptOssWorker"
     if int(tensor_parallel_size) > 1:
         # LoRA work is otherwise repeated on every TP rank. Sharding it also
         # avoids a large adapter-side memory spike on wide models.
