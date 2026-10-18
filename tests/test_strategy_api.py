@@ -321,6 +321,7 @@ def test_openai_prompt_preserves_problem_specific_requirements(problem):
     from problems.erdos import ErdosMinOverlap
     from problems.ac_inequalities import ACInequalities
     cfg = yaml.safe_load((ROOT / "configs" / f"{problem}.yaml").read_text())
+    cfg["api_strategy"] = "gpt-6-luna"
     cls = ErdosMinOverlap if problem == "erdos" else ACInequalities
     instance = cls(cfg)
     messages = [{"role": "user", "content": "TASK_AND_PARENT"}]
@@ -366,15 +367,21 @@ def config(monkeypatch):
 
 
 @pytest.mark.parametrize("filename", sorted(p.name for p in (ROOT / "configs").glob("*.yaml")))
-def test_yaml_activation_and_max_effort(config, filename):
-    cfg, merged = config(filename=filename)
-    assert cfg.api_strategy == "gpt-6-luna" and cfg.strategies
-    assert cfg.strategy_backend == "api"
-    assert cfg.strategy_reasoning_effort == "max" and cfg.strategy_thinking
-    assert cfg.strategy_max_new_tokens == 128000
-    assert cfg.strategy_api_base_url == "https://api.openai.com/v1"
-    assert cfg.strategy_api_key_env == "OPENAI_API_KEY"
-    assert cfg.strategy_api_concurrency == cfg.groups_per_step
+def test_yaml_local_strategy_and_low_effort_gpt_oss_coder(config, filename):
+    cfg, merged = config("--strategies", "--generation-backend", "vllm",
+                         filename=filename)
+    assert cfg.api_strategy == "" and cfg.strategies
+    assert cfg.strategy_backend == "local"
+    assert cfg.strategy_model_name == "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+    assert cfg.strategy_reasoning_effort == "high" and cfg.strategy_thinking
+    assert cfg.strategy_max_new_tokens == 131072
+    assert cfg.model_name == "openai/gpt-oss-120b"
+    assert cfg.coder_template_kind == "gpt-oss"
+    assert cfg.coder_reasoning_effort == "low" and cfg.thinking
+    assert cfg.pilot_xhigh_programs_per_strategy == 0
+    assert cfg.load_in_4bit and cfg.backend == "unsloth"
+    assert cfg.training_model_name == "unsloth/gpt-oss-120b-unsloth-bnb-4bit"
+    assert cfg.training_layout == "replicated"
     assert "test-key-never-sent" not in json.dumps(merged)
 
 
@@ -393,7 +400,7 @@ def test_missing_credential_fails_early(config, monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(strategy_api, "OPENAI_KEY_FILE", tmp_path / "missing")
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
-        config()
+        config("--api-strategy", "gpt-6-luna")
 
 
 def test_old_resume_does_not_silently_enable_api(config, tmp_path):
@@ -405,7 +412,7 @@ def test_old_resume_does_not_silently_enable_api(config, tmp_path):
 
 
 def test_resumed_api_can_be_disabled_without_losing_local_model(config, tmp_path):
-    _, saved = config()
+    _, saved = config("--api-strategy", "gpt-6-luna")
     (tmp_path / "config.json").write_text(json.dumps(saved))
     cfg, _ = config("--resume", str(tmp_path), "--api-strategy", "")
     assert cfg.api_strategy == "" and cfg.strategy_backend == "local"
