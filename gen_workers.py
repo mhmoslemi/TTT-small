@@ -621,6 +621,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         kwargs["enable_expert_parallel"] = True
     if bool(enable_sleep_mode):
         kwargs["enable_sleep_mode"] = True
+        kwargs["worker_extension_cls"] = (
+            "vllm_compat.sleep_memory.SleepMemoryExtension")
     if bool(disable_custom_all_reduce):
         # vLLM's CUDA custom all-reduce uses process-global IPC resources.
         # Multiple independent TP engines on disjoint, remapped GPU subsets
@@ -952,6 +954,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 await llm.wake_up(tags=["kv_cache"])
             else:
                 await llm.wake_up()
+            await llm.collective_rpc("ttt_host_memory")
+        elif command == "host_memory":
+            return await llm.collective_rpc("ttt_host_memory")
         else:
             raise ValueError(f"unknown vLLM control command {command!r}")
 
@@ -974,6 +979,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 and task[0] == "__control__"):
             command = task[1]
             try:
+                control_detail = ""
                 if not can_sleep:
                     raise RuntimeError(
                         "installed vLLM does not expose LLM.sleep/wake_up")
@@ -995,11 +1001,20 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                         llm.wake_up(tags=["kv_cache"])
                     else:
                         llm.wake_up()
+                    if not async_engine:
+                        llm.collective_rpc("ttt_host_memory")
+                elif command == "host_memory":
+                    reports = (_run_async(_async_control(command))
+                               if async_engine else
+                               llm.collective_rpc("ttt_host_memory"))
+                    control_detail = {
+                        "backup_bytes": sum(
+                            int(report["backup_bytes"]) for report in reports)}
                 else:
                     raise ValueError(f"unknown vLLM control command {command!r}")
                 print(f"[vllm worker {rank}] {command} complete", flush=True)
                 if control_queue is not None:
-                    control_queue.put(("ok", rank, command, ""))
+                    control_queue.put(("ok", rank, command, control_detail))
             except Exception:
                 detail = traceback.format_exc()
                 if vllm_log_path:
@@ -1778,6 +1793,7 @@ class GenerationPool:
                     f"vLLM worker {rank} is unavailable during {command}")
             task_queue.put(("__control__", command))
         completed_workers = set()
+        details = {}
         control_timeout = _positive_env_timeout(
             "TTT_VLLM_CONTROL_TIMEOUT_S", 600.0)
         control_deadline = time.monotonic() + control_timeout
@@ -1819,13 +1835,70 @@ class GenerationPool:
                     f"duplicate vLLM control acknowledgement from worker "
                     f"{rank} during {command}")
             completed_workers.add(int(rank))
+            details[int(rank)] = detail
+        return details
 
-    def sleep(self):
+    def sleep(self, *, after_sleep=None, host_admission=None):
         # Stop transient engines first. Creating the sole persistent worker's
         # host-RAM backup afterwards avoids a temporary peak containing both
         # that backup and all transient engine processes.
         self._stop_workers(self._transient_worker_ids)
-        self._vllm_control("sleep", self._persistent_worker_ids)
+        if after_sleep and self._transient_worker_ids:
+            after_sleep([gpu for rank in self._transient_worker_ids
+                         for gpu in self._gpu_groups[rank]])
+        if not self._persistent_worker_ids:
+            return
+        from contextlib import nullcontext
+        from host_memory import (HostMemoryUnavailable, host_memory_info,
+                                 host_transfer_wave, GIB)
+
+        reports = self._vllm_control("host_memory", self._persistent_worker_ids)
+        sizes = {rank: (int(reports[rank]["backup_bytes"])
+                        if self.sleep_level == 1 else 0)
+                 for rank in self._persistent_worker_ids}
+        pending = list(self._persistent_worker_ids)
+        while pending:
+            available = (host_admission.available_bytes()
+                         if host_admission is not None else None)
+            wave = host_transfer_wave(pending, sizes, available_bytes=available)
+            transfer_bytes = sum(sizes[rank] for rank in wave)
+            # Margin covers small buffers/allocator rounding. Pageable backups
+            # avoid the much larger power-of-two pinned-allocation overhead.
+            reservation = (host_admission.reservation(
+                               int(transfer_bytes * 1.05), wait_for_external=False)
+                           if host_admission is not None else nullcontext())
+            print(f"[pool] sleeping {len(wave)}/{self.num_workers} engine(s): "
+                  f"{transfer_bytes / GIB:.1f} GiB pageable host backup", flush=True)
+            transfer_started = time.monotonic()
+            try:
+                with reservation:
+                    self._vllm_control("sleep", wave)
+                    if after_sleep:
+                        after_sleep([gpu for rank in wave
+                                     for gpu in self._gpu_groups[rank]])
+            except HostMemoryUnavailable:
+                # No admitted CPU work can return RAM to unblock this copy.
+                # Keep all rollout GPUs; reload only the unretainable engines
+                # next phase instead of hanging or overcommitting the host.
+                print(f"[pool] host RAM cannot retain engines {list(wave)}; "
+                      "releasing them for training and reloading next phase",
+                      flush=True)
+                self._stop_workers(wave)
+                self._persistent_worker_ids = tuple(
+                    rank for rank in self._persistent_worker_ids if rank not in wave)
+                self._transient_worker_ids = tuple(sorted(
+                    set(self._transient_worker_ids).union(wave)))
+                self.persistent_workers = len(self._persistent_worker_ids)
+                if after_sleep:
+                    after_sleep([gpu for rank in wave
+                                 for gpu in self._gpu_groups[rank]])
+            memory = host_memory_info()
+            available_label = ("unknown" if memory is None else
+                               f"{memory['available'] / GIB:.1f} GiB")
+            print(f"[pool] engines {list(wave)} sleep/handoff complete in "
+                  f"{time.monotonic() - transfer_started:.1f}s; "
+                  f"host RAM available={available_label}", flush=True)
+            pending = [rank for rank in pending if rank not in wave]
 
     def wake_up(self):
         if not self.vllm_co_resident_sleep:
@@ -2541,6 +2614,7 @@ class PhasedVLLMGenerationPool:
     def __init__(self, before_start, after_stop, **pool_kwargs):
         self._before_start = before_start
         self._after_stop = after_stop
+        self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
@@ -2742,13 +2816,25 @@ class PhasedVLLMGenerationPool:
     def score_token_logprobs(self, *args, **kwargs):
         return self._ensure_started().score_token_logprobs(*args, **kwargs)
 
-    def release(self):
+    def release_for_training(self, trainer):
+        """Restore each trainer group as its coder engines release the GPUs."""
+        return self.release(
+            after_sleep=trainer.restore_on_gpus,
+            host_admission=trainer.host_memory_admission)
+
+    def release(self, *, after_sleep=None, host_admission=None):
         if not self._awake:
             return
+        if host_admission is None:
+            host_admission = self.host_memory_admission
         try:
             if self._persistent:
                 try:
-                    self._pool.sleep()
+                    if after_sleep is None and host_admission is None:
+                        self._pool.sleep()
+                    else:
+                        self._pool.sleep(after_sleep=after_sleep,
+                                         host_admission=host_admission)
                 except Exception as exc:
                     # A vLLM EngineCore can die after an inference OOM.  It
                     # cannot acknowledge sleep, but shutting down the complete
@@ -2767,6 +2853,8 @@ class PhasedVLLMGenerationPool:
                             "continuing after process cleanup request",
                             flush=True,
                         )
+                    if after_sleep is not None:
+                        raise
                     print(
                         "[pool] vLLM sleep failed after an engine failure "
                         f"({type(exc).__name__}); discarded the pool and will "
@@ -2776,13 +2864,16 @@ class PhasedVLLMGenerationPool:
             else:
                 pool, self._pool = self._pool, None
                 pool.shutdown()
+                if after_sleep:
+                    after_sleep(self._pool_kwargs["gpu_ids"])
         finally:
             self._awake = False
             self._after_stop()
 
     def shutdown(self):
-        if self._awake:
-            self.release()
+        # Terminal cleanup has no next wake-up: copying every model to host
+        # RAM here can recreate the very pressure that caused the shutdown.
+        self._awake = False
         if self._pool is not None:
             self._pool.shutdown()
             self._pool = None

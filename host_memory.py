@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import threading
+from contextlib import contextmanager
 
 
 GIB = 1024 ** 3
@@ -75,6 +76,94 @@ def automatic_activation_offload_budget_bytes(
     )
 
 
+def host_memory_reserve_bytes(info):
+    """Leave OS/runtime headroom without assuming a particular model or node."""
+    total = max(1, int(info["total"]))
+    return min(total // 4, max(GIB, min(128 * GIB, total // 10)))
+
+
+class HostMemoryUnavailable(MemoryError):
+    """A transfer cannot fit and no admitted work can release RAM for it."""
+
+
+class HostMemoryAdmission:
+    """Share live RAM admission across evaluator, transfer and trainer processes.
+
+    Outstanding reservations are charged in addition to current RSS. This is
+    deliberately conservative: a newly admitted process may not have touched
+    its pages yet. Reading MemAvailable alone lets concurrent allocations all
+    spend the same free RAM. No GPU-resident forward acquires this gate.
+    """
+
+    def __init__(self, multiprocessing_context):
+        self._reserved = multiprocessing_context.Value("q", 0, lock=False)
+        self._condition = multiprocessing_context.Condition(
+            multiprocessing_context.RLock())
+
+    @property
+    def reserved_bytes(self):
+        with self._condition:
+            return int(self._reserved.value)
+
+    def available_bytes(self):
+        with self._condition:
+            info = host_memory_info()
+            if info is None:
+                return None
+            return max(0, int(info["available"])
+                       - host_memory_reserve_bytes(info)
+                       - int(self._reserved.value))
+
+    @contextmanager
+    def reservation(self, size_bytes, *, wait_for_external=True):
+        size_bytes = max(0, int(size_bytes))
+        with self._condition:
+            while True:
+                info = host_memory_info()
+                if info is None:
+                    break
+                reserve = host_memory_reserve_bytes(info)
+                if size_bytes > int(info["total"]) - reserve:
+                    raise HostMemoryUnavailable(
+                        "host-memory request exceeds node capacity")
+                if (int(info["available"]) - reserve
+                        - int(self._reserved.value) >= size_bytes):
+                    break
+                if not wait_for_external and not self._reserved.value:
+                    raise HostMemoryUnavailable(
+                        "host RAM cannot retain another model backup")
+                # Also observe memory released outside this gate (model moves,
+                # page-cache reclamation and completed inference wake-ups).
+                self._condition.wait(timeout=0.25)
+            self._reserved.value += size_bytes
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._reserved.value -= size_bytes
+                self._condition.notify_all()
+
+
+def host_transfer_wave(worker_ids, backup_bytes, *, memory_info=None,
+                       available_bytes=None):
+    """Bound temporary CPU duplicates; generation parallelism is unaffected."""
+    info = host_memory_info() if memory_info is None else memory_info
+    # Large concurrent cudaHostAlloc/copies used to stall every engine. Limit
+    # only phase-boundary transfers, and restore matching trainers between waves.
+    budget = 128 * GIB if info is None else max(
+        GIB, min(256 * GIB, int(info["total"]) // 10))
+    if available_bytes is not None:
+        budget = min(budget, max(0, int(available_bytes)))
+    wave, used = [], 0
+    for rank in worker_ids:
+        size = max(0, int(backup_bytes[rank]))
+        if wave and used + size > budget:
+            break
+        wave.append(rank)
+        used += size
+    return tuple(wave)
+
+
 def automatic_activation_offload_slots(
         worker_count, *, memory_info=None,
         bytes_per_slot=DEFAULT_ACTIVATION_OFFLOAD_SLOT_BYTES,
@@ -109,11 +198,19 @@ class _ActivationOffloadReservation:
 
     def __enter__(self):
         self._units = self._gate._acquire(self._work)
+        self._host_context = self._gate.host_admission.reservation(
+            self._units * self._gate.unit_bytes)
+        try:
+            self._host_context.__enter__()
+        except BaseException:
+            self._gate._release(self._units)
+            raise
         self._acquired = True
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._acquired:
+            self._host_context.__exit__(exc_type, exc_value, traceback)
             self._gate._release(self._units)
             self._acquired = False
         return False
@@ -157,6 +254,7 @@ class TokenWeightedActivationOffloadGate:
             "d", 0.0, lock=False)
         self._condition = multiprocessing_context.Condition(
             multiprocessing_context.RLock())
+        self.host_admission = HostMemoryAdmission(multiprocessing_context)
 
     @property
     def full_context_concurrency(self):
@@ -184,14 +282,22 @@ class TokenWeightedActivationOffloadGate:
             return None
         units = int(math.ceil(
             self.estimated_request_bytes(work) / self.unit_bytes))
-        # A completed calibration job proves that one such graph can finish
-        # on this host even if the added safety margin exceeds the allocatable
-        # budget. In that case reserve the entire budget and serialize it;
-        # never turn a successful measurement into a recovery failure.
-        return min(self.capacity_units, max(1, units))
+        # Never reserve less than the estimated allocation. An oversized
+        # request must use the existing model-sharded fallback instead.
+        return max(1, units) if units <= self.capacity_units else None
 
     def can_admit(self, work):
-        return self.request_units(work) is not None
+        units = self.request_units(work)
+        if units is None:
+            return False
+        info = host_memory_info()
+        if info is None:
+            return True
+        # Other admitted work can finish and return its RAM. If even that
+        # cannot make this request fit, don't wait forever on resident models.
+        return units * self.unit_bytes <= (
+            int(info["available"]) + self.host_admission.reserved_bytes
+            - host_memory_reserve_bytes(info))
 
     def reservation(self, work):
         units = self.request_units(work)

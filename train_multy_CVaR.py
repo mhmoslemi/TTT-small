@@ -847,7 +847,7 @@ def _coder_model_profile(model_name):
             "name": "gpt-oss-120b",
             "native_context": 131_072,
             "max_output": 131_072,
-            "reasoning_effort": "medium",
+            "reasoning_effort": "high",
             "template_kind": "gpt-oss",
             "training_4bit": True,
             # The trainable Unsloth BitsAndBytes copy fits on one 95+ GiB
@@ -6207,6 +6207,7 @@ class ProcessDistributedTrainer:
         self._process_label = (
             "train-fast" if bool(cfg.fast) else "train-process")
         self._offloaded = False
+        self._offloaded_ranks = set()
         self._closed = False
         self._workers_idle = True
         self._entropic_overlap = None
@@ -6337,7 +6338,8 @@ class ProcessDistributedTrainer:
             f"physical GPUs {self._physical_ids}; adaptive memory ceiling="
             f"{self._memory_percentage:g}%, "
             "exact long-rollout rescue staged at 96%, 98%, then 99%; "
-            f"{fallback_description}", flush=True)
+            f"{fallback_description}; live RAM admission is shared with "
+            "evaluation and model transfers", flush=True)
 
     @property
     def world_size(self):
@@ -6361,6 +6363,10 @@ class ProcessDistributedTrainer:
             1.05 * (model_bytes * self._world_size + optimizer_bytes)
             + self._world_size * GIB
         )
+
+    @property
+    def host_memory_admission(self):
+        return self._activation_offload_semaphore.host_admission
 
     def reclaim_host_memory(self):
         """Synchronize every trainer process and free unused host caches."""
@@ -7846,6 +7852,7 @@ class ProcessDistributedTrainer:
         if purge_host_cache:
             self.reclaim_host_memory()
         self._offloaded = True
+        self._offloaded_ranks = set(range(self._world_size))
         try:
             for command_queue in self._command_queues.values():
                 command_queue.put({"kind": "offload"})
@@ -7864,7 +7871,21 @@ class ProcessDistributedTrainer:
             raise
 
     def restore_after_generation(self):
+        self.restore_on_gpus(self._physical_ids)
+
+    def restore_on_gpus(self, physical_gpu_ids):
+        """Move only released GPU groups back to training, in parallel.
+
+        Called between coder sleep waves, so a complete set of CPU trainer
+        copies never has to coexist with all new inference sleep backups.
+        No collective or parameter update occurs until every rank is ready.
+        """
         if not self._offloaded:
+            return
+        physical_gpu_ids = set(int(gpu) for gpu in physical_gpu_ids)
+        ranks = {rank for rank in self._offloaded_ranks
+                 if self._physical_ids[rank] in physical_gpu_ids}
+        if not ranks:
             return
         if not self._dist_initialized:
             raise RuntimeError(
@@ -7877,21 +7898,27 @@ class ProcessDistributedTrainer:
         from host_memory import reclaim_unused_host_memory
 
         try:
-            for command_queue in self._command_queues.values():
-                command_queue.put({"kind": "restore"})
-            gc.collect()
-            with torch.cuda.device(0):
-                torch.cuda.empty_cache()
-                set_total_memory_ceiling(0, self._memory_fraction)
-                self.backend.restore_after_generation()
-                self.backend.set_training_mode()
-                torch.cuda.synchronize(0)
-            validate_model_device(self.model, 0)
-            _restore_optimizer_state_to_parameters(self.optimizer)
-            reclaim_unused_host_memory(
-                torch, cuda_devices=(0,), force=True)
-            self._collect_event("restored", range(1, self._world_size))
-            self._offloaded = False
+            print(f"[{self._process_label}] restoring trainer GPUs "
+                  f"{[self._physical_ids[rank] for rank in sorted(ranks)]} "
+                  "as coder memory is released; CPU evaluation continues",
+                  flush=True)
+            for rank in sorted(ranks - {0}):
+                self._command_queues[rank].put({"kind": "restore"})
+            if 0 in ranks:
+                gc.collect()
+                with torch.cuda.device(0):
+                    torch.cuda.empty_cache()
+                    set_total_memory_ceiling(0, self._memory_fraction)
+                    self.backend.restore_after_generation()
+                    self.backend.set_training_mode()
+                    torch.cuda.synchronize(0)
+                validate_model_device(self.model, 0)
+                _restore_optimizer_state_to_parameters(self.optimizer)
+                reclaim_unused_host_memory(
+                    torch, cuda_devices=(0,), force=True)
+            self._collect_event("restored", ranks - {0})
+            self._offloaded_ranks.difference_update(ranks)
+            self._offloaded = bool(self._offloaded_ranks)
         except BaseException:
             self._workers_idle = False
             self._abort_workers()
@@ -8751,6 +8778,11 @@ def _finalize_pending_spo_rs_artifacts(
         workers = max(1, min(
             len(artifacts), _resolve_reward_workers(cfg, problem)))
 
+    from host_memory import HostMemoryAdmission
+    import multiprocessing
+    host_admission = (getattr(gen_pool, "host_memory_admission", None)
+                      or HostMemoryAdmission(multiprocessing.get_context("spawn")))
+
     def evaluate(item):
         meta = item["meta"]
         issue = meta.get("output_format_issue")
@@ -8764,14 +8796,15 @@ def _finalize_pending_spo_rs_artifacts(
         if not isolated_eval:
             return problem.compute_reward(
                 response_text, parent_context, cfg.sandbox_timeout_s)
-        cpu_id = isolated_slots.get()
-        try:
-            return problem.compute_reward(
-                response_text, parent_context, cfg.sandbox_timeout_s,
-                cpu_id=cpu_id,
-                memory_limit_bytes=isolated_memory_limit)
-        finally:
-            isolated_slots.put(cpu_id)
+        with host_admission.reservation(isolated_memory_limit):
+            cpu_id = isolated_slots.get()
+            try:
+                return problem.compute_reward(
+                    response_text, parent_context, cfg.sandbox_timeout_s,
+                    cpu_id=cpu_id,
+                    memory_limit_bytes=isolated_memory_limit)
+            finally:
+                isolated_slots.put(cpu_id)
 
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
     evaluation_futures = {
@@ -9484,11 +9517,9 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
 def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     """Return a conservative automatic per-process sandbox address-space cap.
 
-    At most 40% of physical RAM can be committed by concurrently admitted
-    generated programs. The remainder is reserved for trainer replicas,
-    sleeping vLLM weight backups, the active rollout engines, and the parent
-    process. A four-GiB per-program ceiling is already far above the working
-    set required by the intended sub-1k-point discovery problem.
+    This sets a per-program ceiling, not a promise that the whole evaluator
+    pool fits beside resident models. HostMemoryAdmission separately reserves
+    live RAM at each launch and shares that budget with transfers/activations.
     """
     concurrent_sandboxes = max(1, int(concurrent_sandboxes))
     try:
@@ -9945,6 +9976,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
+    from host_memory import HostMemoryAdmission
+    host_admission = getattr(parallel_trainer, "host_memory_admission", None)
+    if host_admission is None:
+        host_admission = getattr(gen_pool, "host_memory_admission", None)
+    if host_admission is None:
+        import multiprocessing
+        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"))
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
     isolated_cpu_slots = None
     isolated_cpu_count = 0
@@ -9970,8 +10008,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             f"{isolated_cpu_count} CPU(s), up to "
             f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
             "process tree is pinned to one CPU and excess candidates remain "
-            "queued; sandbox launches are FD-safe and do not reduce this "
-            f"parallelism; automatic memory ceiling="
+            "queued; live RAM admission is shared with model transfers and "
+            f"activation offload; automatic memory ceiling="
             f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
             "stdout+stderr capture is bounded")
     else:
@@ -10033,14 +10071,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "shared-GPU evaluator")
 
     def _run_isolated_reward(response_text, parent_ctx):
-        cpu_id = isolated_cpu_slots.get()
-        try:
-            return problem.compute_reward(
-                response_text, parent_ctx, cfg.sandbox_timeout_s,
-                cpu_id=cpu_id,
-                memory_limit_bytes=isolated_memory_limit_bytes)
-        finally:
-            isolated_cpu_slots.put(cpu_id)
+        with host_admission.reservation(isolated_memory_limit_bytes):
+            cpu_id = isolated_cpu_slots.get()
+            try:
+                return problem.compute_reward(
+                    response_text, parent_ctx, cfg.sandbox_timeout_s,
+                    cpu_id=cpu_id,
+                    memory_limit_bytes=isolated_memory_limit_bytes)
+            finally:
+                isolated_cpu_slots.put(cpu_id)
 
     def _submit_rollout(record):
         job = prompt_jobs[record["job_idx"]]
@@ -10963,6 +11002,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # ----- ROLLOUTS (streamed) + dispatch rewards as each rollout lands -----
     rollout_t0 = time.time()
     evaluation_trainer_offloaded = False
+    coder_phase_complete = False
     try:
         try:
             api_planned = bool(two_stage_rollouts and
@@ -11614,9 +11654,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
 
+            coder_phase_complete = True
         finally:
             if gen_pool is not None and getattr(gen_pool, "sequential", False):
-                gen_pool.release()
+                immediate_restore = bool(
+                    coder_phase_complete and training_enabled
+                    and not defer_gpu_evaluation
+                    and hasattr(parallel_trainer, "restore_on_gpus")
+                    and hasattr(gen_pool, "release_for_training")
+                    and not getattr(cfg,
+                        "dual_resident_qwen3_8b_strategy_coder_pools", False))
+                if immediate_restore:
+                    gen_pool.release_for_training(parallel_trainer)
+                else:
+                    gen_pool.release()
             if (getattr(
                     cfg,
                     "dual_resident_qwen3_8b_strategy_coder_pools",
@@ -13491,6 +13542,11 @@ def main():
             vllm_log_path=vllm_log_path,
         )
         if cfg.generation_backend == "vllm":
+            from host_memory import HostMemoryAdmission
+            import multiprocessing
+            pool_options["host_memory_admission"] = (
+                getattr(parallel_trainer, "host_memory_admission", None)
+                or HostMemoryAdmission(multiprocessing.get_context("spawn")))
             trainer_offloaded = False
 
             def _offload_trainer_for_generation(phase="coder"):
@@ -13620,6 +13676,10 @@ def main():
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
+                if (parallel_trainer is not None
+                        and not parallel_trainer.is_offloaded):
+                    trainer_offloaded = False
+                    return
                 if not runtime_training_active["value"]:
                     print("[gpu] keeping inactive training model offloaded "
                           "(no-training phase)", flush=True)

@@ -53,11 +53,18 @@ def test_gpt_oss_layout_and_worker_share_bounded_startup_contract(
 @pytest.mark.parametrize("resume", [False, True])
 def test_erdos_gpt_oss_config_uses_eight_coders(monkeypatch, tmp_path, resume):
     import train_multy_CVaR as training
+    import yaml
 
     monkeypatch.setenv("AVAILABLE_GPUS", "0,1,2,3,4,5,6,7")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setattr(gpu_runtime, "query_gpu_memory", blackwell_cards)
-    argv = ["train_multy_CVaR.py", "--config", str(ROOT / "configs/erdos.yaml"),
+    # Pin this fixture's effort explicitly; the user's profile may be changed
+    # independently of GPU placement. Also verify YAML retains precedence.
+    config = yaml.safe_load((ROOT / "configs/erdos.yaml").read_text())
+    config["coder_reasoning_effort"] = "low"
+    config_path = tmp_path / "erdos.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    argv = ["train_multy_CVaR.py", "--config", str(config_path),
             "--backend", "hf", "--advantage-mode", "spo-rs", "--fast",
             "--strategies", "--coder-retry", "--fused-long-attention"]
     if resume:
