@@ -847,7 +847,7 @@ def _coder_model_profile(model_name):
             "name": "gpt-oss-120b",
             "native_context": 131_072,
             "max_output": 131_072,
-            "reasoning_effort": "low",
+            "reasoning_effort": "medium",
             "template_kind": "gpt-oss",
             "training_4bit": True,
             # The trainable Unsloth BitsAndBytes copy fits on one 95+ GiB
