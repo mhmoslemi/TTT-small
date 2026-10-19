@@ -58,7 +58,9 @@ def test_wake_oom_recovery_uses_live_budget_and_keeps_eight_workers(monkeypatch,
     def start(pool, ranks, **kwargs):
         started.extend(ranks)
         pool._sleep_capable_workers.update(ranks)
-        assert pool._worker_options["gpu_memory_utilization"] * 95.6 <= 76.4 + 1e-8
+        # The 16-GiB shared-pool reserve is kept beyond the 18.2 GiB already
+        # allocated when recovery begins: 77.4 GiB free - 16 GiB reserve.
+        assert pool._worker_options["gpu_memory_utilization"] * 95.6 <= 61.4 + 1e-8
 
     monkeypatch.setattr(gen_workers.GenerationPool, "_start_workers", start)
     calls = []

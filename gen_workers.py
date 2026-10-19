@@ -1479,6 +1479,7 @@ class GenerationPool:
             if vllm_runtime_reserve_gib is None else
             max(0.0, float(vllm_runtime_reserve_gib))
         )
+        self.vllm_runtime_reserve_gib = float(reserve_gib)
         reserve_reasons = []
         if self.vllm_co_resident_sleep:
             reserve_reasons.append("shared sleep residency")
@@ -1578,19 +1579,27 @@ class GenerationPool:
         self.control_queue = ctx.Queue()
 
         if self.backend == "vllm":
-            # Utilization is an upper bound. Apply the same live-memory cap
-            # used by _start_worker BEFORE preflight; otherwise a wake OOM
-            # can never reach its recovery loader when trainer/runtime
-            # allocations have grown since the first generation phase.
+            # Utilization is an upper bound. The absolute runtime reserve must
+            # remain free in addition to allocations already present on the
+            # card. Capping only against total capacity silently spends the
+            # reserve on an offloaded trainer or sleeping peer pool; a later
+            # wake can then succeed but run out of activation memory during
+            # generation.
+            live_reserve_gib = max(
+                VLLM_STARTUP_FREE_MARGIN_GIB,
+                self.vllm_runtime_reserve_gib,
+            )
             startup_utilization = _cap_vllm_utilization_for_gpus(
                 self.vllm_gpu_memory_utilization, self.gpu_ids,
-                reserve_gib=VLLM_STARTUP_FREE_MARGIN_GIB,
+                reserve_gib=live_reserve_gib,
                 reserve_from_free=True)
             if startup_utilization < self.vllm_gpu_memory_utilization - 1e-9:
                 print("[pool] current free GPU memory caps vLLM utilization "
                       f"{self.vllm_gpu_memory_utilization:.3f} -> "
-                      f"{startup_utilization:.3f}; worker count and token "
-                      "limits unchanged", flush=True)
+                      f"{startup_utilization:.3f}, preserving "
+                      f"{live_reserve_gib:.1f} GiB/GPU beyond current "
+                      "allocations; worker count and token limits unchanged",
+                      flush=True)
                 self.vllm_gpu_memory_utilization = startup_utilization
             _assert_vllm_memory_available(
                 self.gpu_ids, self.vllm_gpu_memory_utilization, model_name)
@@ -1658,7 +1667,10 @@ class GenerationPool:
         startup_utilization = _cap_vllm_utilization_for_gpus(
             worker_options["gpu_memory_utilization"],
             self._gpu_groups[rank],
-            reserve_gib=VLLM_STARTUP_FREE_MARGIN_GIB,
+            reserve_gib=max(
+                VLLM_STARTUP_FREE_MARGIN_GIB,
+                self.vllm_runtime_reserve_gib,
+            ),
             reserve_from_free=True,
         )
         if (startup_utilization
