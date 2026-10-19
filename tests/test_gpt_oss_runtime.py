@@ -28,9 +28,10 @@ def _attention(query, key, value, *, mask, sinks):
     return weights @ value
 
 
-@pytest.mark.parametrize("batch,length,window", [(1, 17, None), (2, 11, 4)])
+@pytest.mark.parametrize("batch,length,window,hooked", [
+    (1, 17, None, False), (2, 11, 4, True)])
 def test_compiled_attention_normalizes_layout_without_changing_gradients(
-        monkeypatch, batch, length, window):
+        monkeypatch, batch, length, window, hooked):
     compiled_rope = torch.compile(_rotary, backend="aot_eager", fullgraph=True)
     compiled_attention = torch.compile(_attention, backend="aot_eager", fullgraph=True)
     seen = []
@@ -61,7 +62,23 @@ def test_compiled_attention_normalizes_layout_without_changing_gradients(
 
     torch.manual_seed(12)
     model = Attention()
+    if hooked:
+        # Quantized replica placement installs this actual Accelerate wrapper:
+        # forward becomes a partial and the bound method lives in _old_forward.
+        from accelerate.hooks import (
+            ModelHook, add_hook_to_module, remove_hook_from_module)
+        add_hook_to_module(model, ModelHook())
+    placed_forward = model.forward
     assert install_attention_layout_guards(model) == 1
+    if hooked:
+        assert model.forward is placed_forward  # Keep Accelerate's routing.
+        remove_hook_from_module(model)
+        add_hook_to_module(model, ModelHook())
+        # Repeat installation after the same hook removal/redispatch lifecycle
+        # used between generation and training. It must remain idempotent.
+        flex_guard = sink_module.flex_attention
+        assert install_attention_layout_guards(model) == 1
+        assert sink_module.flex_attention is flex_guard
     # The original kernels remain the delegates, not an eager replacement.
     assert sink_module.flex_attention.__wrapped__ is attention_kernel
     raw = [torch.randn(batch, length, heads, 4, dtype=torch.float64)

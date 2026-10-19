@@ -49,10 +49,19 @@ def install_attention_layout_guards(model):
         nonlocal rotary_boundaries
         if isinstance(function, types.MethodType):
             function = function.__func__
-        if not isinstance(function, types.FunctionType) or id(function) in visited:
+        if not callable(function) or id(function) in visited:
             return
         visited.add(id(function))
         if getattr(function, "_ttt_attention_layout", False):
+            return
+        # Accelerate uses update_wrapper(partial(new_forward, module),
+        # old_forward). Follow its metadata BEFORE filtering for plain Python
+        # functions; otherwise every hooked attention layer is skipped.
+        for name in ("__wrapped__", "_torchdynamo_orig_callable"):
+            visit(getattr(function, name, None))
+        if isinstance(function, functools.partial):
+            visit(function.func)
+        if not isinstance(function, types.FunctionType):
             return
         for name, cell in zip(function.__code__.co_freevars,
                               function.__closure__ or ()):
@@ -75,12 +84,14 @@ def install_attention_layout_guards(model):
                 rotary_boundaries += 1
             elif "forward" in name:
                 visit(namespace.get(name))
-        for name in ("__wrapped__", "_torchdynamo_orig_callable"):
-            visit(getattr(function, name, None))
 
     for module in model.modules():
         if getattr(module, "sinks", None) is not None:
             visit(module.forward)
+            # Accelerate restores this same method when hooks are removed
+            # for CPU offload. Patch its rotary call, not the routing wrapper,
+            # so protection survives offload and redispatch unchanged.
+            visit(getattr(module, "_old_forward", None))
     if not rotary_boundaries:
         raise RuntimeError(
             "GPT-OSS attention layout guard could not locate the loaded "
