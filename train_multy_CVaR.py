@@ -7927,17 +7927,26 @@ class ProcessDistributedTrainer:
     def _abort_workers(self):
         import torch.distributed as dist
 
-        for process in self._processes.values():
-            if process.is_alive():
-                process.terminate()
-        for process in self._processes.values():
-            process.join(timeout=10.0)
-        if self._dist_initialized and dist.is_initialized():
+        was_initialized = self._dist_initialized
+        self._terminate_workers_for_restart()
+        if was_initialized and dist.is_initialized():
             try:
                 dist.destroy_process_group()
             except Exception:
                 pass
         self._dist_initialized = False
+
+    def _close_queues(self):
+        # After consumers exit, pending rollout tensors cannot drain from the
+        # feeder pipe. Joining that feeder at interpreter exit hangs forever.
+        # Discard pending messages only when this trainer has stopped/aborted.
+        queues = [getattr(self, "_work_queue", None),
+                  getattr(self, "_result_queue", None)]
+        queues.extend(getattr(self, "_command_queues", {}).values())
+        for queue in queues:
+            if queue is not None:
+                queue.cancel_join_thread()
+                queue.close()
 
     def _terminate_workers_for_restart(self):
         """Stop child ranks without entering another distributed collective.
@@ -7976,6 +7985,7 @@ class ProcessDistributedTrainer:
             if process.is_alive():
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
         self._dist_initialized = False
+        self._close_queues()
 
     def shutdown(self, *, for_restart=False):
         if self._closed:
@@ -8035,6 +8045,7 @@ class ProcessDistributedTrainer:
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=10.0)
+            self._close_queues()
 
 
 # ======================================================================

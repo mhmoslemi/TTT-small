@@ -1129,6 +1129,11 @@ class UnslothBackend(_ModelPlacementBackend):
             random_state=self.cfg.seed,
         )
         set_gradient_checkpointing(model, False)
+        if str(getattr(self.cfg, "coder_model_profile", "")) == "gpt-oss-120b":
+            from gpt_oss_training import install_attention_layout_guards
+            install_attention_layout_guards(model)
+            print("[memory] GPT-OSS compiled rotary/flex attention: "
+                  "stable Q/K/V layouts; fused kernels retained", flush=True)
         _configure_exact_long_training(model, self.cfg)
         tokenizer = _ensure_pad_token(tokenizer)
 
