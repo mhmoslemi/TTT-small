@@ -1578,6 +1578,20 @@ class GenerationPool:
         self.control_queue = ctx.Queue()
 
         if self.backend == "vllm":
+            # Utilization is an upper bound. Apply the same live-memory cap
+            # used by _start_worker BEFORE preflight; otherwise a wake OOM
+            # can never reach its recovery loader when trainer/runtime
+            # allocations have grown since the first generation phase.
+            startup_utilization = _cap_vllm_utilization_for_gpus(
+                self.vllm_gpu_memory_utilization, self.gpu_ids,
+                reserve_gib=VLLM_STARTUP_FREE_MARGIN_GIB,
+                reserve_from_free=True)
+            if startup_utilization < self.vllm_gpu_memory_utilization - 1e-9:
+                print("[pool] current free GPU memory caps vLLM utilization "
+                      f"{self.vllm_gpu_memory_utilization:.3f} -> "
+                      f"{startup_utilization:.3f}; worker count and token "
+                      "limits unchanged", flush=True)
+                self.vllm_gpu_memory_utilization = startup_utilization
             _assert_vllm_memory_available(
                 self.gpu_ids, self.vllm_gpu_memory_utilization, model_name)
 
@@ -2745,11 +2759,12 @@ class PhasedVLLMGenerationPool:
                     # instead of losing the completed training step.
                     failed_pool, self._pool = self._pool, None
                     failed_pool.shutdown()
+                    failed_sleep_level = self._sleep_level
                     self._sleep_level = 1
                     self._force_transient = False
                     self._level_one_override_model = "reload-fallback"
                     print(
-                        "[pool] level-2 vLLM wake failed "
+                        f"[pool] level-{failed_sleep_level} vLLM wake failed "
                         f"({type(exc).__name__}); restarting once with "
                         "persistent level-1 sleep",
                         flush=True,

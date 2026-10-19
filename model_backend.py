@@ -1148,6 +1148,14 @@ class UnslothBackend(_ModelPlacementBackend):
     def set_inference_mode(self):
         self._FastLanguageModel.for_inference(self.model)
 
+    def offload_for_generation(self):
+        if (not getattr(self, "_trainer_is_offloaded", False)
+                and str(getattr(self.cfg, "coder_model_profile", ""))
+                == "gpt-oss-120b"):
+            from gpt_oss_training import release_checkpoint_workspaces
+            release_checkpoint_workspaces()
+        super().offload_for_generation()
+
     def set_training_mode(self):
         self._FastLanguageModel.for_training(self.model)
 

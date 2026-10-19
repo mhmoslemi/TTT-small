@@ -12,6 +12,80 @@ import host_memory
 from host_memory import GIB, HostMemoryAdmission, TokenWeightedActivationOffloadGate
 
 
+def test_unsloth_offload_releases_storage_and_buffers_can_regrow(monkeypatch):
+    import torch
+    from model_backend import UnslothBackend, _ModelPlacementBackend
+
+    buffers = [torch.ones(4096) for _ in range(3)]
+    buffers[1].resize_(0)
+    assert buffers[1].untyped_storage().nbytes() == 4096 * 4
+    checkpointing = SimpleNamespace(
+        CPU_BUFFERS=[buffers[0]], GPU_BUFFERS=(buffers[1],),
+        GPU_BUFFERS_B=(buffers[2],), USE_DOUBLE_BUFFER=True,
+        NEXT_BUFFER_SLOT=[1])
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.gradient_checkpointing", checkpointing)
+    monkeypatch.setattr(host_memory, "reclaim_unused_host_memory", lambda *a, **kw: None)
+    offloads = []
+
+    def move_model(backend):
+        assert all(b.untyped_storage().nbytes() == 0 for b in buffers)
+        if not getattr(backend, "_trainer_is_offloaded", False):
+            offloads.append(True)
+        backend._trainer_is_offloaded = True
+
+    monkeypatch.setattr(_ModelPlacementBackend, "offload_for_generation", move_model)
+    backend = UnslothBackend(SimpleNamespace(coder_model_profile="gpt-oss-120b"))
+    backend.offload_for_generation()
+    backend.offload_for_generation()
+    assert offloads == [True]
+    assert checkpointing.GPU_BUFFERS[0] is buffers[1]
+    assert checkpointing.USE_DOUBLE_BUFFER and checkpointing.NEXT_BUFFER_SLOT == [1]
+    # This is how Unsloth reuses its scratch tensors on the next forward.
+    for buffer in buffers:
+        buffer.resize_(128).fill_(7)
+        assert buffer.sum().item() == 896
+
+
+def test_wake_oom_recovery_uses_live_budget_and_keeps_eight_workers(monkeypatch, capsys):
+    import gen_workers
+    import gpu_runtime
+
+    monkeypatch.setattr(gpu_runtime, "query_gpu_memory", lambda: {
+        gpu: SimpleNamespace(total_gib=95.6, free_gib=77.4) for gpu in range(8)})
+    monkeypatch.setattr(gen_workers, "_resolve_vllm_enforce_eager", lambda eager: (eager, False))
+    started = []
+
+    def start(pool, ranks, **kwargs):
+        started.extend(ranks)
+        pool._sleep_capable_workers.update(ranks)
+        assert pool._worker_options["gpu_memory_utilization"] * 95.6 <= 76.4 + 1e-8
+
+    monkeypatch.setattr(gen_workers.GenerationPool, "_start_workers", start)
+    calls = []
+    phase = gen_workers.PhasedVLLMGenerationPool(
+        lambda: calls.append("offload"), lambda: calls.append("restore"),
+        model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", backend="vllm",
+        num_workers=8, gpu_ids=list(range(8)), vllm_tensor_parallel_size=1,
+        vllm_co_resident_sleep=True, vllm_runtime_reserve_gib=16,
+        max_seq_length=131072, vllm_sleep_level=1)
+
+    def failed_wake():
+        calls.append("wake")
+        raise RuntimeError("CUDA out of memory")
+
+    phase._pool = SimpleNamespace(
+        wake_up=failed_wake, shutdown=lambda: calls.append("stop_failed_pool"))
+    phase._persistent = True
+    pool = phase._ensure_started()
+    assert calls == ["offload", "wake", "stop_failed_pool"]
+    assert phase.active and phase._persistent
+    assert started == list(range(8)) and pool.num_workers == 8
+    assert pool.tensor_parallel_size == 1 and pool.max_seq_length == 131072
+    assert "level-1 vLLM wake failed" in capsys.readouterr().out
+    for q in (pool.result_queue, pool._ready_queue, pool.control_queue):
+        q.close()
+
+
 def test_live_ram_admission_accounts_for_not_yet_allocated_reservations(monkeypatch):
     monkeypatch.setattr(host_memory, "host_memory_info",
                         lambda: {"total": 100 * GIB, "available": 60 * GIB})

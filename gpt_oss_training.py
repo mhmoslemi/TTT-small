@@ -2,9 +2,50 @@
 
 import functools
 import importlib
+import sys
 import types
 
 import torch
+
+
+def release_checkpoint_workspaces():
+    """Release idle Unsloth scratch storage after backward, before generation.
+
+    These global buffers are not model parameters/buffers, so model.to('cpu')
+    cannot move them. Tensor.resize_(0) alone also retains the old storage.
+    Keep the tensor objects, streams, and double-buffering state: Unsloth's
+    existing forward grows these empty buffers on the next training phase.
+    Must only be called after all backward work in this process has finished.
+    """
+    checkpointing = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    if checkpointing is None:
+        return {"cpu": 0, "cuda": 0}
+    buffers = []
+    for name in ("CPU_BUFFERS", "GPU_BUFFERS", "GPU_BUFFERS_B"):
+        buffers.extend(buffer for buffer in (getattr(checkpointing, name, None) or ())
+                       if isinstance(buffer, torch.Tensor))
+    devices = {buffer.device.index for buffer in buffers
+               if buffer.device.type == "cuda"}
+    for device in sorted(devices):
+        torch.cuda.synchronize(device)
+    released = {"cpu": 0, "cuda": 0}
+    with torch.no_grad():
+        for buffer in buffers:
+            storage = buffer.untyped_storage()
+            released[buffer.device.type] += storage.nbytes()
+            buffer.resize_(0)
+            storage.resize_(0)
+    if any(released.values()):
+        from host_memory import reclaim_unused_host_memory
+        for device in sorted(devices):
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+        reclaim_unused_host_memory(torch, force=True)
+        print("[memory] released idle Unsloth checkpoint workspaces: "
+              f"GPU={released['cuda'] / 2**30:.2f} GiB, "
+              f"CPU={released['cpu'] / 2**30:.2f} GiB; "
+              "compiled kernels and double buffering retained", flush=True)
+    return released
 
 
 def _contiguous_inputs(function, names):
