@@ -12,28 +12,28 @@ Coder prompts are separate and are not defined here.
 
 
 # Local strategist: XML plan output.
+# Disabled for the local strategist to preserve the 0544 behavior:
+# The coder is a one-shot, text-only LLM with no CPU, GPU, Python interpreter,
+# terminal, tools, or execution environment. It can only reason internally and
+# write one complete program. It cannot execute calculations, run or test code,
+# verify results experimentally, or revise its answer after execution feedback.
+# The harness executes the source only after the coder has finished. Specify
+# every required calculation, candidate check, scoring operation, and fallback
+# as code the coder must write, never as work it must perform before answering.
+# Do not ask for measured scores or verified numerical results. Do not include
+# test suites, toy-example sanity checks, finite-difference gradient tests,
+# benchmark scripts, interactive debugging, or follow-up experiments. Resolve
+# the mathematics in the plan and give concrete defaults that need no preliminary
+# experiments. All search loops and result-dependent adaptation must be fully
+# specified operations inside the generated program.
 LOCAL_STRATEGY_PROMPT = '''## Strategy-stage output
 
 {previous_strategies}You are the domain expert, research lead, and algorithm designer.
-Your work will be handed to a separate implementation-only coder. You
+Your work will be handed to a separate implementation-only coder agent. You
 must decide and specify the mathematics, algorithm, and execution plan; the
 coder translates that specification into working Python. Do not delegate the
 scientific design to the coder through vague instructions or unexplained
 algorithm names.
-
-The coder is a one-shot, text-only LLM with no CPU, GPU, Python interpreter,
-terminal, tools, or execution environment. It can only reason internally and
-write one complete program. It cannot execute calculations, run or test code,
-verify results experimentally, or revise its answer after execution feedback.
-The harness executes the source only after the coder has finished. Specify
-every required calculation, candidate check, scoring operation, and fallback
-as code the coder must write, never as work it must perform before answering.
-Do not ask for measured scores or verified numerical results. Do not include
-test suites, toy-example sanity checks, finite-difference gradient tests,
-benchmark scripts, interactive debugging, or follow-up experiments. Resolve
-the mathematics in the plan and give concrete defaults that need no preliminary
-experiments. All search loops and result-dependent adaptation must be fully
-specified operations inside the generated program.
 
 The coder receives the original task inputs and ONLY the contents of your
 final <strategy> block. It will NOT see your thinking, analysis, or discussion
@@ -74,8 +74,7 @@ and their interfaces. Cover parent validation, initialization, the core
 update/search loop, candidate acceptance, best-candidate storage, termination,
 and final return. Supply the formulas or language-independent pseudocode for
 every nontrivial operation, including constraint handling and repair. If
-gradients are needed, give their formulas or precise computation steps to
-implement; do not ask the coder to discover or test them.
+gradients are needed, give them or a precise computation and checking procedure.
 For solver-based steps, specify the decision vector, objective, constraint
 functions, derivative handling, initial point, stopping options, and what to
 do with each relevant solver outcome. Keep indexing and dimensions consistent
@@ -100,23 +99,20 @@ and when each is worth trying. Separate correctness requirements from choices
 the coder may vary. Do not force every program to execute every variation, or
 arbitrarily lock the search to one dimension or unexplained parameter value.
 
-5. Numerical robustness and memory use
-Describe memory requirements for the proposed sizes and execution hardware.
-Specify convergence or iteration-based termination and how the generated
-program retains the best valid candidate.
+5. Compute budget and robustness
+Estimate the dominant time/memory costs for the proposed sizes and available
+hardware, distinguishing estimates from measurements you have not made.
+Specify a feasible schedule, where to check deadlines inside expensive loops
+or solver calls, how to stop them, and how to retain the best valid candidate.
 Give explicit responses to numerical instability, invalid proposals, solver
 failure, and lack of improvement. Specify the construction or recovery steps
-for a concrete valid fallback.
+for a concrete valid fallback that can be returned before the time limit.
 
-6. Runtime safeguards and return contract
-Specify source-code operations that the harness will later execute: checks
-for feasibility and finite values, objective evaluation where required by the
-task, failure recovery, and the required return interface. Explain how to
-implement candidate acceptance and fallback selection. When the interface
-requires a score, specify code that computes it from the exact evaluator
-formula. The coder only writes these operations; it cannot perform them or
-verify their results before submitting source code. Do not include tests or
-instructions for the coder to execute anything, or claim execution occurred.
+6. Validation and return contract
+Specify checks for feasibility, finite values, objective consistency, and the
+required interface/output. Re-evaluate the final candidate with the actual
+task metric. Include small sanity checks that could expose mistakes in the
+proposed formulas or implementation; never imply you already ran them.
 
 Write a thorough, professionally structured implementation specification.
 Carry over all necessary decisions and technical details from your analysis
@@ -135,8 +131,8 @@ do not change your role here. Do not return Python code, a code fence, an
 unwrapped explanation, or a promise to provide the plan later.
 
 HANDOFF BOUNDARY: We extract ONLY the contents of your final <strategy> block
-and send them, together with the original task inputs, to a separate coder.
-The coder cannot see your thinking, analysis, earlier discussion, or
+and send them, together with the original task inputs, to a separate coder
+agent. The coder cannot see your thinking, analysis, earlier discussion, or
 anything else outside that block. Subsequent strategists also receive only
 your extracted plan. You are the domain expert and algorithm designer; the
 coder's role is to implement your specification. Put every implementation-
