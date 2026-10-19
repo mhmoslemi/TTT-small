@@ -54,6 +54,7 @@ Protocol (per step):
 import asyncio
 import importlib.metadata
 import os
+import signal
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -118,6 +119,54 @@ def _positive_env_timeout(name, default):
     if value <= 0:
         raise ValueError(f"{name} must be a positive number")
     return value
+
+
+def _isolate_vllm_worker_process_group():
+    """Give a vLLM wrapper and every EngineCore child one killable group."""
+    if os.name != "posix" or not hasattr(os, "setsid"):
+        return False
+    try:
+        os.setsid()
+    except OSError:
+        return False
+    return True
+
+
+def _vllm_process_group_exists(process_group_id):
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(int(process_group_id), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_vllm_process_group(process_group_id, grace_seconds=3.0):
+    """Terminate EngineCore descendants even after their wrapper has exited."""
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        return False
+    process_group_id = int(process_group_id)
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    group_exists = _vllm_process_group_exists(process_group_id)
+    while group_exists and time.monotonic() < deadline:
+        time.sleep(0.05)
+        group_exists = _vllm_process_group_exists(process_group_id)
+    if group_exists:
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return True
 
 
 class _PrintBar:
@@ -803,6 +852,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False):
     """Persistent vLLM engine spanning one physical GPU group."""
+    # vLLM creates EngineCore grandchildren. If a wrapper exits after an
+    # engine failure, killing only the multiprocessing.Process can leave those
+    # grandchildren orphaned on the GPU. A private session lets the parent
+    # reap the complete worker tree by process group during shutdown.
+    _isolate_vllm_worker_process_group()
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_group)
@@ -1785,7 +1839,12 @@ class GenerationPool:
             task_queue = self.task_queues[rank]
             if process is not None:
                 process.join(timeout=10)
-                if process.is_alive():
+                if self.backend == "vllm" and process.pid is not None:
+                    # The wrapper may already be gone while a vLLM EngineCore
+                    # grandchild remains alive. Always reap its private group.
+                    _terminate_vllm_process_group(process.pid)
+                    process.join(timeout=5)
+                elif process.is_alive():
                     process.terminate()
                     process.join(timeout=10)
                 if process.is_alive():
