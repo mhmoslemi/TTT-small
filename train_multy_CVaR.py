@@ -13777,6 +13777,25 @@ def main():
                 f"rollout GPUs {gpu_ids}", flush=True)
             if separate_strategy_pool:
                 strategy_pool_options = dict(pool_options)
+                # A sleeping local strategist still owns a CUDA context on
+                # every rollout GPU.  That residue is small beside ordinary
+                # coders, but it prevents a full-context GPT-OSS-120B coder
+                # from restoring its level-1 allocation after training.  Keep
+                # the expensive coder resident and make the much smaller
+                # strategist pool transient so its processes are completely
+                # gone before the coder wakes.
+                strategy_persistent_workers = getattr(
+                    cfg, "strategy_vllm_persistent_workers", None)
+                if str(getattr(
+                        cfg, "coder_model_profile", "")).lower() == (
+                            "gpt-oss-120b"):
+                    strategy_persistent_workers = 0
+                    setting_log_only(
+                        "[memory] GPT-OSS-120B coder: local strategist "
+                        "engines use transient residency so coder wake-up "
+                        "retains the full 131k-context memory budget",
+                        flush=True,
+                    )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
                     "max_seq_length": cfg.strategy_max_seq_length,
@@ -13798,8 +13817,7 @@ def main():
                     "vllm_runtime_reserve_gib": float(getattr(
                         cfg, "strategy_vllm_runtime_reserve_gib",
                         16.0)),
-                    "vllm_persistent_workers": getattr(
-                        cfg, "strategy_vllm_persistent_workers", None),
+                    "vllm_persistent_workers": strategy_persistent_workers,
                     "vllm_staged_loading": (
                         cfg.strategy_vllm_staged_loading),
                     "vllm_log_path": strategy_vllm_log_path,
