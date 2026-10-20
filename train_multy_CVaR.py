@@ -831,6 +831,14 @@ def _coder_model_profile(model_name):
     return None
 
 
+def _coder_vllm_persistent_workers(cfg):
+    """Release GPT-OSS coder engines completely during adapter training."""
+    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b"
+            and not bool(getattr(cfg, "no_train", False))):
+        return 0
+    return None
+
+
 def _resolve_coder_token_limits(merged):
     """Fill missing coder limits without changing explicit limits or model behavior.
 
@@ -13507,6 +13515,11 @@ def main():
             vllm_max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
             vllm_enable_expert_parallel=cfg.vllm_enable_expert_parallel,
             vllm_sleep_level=cfg.vllm_sleep_level,
+            # A sleeping GPT-OSS EngineCore retains enough CUDA/NCCL state to
+            # starve the packed-MXFP4 trainer's fused dequant workspace.  A
+            # fresh rollout pool is faster overall than training every step
+            # through the OOM-driven unfused fallback.
+            vllm_persistent_workers=_coder_vllm_persistent_workers(cfg),
             # Distinct strategist/coder pools share the same cards. Account
             # for either a sleeping pool's residual CUDA/NCCL state or the
             # Qwen3-8B ablation's concurrently awake peer pool.

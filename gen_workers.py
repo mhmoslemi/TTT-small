@@ -2816,6 +2816,13 @@ class PhasedVLLMGenerationPool:
                             f"vLLM sleep level {self._sleep_level}")
                         setting_log_only(
                             f"[pool] {prefix} ready; {detail}", flush=True)
+                    elif int(self._pool_kwargs.get(
+                            "vllm_persistent_workers", -1)) == 0:
+                        setting_log_only(
+                            "[pool] transient coder engines selected; all "
+                            "CUDA/NCCL residency is released before training",
+                            flush=True,
+                        )
                     else:
                         print("[pool] installed vLLM lacks safe deep sleep; "
                               "using transient engines for phase sharing",

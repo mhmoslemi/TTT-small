@@ -17,7 +17,6 @@ from typing import Any, List
 import numpy as np
 
 from problems.base import (
-    CODER_EXECUTION_CONTRACT,
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
@@ -224,9 +223,11 @@ Autocorrelation-specific implementation constraints:
   coordinate. Those constructions have quadratic memory or evaluation count
   and are not feasible here. An LP is acceptable only with a genuinely sparse
   or matrix-free operator whose storage and solver behavior you spell out.
-- The exact evaluator itself performs the authoritative full convolution.
-  Vectorized or FFT surrogates may help propose candidates, but implement
-  acceptance using the exact evaluator and retain the best valid fallback.
+- The exact evaluator itself performs the authoritative full convolution, so
+  exact acceptance calls are the scarce resource. Use cheap vectorized or FFT
+  surrogates to propose candidates if useful, then spend a bounded number of
+  exact calls on acceptance. Adapt that count from measured elapsed time and
+  retain enough headroom to return the fallback.
 - Derive dimensions from runtime inputs. If changing resolution, specify the
   exact interpolation/resampling rule, normalization, validity checks, and how
   the new candidate is compared with the parent. Explain initialization when
@@ -289,7 +290,7 @@ AC2 mathematical checks for the final plan:
         entrypoint = ("propose_candidate" if self.problem_type == "ac1"
                       else "construct_function")
         return self._append_user_instruction(staged, f'''
-## Mandatory compact-source and return contract
+## Mandatory compact-source contract
 
 - `height_sequence_1` is runtime input when a parent construction exists.
   Reference it directly; NEVER assign a pasted copy of its values, serialize
@@ -299,22 +300,25 @@ AC2 mathematical checks for the final plan:
   unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
   values. Build every larger vector algorithmically with NumPy, a compact
   formula, interpolation, tiling, or a loop.
-- Keep the source concise: at most 300 lines and about 12,000 characters.
-  Finish `{entrypoint}`, return a non-empty Python list of finite coefficients,
-  and close the single Python fence well before the generation limit.
-- Implement final acceptance using the supplied `evaluate_sequence` and
-  preserve a valid best-so-far fallback inside the generated program.
+- Keep the complete source concise: at most 300 lines and about 12,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `{entrypoint}`, return a non-empty Python list of finite
+  coefficients, and close the single Python fence well before the generation
+  limit.
+- Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
+  best-so-far fallback and return it before the configured deadline.
 - The expert plan has already done the mathematical design. Do not spend the
   response re-deriving the problem on toy lengths or narrating alternatives.
   Resolve only implementation details in private reasoning, then emit the
   complete program. A simple executable implementation with the parent as a
   fallback is preferable to an ambitious program that is never finished.
 
-These are hard output constraints even if the proposed strategy conflicts
-with them.''')
+These are hard output constraints even if the proposed strategy suggests
+otherwise.''')
 
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = self._state_ctx(parent)
+        budget_s = self.budget_s
         if self.problem_type == "ac1":
             direction = "minimize"
             metric = "the AC1 upper bound"
@@ -359,8 +363,6 @@ before the response-token limit.'''
 inequalities, and numerical optimization. Write a compact search program whose
 returned nonnegative step-function heights {direction} {metric}.
 
-{CODER_EXECUTION_CONTRACT}
-
 ## Authoritative evaluator
 
 The evaluator below is read-only and is the only definition of the score:
@@ -370,29 +372,41 @@ The evaluator below is read-only and is the only definition of the score:
 
 {literature}
 
-## Runtime contract and resources
+## Budget & Resources
+- **Time budget**: {budget_s}s for your code to run
+- **CPUs**: {self.eval_cpus} available
 
-- Define `{entrypoint}(seed={self.seed}, **kwargs)`.
-- The harness invokes `{entrypoint}()` with no arguments, so those defaults are
-  active. Return a non-empty Python list of finite real coefficients.
-- `evaluate_sequence` is pre-imported and may be called during search. Do not
-  redefine or import it.
-- Implement exact scoring and preservation of the best valid candidate inside
-  the generated program; the coder does not compute or verify the result itself.
+## Rules
+- Define `{entrypoint}(seed={self.seed}, budget_s={budget_s}, **kwargs)` that
+  returns a non-empty Python list of finite real coefficients
+- It is called with NO arguments, so your default for `budget_s` is the one that
+  runs. Respect it: track elapsed time and return your best solution before it
+  expires, rather than being killed with nothing to show
+- Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
+- Make all helper functions top level, no closures or lambdas
+- No filesystem or network IO
+- `evaluate_sequence()` and `height_sequence_1` (an initial construction, if
+  available) are pre-imported
+- When `height_sequence_1` is available, use it directly. Never redefine it or
+  copy its entries into the response. Construct all large arrays
+  algorithmically; do not print long numeric literals or unrolled tables
+- Check the deadline inside expensive loops and solver calls, preserve the best
+  exact-scoring valid candidate, and return it with headroom before the hard
+  sandbox timeout
 - Candidate failure receives the configured failure reward; do not hide an
   error by returning an empty or non-finite sequence.
-- The generated program may use NumPy, SciPy, CVXPY, math, and the Python
-  standard library. The harness provides up to {self.eval_cpus} CPUs for execution.
-- Make helper functions top-level. Do not use nested-function closures or
-  lambda functions. Do not use filesystem or network I/O.
 - Construct large arrays algorithmically. Do not paste long numeric literals,
   lookup tables, repeated-value lists, or unrolled patterns.
 - Runtime parent lengths are commonly in the thousands. Do not allocate dense
   n-by-n matrices (including `np.eye(n)`), dense convolution/Toeplitz
   operators, or use one finite-difference evaluation per coordinate. Generated
   programs must keep auxiliary storage linear or near-linear in n. If using a
-  solver, use a truly sparse/matrix-free formulation with a defined convergence
-  or iteration-based stopping condition and preserve a valid fallback.
+  solver, use a truly sparse/matrix-free formulation and set an internal stop
+  condition that leaves time to return the saved fallback.
+- Your function must complete within budget_s seconds and return the best solution found
+- The extracted block must define `{entrypoint}` at top level. The harness
+  prepends the pre-imported evaluator and optional parent construction before
+  execution; do not copy those inputs into the block to make it standalone
 
 {state_ctx}
 {construction_section}
@@ -455,7 +469,7 @@ parent/search program when one exists. {correction_instruction}
             if self.problem_type == "ac1":
                 raw = float(evaluate_sequence_ac1(construction))
                 value = float(1.0 / raw)
-                code = example_ae_program_random_init()
+                code = example_ae_program_random_init(self.budget_s)
             else:
                 raw = float(evaluate_sequence_ac2(construction))
                 value = raw

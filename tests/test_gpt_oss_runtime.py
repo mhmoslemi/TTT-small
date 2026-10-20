@@ -14,6 +14,7 @@ from torch.utils.checkpoint import checkpoint
 from gpt_oss_training import install_attention_layout_guards
 from model_backend import (
     _is_packed_mxfp4, _require_packed_mxfp4_training_runtime)
+from train_multy_CVaR import _coder_vllm_persistent_workers
 
 
 def _rotary(q, k, cos, sin):
@@ -63,6 +64,16 @@ def test_packed_mxfp4_runtime_does_not_modify_qwen(monkeypatch):
             SimpleNamespace(coder_model_profile=name))
     assert os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] == "0"
     assert "UNSLOTH_MXFP4_NO_DEQUANTIZE" not in os.environ
+
+
+def test_only_gpt_oss_training_uses_transient_coder_engines():
+    assert _coder_vllm_persistent_workers(SimpleNamespace(
+        coder_model_profile="gpt-oss-120b", no_train=False)) == 0
+    assert _coder_vllm_persistent_workers(SimpleNamespace(
+        coder_model_profile="gpt-oss-120b", no_train=True)) is None
+    for profile in ("qwen3-8b", "qwen3.8-27b"):
+        assert _coder_vllm_persistent_workers(SimpleNamespace(
+            coder_model_profile=profile, no_train=False)) is None
 
 
 @pytest.fixture
