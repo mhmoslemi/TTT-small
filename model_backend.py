@@ -191,13 +191,30 @@ def _quantization_method(model_config):
     return method
 
 
-def _is_packed_mxfp4(model_config):
-    quantization = getattr(model_config, "quantization_config", None)
-    dequantized = bool(
-        quantization.get("dequantize", False)
-        if isinstance(quantization, dict)
-        else getattr(quantization, "dequantize", False))
-    return _quantization_method(model_config) == "mxfp4" and not dequantized
+def _is_packed_mxfp4(model):
+    """Check expert storage: modern Unsloth keeps it packed with dequantize=True."""
+    from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+
+    experts = [module for name, module in model.named_modules()
+               if name.endswith(".experts")]
+    layers = int(getattr(model.config, "num_hidden_layers", 0))
+    if layers < 1 or len(experts) != layers:
+        return False
+    for module in experts:
+        for name in ("gate_up_proj", "down_proj"):
+            weight = module._parameters.get(name)
+            if not is_mxfp4_expert_param(weight):
+                return False
+            scales = weight.mxfp4_scales
+            if (weight.dtype != torch.uint8 or weight.ndim != 4
+                    or weight.shape[-1] != 16 or weight.requires_grad
+                    or weight.device.type == "meta"
+                    or not torch.is_tensor(scales)
+                    or scales.dtype != torch.uint8
+                    or scales.shape != weight.shape[:-1]
+                    or scales.device != weight.device):
+                return False
+    return True
 
 
 def _use_training_4bit(
@@ -1086,17 +1103,16 @@ def _require_packed_mxfp4_training_runtime(cfg):
     if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
         return
 
-    # Unsloth otherwise dequantizes native MXFP4 to BF16 before LoRA setup.
-    # This switch is read while its GPT-OSS patch module is imported.
-    os.environ["UNSLOTH_MXFP4_NO_DEQUANTIZE"] = "1"
+    # The training-capable path decodes per layer from Mxfp4ExpertParam.
+    # NO_DEQUANTIZE selects an older native path; it is not the storage check.
+    os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] = "1"
 
     from importlib.metadata import PackageNotFoundError, version
     from packaging.version import InvalidVersion, Version
 
-    minimums = (("unsloth", "2026.9.12"), ("unsloth_zoo", "2026.9.8"))
+    minimums = (("unsloth", "2026.9.12"), ("unsloth_zoo", "2026.9.8"),
+                ("transformers", "5.0.0"))
     failures = []
-    if importlib.util.find_spec("triton_kernels") is None:
-        failures.append("triton_kernels is not installed")
     for package, minimum in minimums:
         try:
             installed = version(package)
@@ -1115,7 +1131,8 @@ def _require_packed_mxfp4_training_runtime(cfg):
             "Exact packed-MXFP4 GPT-OSS LoRA training is unavailable: "
             + "; ".join(failures)
             + ". Update once before launching: uv pip install --upgrade "
-              "'unsloth>=2026.9.12' 'unsloth-zoo>=2026.9.8'")
+              "'unsloth>=2026.9.12' 'unsloth-zoo>=2026.9.8' "
+              "'transformers>=5.0.0'")
 
 
 # ======================================================================
@@ -1163,13 +1180,16 @@ class UnslothBackend(_ModelPlacementBackend):
                if _training_max_memory(self.cfg) else {}),
         )
         self._remember_training_placement(model)
-        if (packed_mxfp4
-                and not _is_packed_mxfp4(getattr(model, "config", None))):
+        if packed_mxfp4 and not _is_packed_mxfp4(model):
             raise RuntimeError(
-                "GPT-OSS training did not retain the original checkpoint's "
-                "packed MXFP4 experts; refusing a silent BF16/NF4 "
-                "conversion. Verify that triton_kernels is installed and "
-                "compatible with this GPU.")
+                "GPT-OSS training requires Mxfp4ExpertParam bytes and E8M0 "
+                "scales for both projections in every expert layer. The "
+                "loaded model does not satisfy this storage contract; "
+                "refusing a BF16/NF4 or partially converted model. "
+                "Check Unsloth's packed-expert/grouped_mm loading path.")
+        if packed_mxfp4:
+            print("[precision] verified packed MXFP4 bytes and scales in all "
+                  f"{model.config.num_hidden_layers} expert layers", flush=True)
         _validate_gpt_oss_training_attention(model, self.cfg)
         target_modules = _resolve_lora_target_modules(
             self.cfg, getattr(model, "config", None))

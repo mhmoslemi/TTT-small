@@ -39,34 +39,71 @@ def _attention(query, key, value, *, mask, sinks):
 
 def test_packed_mxfp4_training_requires_modern_unsloth(monkeypatch):
     cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b")
-    versions = {"unsloth": "2026.9.12", "unsloth_zoo": "2026.9.8"}
+    versions = {"unsloth": "2026.9.12", "unsloth_zoo": "2026.9.8",
+                "transformers": "5.17.0"}
     monkeypatch.delenv("UNSLOTH_MXFP4_NO_DEQUANTIZE", raising=False)
-    monkeypatch.setattr(importlib.util, "find_spec", lambda package: object())
+    monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "0")
     monkeypatch.setattr(
         importlib.metadata, "version", lambda package: versions[package])
     _require_packed_mxfp4_training_runtime(cfg)
-    assert os.environ["UNSLOTH_MXFP4_NO_DEQUANTIZE"] == "1"
+    assert os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] == "1"
+    assert "UNSLOTH_MXFP4_NO_DEQUANTIZE" not in os.environ
 
     versions["unsloth"] = "2026.9.11"
     with pytest.raises(RuntimeError, match="packed-MXFP4"):
         _require_packed_mxfp4_training_runtime(cfg)
 
 
-def test_packed_mxfp4_training_requires_triton_kernels(monkeypatch):
-    cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b")
-    monkeypatch.setattr(importlib.util, "find_spec", lambda package: None)
-    monkeypatch.setattr(
-        importlib.metadata, "version", lambda package: "9999.0.0")
-    with pytest.raises(RuntimeError, match="triton_kernels is not installed"):
-        _require_packed_mxfp4_training_runtime(cfg)
+def test_packed_mxfp4_runtime_does_not_modify_qwen(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "0")
+    monkeypatch.delenv("UNSLOTH_MXFP4_NO_DEQUANTIZE", raising=False)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: pytest.fail(name))
+    for name in ("qwen3-8b", "qwen3.8-27b"):
+        _require_packed_mxfp4_training_runtime(
+            SimpleNamespace(coder_model_profile=name))
+    assert os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] == "0"
+    assert "UNSLOTH_MXFP4_NO_DEQUANTIZE" not in os.environ
 
 
-def test_packed_mxfp4_check_rejects_dequantization():
-    config = SimpleNamespace(quantization_config={
-        "quant_method": "mxfp4", "dequantize": False})
-    assert _is_packed_mxfp4(config)
-    config.quantization_config["dequantize"] = True
-    assert not _is_packed_mxfp4(config)
+@pytest.fixture
+def packed_model(monkeypatch):
+    class PackedExpert(torch.nn.Parameter):
+        def __new__(cls):
+            weight = torch.Tensor._make_subclass(
+                cls, torch.zeros((2, 8, 2, 16), dtype=torch.uint8), False)
+            weight.mxfp4_scales = torch.ones((2, 8, 2), dtype=torch.uint8)
+            return weight
+
+    # Avoid importing Unsloth and mutating Transformers during a CPU unit test.
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.mxfp4_dequant", SimpleNamespace(
+        is_mxfp4_expert_param=lambda weight: isinstance(weight, PackedExpert)))
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(num_hidden_layers=2, quantization_config={
+        "quant_method": "mxfp4", "dequantize": True})
+    model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(2)])
+    for layer in model.layers:
+        layer.experts = torch.nn.Module()
+        layer.experts.gate_up_proj = PackedExpert()
+        layer.experts.down_proj = PackedExpert()
+    return model
+
+
+def test_packed_mxfp4_accepts_actual_packed_experts_with_dequantize_true(packed_model):
+    assert _is_packed_mxfp4(packed_model)
+
+
+@pytest.mark.parametrize("failure", ["dense", "missing_layer", "missing_scales"])
+def test_packed_mxfp4_rejects_incomplete_or_dense_experts(packed_model, failure):
+    # Metadata claiming packed storage must never excuse dense/missing tensors.
+    packed_model.config.quantization_config["dequantize"] = False
+    if failure == "dense":
+        packed_model.layers[1].experts.down_proj = torch.nn.Parameter(
+            torch.zeros((2, 64, 8)), requires_grad=False)
+    elif failure == "missing_layer":
+        del packed_model.layers[1].experts
+    else:
+        packed_model.layers[1].experts.down_proj.mxfp4_scales = None
+    assert not _is_packed_mxfp4(packed_model)
 
 
 @pytest.mark.parametrize("batch,length,window,hooked", [
