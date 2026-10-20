@@ -1086,11 +1086,17 @@ def _require_packed_mxfp4_training_runtime(cfg):
     if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
         return
 
+    # Unsloth otherwise dequantizes native MXFP4 to BF16 before LoRA setup.
+    # This switch is read while its GPT-OSS patch module is imported.
+    os.environ["UNSLOTH_MXFP4_NO_DEQUANTIZE"] = "1"
+
     from importlib.metadata import PackageNotFoundError, version
     from packaging.version import InvalidVersion, Version
 
     minimums = (("unsloth", "2026.9.12"), ("unsloth_zoo", "2026.9.8"))
     failures = []
+    if importlib.util.find_spec("triton_kernels") is None:
+        failures.append("triton_kernels is not installed")
     for package, minimum in minimums:
         try:
             installed = version(package)

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import importlib.metadata
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -39,12 +40,24 @@ def _attention(query, key, value, *, mask, sinks):
 def test_packed_mxfp4_training_requires_modern_unsloth(monkeypatch):
     cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b")
     versions = {"unsloth": "2026.9.12", "unsloth_zoo": "2026.9.8"}
+    monkeypatch.delenv("UNSLOTH_MXFP4_NO_DEQUANTIZE", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda package: object())
     monkeypatch.setattr(
         importlib.metadata, "version", lambda package: versions[package])
     _require_packed_mxfp4_training_runtime(cfg)
+    assert os.environ["UNSLOTH_MXFP4_NO_DEQUANTIZE"] == "1"
 
     versions["unsloth"] = "2026.9.11"
     with pytest.raises(RuntimeError, match="packed-MXFP4"):
+        _require_packed_mxfp4_training_runtime(cfg)
+
+
+def test_packed_mxfp4_training_requires_triton_kernels(monkeypatch):
+    cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b")
+    monkeypatch.setattr(importlib.util, "find_spec", lambda package: None)
+    monkeypatch.setattr(
+        importlib.metadata, "version", lambda package: "9999.0.0")
+    with pytest.raises(RuntimeError, match="triton_kernels is not installed"):
         _require_packed_mxfp4_training_runtime(cfg)
 
 
