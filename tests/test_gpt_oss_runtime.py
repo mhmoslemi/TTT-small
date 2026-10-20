@@ -7,15 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from gpt_oss_training import install_attention_layout_guards
 
 
 def _rotary(q, k, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+
     def rotate(x):
         first, second = x.chunk(2, dim=-1)
-        return torch.cat((-second, first), dim=-1)
-    return q * cos + rotate(q) * sin, k * cos + rotate(k) * sin
+        return torch.cat((first * cos - second * sin,
+                          second * cos + first * sin), dim=-1)
+    return rotate(q), rotate(k)
 
 
 def _attention(query, key, value, *, mask, sinks):
@@ -36,9 +41,10 @@ def test_compiled_attention_normalizes_layout_without_changing_gradients(
     compiled_attention = torch.compile(_attention, backend="aot_eager", fullgraph=True)
     seen = []
 
-    def rotary_kernel(q, k, *args):
-        seen.append(("rotary", q.is_contiguous(), k.is_contiguous()))
-        return compiled_rope(q, k, *args)
+    def rotary_kernel(q, k, cos, sin):
+        seen.append(("rotary", q.is_contiguous(), k.is_contiguous(),
+                     cos.is_contiguous(), sin.is_contiguous()))
+        return compiled_rope(q, k, cos, sin)
 
     def attention_kernel(q, k, v, **kwargs):
         seen.append(("attention", q.is_contiguous(), k.is_contiguous(), v.is_contiguous()))
@@ -89,11 +95,16 @@ def test_compiled_attention_normalizes_layout_without_changing_gradients(
     mask = positions[:, None] >= positions[None, :]
     if window is not None:
         mask &= positions[:, None] - positions[None, :] < window
-    angle = torch.randn(1, 1, length, 4, dtype=torch.float64)
-    cos, sin = angle.cos(), angle.sin()
+    # GPT-OSS rotary tensors are [B, L, head_dim/2]. This reproduces the
+    # transposed stride that broke the checkpointed compiled backward.
+    cos = torch.randn(batch, 2, length, dtype=torch.float64).transpose(1, 2)
+    sin = torch.randn(batch, 2, length, dtype=torch.float64).transpose(1, 2)
+    assert not cos.is_contiguous() and not sin.is_contiguous()
     qr, kr = _rotary(q, k, cos, sin)
     expected = _attention(qr, kr, v, mask=mask, sinks=model.sinks)
-    actual = model(q, k, v, cos, sin, mask)
+    actual = checkpoint(
+        lambda q, k, v, cos, sin: model(q, k, v, cos, sin, mask),
+        q, k, v, cos, sin, use_reentrant=False)
     weights = torch.randn_like(expected)
     inputs = (q, k, v, model.sinks)
     expected_grads = torch.autograd.grad((expected * weights).sum(), inputs)
@@ -101,7 +112,14 @@ def test_compiled_attention_normalizes_layout_without_changing_gradients(
     torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-10, atol=1e-10)
-    assert seen == [("rotary", True, True), ("attention", True, True, True)]
+    rotary_seen = [entry for entry in seen if entry[0] == "rotary"]
+    attention_seen = [entry for entry in seen if entry[0] == "attention"]
+    assert len(rotary_seen) >= 2  # forward plus checkpoint recomputation
+    assert attention_seen
+    assert all(entry == ("rotary", True, True, True, True)
+               for entry in rotary_seen)
+    assert all(entry == ("attention", True, True, True)
+               for entry in attention_seen)
 
 
 def test_failed_trainer_exits_with_unconsumed_tensor_work():

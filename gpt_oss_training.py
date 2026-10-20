@@ -72,12 +72,13 @@ def _contiguous_inputs(function, names):
 
 
 def install_attention_layout_guards(model):
-    """Retain Unsloth's kernels/sinks/masks; normalize only Q/K/V storage.
+    """Retain Unsloth's kernels/sinks/masks with stable tensor storage.
 
     Unsloth 2026.9.3 captures a compiled rotary function in the patched
     attention forward's closure. Flex attention is a module-global compiled
-    callable. Cover both boundaries: the failing [B, 8, L, 64] input can be
-    a rotary key or a flex key/value. No weights or attention math change.
+    callable. Normalize every tensor consumed by those compiled boundaries;
+    checkpoint recomputation must not change Q/K/V or rotary cos/sin strides.
+    No weights or attention math change.
     """
     attention_sink = importlib.import_module(
         "unsloth_zoo.flex_attention.attention_sink")
@@ -111,7 +112,8 @@ def install_attention_layout_guards(model):
             except ValueError:
                 continue
             if name == "apply_rotary_pos_emb" and callable(value):
-                cell.cell_contents = _contiguous_inputs(value, ("q", "k"))
+                cell.cell_contents = _contiguous_inputs(
+                    value, ("q", "k", "cos", "sin"))
                 rotary_boundaries += 1
             elif "forward" in name:
                 visit(value)
@@ -121,7 +123,8 @@ def install_attention_layout_guards(model):
         namespace = function.__globals__
         for name in function.__code__.co_names:
             if name == "apply_rotary_pos_emb" and callable(namespace.get(name)):
-                namespace[name] = _contiguous_inputs(namespace[name], ("q", "k"))
+                namespace[name] = _contiguous_inputs(
+                    namespace[name], ("q", "k", "cos", "sin"))
                 rotary_boundaries += 1
             elif "forward" in name:
                 visit(namespace.get(name))
