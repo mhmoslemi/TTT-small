@@ -788,10 +788,10 @@ def _coder_model_profile(model_name):
             "max_output": 131_072,
             "reasoning_effort": "high",
             "template_kind": "gpt-oss",
-            "training_4bit": True,
-            # The trainable Unsloth BitsAndBytes copy fits on one 95+ GiB
-            # card. Keep one complete QLoRA trainer per GPU; the native MXFP4
-            # checkpoint remains exclusive to vLLM rollout generation.
+            # Modern Unsloth trains the published MXFP4 experts while keeping
+            # them packed. This is the same base used by vLLM, without NF4
+            # re-quantization or a second full-precision model copy.
+            "training_4bit": False,
             "training_layout": "replicated",
             "training_memory_fraction": 0.88,
             "vllm_runtime_reserve_gib": 5.0,
@@ -985,8 +985,8 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     else:
         _profile_default(merged, "thinking", True, explicit_keys)
 
-    # Native GPT-OSS MXFP4 remains the vLLM checkpoint. Its trainable copy is
-    # selected independently by _resolve_training_model_name below.
+    # Quantization and placement describe only the differentiable copy. The
+    # aligned GPT-OSS profile keeps the original checkpoint name on both sides.
     _profile_default(
         merged, "load_in_4bit", bool(profile["training_4bit"]), explicit_keys)
     _profile_default(merged, "training_model_name", "", explicit_keys)
@@ -2046,10 +2046,9 @@ def _parse_gpu_ids(value) -> list:
 def _resolve_training_model_name(model_name, requested_name, load_in_4bit):
     """Keep inference and trainable checkpoint choices independent.
 
-    OpenAI GPT-OSS is distributed in inference-oriented MXFP4. Transformers
-    cannot train that quantizer and dequantizes it to BF16 when its kernels are
-    unavailable. For QLoRA, use Unsloth's trainable BitsAndBytes conversion
-    while leaving vLLM pointed at the configured original checkpoint.
+    Explicit legacy QLoRA configurations may still resolve a trainable
+    BitsAndBytes conversion. The supported GPT-OSS coder profile rejects that
+    split-policy setup and trains the original checkpoint's packed MXFP4 base.
     """
     if str(requested_name or "").strip():
         return str(requested_name).strip()
@@ -2118,7 +2117,7 @@ def _validate_known_training_capacity(
     elif "gpt-oss-20b" in name and "bnb-4bit" in name:
         required_gib, precision = 14.0, "trainable 4-bit"
     elif "gpt-oss-120b" in name:
-        required_gib, precision = 196.0, "BF16 LoRA"
+        required_gib, precision = 65.0, "packed MXFP4 LoRA"
     available_gib = min(budgets) if replicated else sum(budgets)
     if required_gib is not None and available_gib < required_gib:
         placement = "on every replica GPU" if replicated else "in aggregate"
@@ -2737,12 +2736,21 @@ def load_config():
         print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
-    if (merged.get("coder_model_profile") == "gpt-oss-120b"
-            and merged["backend"] != "unsloth"):
-        raise ValueError(
-            "the automatic GPT-OSS-120B coder profile requires the Unsloth "
-            "BitsAndBytes training backend; native MXFP4 remains the vLLM "
-            "rollout checkpoint but is not differentiable")
+    if merged.get("coder_model_profile") == "gpt-oss-120b":
+        if (merged["training_model_name"] != merged.get("model_name")
+                or bool(merged.get("load_in_4bit", False))):
+            raise ValueError(
+                "GPT-OSS-120B rollout and training must use the same original "
+                "checkpoint. Remove coder_training_model_name and set "
+                "load_in_4bit: false; modern Unsloth keeps the checkpoint's "
+                "native MXFP4 experts packed during LoRA training.")
+        if merged["backend"] != "unsloth":
+            raise ValueError(
+                "GPT-OSS-120B aligned training requires backend: unsloth")
+        if merged["training_layout"] != "replicated":
+            raise ValueError(
+                "GPT-OSS-120B packed-MXFP4 training requires "
+                "training_layout: replicated")
     if merged["training_layout"] == "sharded":
         if merged["backend"] != "hf":
             raise ValueError(
@@ -8043,9 +8051,8 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
                else _adapter_dir(exp_dir, step_idx))
     # PEFT/Unsloth models support save_pretrained, which writes just the adapter
     model.save_pretrained(out_dir)
-    # The trainable GPT-OSS copy may be a BnB conversion while vLLM hosts the
-    # original MXFP4 checkpoint. Their module names are identical; advertise
-    # the actual rollout base so vLLM does not reject the adapter as mismatched.
+    # Explicit legacy configurations may train against a differently named
+    # compatible base; always advertise the rollout base to the vLLM loader.
     config_path = Path(out_dir) / "adapter_config.json"
     if generation_model_name and config_path.is_file():
         adapter_config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -13177,8 +13184,13 @@ def main():
             strategy_tokenizer.pad_token = strategy_tokenizer.eos_token
     effective_4bit = bool(getattr(cfg, "effective_load_in_4bit",
                                   cfg.load_in_4bit))
-    print(f"[precision] training copy: "
-          f"{'BitsAndBytes 4-bit' if effective_4bit else 'checkpoint/default precision'}")
+    if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
+        training_precision = "original packed MXFP4 (no NF4 re-quantization)"
+    else:
+        training_precision = (
+            "BitsAndBytes 4-bit" if effective_4bit
+            else "checkpoint/default precision")
+    print(f"[precision] training copy: {training_precision}")
 
     if cfg.generation_backend == "vllm":
         from gpu_runtime import validate_attention_heads

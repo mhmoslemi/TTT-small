@@ -359,7 +359,7 @@ def config(monkeypatch):
 
     def load(*extra, filename="erdos.yaml"):
         monkeypatch.setattr(sys, "argv", ["train_multy_CVaR.py", "--config",
-            str(ROOT / "configs" / filename), "--backend", "hf",
+            str(ROOT / "configs" / filename), "--backend", "unsloth",
             "--generation-backend", "hf", "--max-seq-length", "32768",
             "--max-new-tokens", "4096", *extra])
         return training.load_config()
@@ -367,7 +367,7 @@ def config(monkeypatch):
 
 
 @pytest.mark.parametrize("filename", sorted(p.name for p in (ROOT / "configs").glob("*.yaml")))
-def test_yaml_local_strategy_and_low_effort_gpt_oss_coder(config, filename):
+def test_yaml_local_strategy_and_aligned_gpt_oss_coder(config, filename):
     cfg, merged = config("--strategies", "--generation-backend", "vllm",
                          filename=filename)
     assert cfg.api_strategy == "" and cfg.strategies
@@ -379,8 +379,8 @@ def test_yaml_local_strategy_and_low_effort_gpt_oss_coder(config, filename):
     assert cfg.coder_template_kind == "gpt-oss"
     assert cfg.coder_reasoning_effort == "low" and cfg.thinking
     assert cfg.pilot_xhigh_programs_per_strategy == 0
-    assert cfg.load_in_4bit and cfg.backend == "unsloth"
-    assert cfg.training_model_name == "unsloth/gpt-oss-120b-unsloth-bnb-4bit"
+    assert not cfg.load_in_4bit and cfg.backend == "unsloth"
+    assert cfg.training_model_name == "openai/gpt-oss-120b"
     assert cfg.training_layout == "replicated"
     assert "test-key-never-sent" not in json.dumps(merged)
 

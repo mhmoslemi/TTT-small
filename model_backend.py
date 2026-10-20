@@ -191,6 +191,15 @@ def _quantization_method(model_config):
     return method
 
 
+def _is_packed_mxfp4(model_config):
+    quantization = getattr(model_config, "quantization_config", None)
+    dequantized = bool(
+        quantization.get("dequantize", False)
+        if isinstance(quantization, dict)
+        else getattr(quantization, "dequantize", False))
+    return _quantization_method(model_config) == "mxfp4" and not dequantized
+
+
 def _use_training_4bit(
         cfg, *, native_quantization=False, prequantized_bnb=False):
     """Resolve the requested QLoRA mode without affecting vLLM."""
@@ -1072,6 +1081,37 @@ def _validate_hf_training_attention(model, cfg):
           "exact bounded fallback retained", flush=True)
 
 
+def _require_packed_mxfp4_training_runtime(cfg):
+    """Fail before model loading if exact GPT-OSS training is unavailable."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
+        return
+
+    from importlib.metadata import PackageNotFoundError, version
+    from packaging.version import InvalidVersion, Version
+
+    minimums = (("unsloth", "2026.9.12"), ("unsloth_zoo", "2026.9.8"))
+    failures = []
+    for package, minimum in minimums:
+        try:
+            installed = version(package)
+        except PackageNotFoundError:
+            failures.append(f"{package} is not installed")
+            continue
+        try:
+            too_old = Version(installed) < Version(minimum)
+        except InvalidVersion:
+            failures.append(f"{package} has unreadable version {installed!r}")
+            continue
+        if too_old:
+            failures.append(f"{package} {installed} < {minimum}")
+    if failures:
+        raise RuntimeError(
+            "Exact packed-MXFP4 GPT-OSS LoRA training is unavailable: "
+            + "; ".join(failures)
+            + ". Update once before launching: uv pip install --upgrade "
+              "'unsloth>=2026.9.12' 'unsloth-zoo>=2026.9.8'")
+
+
 # ======================================================================
 # Unsloth backend
 # ======================================================================
@@ -1085,6 +1125,7 @@ class UnslothBackend(_ModelPlacementBackend):
         self._FastLanguageModel = None
 
     def load(self):
+        _require_packed_mxfp4_training_runtime(self.cfg)
         # Unsloth must be imported BEFORE transformers/trl/peft
         from unsloth import FastLanguageModel
         self._FastLanguageModel = FastLanguageModel
@@ -1094,6 +1135,9 @@ class UnslothBackend(_ModelPlacementBackend):
         use_4bit = _use_training_4bit(
             self.cfg, prequantized_bnb=prequantized_bnb)
         self.cfg.effective_load_in_4bit = use_4bit
+        packed_mxfp4 = bool(
+            str(getattr(self.cfg, "coder_model_profile", ""))
+            == "gpt-oss-120b" and not use_4bit)
 
         device_map = _training_device_map(self.cfg)
         print(f"[backend=unsloth] loading {training_name} across "
@@ -1104,16 +1148,22 @@ class UnslothBackend(_ModelPlacementBackend):
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
             dtype=torch.bfloat16,
-            # In offline mode Unsloth otherwise remaps a cached upstream model
-            # to an uncached `unsloth/*-bnb-4bit` Hub repository. Pin the exact
-            # requested repo and let BitsAndBytes quantize its cached weights.
-            use_exact_model_name=offline,
+            # Keep GPT-OSS on the exact checkpoint used by vLLM. Modern
+            # Unsloth leaves its published MXFP4 experts packed for backward.
+            use_exact_model_name=offline or packed_mxfp4,
             local_files_only=offline,
             device_map=device_map,
             **({"max_memory": _training_max_memory(self.cfg)}
                if _training_max_memory(self.cfg) else {}),
         )
         self._remember_training_placement(model)
+        if (packed_mxfp4
+                and not _is_packed_mxfp4(getattr(model, "config", None))):
+            raise RuntimeError(
+                "GPT-OSS training did not retain the original checkpoint's "
+                "packed MXFP4 experts; refusing a silent BF16/NF4 "
+                "conversion. Verify that triton_kernels is installed and "
+                "compatible with this GPU.")
         _validate_gpt_oss_training_attention(model, self.cfg)
         target_modules = _resolve_lora_target_modules(
             self.cfg, getattr(model, "config", None))
@@ -1202,10 +1252,9 @@ class HFBackend(_ModelPlacementBackend):
         quantization_method = _quantization_method(hf_config)
         if quantization_method == "mxfp4":
             raise RuntimeError(
-                f"{training_name} uses inference-only MXFP4 weights. Native "
-                "MXFP4 cannot be LoRA-trained by Transformers; enable "
-                "load_in_4bit so GPT-OSS selects its trainable BitsAndBytes "
-                "checkpoint, or set training_model_name explicitly.")
+                f"{training_name} uses native MXFP4 weights. Train it with "
+                "the profiled Unsloth packed-MXFP4 backend; vanilla "
+                "Transformers cannot preserve that packed training path.")
         prequantized_bnb = quantization_method == "bitsandbytes-4bit"
         native_quantization = bool(
             getattr(hf_config, "quantization_config", None)

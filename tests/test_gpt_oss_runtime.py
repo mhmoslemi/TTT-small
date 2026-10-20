@@ -1,6 +1,7 @@
 """CPU regressions for compiled attention layouts and an undrained queue."""
 
 from pathlib import Path
+import importlib.metadata
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -10,6 +11,8 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from gpt_oss_training import install_attention_layout_guards
+from model_backend import (
+    _is_packed_mxfp4, _require_packed_mxfp4_training_runtime)
 
 
 def _rotary(q, k, cos, sin):
@@ -31,6 +34,26 @@ def _attention(query, key, value, *, mask, sinks):
     sink = sinks[None, :, None, None].expand(*scores.shape[:-1], 1)
     weights = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
     return weights @ value
+
+
+def test_packed_mxfp4_training_requires_modern_unsloth(monkeypatch):
+    cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b")
+    versions = {"unsloth": "2026.9.12", "unsloth_zoo": "2026.9.8"}
+    monkeypatch.setattr(
+        importlib.metadata, "version", lambda package: versions[package])
+    _require_packed_mxfp4_training_runtime(cfg)
+
+    versions["unsloth"] = "2026.9.11"
+    with pytest.raises(RuntimeError, match="packed-MXFP4"):
+        _require_packed_mxfp4_training_runtime(cfg)
+
+
+def test_packed_mxfp4_check_rejects_dequantization():
+    config = SimpleNamespace(quantization_config={
+        "quant_method": "mxfp4", "dequantize": False})
+    assert _is_packed_mxfp4(config)
+    config.quantization_config["dequantize"] = True
+    assert not _is_packed_mxfp4(config)
 
 
 @pytest.mark.parametrize("batch,length,window,hooked", [

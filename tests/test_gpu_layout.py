@@ -65,7 +65,7 @@ def test_erdos_gpt_oss_config_uses_eight_coders(monkeypatch, tmp_path, resume):
     config_path = tmp_path / "erdos.yaml"
     config_path.write_text(yaml.safe_dump(config))
     argv = ["train_multy_CVaR.py", "--config", str(config_path),
-            "--backend", "hf", "--advantage-mode", "spo-rs", "--fast",
+            "--backend", "unsloth", "--advantage-mode", "spo-rs", "--fast",
             "--strategies", "--coder-retry", "--fused-long-attention"]
     if resume:
         # Resume recomputes topology instead of retaining the TP=2 workaround.

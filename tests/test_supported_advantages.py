@@ -36,7 +36,7 @@ def load_config(monkeypatch):
     def load(mode="entropic", filename="erdos.yaml", extra=()):
         monkeypatch.setattr(sys, "argv", [
             "train_multy_CVaR.py", "--config", str(ROOT / "configs" / filename),
-            "--backend", "hf", "--generation-backend", "hf",
+            "--backend", "unsloth", "--generation-backend", "hf",
             "--max-seq-length", "32768", "--max-new-tokens", "4096",
             "--advantage-mode", mode, "--api-strategy", "", *extra,
         ])
