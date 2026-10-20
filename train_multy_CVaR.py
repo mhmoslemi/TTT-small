@@ -2951,6 +2951,16 @@ def load_config():
     for note in resolve_memory_settings(merged, roles, memory):
         print(f"[memory] auto: {note}")
 
+    if (merged.get("problem") in {"ac1", "ac2"}
+            and merged.get("coder_model_profile") == "gpt-oss-120b"
+            and merged.get("generation_backend") == "vllm"):
+        # AC responses can exceed 64K tokens; bound vLLM's exact FP32
+        # prompt-logprob projection without shortening or approximating them.
+        merged["vllm_max_num_batched_tokens"] = min(
+            int(merged["vllm_max_num_batched_tokens"]), 2048)
+        print("[memory] AC GPT-OSS exact scoring: vLLM max batched "
+              "tokens=2048")
+
     print(f"[config] AVAILABLE_GPUS={roles.available} ({inventory_source})")
     print(f"[config] GPU roles: train={training_gpu_ids}, "
           f"generation={gpu_ids}, evaluation={evaluation_gpu_id}; "

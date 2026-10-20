@@ -385,6 +385,29 @@ def test_yaml_local_strategy_and_low_effort_gpt_oss_coder(config, filename):
     assert "test-key-never-sent" not in json.dumps(merged)
 
 
+@pytest.mark.parametrize(("filename", "expected"), [
+    ("ac1.yaml", 2048), ("ac2.yaml", 2048), ("erdos.yaml", 8192),
+])
+def test_only_ac_gpt_oss_bounds_exact_scoring_projection(
+        config, filename, expected):
+    cfg, _ = config(
+        "--strategies", "--generation-backend", "vllm",
+        filename=filename)
+    assert cfg.vllm_max_num_batched_tokens == expected
+
+
+def test_resumed_ac_run_reapplies_exact_scoring_bound(config, tmp_path):
+    _, saved = config(
+        "--strategies", "--generation-backend", "vllm",
+        filename="ac1.yaml")
+    saved["vllm_max_num_batched_tokens"] = 8192
+    (tmp_path / "config.json").write_text(json.dumps(saved))
+    cfg, _ = config(
+        "--strategies", "--generation-backend", "vllm",
+        "--resume", str(tmp_path), filename="ac1.yaml")
+    assert cfg.vllm_max_num_batched_tokens == 2048
+
+
 def test_empty_selector_disables_api_and_cli_overrides_effort(config, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cfg, _ = config("--api-strategy", "")
