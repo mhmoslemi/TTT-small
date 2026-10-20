@@ -2067,17 +2067,16 @@ def _resolve_training_model_name(model_name, requested_name, load_in_4bit):
 
 
 def _resolve_training_backend(backend, training_model_name):
-    """Use the loader that matches GPT-OSS's Unsloth BNB tensor layout.
+    """Select the training loader from the checkpoint when backend is auto.
 
-    The ``*-unsloth-bnb-4bit`` GPT-OSS conversions store every expert as a
-    separate quantized module.  Vanilla Transformers expects fused expert
-    tensors instead; it reports every checkpoint expert as unexpected,
-    initializes a second BF16 expert bank, and can OOM while PEFT casts those
-    replacement tensors.  Unsloth installs the matching model implementation
-    before loading the checkpoint.
+    GPT-OSS needs Unsloth for its packed/split expert layouts. All other
+    checkpoints keep the established HF path. An explicit backend remains an
+    override, except that an incompatible GPT-OSS BNB/HF pairing is corrected.
     """
     resolved = str(backend).strip().lower()
     checkpoint = str(training_model_name).strip().lower()
+    if resolved == "auto":
+        return "unsloth" if "gpt-oss" in checkpoint else "hf"
     requires_unsloth = (
         "gpt-oss" in checkpoint
         and "unsloth-bnb-4bit" in checkpoint

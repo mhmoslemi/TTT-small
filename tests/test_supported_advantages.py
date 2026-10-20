@@ -26,6 +26,15 @@ from spo_rs import SPORSTracker
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize(("model_name", "expected"), [
+    ("openai/gpt-oss-120b", "unsloth"),
+    ("Qwen/Qwen3-8B", "hf"),
+    ("Qwen/Qwen3.8-27B", "hf"),
+])
+def test_auto_training_backend_follows_coder_model(model_name, expected):
+    assert training._resolve_training_backend("auto", model_name) == expected
+
+
 @pytest.fixture
 def load_config(monkeypatch):
     monkeypatch.setenv("AVAILABLE_GPUS", "0,1")
