@@ -107,9 +107,15 @@ def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     (saved_dir / "config.json").write_text(json.dumps(values))
     cfg, _ = load_config(extra=("--resume", str(saved_dir)))
     assert cfg.parent_selection == mode
+    if mode != "thompson":
+        with pytest.raises(ValueError, match="requires training_state.pt"):
+            load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
+        (saved_dir / "training_state.pt").touch()
+        cfg, _ = load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
+        assert cfg.parent_selection == "thompson" and not cfg.uct
     with pytest.raises(ValueError, match="cannot change parent_selection"):
         load_config(extra=("--resume", str(saved_dir), "--parent-selection",
-                           "puct" if mode != "puct" else "thompson"))
+                           "puct" if mode != "puct" else "uct"))
 
 
 def test_legacy_uct_config_and_flag_keep_their_meaning(load_config, tmp_path):

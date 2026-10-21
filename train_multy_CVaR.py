@@ -1850,7 +1850,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
     p.add_argument("--parent-selection", choices=("puct", "uct", "thompson"),
-                   default=None, help="Override the YAML parent_selection picker.")
+                   default=None, help="Override the YAML picker; on resume, "
+                   "thompson migrates a PUCT/UCT archive at the next fresh step.")
     p.add_argument("--uct", dest="parent_selection", action="store_const",
                    const="uct", default=None,
                    help="Compatibility alias for --parent-selection uct.")
@@ -2266,9 +2267,13 @@ def load_config():
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
-        raise ValueError(
-            "cannot change parent_selection while resuming its search history; "
-            "start a fresh run for a different picker")
+        if merged["parent_selection"] != "thompson":
+            raise ValueError(
+                "cannot change parent_selection while resuming except "
+                "PUCT/UCT to Thompson")
+        if not (resume_dir / "training_state.pt").is_file():
+            raise ValueError("Thompson migration requires training_state.pt; "
+                             "refusing to reset the trained run")
     if (saved and args.spo_rs_adaptive_beta is not None
             and bool(saved.get("spo_rs_adaptive_beta", False))
             != bool(args.spo_rs_adaptive_beta)):
@@ -8213,6 +8218,40 @@ def _load_training_checkpoint(exp_dir):
     return payload
 
 
+def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
+                              optimizer, spo_rs_tracker, *, recovery_pending):
+    """Switch only before fresh selection, preserving the complete training state."""
+    if sampler.selection_mode == cfg.parent_selection:
+        return sampler
+    if cfg.parent_selection != "thompson" or sampler.selection_mode not in ("puct", "uct"):
+        raise ValueError("unsupported resume parent-selection change")
+    if recovery_pending:
+        print(f"[resume] finishing interrupted step {next_step} with "
+              f"{sampler.selection_mode.upper()}; Thompson starts at the next fresh step",
+              flush=True)
+        return sampler
+    from thompson_sampler import ThompsonSampler
+    migrated = ThompsonSampler(
+        num_seeds=1, group_size=int(cfg.group_size), seed=int(cfg.seed),
+        puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
+        topk_children=sampler.topk_children)
+    count = migrated.migrate_state_dict(sampler.state_dict(), exp_dir, next_step)
+    # Persist intent first: a crash before checkpoint replacement repeats the
+    # deterministic migration, never recovers Thompson picks with legacy PUCT.
+    path = Path(exp_dir) / "config.json"
+    saved = json.loads(path.read_text())
+    saved.update(parent_selection="thompson", uct=False)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(saved, indent=2) + "\n")
+    tmp.replace(path)
+    _save_training_checkpoint(exp_dir, next_step, adapter_path, migrated,
+                              optimizer, spo_rs_tracker)
+    print(f"[resume] {sampler.selection_mode.upper()} -> Thompson at step {next_step}; "
+          f"rebuilt evidence from {count} evaluated attempts; "
+          "archive, adapter, optimizer and SPO tracker preserved", flush=True)
+    return migrated
+
+
 def _legacy_resume_info(exp_dir):
     """Locate the safe restart point for a pre-checkpoint run directory."""
     matches = []
@@ -13362,8 +13401,14 @@ def main():
 
     # ---- sampler ----
     from sampler import make_sampler
+    restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
+                          if resume_payload is not None else cfg.parent_selection)
+    if (restored_selection != cfg.parent_selection
+            and not (cfg.parent_selection == "thompson"
+                     and restored_selection in ("puct", "uct"))):
+        raise ValueError("saved sampler differs from the requested parent picker")
     sampler = make_sampler(
-        parent_selection=cfg.parent_selection,
+        parent_selection=restored_selection,
         group_size=int(cfg.group_size), seed=int(cfg.seed),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
@@ -13374,7 +13419,7 @@ def main():
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
-        print(f"[resume] restored exact {cfg.parent_selection.upper()} "
+        print(f"[resume] restored exact {sampler.selection_mode.upper()} "
               "archive and search statistics")
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(
@@ -13961,6 +14006,12 @@ def main():
             else:
                 interrupted_spo_rs_artifacts = None
                 pending_spo_rs_artifacts = None
+
+            sampler = _migrate_parent_selection(
+                sampler, cfg, exp_dir, step, current_policy_adapter_path,
+                optimizer, spo_rs_tracker,
+                recovery_pending=(interrupted_spo_rs_artifacts is not None
+                                  or pending_spo_rs_artifacts is not None))
 
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(

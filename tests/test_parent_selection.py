@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from config_validation import validate_problem_config
-from experiment_io import save_parent_selections
+from experiment_io import save_parent_selections, save_step_summary
 from sampler import PUCTSampler, State, make_sampler, parent_selection_mode
 from thompson_sampler import OutcomeStats, ThompsonSampler, expected_max_gain
 
@@ -21,6 +21,151 @@ def search(seeds=2, **kwargs):
         num_seeds=seeds, group_size=8, seed=42,
         seed_states=[SimpleNamespace(value=1.0, code=f"seed{i}") for i in range(seeds)],
         **kwargs)
+
+
+@pytest.fixture
+def legacy_history(tmp_path):
+    old = PUCTSampler(num_seeds=1, seed_value=1., topk_children=1)
+    root = old._states[0]
+
+    def step(index, parent, rewards, retries=0):
+        save_parent_selections(tmp_path, index, "PUCTSampler", [parent], [])
+        batch = []
+        for i, reward in enumerate(rewards):
+            child = State.make(index, reward, f"code-{index}-{i}")
+            if index == 0 and i == 3:
+                child.code = batch[0].code  # A duplicate is still an observed attempt.
+            row = dict(step=index, group=0, parent_group=0, rollout=i,
+                       node_id=child.id, parent_id=parent.id, parent_value=parent.value,
+                       reward=reward, valid=reward > 0,
+                       retry_attempt=int(i >= len(rewards) - retries),
+                       counts_toward_allocation=i < len(rewards) - retries)
+            (tmp_path / f"step{index:02d}" / f"step{index:02d}_group00_rollout{i:03d}.meta.json").write_text(json.dumps(row))
+            batch.append(child)
+        old.record_expansion(parent, len(rewards) - retries)
+        old.update([(child, parent) for child in batch if child.value > 0])
+        save_step_summary(tmp_path, index, dict(step=index, completed=True,
+                          planned_rollouts=len(rewards) - retries, coder_format_retries=retries))
+        return batch[0]
+
+    pruned = step(0, root, [1.2, 1.1, 0., 1.2])
+    step(1, pruned, [1.3, 0., 1.25], retries=1)
+    step(2, root, [1.4])
+    assert pruned.id not in {s.id for s in old._states}
+    (tmp_path / "config.json").write_text(json.dumps({"model_name": "unchanged", "uct": False}))
+    return old, root, pruned
+
+
+@pytest.mark.parametrize("source", ["puct", "uct"])
+def test_migrate_preserves_archive_and_rebuilds_all_attempts(tmp_path, legacy_history, source):
+    old, root, pruned = legacy_history
+    old.use_uct = source == "uct"
+    original = deepcopy(old.state_dict())
+    migrated = search()
+    assert migrated.migrate_state_dict(original, tmp_path, 3) == 8
+    assert old.state_dict() == original
+    assert migrated._outcomes.valid == 6
+    assert migrated._nodes[root.id].subtree.attempts == 8
+    assert migrated._nodes[root.id].direct.attempts == 5
+    assert migrated._nodes[pruned.id].direct.attempts == 3
+    assert migrated._best_reward == 1.4
+    snapshot = migrated.state_dict()
+    assert {k: snapshot[k] for k in original if k != "selection_mode"} == {
+        k: v for k, v in original.items() if k != "selection_mode"}
+    restored = search()
+    restored.load_state_dict(snapshot)
+    assert [s.id for s in migrated.sample_states(3)] == [s.id for s in restored.sample_states(3)]
+
+
+@pytest.mark.parametrize("damage", ["missing", "pending", "genealogy", "identity", "summary"])
+def test_migration_refuses_incomplete_or_inconsistent_history(tmp_path, legacy_history, damage):
+    old, _, _ = legacy_history
+    original = deepcopy(old.state_dict())
+    path = tmp_path / "step01/step01_group00_rollout001.meta.json"
+    if damage == "missing":
+        path.unlink()
+    elif damage in ("pending", "identity"):
+        row = json.loads(path.read_text())
+        row.update({"status": "evaluation_pending"} if damage == "pending" else {"parent_id": "wrong"})
+        path.write_text(json.dumps(row))
+    elif damage == "summary":
+        (tmp_path / "step01/step01.summary.json").unlink()
+    else:
+        path = tmp_path / "step01/step01.parents.json"
+        row = json.loads(path.read_text())
+        row["parents"][0]["ancestor_ids"] = ["missing-root"]
+        path.write_text(json.dumps(row))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        search().migrate_state_dict(original, tmp_path, 3)
+    assert old.state_dict() == original
+
+
+def test_migration_defers_recovery_and_checkpoints_before_new_selection(tmp_path, legacy_history, monkeypatch):
+    import train_multy_CVaR as training
+    old, _, _ = legacy_history
+    cfg = SimpleNamespace(parent_selection="thompson", group_size=8, seed=42)
+    optimizer, tracker, adapter = object(), object(), tmp_path / "adapter_step002"
+    saved = []
+
+    def checkpoint(directory, next_step, path, sampler, opt, spo):
+        assert (directory, next_step, path, opt, spo) == (tmp_path, 3, adapter, optimizer, tracker)
+        assert json.loads((tmp_path / "config.json").read_text())["parent_selection"] == "thompson"
+        saved.append(sampler.state_dict())
+    monkeypatch.setattr(training, "_save_training_checkpoint", checkpoint)
+    args = (old, cfg, tmp_path, 3, adapter, optimizer, tracker)
+    assert training._migrate_parent_selection(*args, recovery_pending=True) is old
+    assert saved == []
+    assert "parent_selection" not in json.loads((tmp_path / "config.json").read_text())
+    migrated = training._migrate_parent_selection(*args, recovery_pending=False)
+    assert saved == [migrated.state_dict()]
+    assert json.loads((tmp_path / "config.json").read_text())["model_name"] == "unchanged"
+    assert training._migrate_parent_selection(migrated, *args[1:], recovery_pending=False) is migrated
+    assert len(saved) == 1
+
+
+def test_failed_checkpoint_can_repeat_migration_without_changing_training_state(tmp_path, legacy_history, monkeypatch):
+    import train_multy_CVaR as training
+    old, _, _ = legacy_history
+    original = deepcopy(old.state_dict())
+    cfg = SimpleNamespace(parent_selection="thompson", group_size=8, seed=42)
+    states = []
+    def checkpoint(*args):
+        states.append(args[3].state_dict())
+        if len(states) == 1:
+            raise OSError("simulated interrupted checkpoint write")
+    monkeypatch.setattr(training, "_save_training_checkpoint", checkpoint)
+    args = (old, cfg, tmp_path, 3, tmp_path / "adapter_step002", object(), object())
+    with pytest.raises(OSError):
+        training._migrate_parent_selection(*args, recovery_pending=False)
+    training._migrate_parent_selection(*args, recovery_pending=False)
+    assert states[0] == states[1]
+    assert old.state_dict() == original
+
+
+def test_migration_saved_checkpoint_keeps_optimizer_and_spo_state(tmp_path, legacy_history):
+    import torch
+    import train_multy_CVaR as training
+    old, _, _ = legacy_history
+    parameter = torch.nn.Parameter(torch.tensor([1.]))
+    optimizer = torch.optim.AdamW([parameter], lr=.01)
+    parameter.square().sum().backward()
+    optimizer.step()
+    before = deepcopy(optimizer.state_dict())
+    spo = {"version": 2, "value": 123., "history": [1., 2.]}
+    tracker = SimpleNamespace(state_dict=lambda: spo)
+    cfg = SimpleNamespace(parent_selection="thompson", group_size=8, seed=42)
+    migrated = training._migrate_parent_selection(
+        old, cfg, tmp_path, 3, tmp_path / "adapter_step002", optimizer, tracker,
+        recovery_pending=False)
+    checkpoint = training._load_training_checkpoint(tmp_path)
+    assert checkpoint["next_step"] == 3
+    assert checkpoint["adapter_dir"] == "adapter_step002"
+    assert checkpoint["spo_rs_tracker"] == spo
+    assert checkpoint["sampler"] == migrated.state_dict()
+    assert checkpoint["optimizer"]["param_groups"] == before["param_groups"]
+    for index, state in before["state"].items():
+        for key, value in state.items():
+            assert torch.equal(value, checkpoint["optimizer"]["state"][index][key])
 
 
 def children(sampler, parent, rewards, step=0):

@@ -21,11 +21,13 @@ There are no extra LLM calls, evaluations, GPU work, or problem descriptors.
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 
-from sampler import PUCTSampler
+from sampler import PUCTSampler, State
 
 
 @dataclass
@@ -363,6 +365,92 @@ class ThompsonSampler(PUCTSampler):
                 "nodes": {sid: asdict(node) for sid, node in self._nodes.items()},
             }
             return payload
+
+    def migrate_state_dict(self, payload, exp_dir, before_step):
+        """Keep a legacy archive intact; rebuild evidence from completed attempts.
+
+        Called on a new sampler, so failed validation never mutates the live
+        picker. Pruned, never-expanded leaves need no posterior of their own.
+        """
+        if payload.get("selection_mode", "puct") not in ("puct", "uct"):
+            raise ValueError("Thompson migration requires a PUCT/UCT checkpoint")
+        PUCTSampler.load_state_dict(self, dict(payload, selection_mode="thompson"))
+        self._nodes = {}
+        self._outcomes = OutcomeStats()
+        self._selection_step, self._selected = None, []
+        claims, history = {}, []
+
+        def claim(sid, value, ancestors):
+            value, ancestors = float(value), tuple(ancestors)
+            if not math.isfinite(value) or sid in ancestors or len(set(ancestors)) != len(ancestors):
+                raise ValueError(f"invalid Thompson migration genealogy: {sid}")
+            row = (value, ancestors)
+            if sid in claims and claims[sid] != row:
+                raise ValueError(f"conflicting Thompson migration identity: {sid}")
+            claims[sid] = row
+
+        for state in self._states:
+            claim(state.id, state.value, [p["id"] for p in state.parents])
+        for step in range(int(before_step)):
+            directory = Path(exp_dir) / f"step{step:02d}"
+            summary = json.loads((directory / f"step{step:02d}.summary.json").read_text())
+            event = json.loads((directory / f"step{step:02d}.parents.json").read_text())
+            if (summary.get("completed") is not True or summary.get("step") != step
+                    or event.get("step") != step):
+                raise ValueError(f"Thompson migration needs completed step {step}")
+            parents = {int(row["group"]): row for row in event["parents"]}
+            if len(parents) != len(event["parents"]) or not parents:
+                raise ValueError(f"invalid saved parent groups for step {step}")
+            for row in parents.values():
+                claim(row["parent_id"], row["parent_reward"], row["ancestor_ids"])
+            history.append((step, directory, summary, parents))
+
+        for sid, (value, ancestors) in sorted(claims.items(), key=lambda item: len(item[1][1])):
+            if ancestors:
+                parent = claims.get(ancestors[0])
+                if parent is None or parent[1] != ancestors[1:]:
+                    raise ValueError(f"missing or inconsistent migration ancestor for {sid}")
+            elif sid not in self._seed_ids:
+                raise ValueError(f"migration root is not a saved seed: {sid}")
+            self._nodes[sid] = SearchNode(ancestors[0] if ancestors else None, value)
+        values = [claims[sid][0] for sid in self._seed_ids]
+        self._best_reward = max(values)
+        self._initial_scale = max(float(np.std(values)), .05 * max(abs(v) for v in values), 1e-12)
+        unseen = set(claims) - self._seed_ids
+        for step, directory, summary, parents in history:
+            seen, primary = set(), 0
+            for path in sorted(directory.glob(f"step{step:02d}_group*_rollout*.meta.json")):
+                row = json.loads(path.read_text())
+                key = (int(row["group"]), int(row["rollout"]))
+                parent = parents[int(row.get("parent_group", row["group"]))]
+                reward, valid = float(row["reward"]), row["valid"]
+                if (row.get("step") != step or key in seen
+                        or row["parent_id"] != parent["parent_id"]
+                        or float(row["parent_value"]) != float(parent["parent_reward"])
+                        or not isinstance(valid, bool) or not math.isfinite(reward)
+                        or row.get("status") == "evaluation_pending"):
+                    raise ValueError(f"inconsistent evaluated rollout for migration: {path}")
+                seen.add(key)
+                primary += int(bool(row.get("counts_toward_allocation", True))
+                               and int(row.get("retry_attempt", 0) or 0) == 0)
+                sid = row["node_id"]
+                if sid in claims:
+                    value, ancestors = claims[sid]
+                    if not valid or value != reward or not ancestors or ancestors[0] != row["parent_id"]:
+                        raise ValueError(f"rollout does not match saved archive identity: {path}")
+                    unseen.discard(sid)
+                state = State(id=parent["parent_id"], timestep=parent["parent_timestep"],
+                              value=parent["parent_reward"], code="",
+                              parents=[{"id": sid} for sid in parent["ancestor_ids"]])
+                self.record_outcomes(state, [reward], [valid])
+            expected = int(summary["planned_rollouts"])
+            retries = int(summary.get("coder_format_retries", 0))
+            if primary != expected or len(seen) != expected + retries:
+                raise ValueError(f"incomplete rollout history for Thompson migration at step {step}: "
+                                 f"found {len(seen)}, expected {expected + retries}")
+        if unseen:
+            raise ValueError(f"Thompson migration cannot trace {len(unseen)} saved nodes to evaluated rollouts")
+        return self._outcomes.attempts
 
     def load_state_dict(self, payload):
         data = payload.get("thompson", {})
