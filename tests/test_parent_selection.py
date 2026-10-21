@@ -199,7 +199,7 @@ def test_all_yaml_presets_default_to_original_picker_and_accept_new_mode():
     for path in paths:
         config = yaml.safe_load(path.read_text())
         assert config["parent_selection"] == "puct"
-        for mode in ("puct", "uct", "thompson"):
+        for mode in ("puct", "uct", "thompson", "llm"):
             config["parent_selection"] = mode
             validate_problem_config(config, source=path)
     assert parent_selection_mode({}) == "puct"

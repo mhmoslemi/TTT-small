@@ -224,9 +224,9 @@ def validate_problem_config(
             f"{_label(source)}: strict_strategy_validation must be a boolean")
     if "parent_selection" in data:
         mode = data["parent_selection"]
-        if not isinstance(mode, str) or mode.lower() not in {"puct", "uct", "thompson"}:
+        if not isinstance(mode, str) or mode.lower() not in {"puct", "uct", "thompson", "llm"}:
             raise ValueError(
-                f"{_label(source)}: parent_selection must be 'puct', 'uct', or 'thompson'")
+                f"{_label(source)}: parent_selection must be 'puct', 'uct', 'thompson', or 'llm'")
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

@@ -38,7 +38,7 @@ import numpy as np
 from dataclasses import asdict, dataclass, field
 
 
-PARENT_SELECTION_MODES = ("puct", "uct", "thompson")
+PARENT_SELECTION_MODES = ("puct", "uct", "thompson", "llm")
 
 
 def parent_selection_mode(config):
@@ -47,12 +47,21 @@ def parent_selection_mode(config):
     if mode is None:
         mode = "uct" if config.get("uct", False) else "puct"
     if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
-        raise ValueError("parent_selection must be 'puct', 'uct', or 'thompson'")
+        raise ValueError("parent_selection must be 'puct', 'uct', 'thompson', or 'llm'")
     return mode.lower()
 
 
-def make_sampler(*, parent_selection="puct", group_size=1, seed=0, **kwargs):
+def can_migrate_parent_selection(source, target):
+    return ((target == "thompson" and source in ("puct", "uct"))
+            or (target == "llm" and source in ("puct", "uct", "thompson")))
+
+
+def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
+                 exp_dir=None, problem=None, **kwargs):
     mode = parent_selection_mode({"parent_selection": parent_selection})
+    if mode == "llm":
+        from llm_sampler import LLMSampler
+        return LLMSampler(exp_dir=exp_dir, problem=problem, **kwargs)
     if mode == "thompson":
         from thompson_sampler import ThompsonSampler
         return ThompsonSampler(group_size=group_size, seed=seed, **kwargs)

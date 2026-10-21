@@ -1849,9 +1849,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "from each generated strategy before applying the existing "
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
-    p.add_argument("--parent-selection", choices=("puct", "uct", "thompson"),
+    p.add_argument("--parent-selection", choices=("puct", "uct", "thompson", "llm"),
                    default=None, help="Override the YAML picker; on resume, "
-                   "thompson migrates a PUCT/UCT archive at the next fresh step.")
+                   "thompson or llm starts at the next fresh step. "
+                   "llm uses GPT-6 Luna with maximum reasoning.")
     p.add_argument("--uct", dest="parent_selection", action="store_const",
                    const="uct", default=None,
                    help="Compatibility alias for --parent-selection uct.")
@@ -2263,16 +2264,17 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
-    from sampler import parent_selection_mode
+    from sampler import can_migrate_parent_selection, parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
-        if merged["parent_selection"] != "thompson":
+        if not can_migrate_parent_selection(
+                parent_selection_mode(saved), merged["parent_selection"]):
             raise ValueError(
                 "cannot change parent_selection while resuming except "
-                "PUCT/UCT to Thompson")
+                "PUCT/UCT to Thompson or an existing picker to LLM")
         if not (resume_dir / "training_state.pt").is_file():
-            raise ValueError("Thompson migration requires training_state.pt; "
+            raise ValueError("parent-picker migration requires training_state.pt; "
                              "refusing to reset the trained run")
     if (saved and args.spo_rs_adaptive_beta is not None
             and bool(saved.get("spo_rs_adaptive_beta", False))
@@ -8219,35 +8221,48 @@ def _load_training_checkpoint(exp_dir):
 
 
 def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
-                              optimizer, spo_rs_tracker, *, recovery_pending):
+                              optimizer, spo_rs_tracker, *, recovery_pending,
+                              problem=None):
     """Switch only before fresh selection, preserving the complete training state."""
     if sampler.selection_mode == cfg.parent_selection:
         return sampler
-    if cfg.parent_selection != "thompson" or sampler.selection_mode not in ("puct", "uct"):
+    from sampler import can_migrate_parent_selection
+    if not can_migrate_parent_selection(sampler.selection_mode, cfg.parent_selection):
         raise ValueError("unsupported resume parent-selection change")
     if recovery_pending:
         print(f"[resume] finishing interrupted step {next_step} with "
-              f"{sampler.selection_mode.upper()}; Thompson starts at the next fresh step",
+              f"{sampler.selection_mode.upper()}; "
+              f"{cfg.parent_selection.upper()} starts at the next fresh step",
               flush=True)
         return sampler
-    from thompson_sampler import ThompsonSampler
-    migrated = ThompsonSampler(
-        num_seeds=1, group_size=int(cfg.group_size), seed=int(cfg.seed),
-        puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
-        topk_children=sampler.topk_children)
-    count = migrated.migrate_state_dict(sampler.state_dict(), exp_dir, next_step)
+    if cfg.parent_selection == "llm":
+        from llm_sampler import LLMSampler
+        migrated = LLMSampler(
+            num_seeds=0, exp_dir=exp_dir, problem=problem,
+            puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
+            topk_children=sampler.topk_children)
+        migrated.load_state_dict(dict(sampler.state_dict(), selection_mode="llm"))
+        detail = "the full evaluated tree is available for LLM selection"
+    else:
+        from thompson_sampler import ThompsonSampler
+        migrated = ThompsonSampler(
+            num_seeds=1, group_size=int(cfg.group_size), seed=int(cfg.seed),
+            puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
+            topk_children=sampler.topk_children)
+        count = migrated.migrate_state_dict(sampler.state_dict(), exp_dir, next_step)
+        detail = f"rebuilt evidence from {count} evaluated attempts"
     # Persist intent first: a crash before checkpoint replacement repeats the
-    # deterministic migration, never recovers Thompson picks with legacy PUCT.
+    # migration, never recovers new-picker decisions with the legacy picker.
     path = Path(exp_dir) / "config.json"
     saved = json.loads(path.read_text())
-    saved.update(parent_selection="thompson", uct=False)
+    saved.update(parent_selection=cfg.parent_selection, uct=False)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(saved, indent=2) + "\n")
     tmp.replace(path)
     _save_training_checkpoint(exp_dir, next_step, adapter_path, migrated,
                               optimizer, spo_rs_tracker)
-    print(f"[resume] {sampler.selection_mode.upper()} -> Thompson at step {next_step}; "
-          f"rebuilt evidence from {count} evaluated attempts; "
+    print(f"[resume] {sampler.selection_mode.upper()} -> "
+          f"{cfg.parent_selection.upper()} at step {next_step}; {detail}; "
           "archive, adapter, optimizer and SPO tracker preserved", flush=True)
     return migrated
 
@@ -9617,6 +9632,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
+        if info.get("selection_mode") == "llm":
+            detail = info["llm"]
+            print(f"  parent {i} [{tag}] raw={parents[i].raw_score!r} "
+                  f"Luna rank={detail['rank']} ({detail['role']}): "
+                  f"{detail['reason']}")
+            continue
         if info.get("selection_mode") == "thompson":
             detail = info["thompson"]
             print(f"  parent {i} [{tag}]  value={info['value']:.9f}  "
@@ -13098,8 +13119,10 @@ def main():
     print(f"Print/SOTA target:  {getattr(cfg, 'target_print', cfg.target)}")
     print(f"Steps:              {cfg.num_steps}")
     selection = cfg.parent_selection
-    selection_detail = ("hierarchical expected-best" if selection == "thompson"
-                        else f"c={cfg.puct_c}")
+    selection_detail = ("gpt-6-luna, reasoning=max; first pick=best raw score"
+                        if selection == "llm" else (
+                        "hierarchical expected-best" if selection == "thompson"
+                        else f"c={cfg.puct_c}"))
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     print(f"Groups per step:    {cfg.groups_per_step}")
@@ -13400,16 +13423,16 @@ def main():
             )
 
     # ---- sampler ----
-    from sampler import make_sampler
+    from sampler import can_migrate_parent_selection, make_sampler
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
                           if resume_payload is not None else cfg.parent_selection)
     if (restored_selection != cfg.parent_selection
-            and not (cfg.parent_selection == "thompson"
-                     and restored_selection in ("puct", "uct"))):
+            and not can_migrate_parent_selection(restored_selection, cfg.parent_selection)):
         raise ValueError("saved sampler differs from the requested parent picker")
     sampler = make_sampler(
         parent_selection=restored_selection,
         group_size=int(cfg.group_size), seed=int(cfg.seed),
+        exp_dir=exp_dir, problem=problem,
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
@@ -14011,7 +14034,8 @@ def main():
                 sampler, cfg, exp_dir, step, current_policy_adapter_path,
                 optimizer, spo_rs_tracker,
                 recovery_pending=(interrupted_spo_rs_artifacts is not None
-                                  or pending_spo_rs_artifacts is not None))
+                                  or pending_spo_rs_artifacts is not None),
+                problem=problem)
 
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(

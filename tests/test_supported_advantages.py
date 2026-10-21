@@ -19,6 +19,7 @@ import train_multy_CVaR as training
 from advantage import entropic_adaptive_advantages
 from config_validation import validate_problem_config
 from problems.base import RewardResult, SeedState
+from reward import extract_python_code
 from sampler import make_sampler
 from spo_rs import SPORSTracker
 
@@ -98,7 +99,7 @@ def test_help_and_new_policy_controls(load_config):
     assert cfg.spo_rs_clip_epsilon_low == cfg.spo_rs_clip_epsilon_high == .3
 
 
-@pytest.mark.parametrize("mode", ["puct", "uct", "thompson"])
+@pytest.mark.parametrize("mode", ["puct", "uct", "thompson", "llm"])
 def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     cfg, values = load_config(extra=("--parent-selection", mode))
     assert cfg.parent_selection == mode and cfg.uct == (mode == "uct")
@@ -107,12 +108,16 @@ def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     (saved_dir / "config.json").write_text(json.dumps(values))
     cfg, _ = load_config(extra=("--resume", str(saved_dir)))
     assert cfg.parent_selection == mode
-    if mode != "thompson":
+    if mode in ("puct", "uct"):
         with pytest.raises(ValueError, match="requires training_state.pt"):
             load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
         (saved_dir / "training_state.pt").touch()
         cfg, _ = load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
         assert cfg.parent_selection == "thompson" and not cfg.uct
+    if mode != "llm":
+        (saved_dir / "training_state.pt").touch()
+        cfg, _ = load_config(extra=("--resume", str(saved_dir), "--parent-selection", "llm"))
+        assert cfg.parent_selection == "llm" and not cfg.uct
     with pytest.raises(ValueError, match="cannot change parent_selection"):
         load_config(extra=("--resume", str(saved_dir), "--parent-selection",
                            "puct" if mode != "puct" else "uct"))
@@ -235,7 +240,7 @@ class TinyProblem:
         index = int(text.split("candidate=")[1].split()[0])
         reward = float(index % 4)
         return RewardResult(reward=reward, raw_score=reward, valid=reward > 0,
-                            parsed=True, ran=True, code=text)
+                            parsed=True, ran=True, code=extract_python_code(text))
 
 
 class CapturingTrainer:
@@ -317,7 +322,21 @@ def test_complete_step_with_cpu_generation_and_evaluation(
         strategy_pool = RemotePool()
     sampler = make_sampler(
         parent_selection=parent_selection, num_seeds=2, group_size=cfg.group_size,
+        exp_dir=tmp_path, problem=problem,
         seed=cfg.seed, seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
+    if parent_selection == "llm":
+        def select(request_path, response_path, tree_path, record):
+            ids = list(sampler._seed_ids)
+            result = {
+                "selected_parent_ids": ids,
+                "selections": [{"node_id": sid, "role": "exploit", "reason": "Seed anchor"}
+                               for sid in ids],
+                "tree_diagnosis": "Bootstrap", "confidence": "low"}
+            response = {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps(result)}]}]}
+            response_path.write_text(json.dumps(response))
+            return response
+        monkeypatch.setattr(sampler, "_request", select)
     trainer = CapturingTrainer()
     adapter = tmp_path / "adapter_initial"
     adapter.mkdir()
@@ -451,6 +470,22 @@ def test_complete_step_with_cpu_generation_and_evaluation(
             assert recovered.state_dict()["thompson"] == sampler.state_dict()["thompson"]
             assert [s.id for s in recovered.sample_states(2, selection_step=1)] == [
                 s.id for s in sampler.sample_states(2, selection_step=1)]
+    if parent_selection == "llm" and mode == "spo-rs":
+        recovered = make_sampler(
+            parent_selection="llm", num_seeds=2, exp_dir=tmp_path, problem=problem,
+            seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
+        monkeypatch.setattr(recovered, "_request", lambda *args: pytest.fail("repeated API call"))
+        recovered_tracker = SPORSTracker(
+            entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
+        recovered_tracker.load_state_dict(initial_tracker)
+        artifacts = training._recoverable_spo_rs_artifacts(tmp_path, 0, cfg)
+        assert artifacts is not None
+        training._prepare_recoverable_response_tokens(None, TinyTokenizer(), artifacts)
+        cfg.strategies = allocation is not None
+        training._resume_spo_rs_step_from_artifacts(
+            backend, model, TinyTokenizer(), recovered, optimizer, 0, cfg, tmp_path,
+            problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts)
+        assert recovered.state_dict() == sampler.state_dict()
 
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
@@ -460,6 +495,15 @@ def test_thompson_full_step_and_spo_recovery(
     test_complete_step_with_cpu_generation_and_evaluation(
         monkeypatch, tmp_path, load_config, mode, allocation,
         remote_strategy=True, pooled_coder=True, parent_selection="thompson")
+
+
+@pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
+@pytest.mark.parametrize("allocation", [None, "hurdle"])
+def test_llm_full_step_and_spo_recovery(
+        monkeypatch, tmp_path, load_config, mode, allocation):
+    test_complete_step_with_cpu_generation_and_evaluation(
+        monkeypatch, tmp_path, load_config, mode, allocation,
+        remote_strategy=True, pooled_coder=True, parent_selection="llm")
 
 
 def test_behavior_cache_keeps_only_aligned_finite_scores():
