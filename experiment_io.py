@@ -136,7 +136,8 @@ class StepPlotter:
         import subprocess
         import sys
 
-        scripts = [("plot_erdos_best_curve.py", [])]
+        scripts = [("plot_erdos_best_curve.py", []),
+                   ("plot_parent_tree.py", [])]
         if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
             scripts.insert(0, ("plot_erdos.py", ["--saved-only"]))
         elif self.problem in {"ac1", "ac2"}:
