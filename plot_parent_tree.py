@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the complete search tree and plot its selected-parent genealogy."""
+"""Export the complete tree; plot selected parents and each batch's best child."""
 
 import argparse
 import html
@@ -102,6 +102,56 @@ def load_genealogy(run_dir, max_step=None):
 
     for node_id in nodes:
         infer_level(node_id)
+    return nodes, edges
+
+
+def load_plot_genealogy(run_dir, max_step=None):
+    """Include each expansion's best evaluated child, even if never selected."""
+    run_dir = Path(run_dir)
+    nodes, edges = load_genealogy(run_dir, max_step)
+    parent_ids = {}
+    for path in sorted(run_dir.glob("step*/step*.parents.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            step = int(payload["step"])
+            for row in payload.get("parents", []):
+                parent_ids[(step, int(row.get("group", 0)))] = row["parent_id"]
+        except (OSError, KeyError, TypeError, ValueError):
+            continue
+
+    best_children = {}
+    for path in sorted(run_dir.glob("step*/step*_group*_rollout*.meta.json")):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            step = int(meta["step"])
+            if ((max_step is not None and step > max_step)
+                    or meta.get("status") == "evaluation_pending"):
+                continue
+            parent_id = meta.get("parent_id") or parent_ids.get(
+                (step, int(meta.get("parent_group", meta.get("group", 0)))))
+            if parent_id not in nodes:
+                continue
+            valid = bool(meta.get("valid"))
+            reward = _finite(meta.get("reward"))
+            raw_score = _finite(meta.get("raw_score")) if valid else 0.0
+            if reward is None or raw_score is None:
+                continue
+            node_id = str(meta.get("node_id") or
+                          f"rollout:{step}:{meta.get('group')}:{meta.get('rollout')}")
+            key = (step, parent_id)
+            candidate = ((valid, reward), node_id, raw_score)
+            if key not in best_children or candidate[0] > best_children[key][0]:
+                best_children[key] = candidate
+        except (OSError, KeyError, TypeError, ValueError):
+            continue
+
+    for (step, parent_id), ((valid, reward), node_id, raw_score) in best_children.items():
+        child = nodes.setdefault(node_id, {
+            "id": node_id, "level": step + 1, "reward": reward,
+            "raw_score": raw_score, "is_seed": False, "selected_steps": set(),
+        })
+        child["valid"] = valid
+        edges.add((parent_id, node_id))
     return nodes, edges
 
 
@@ -273,7 +323,7 @@ def tree_layout(nodes, edges):
 
 def _best_path(nodes, edges):
     candidates = [node for node in nodes.values()
-                  if node["reward"] is not None and node["selected_steps"]]
+                  if node["reward"] is not None and node.get("valid", True)]
     if not candidates:
         return set(), set()
     current = max(candidates, key=lambda node: node["reward"])["id"]
@@ -448,7 +498,7 @@ def main():
     parser.add_argument("--max-step", type=int)
     args = parser.parse_args()
     tree_log = write_tree_log(args.run_dir, args.max_step)
-    nodes, edges = load_genealogy(args.run_dir, args.max_step)
+    nodes, edges = load_plot_genealogy(args.run_dir, args.max_step)
     output = write_svg(args.run_dir, nodes, edges)
     _export_static(output, nodes, edges)
     print(f"Wrote {tree_log} and {output}")

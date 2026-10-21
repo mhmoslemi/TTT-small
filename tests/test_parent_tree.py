@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from experiment_io import StepPlotter
-from plot_parent_tree import (load_genealogy, tree_layout, write_svg,
-                              write_tree_log)
+from plot_parent_tree import (_best_path, load_genealogy, load_plot_genealogy,
+                              tree_layout, write_svg, write_tree_log)
 
 
 def _parents(root, step, rows):
@@ -52,6 +52,39 @@ def test_every_problem_refreshes_the_parent_tree(tmp_path):
                        "plot_parent_tree.py"]
     assert all(call.args[0][3:5] == ["--max-step", "4"]
                for call in run.call_args_list)
+
+
+def test_plot_keeps_completed_steps_when_selection_revisits_old_nodes(tmp_path):
+    for step in range(3):
+        _parents(tmp_path, step, [{
+            "group": 0, "parent_id": "seed", "parent_timestep": 0,
+            "parent_reward": 1.0, "parent_raw_score": 1.0,
+            "parent_is_seed": True, "ancestor_ids": [],
+        }])
+    for step, node_id, reward, raw, valid, pending in [
+            (0, "first-child", 2.0, .5, True, False),
+            (1, "best-child", 4.0, .25, True, False),
+            (1, "worse-child", 3.0, 1 / 3, True, False),
+            (1, "failed-child", 999.0, None, False, False),
+            (2, "pending-child", 10.0, .1, True, True)]:
+        folder = tmp_path / f"step{step:02d}"
+        (folder / f"step{step:02d}_group00_rollout_{node_id}.meta.json").write_text(
+            json.dumps({
+                "step": step, "group": 0, "node_id": node_id,
+                "parent_id": "seed" if step == 0 else None,
+                "reward": reward, "raw_score": raw, "valid": valid,
+                "status": "evaluation_pending" if pending else "evaluated",
+            }))
+    selected, _ = load_genealogy(tmp_path)
+    assert set(selected) == {"seed"}
+    nodes, edges = load_plot_genealogy(tmp_path)
+    assert set(nodes) == {"seed", "first-child", "best-child"}
+    assert edges == {("seed", "first-child"), ("seed", "best-child")}
+    assert nodes["best-child"]["level"] == 2
+    assert nodes["best-child"]["raw_score"] == .25
+    assert _best_path(nodes, edges)[0] == {"seed", "best-child"}
+    earlier, _ = load_plot_genealogy(tmp_path, max_step=0)
+    assert set(earlier) == {"seed", "first-child"}
 
 
 def test_complete_tree_log_links_both_directions_and_zeros_failures(tmp_path):
