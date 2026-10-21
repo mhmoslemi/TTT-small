@@ -1849,9 +1849,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "from each generated strategy before applying the existing "
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
-    p.add_argument("--uct", action="store_const", const=True, default=None,
-                   help="Use UCT parent selection instead of PUCT. Both use "
-                        "the same puct_c configuration value as c.")
+    p.add_argument("--parent-selection", choices=("puct", "uct", "thompson"),
+                   default=None, help="Override the YAML parent_selection picker.")
+    p.add_argument("--uct", dest="parent_selection", action="store_const",
+                   const="uct", default=None,
+                   help="Compatibility alias for --parent-selection uct.")
     p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument(
         "--coder-retry", action="store_const", const=True, default=None,
@@ -2242,6 +2244,9 @@ def load_config():
             merged["phase2_allocation_method"] = "rule_based"
         merged["spo_rs_adaptive_beta"] = bool(
             saved.get("spo_rs_adaptive_beta", False))
+        # A new YAML selector must not switch an old resumed run's search.
+        from sampler import parent_selection_mode
+        merged["parent_selection"] = parent_selection_mode(saved)
         # Introducing an API-enabled preset must not switch an older resumed
         # run to a paid service. An explicit CLI selector can still opt in.
         merged["api_strategy"] = saved.get("api_strategy", "")
@@ -2257,6 +2262,13 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
+    from sampler import parent_selection_mode
+    merged["parent_selection"] = parent_selection_mode(merged)
+    merged["uct"] = merged["parent_selection"] == "uct"
+    if saved and merged["parent_selection"] != parent_selection_mode(saved):
+        raise ValueError(
+            "cannot change parent_selection while resuming its search history; "
+            "start a fresh run for a different picker")
     if (saved and args.spo_rs_adaptive_beta is not None
             and bool(saved.get("spo_rs_adaptive_beta", False))
             != bool(args.spo_rs_adaptive_beta)):
@@ -8692,7 +8704,7 @@ def _finalize_pending_spo_rs_artifacts(
             "generated-step recovery requires every rollout-policy logprob "
             "sidecar")
 
-    parents = sampler.sample_states(int(cfg.groups_per_step))
+    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if len(parents) != int(cfg.groups_per_step):
         raise RuntimeError(
             "generated-step recovery could not reconstruct every parent")
@@ -8715,6 +8727,11 @@ def _finalize_pending_spo_rs_artifacts(
         if row is None:
             raise RuntimeError(
                 f"generated-step recovery is missing parent group {group}")
+        if (sampler.selection_mode == "thompson" and step_idx == 0
+                and parent.id in sampler._seed_ids
+                and row.get("parent_id") is not None
+                and str(row["parent_id"]) != parent.id):
+            sampler.reassign_seed_id(parent, str(row["parent_id"]))
         if (str(row.get("parent_id")) != str(parent.id)
                 or int(row.get("parent_timestep", -1))
                 != int(parent.timestep)
@@ -8879,7 +8896,7 @@ def _finalize_pending_spo_rs_artifacts(
 
     save_ctor = bool(getattr(problem, "saves_construction", False))
     sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
-                    else "PUCTSampler")
+                    else type(sampler).__name__)
     step_dir = Path(exp_dir) / f"step{int(step_idx):02d}"
     for index, (item, result) in enumerate(zip(artifacts, results)):
         pending = item["meta"]
@@ -9007,7 +9024,7 @@ def _resume_spo_rs_step_from_artifacts(
             "evaluated-step recovery cannot find the sampling adapter: "
             f"{sampling_adapter_path}")
 
-    parents = sampler.sample_states(int(cfg.groups_per_step))
+    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if len(parents) != int(cfg.groups_per_step):
         raise RuntimeError(
             "evaluated-step recovery could not reconstruct every selected "
@@ -9041,9 +9058,7 @@ def _resume_spo_rs_step_from_artifacts(
                 # Fresh seed State UUIDs are intentionally random. Reuse the
                 # durable IDs already embedded in every rollout so the healed
                 # checkpoint preserves the original lineage exactly.
-                sampler._seed_ids.remove(parent.id)
-                parent.id = saved_parent_id
-                sampler._seed_ids.add(parent.id)
+                sampler.reassign_seed_id(parent, saved_parent_id)
             else:
                 raise RuntimeError(
                     f"evaluated-step recovery parent ID {group} differs from "
@@ -9310,6 +9325,15 @@ def _resume_spo_rs_step_from_artifacts(
             overflow_state = None
             recovery_examples = all_examples
 
+    # Rebuild search evidence from every durable outcome, including failures,
+    # retries, duplicates and candidates excluded by the archive limits.
+    for parent_group, parent in enumerate(parents):
+        outcomes = [item["meta"] for item in artifacts
+                    if int(item["meta"].get("parent_group", item["meta"]["group"]))
+                    == parent_group]
+        sampler.record_outcomes(
+            parent, [row["reward"] for row in outcomes],
+            [row["valid"] for row in outcomes])
     archive_stats = sampler.update(
         all_children,
         strategy_keys=(strategy_keys if bool(cfg.strategies) else None),
@@ -9550,10 +9574,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
     requested_parent_contexts = (
         int(cfg.groups_per_step))
-    parents = sampler.sample_states(requested_parent_contexts)
+    parents = sampler.sample_states(requested_parent_contexts, selection_step=step_idx)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
+        if info.get("selection_mode") == "thompson":
+            detail = info["thompson"]
+            print(f"  parent {i} [{tag}]  value={info['value']:.9f}  "
+                  f"observed={info['n']}  direct={detail['direct_attempts']}  "
+                  f"Thompson expected gain={info['score']:.9g}  "
+                  f"depth={len(detail['path']) - 1}")
+            continue
         prior_label = ("" if info.get("selection_mode") == "uct"
                        else f"  P={info['P']:.9f}")
         print(f"  parent {i} [{tag}]  value={info['value']:.9f}  n={info['n']}  "
@@ -12134,6 +12165,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if rewards_np.size == 0:
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
+        sampler.record_outcomes(parent, rewards, valids)
         adv_mode = active_advantage_mode
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
@@ -13026,8 +13058,10 @@ def main():
     print(f"Prompt target:      {cfg.target}")
     print(f"Print/SOTA target:  {getattr(cfg, 'target_print', cfg.target)}")
     print(f"Steps:              {cfg.num_steps}")
-    print(f"Search selection:   {'UCT' if cfg.uct else 'PUCT'} "
-          f"(c={cfg.puct_c})")
+    selection = cfg.parent_selection
+    selection_detail = ("hierarchical expected-best" if selection == "thompson"
+                        else f"c={cfg.puct_c}")
+    print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     print(f"Groups per step:    {cfg.groups_per_step}")
     print(f"Group size:         {cfg.group_size}")
@@ -13327,20 +13361,21 @@ def main():
             )
 
     # ---- sampler ----
-    from sampler import PUCTSampler
-    sampler = PUCTSampler(
+    from sampler import make_sampler
+    sampler = make_sampler(
+        parent_selection=cfg.parent_selection,
+        group_size=int(cfg.group_size), seed=int(cfg.seed),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
         topk_children=cfg.topk_children_per_parent,
         seed_value=0.0,
         seed_states=seeds,
-        use_uct=cfg.uct,
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
-        print(f"[resume] restored exact "
-              f"{'UCT' if cfg.uct else 'PUCT'} archive and visit statistics")
+        print(f"[resume] restored exact {cfg.parent_selection.upper()} "
+              "archive and search statistics")
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(
             sampler, exp_dir, before_step=start_step

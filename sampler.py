@@ -38,6 +38,27 @@ import numpy as np
 from dataclasses import asdict, dataclass, field
 
 
+PARENT_SELECTION_MODES = ("puct", "uct", "thompson")
+
+
+def parent_selection_mode(config):
+    """Resolve the new selector while accepting old ``uct: true`` configs."""
+    mode = config.get("parent_selection")
+    if mode is None:
+        mode = "uct" if config.get("uct", False) else "puct"
+    if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
+        raise ValueError("parent_selection must be 'puct', 'uct', or 'thompson'")
+    return mode.lower()
+
+
+def make_sampler(*, parent_selection="puct", group_size=1, seed=0, **kwargs):
+    mode = parent_selection_mode({"parent_selection": parent_selection})
+    if mode == "thompson":
+        from thompson_sampler import ThompsonSampler
+        return ThompsonSampler(group_size=group_size, seed=seed, **kwargs)
+    return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
+
+
 @dataclass
 class State:
     id: str
@@ -119,6 +140,10 @@ class PUCTSampler:
         # Stats from last sample_states call (for printing)
         self.last_picks_info = []
 
+    @property
+    def selection_mode(self):
+        return "uct" if self.use_uct else "puct"
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -188,7 +213,7 @@ class PUCTSampler:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def sample_states(self, num_states: int):
+    def sample_states(self, num_states: int, *, selection_step=None):
         """Pick `num_states` parent states for the next batch."""
         if not self._states:
             return []
@@ -402,6 +427,22 @@ class PUCTSampler:
             self._n[aid] = self._n.get(aid, 0) + count
         self._T += count
 
+    def record_outcomes(self, parent: State, rewards, valids):
+        """PUCT/UCT retain their existing valid-child-only update rule.
+
+        The Thompson subclass consumes every evaluation through this hook,
+        independently of archive deduplication and pruning.
+        """
+
+    def reassign_seed_id(self, state: State, new_id: str):
+        """Bind a freshly recreated step-zero seed to its durable artifact ID."""
+        with self._lock:
+            if state.id not in self._seed_ids:
+                raise ValueError("only fresh seed identities can be rebound")
+            self._seed_ids.remove(state.id)
+            state.id = str(new_id)
+            self._seed_ids.add(state.id)
+
     def best_state(self):
         with self._lock:
             non_seeds = [s for s in self._states if s.id not in self._seed_ids]
@@ -433,7 +474,7 @@ class PUCTSampler:
                 "n": dict(self._n),
                 "m": dict(self._m),
                 "T": int(self._T),
-                "selection_mode": "uct" if self.use_uct else "puct",
+                "selection_mode": self.selection_mode,
                 "best_raw_min": (asdict(self._best_raw_min)
                                  if self._best_raw_min is not None else None),
                 "best_raw_max": (asdict(self._best_raw_max)
@@ -445,7 +486,7 @@ class PUCTSampler:
         if not isinstance(payload, dict) or payload.get("version") != 1:
             raise ValueError("unsupported or invalid sampler checkpoint")
         saved_mode = payload.get("selection_mode")
-        current_mode = "uct" if self.use_uct else "puct"
+        current_mode = self.selection_mode
         if saved_mode is not None and saved_mode != current_mode:
             raise ValueError(
                 f"sampler checkpoint uses {saved_mode}, but this run uses "

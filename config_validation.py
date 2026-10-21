@@ -53,7 +53,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_api_max_retries",
     "strategy_format_max_retries",
     "strict_strategy_validation",
-    "uct",
+    "uct", "parent_selection",
     "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
     "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
@@ -222,6 +222,11 @@ def validate_problem_config(
             and not isinstance(data["strict_strategy_validation"], bool)):
         raise ValueError(
             f"{_label(source)}: strict_strategy_validation must be a boolean")
+    if "parent_selection" in data:
+        mode = data["parent_selection"]
+        if not isinstance(mode, str) or mode.lower() not in {"puct", "uct", "thompson"}:
+            raise ValueError(
+                f"{_label(source)}: parent_selection must be 'puct', 'uct', or 'thompson'")
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

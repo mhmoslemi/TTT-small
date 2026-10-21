@@ -382,6 +382,7 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
                                   if info.get("bonus") is not None else None),
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
+            **({"thompson": info["thompson"]} if "thompson" in info else {}),
         })
     payload = {
         "version": 1,
