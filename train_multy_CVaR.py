@@ -887,18 +887,20 @@ def _resolve_coder_token_limits(merged):
 
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
-    """Use the configured coder effort uniformly in every rollout phase."""
+    """Keep Qwen3.8 phase 2 at medium, independent of saved pilot defaults."""
+    if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
+            and phase == "adaptive"):
+        return "medium"
     return getattr(cfg, "coder_reasoning_effort", None)
 
 
 def _coder_effort_entries(
         prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
-    """Route the configured number of Qwen3.8 pilots through xhigh effort.
+    """Route Qwen3.8 pilots through the configured medium/xhigh counts.
 
     The split changes only the chat-template reasoning control. Every source
     keeps exactly its requested sample count, allocation identity, and pilot
-    status. All non-pilot work and all other coder models retain the run's
-    configured effort unchanged.
+    status. Unassigned pilots retain the base effort; other models are unchanged.
     """
     del prompt_jobs, step_idx
     base_effort = _coder_effort_for_rollout_phase(cfg, phase)
@@ -909,22 +911,29 @@ def _coder_effort_entries(
     ]
     xhigh_per_strategy = int(getattr(
         cfg, "pilot_xhigh_programs_per_strategy", 0))
-    if (str(phase) != "pilot" or xhigh_per_strategy <= 0
+    medium_per_strategy = int(getattr(
+        cfg, "pilot_medium_programs_per_strategy", 0))
+    if (str(phase) != "pilot"
             or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
         return entries
 
     xhigh_entries = []
+    medium_entries = []
     base_entries = []
     for source_idx, count, _effort in entries:
         xhigh_count = min(xhigh_per_strategy, count)
-        xhigh_entries.append((source_idx, xhigh_count, "xhigh"))
-        if count > xhigh_count:
+        medium_count = min(medium_per_strategy, count - xhigh_count)
+        if xhigh_count:
+            xhigh_entries.append((source_idx, xhigh_count, "xhigh"))
+        if medium_count:
+            medium_entries.append((source_idx, medium_count, "medium"))
+        if count > xhigh_count + medium_count:
             base_entries.append(
-                (source_idx, count - xhigh_count, base_effort))
+                (source_idx, count - xhigh_count - medium_count, base_effort))
     # Keep all xhigh variants in the same scheduler call and place those groups
     # first so round-robin assignment spreads the longer requests across the
     # available engines. This adds no rollout or allocation budget.
-    return xhigh_entries + base_entries
+    return xhigh_entries + medium_entries + base_entries
 
 
 def _phase_coder_prompt_job(
@@ -2235,6 +2244,12 @@ def load_config():
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
+        # Pilot effort counts are operator-controlled for future generations,
+        # including resumes; saved prompts and training artifacts stay intact.
+        for key in ("pilot_medium_programs_per_strategy",
+                    "pilot_xhigh_programs_per_strategy"):
+            if key in ydict:
+                merged[key] = ydict[key]
         # A run saved before adaptive pilots existed must resume its original
         # one-pass rollout schedule even if today's YAML enables pilots.
         if "pilot_programs_per_strategy" not in saved:
@@ -2463,15 +2478,14 @@ def load_config():
         raise ValueError(f"advantage_mode must be one of {ADVANTAGE_MODES}")
     merged["advantage_mode"] = advantage_mode
     merged["uct"] = bool(merged.get("uct", False))
-    pilot_xhigh_programs_per_strategy = merged.get(
-        "pilot_xhigh_programs_per_strategy", 0)
-    if (isinstance(pilot_xhigh_programs_per_strategy, bool)
-            or not isinstance(pilot_xhigh_programs_per_strategy, int)
-            or pilot_xhigh_programs_per_strategy < 0):
-        raise ValueError(
-            "pilot_xhigh_programs_per_strategy must be a non-negative integer")
-    merged["pilot_xhigh_programs_per_strategy"] = (
-        pilot_xhigh_programs_per_strategy)
+    pilot_effort_counts = {}
+    for effort in ("xhigh", "medium"):
+        key = f"pilot_{effort}_programs_per_strategy"
+        count = merged.get(key, 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+        merged[key] = count
+        pilot_effort_counts[effort] = count
     strategy_format_max_retries = merged.get("strategy_format_max_retries", 3)
     if (isinstance(strategy_format_max_retries, bool)
             or not isinstance(strategy_format_max_retries, int)
@@ -2528,16 +2542,16 @@ def load_config():
             raise ValueError(
                 "pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
-        if (pilot_xhigh_programs_per_strategy > 0
+        if (sum(pilot_effort_counts.values()) > 0
                 and pilot_programs_per_strategy < 1):
             raise ValueError(
-                "positive pilot_xhigh_programs_per_strategy requires "
+                "positive pilot medium/xhigh counts require "
                 "adaptive pilots to be enabled")
         if (pilot_programs_per_strategy > 0
-                and pilot_xhigh_programs_per_strategy
+                and sum(pilot_effort_counts.values())
                 > pilot_programs_per_strategy):
             raise ValueError(
-                "pilot_xhigh_programs_per_strategy cannot exceed "
+                "pilot medium + xhigh counts cannot exceed "
                 "pilot_programs_per_strategy")
         if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
             raise ValueError(
@@ -10312,8 +10326,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             ]
         prompt_indices = [coder_retry_prompt_job(
             prompt_jobs, record, _render, coder_retry_prompt_cache,
-            reasoning_effort=_coder_effort_for_rollout_phase(
-                cfg, record.get("strategy_rollout_phase")),
+            reasoning_effort=prompt_jobs[int(record["job_idx"])].get(
+                "coder_reasoning_effort", _coder_effort_for_rollout_phase(
+                    cfg, record.get("strategy_rollout_phase"))),
             continue_from_failure=bool(getattr(
                 problem, "coder_retry_uses_failed_response", False)))
             for record in failed]
@@ -13191,15 +13206,15 @@ def main():
         pilot_count = int(getattr(
             cfg, "pilot_programs_per_strategy", -1))
         if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-                and pilot_count > 0
-                and int(getattr(
-                    cfg, "pilot_xhigh_programs_per_strategy", 0)) > 0):
-            xhigh_count = min(
-                int(cfg.pilot_xhigh_programs_per_strategy), pilot_count)
+                and pilot_count > 0):
+            pilot_efforts = _coder_effort_entries(
+                [], [0], [pilot_count], cfg, 0, "pilot")
+            pilot_description = " + ".join(
+                f"{count} {effort}" for _, count, effort in pilot_efforts)
             print(
                 "Coder reasoning:    pilot/strategy="
-                f"{xhigh_count} xhigh + {pilot_count - xhigh_count} "
-                f"{base_effort}; phase 2={base_effort}")
+                f"{pilot_description}; "
+                f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
         else:
             print(f"Coder reasoning:    all rollout phases={base_effort}")
     else:

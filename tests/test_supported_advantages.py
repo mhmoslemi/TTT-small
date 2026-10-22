@@ -157,6 +157,48 @@ def test_optional_values_retain_model_and_worker_defaults():
     assert training._resolve_reward_workers(cfg, problem, cpu_count=8) >= 1
 
 
+def test_qwen38_medium_pilots_and_phase2_with_saved_low():
+    cfg = SimpleNamespace(coder_template_kind="qwen3.8", coder_reasoning_effort="low",
+                          pilot_medium_programs_per_strategy=10,
+                          pilot_xhigh_programs_per_strategy=1)
+    entries = training._coder_effort_entries([], [0, 1], [11, 11], cfg, 7, "pilot")
+    assert entries == [(0, 1, "xhigh"), (1, 1, "xhigh"),
+                       (0, 10, "medium"), (1, 10, "medium")]
+    assert training._coder_effort_entries([], [0], [5], cfg, 7, "adaptive") == [(0, 5, "medium")]
+    jobs = [dict(messages=[], prompt_text="low", coder_reasoning_effort="low")]
+    cache = {}
+    render = lambda messages, **options: options["reasoning_effort"]
+    pilot = training._phase_coder_prompt_job(jobs, 0, "pilot", cfg, render, cache, effort="medium")
+    adaptive = training._phase_coder_prompt_job(jobs, 0, "adaptive", cfg, render, cache)
+    assert pilot == adaptive != 0
+    assert jobs[adaptive]["prompt_text"] == jobs[adaptive]["coder_reasoning_effort"] == "medium"
+    assert jobs[0]["prompt_text"] == "low"  # saved/source prompts are never overwritten
+    cfg.coder_template_kind = "gpt-oss"
+    assert training._coder_effort_entries([], [0], [11], cfg, 7, "pilot") == [(0, 11, "low")]
+    assert training._coder_effort_for_rollout_phase(cfg, "adaptive") == "low"
+
+
+def test_resume_uses_current_yaml_pilot_effort_counts(load_config, tmp_path):
+    options = ("--strategies", "--coder-model-name", "Qwen/Qwen3.8-27B")
+    _, saved = load_config(extra=options)
+    saved.pop("pilot_medium_programs_per_strategy", None)
+    saved.update(coder_reasoning_effort="low", pilot_xhigh_programs_per_strategy=2)
+    (tmp_path / "config.json").write_text(json.dumps(saved))
+    resumed, _ = load_config(extra=(*options, "--resume", str(tmp_path)))
+    current = yaml.safe_load((ROOT / "configs/erdos.yaml").read_text())
+    for key in ("pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy"):
+        assert getattr(resumed, key) == current[key]
+    assert training._coder_effort_for_rollout_phase(resumed, "adaptive") == "medium"
+
+
+def test_pilot_effort_counts_reject_invalid_or_excess_budget():
+    values = yaml.safe_load((ROOT / "configs/erdos.yaml").read_text())
+    for count in (-1, True, values["pilot_programs_per_strategy"] + 1):
+        invalid = dict(values, pilot_medium_programs_per_strategy=count)
+        with pytest.raises(ValueError, match="pilot.*(medium|xhigh)"):
+            validate_problem_config(invalid)
+
+
 def test_resume_migrates_retained_controls_and_drops_unused_options():
     saved = dict(advantage_mode="spo-rs", rank_update_epochs=3, rank_gamma=1.,
                  binary_coder_training=False, x_grpo_budgets=[1, 2], cvar_alpha=.2)
@@ -272,6 +314,7 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     cfg.strategies_per_parent = 2
     cfg.programs_per_strategy = 2
     cfg.pilot_programs_per_strategy = -1 if allocation == "fixed" else 1
+    cfg.pilot_medium_programs_per_strategy = 0
     cfg.pilot_xhigh_programs_per_strategy = 0
     cfg.phase2_allocation_method = allocation if allocation not in {None, "fixed"} else "hurdle"
     if pooled_coder == "live" and allocation not in {None, "fixed"}:

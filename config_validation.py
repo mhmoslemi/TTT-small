@@ -46,6 +46,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "fused_long_attention",
     "training_layout",
     "phase2_allocation_method",
+    "pilot_medium_programs_per_strategy",
     "min_p", "strategy_min_p",
     "strategy_vllm_persistent_workers",
     "api_strategy", "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
@@ -241,26 +242,25 @@ def validate_problem_config(
             raise ValueError(
                 f"{_label(source)}: pilot_programs_per_strategy cannot exceed "
                 "programs_per_strategy")
-    if "pilot_xhigh_programs_per_strategy" in data:
-        xhigh_count = data["pilot_xhigh_programs_per_strategy"]
-        if (isinstance(xhigh_count, bool)
-                or not isinstance(xhigh_count, int)
-                or xhigh_count < 0):
+    pilot_effort_total = 0
+    for key in ("pilot_xhigh_programs_per_strategy",
+                "pilot_medium_programs_per_strategy"):
+        count = data.get(key, 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ValueError(
-                f"{_label(source)}: pilot_xhigh_programs_per_strategy must "
+                f"{_label(source)}: {key} must "
                 "be a non-negative integer")
-        pilot_count = data.get("pilot_programs_per_strategy")
-        if xhigh_count > 0 and isinstance(pilot_count, int):
-            if pilot_count < 1:
-                raise ValueError(
-                    f"{_label(source)}: positive "
-                    "pilot_xhigh_programs_per_strategy requires adaptive "
-                    "pilots to be enabled")
-            if xhigh_count > pilot_count:
-                raise ValueError(
-                    f"{_label(source)}: "
-                    "pilot_xhigh_programs_per_strategy cannot exceed "
-                    "pilot_programs_per_strategy")
+        pilot_effort_total += count
+    pilot_count = data.get("pilot_programs_per_strategy")
+    if pilot_effort_total > 0 and isinstance(pilot_count, int):
+        if pilot_count < 1:
+            raise ValueError(
+                f"{_label(source)}: positive pilot medium/xhigh counts require "
+                "adaptive pilots to be enabled")
+        if pilot_effort_total > pilot_count:
+            raise ValueError(
+                f"{_label(source)}: pilot medium + xhigh counts cannot exceed "
+                "pilot_programs_per_strategy")
     if "phase2_allocation_method" in data:
         allocation_method = str(data["phase2_allocation_method"]).strip().lower()
         if allocation_method not in {"rule_based", "bandit", "hurdle"}:
