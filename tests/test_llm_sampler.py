@@ -1,8 +1,10 @@
 """Mocked API and artifact replay checks for LLM parent selection."""
 
 from copy import deepcopy
+from concurrent.futures import Future
 import json
 import sys
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -114,6 +116,72 @@ def test_full_tree_selects_pruned_nodes_once_and_saves_exact_request(tmp_path, a
     assert len(api["requests"]) == 1
     event = save_parent_selections(tmp_path, 1, "LLMSampler", picks, sampler.last_picks_info)
     assert json.loads(event.read_text())["parents"][1]["llm"]["rank"] == 2
+
+
+def test_prefetch_overlaps_checkpoints_and_reuses_one_decision(tmp_path, api, monkeypatch):
+    sampler, _ = history(tmp_path)
+    api["reply"] = response(["champion", "pruned"])
+    sampler.last_picks_info = [{"current_step": True}]
+    before = sampler.state_dict()
+    started, release = Event(), Event()
+    request = sampler._request
+
+    def slow_request(*args):
+        started.set()
+        assert release.wait(5), "training never released the API response"
+        return request(*args)
+
+    monkeypatch.setattr(sampler, "_request", slow_request)
+    future = sampler.prefetch_states(2, selection_step=1)
+    try:
+        assert started.wait(5)
+        assert not future.done()
+        assert sampler.prefetch_states(2, selection_step=1) is future
+        assert sampler.state_dict() == before
+        assert not future.done(), "checkpoint waited for the API response"
+        assert sampler._selection_step is None
+        assert sampler.last_picks_info == [{"current_step": True}]
+        with pytest.raises(ValueError, match="parent count"):
+            sampler.sample_states(1, selection_step=1)
+
+        consumed = Future()
+
+        def next_step():
+            try:
+                consumed.set_result(sampler.sample_states(2, selection_step=1))
+            except Exception as error:
+                consumed.set_exception(error)
+
+        Thread(target=next_step, daemon=True).start()
+        release.set()
+        picks = consumed.result(timeout=5)
+        future.result(timeout=5)
+    finally:
+        release.set()
+        future.result(timeout=5)
+
+    assert [state.id for state in picks] == ["champion", "pruned"]
+    assert len(api["requests"]) == 1
+    assert api["uploads"][0][2]["updated_through_step"] == 0
+    assert not any(key.startswith("prefetch") for key in before)
+    restored = LLMSampler(num_seeds=0, exp_dir=tmp_path, problem=problem())
+    restored.load_state_dict(before)
+    assert restored.sample_states(2, selection_step=1) == picks
+    assert len(api["requests"]) == 1
+
+
+def test_prefetch_error_is_deferred_without_repeating_the_request(tmp_path, api):
+    sampler, _ = history(tmp_path)
+    api["reply"] = response(["pruned", "champion"])
+    before = sampler.state_dict()
+    future = sampler.prefetch_states(2, selection_step=1)
+    with pytest.raises(ValueError, match="exact best"):
+        future.result(timeout=5)
+    assert sampler.state_dict() == before
+    assert sampler.last_picks_info == []
+    with pytest.raises(ValueError, match="exact best"):
+        sampler.sample_states(2, selection_step=1)
+    assert len(api["requests"]) == 1
 
 
 @pytest.mark.parametrize("maximize,anchor", [(False, "champion"), (True, "seed")])

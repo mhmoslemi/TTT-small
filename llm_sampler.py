@@ -6,8 +6,10 @@ import ast
 import hashlib
 import json
 import math
+from concurrent.futures import Future
 from pathlib import Path
 from string import Template
+from threading import Thread
 
 from plot_parent_tree import load_genealogy, write_tree_log
 from sampler import PUCTSampler, State
@@ -28,6 +30,15 @@ def _write_json(path, value):
 def _finite_score(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
+
+
+def _selection_key(num_states, selection_step):
+    if (isinstance(num_states, bool) or int(num_states) != num_states or num_states < 1
+            or selection_step is None or isinstance(selection_step, bool)
+            or int(selection_step) != selection_step
+            or selection_step < 0):
+        raise ValueError("LLM parent selection needs a positive count and explicit nonnegative step")
+    return int(num_states), int(selection_step)
 
 
 def _selection_format(count):
@@ -64,6 +75,7 @@ class LLMSampler(PUCTSampler):
         self.exp_dir = Path(exp_dir)
         self.problem = problem
         self._selection_step, self._selected = None, []
+        self._prefetch = None
 
     @property
     def selection_mode(self):
@@ -72,6 +84,7 @@ class LLMSampler(PUCTSampler):
     def load_state_dict(self, payload):
         super().load_state_dict(payload)
         self._selection_step, self._selected = None, []
+        self._prefetch = None
 
     def import_legacy_states(self, *args, **kwargs):
         raise ValueError("LLM resume requires training_state.pt to preserve the saved node identities")
@@ -257,64 +270,104 @@ class LLMSampler(PUCTSampler):
             raise ValueError(f"LLM selection is missing saved programs: {sorted(missing)}")
         return [known[sid] for sid in ids]
 
+    def _selection_response(self, count, step):
+        directory = self.exp_dir / f"step{step:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        base = directory / f"step{step:02d}.sampler"
+        tree_path, request_path, response_path = (
+            Path(str(base) + suffix) for suffix in
+            (".tree.json", ".request.json", ".response.json"))
+        if request_path.is_file():
+            record = json.loads(request_path.read_text(encoding="utf-8"))
+            if (record["step"] != step or record["num_parents"] != count
+                    or record["problem"] != self.problem.name
+                    or record["maximize"] != bool(self.problem.maximize)):
+                raise ValueError("saved LLM request differs from this step's problem or parent budget")
+            if step == 0:
+                self._restore_initial_seed_ids(record["seed_identities"])
+            tree_bytes = tree_path.read_bytes()
+            if hashlib.sha256(tree_bytes).hexdigest() != record["tree_sha256"]:
+                raise ValueError("saved LLM tree snapshot changed after submission")
+            tree = json.loads(tree_bytes)
+        else:
+            if response_path.exists():
+                raise ValueError("saved LLM response has lost its request/tree snapshot")
+            tree = self._tree(step, tree_path)
+            eligible, _, _ = self._eligible(tree)
+            if len(eligible) < count:
+                raise ValueError(f"LLM requested {count} parents but only {len(eligible)} are eligible")
+            prompt = self._prompt(tree, step, count)
+            Path(str(base) + ".prompt.txt").write_text(prompt, encoding="utf-8")
+            record = {
+                "step": step, "num_parents": count, "problem": self.problem.name,
+                "maximize": bool(self.problem.maximize),
+                "seed_identities": self._seed_identities(),
+                "tree_sha256": hashlib.sha256(tree_path.read_bytes()).hexdigest(),
+                "api_request": {
+                    "model": OPENAI_STRATEGY_MODEL, "reasoning": {"effort": "max"},
+                    "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS, "store": False,
+                    "tools": [], "tool_choice": "none", "parallel_tool_calls": False,
+                    "text": {"format": _selection_format(count)},
+                    "input": [{"role": "user", "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_file", "filename": "search_tree.json"}]}],
+                },
+            }
+            _write_json(request_path, record)
+        response = (json.loads(response_path.read_text(encoding="utf-8"))
+                    if response_path.is_file() else self._request(
+                        request_path, response_path, tree_path, record))
+        return tree, response
+
+    def prefetch_states(self, num_states, *, selection_step):
+        """Save the next decision during training without changing current picks."""
+        count, step = _selection_key(num_states, selection_step)
+        with self._lock:
+            if self._prefetch is not None:
+                previous_step, previous_count, future = self._prefetch
+                if previous_step == step:
+                    if previous_count != count:
+                        raise ValueError("cannot change the saved LLM parent count within a step")
+                    return future
+                if not future.done():
+                    raise ValueError("another LLM parent decision is still running")
+            future = Future()
+            self._prefetch = step, count, future
+
+        def prepare():
+            try:
+                tree, response = self._selection_response(count, step)
+                self._validate_response(response, tree, count)
+            except Exception as error:
+                future.set_exception(error)
+                print(f"[warn] LLM sampler step {step}: background decision failed "
+                      f"({type(error).__name__}); current training can finish; "
+                      "the error will be raised before next-step selection", flush=True)
+            else:
+                future.set_result(None)
+                print(f"[llm-sampler] step {step}: next-parent response saved "
+                      "and validated while training continues", flush=True)
+
+        # A slow API request must not delay checkpoint saving or process shutdown.
+        Thread(target=prepare, name=f"llm-sampler-step{step}", daemon=True).start()
+        return future
+
     def sample_states(self, num_states, *, selection_step=None):
-        if (isinstance(num_states, bool) or int(num_states) != num_states or num_states < 1
-                or selection_step is None or isinstance(selection_step, bool)
-                or int(selection_step) != selection_step
-                or selection_step < 0):
-            raise ValueError("LLM parent selection needs a positive count and explicit nonnegative step")
-        count, step = int(num_states), int(selection_step)
+        count, step = _selection_key(num_states, selection_step)
+        prefetched = self._prefetch
+        if prefetched is not None and prefetched[0] == step:
+            if prefetched[1] != count:
+                raise ValueError("cannot change the saved LLM parent count within a step")
+            if not prefetched[2].done():
+                print(f"[llm-sampler] step {step}: waiting for the parent "
+                      "request started during previous-step training", flush=True)
+            prefetched[2].result()
         with self._lock:
             if self._selection_step == step:
                 if len(self._selected) != count:
                     raise ValueError("cannot change the saved LLM parent count within a step")
                 return list(self._selected)
-            directory = self.exp_dir / f"step{step:02d}"
-            directory.mkdir(parents=True, exist_ok=True)
-            base = directory / f"step{step:02d}.sampler"
-            tree_path, request_path, response_path = (
-                Path(str(base) + suffix) for suffix in
-                (".tree.json", ".request.json", ".response.json"))
-            if request_path.is_file():
-                record = json.loads(request_path.read_text(encoding="utf-8"))
-                if (record["step"] != step or record["num_parents"] != count
-                        or record["problem"] != self.problem.name
-                        or record["maximize"] != bool(self.problem.maximize)):
-                    raise ValueError("saved LLM request differs from this step's problem or parent budget")
-                if step == 0:
-                    self._restore_initial_seed_ids(record["seed_identities"])
-                tree_bytes = tree_path.read_bytes()
-                if hashlib.sha256(tree_bytes).hexdigest() != record["tree_sha256"]:
-                    raise ValueError("saved LLM tree snapshot changed after submission")
-                tree = json.loads(tree_bytes)
-            else:
-                if response_path.exists():
-                    raise ValueError("saved LLM response has lost its request/tree snapshot")
-                tree = self._tree(step, tree_path)
-                eligible, _, _ = self._eligible(tree)
-                if len(eligible) < count:
-                    raise ValueError(f"LLM requested {count} parents but only {len(eligible)} are eligible")
-                prompt = self._prompt(tree, step, count)
-                Path(str(base) + ".prompt.txt").write_text(prompt, encoding="utf-8")
-                record = {
-                    "step": step, "num_parents": count, "problem": self.problem.name,
-                    "maximize": bool(self.problem.maximize),
-                    "seed_identities": self._seed_identities(),
-                    "tree_sha256": hashlib.sha256(tree_path.read_bytes()).hexdigest(),
-                    "api_request": {
-                        "model": OPENAI_STRATEGY_MODEL, "reasoning": {"effort": "max"},
-                        "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS, "store": False,
-                        "tools": [], "tool_choice": "none", "parallel_tool_calls": False,
-                        "text": {"format": _selection_format(count)},
-                        "input": [{"role": "user", "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_file", "filename": "search_tree.json"}]}],
-                    },
-                }
-                _write_json(request_path, record)
-            response = (json.loads(response_path.read_text(encoding="utf-8"))
-                        if response_path.is_file() else self._request(
-                            request_path, response_path, tree_path, record))
+            tree, response = self._selection_response(count, step)
             result = self._validate_response(response, tree, count)
             picks = self._states_from_tree(result["selected_parent_ids"], tree, step)
             infos = []
@@ -337,5 +390,6 @@ class LLMSampler(PUCTSampler):
                 "completion": usage.get("output_tokens", 0)})
             print(f"[llm-sampler] step {step}: {count} parents validated; "
                   f"estimated request cost=${input_usd + output_usd:.6f}; "
-                  f"prompt/tree/request/response saved under {directory}", flush=True)
+                  "prompt/tree/request/response saved under "
+                  f"{self.exp_dir / f'step{step:02d}'}", flush=True)
             return picks

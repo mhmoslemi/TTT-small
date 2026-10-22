@@ -264,8 +264,9 @@ class CapturingTrainer:
     (False, False), (True, False), (True, True), (True, "live")])
 def test_complete_step_with_cpu_generation_and_evaluation(
         monkeypatch, tmp_path, load_config, mode, allocation, remote_strategy, pooled_coder,
-        parent_selection="puct"):
+        parent_selection="puct", num_steps=2):
     cfg, _ = load_config(mode)
+    cfg.num_steps = num_steps
     cfg.groups_per_step = 2
     cfg.group_size = 4
     cfg.strategies_per_parent = 2
@@ -324,6 +325,7 @@ def test_complete_step_with_cpu_generation_and_evaluation(
         parent_selection=parent_selection, num_seeds=2, group_size=cfg.group_size,
         exp_dir=tmp_path, problem=problem,
         seed=cfg.seed, seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
+    prefetched = []
     if parent_selection == "llm":
         def select(request_path, response_path, tree_path, record):
             ids = list(sampler._seed_ids)
@@ -337,6 +339,17 @@ def test_complete_step_with_cpu_generation_and_evaluation(
             response_path.write_text(json.dumps(response))
             return response
         monkeypatch.setattr(sampler, "_request", select)
+
+        def prefetch(count, *, selection_step):
+            metadata = [json.loads(path.read_text()) for path in
+                        (tmp_path / "step00").glob("*rollout*.meta.json")]
+            assert len(metadata) == expected_total
+            assert all(row.get("status") != "evaluation_pending" for row in metadata)
+            assert sampler.best_raw_state(maximize=True).raw_score == 3.
+            assert not trainer.calls, "selection started after training finished"
+            prefetched.append((count, selection_step))
+
+        monkeypatch.setattr(sampler, "prefetch_states", prefetch)
     trainer = CapturingTrainer()
     adapter = tmp_path / "adapter_initial"
     adapter.mkdir()
@@ -418,6 +431,8 @@ def test_complete_step_with_cpu_generation_and_evaluation(
         sampling_adapter_path=str(adapter) if tracker else None)
     assert len(generated) == expected_total
     assert len(trainer.calls) == 1
+    if parent_selection == "llm":
+        assert prefetched == ([(2, 1)] if num_steps > 1 else [])
     assert trainer.calls[0][0] == mode
     examples = trainer.calls[0][1]
     assert len(examples) == expected_total
@@ -499,11 +514,12 @@ def test_thompson_full_step_and_spo_recovery(
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
 @pytest.mark.parametrize("allocation", [None, "hurdle"])
+@pytest.mark.parametrize("num_steps", [1, 2])
 def test_llm_full_step_and_spo_recovery(
-        monkeypatch, tmp_path, load_config, mode, allocation):
+        monkeypatch, tmp_path, load_config, mode, allocation, num_steps):
     test_complete_step_with_cpu_generation_and_evaluation(
         monkeypatch, tmp_path, load_config, mode, allocation,
-        remote_strategy=True, pooled_coder=True, parent_selection="llm")
+        remote_strategy=True, pooled_coder=True, parent_selection="llm", num_steps=num_steps)
 
 
 def test_behavior_cache_keeps_only_aligned_finite_scores():

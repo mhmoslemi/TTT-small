@@ -12746,6 +12746,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
 
+    if (sampler.selection_mode == "llm"
+            and step_idx + 1 < int(cfg.num_steps)):
+        sampler.prefetch_states(
+            int(cfg.groups_per_step), selection_step=step_idx + 1)
+
     # A model-parallel trainer can remain on CPU throughout every vLLM phase
     # and all reward processing. Restore its shards only when this step has a
     # real backward update to perform.
