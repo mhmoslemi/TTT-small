@@ -345,8 +345,8 @@ class LLMSampler(PUCTSampler):
                       "the error will be raised before next-step selection", flush=True)
             else:
                 future.set_result(None)
-                print(f"[llm-sampler] step {step}: next-parent response saved "
-                      "and validated while training continues", flush=True)
+                print(f"[llm-sampler] step {step}: background parent response "
+                      "saved and validated", flush=True)
 
         # A slow API request must not delay checkpoint saving or process shutdown.
         Thread(target=prepare, name=f"llm-sampler-step{step}", daemon=True).start()
@@ -359,8 +359,8 @@ class LLMSampler(PUCTSampler):
             if prefetched[1] != count:
                 raise ValueError("cannot change the saved LLM parent count within a step")
             if not prefetched[2].done():
-                print(f"[llm-sampler] step {step}: waiting for the parent "
-                      "request started during previous-step training", flush=True)
+                print(f"[llm-sampler] step {step}: waiting for the background "
+                      "parent request", flush=True)
             prefetched[2].result()
         with self._lock:
             if self._selection_step == step:

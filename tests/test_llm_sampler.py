@@ -166,6 +166,7 @@ def test_prefetch_overlaps_checkpoints_and_reuses_one_decision(tmp_path, api, mo
     assert not any(key.startswith("prefetch") for key in before)
     restored = LLMSampler(num_seeds=0, exp_dir=tmp_path, problem=problem())
     restored.load_state_dict(before)
+    restored.prefetch_states(2, selection_step=1).result(timeout=5)
     assert restored.sample_states(2, selection_step=1) == picks
     assert len(api["requests"]) == 1
 
@@ -273,6 +274,62 @@ def test_missing_checkpoint_cannot_relabel_a_legacy_tree(tmp_path):
     sampler = LLMSampler(num_seeds=1, exp_dir=tmp_path, problem=problem())
     with pytest.raises(ValueError, match="training_state.pt"):
         sampler.import_legacy_states([])
+
+
+@pytest.mark.parametrize("source", ["llm", "puct", "uct", "thompson"])
+def test_resume_starts_selection_after_migration_before_runtime_startup(
+        tmp_path, monkeypatch, source):
+    import train_multy_CVaR as training
+
+    old = make_sampler(parent_selection=source, num_seeds=1, seed_value=1.,
+                       exp_dir=tmp_path, problem=problem())
+    before = old.state_dict()
+    cfg = SimpleNamespace(parent_selection="llm", num_steps=3,
+                          groups_per_step=8, advantage_mode="entropic")
+    (tmp_path / "config.json").write_text(json.dumps({"parent_selection": source}))
+    checkpoints, starts = [], []
+    future = Future()
+    monkeypatch.setattr(training, "_save_training_checkpoint",
+                        lambda *args: checkpoints.append(args))
+
+    def prefetch(self, count, *, selection_step):
+        assert self.selection_mode == "llm"
+        assert self.state_dict()["states"] == before["states"]
+        starts.append((count, selection_step))
+        return future
+
+    monkeypatch.setattr(LLMSampler, "prefetch_states", prefetch)
+    optimizer, tracker, adapter = object(), object(), tmp_path / "adapter_step000"
+    sampler, running = training._prefetch_resume_parents(
+        old, cfg, tmp_path, 1, adapter, optimizer, tracker, problem=problem())
+    assert sampler.selection_mode == "llm"
+    assert running is future and not running.done()
+    assert starts == [(8, 1)]
+    assert len(checkpoints) == (0 if source == "llm" else 1)
+    if checkpoints:
+        assert checkpoints[0][2] == adapter
+        assert checkpoints[0][4:6] == (optimizer, tracker)
+    assert old.state_dict() == before
+
+
+@pytest.mark.parametrize("skip", ["other-picker", "finished", "evaluated", "pending-eval"])
+def test_resume_does_not_buy_unused_or_recovery_selections(tmp_path, monkeypatch, skip):
+    import train_multy_CVaR as training
+
+    sampler = LLMSampler(num_seeds=1, exp_dir=tmp_path, problem=problem())
+    cfg = SimpleNamespace(parent_selection="puct" if skip == "other-picker" else "llm",
+                          num_steps=1 if skip == "finished" else 3,
+                          groups_per_step=1, advantage_mode="spo-rs")
+    monkeypatch.setattr(training, "_recoverable_pending_spo_rs_artifacts",
+                        lambda *args: [] if skip == "pending-eval" else None)
+    monkeypatch.setattr(training, "_migrate_parent_selection",
+                        lambda *args, **kwargs: pytest.fail("unexpected sampler migration"))
+    monkeypatch.setattr(sampler, "prefetch_states",
+                        lambda *args, **kwargs: pytest.fail("unexpected API selection"))
+    result = training._prefetch_resume_parents(
+        sampler, cfg, tmp_path, 1, object(), object(), object(), problem=problem(),
+        interrupted_artifacts=[] if skip == "evaluated" else None)
+    assert result == (sampler, None)
 
 
 @pytest.mark.parametrize("source", ["puct", "uct", "thompson"])

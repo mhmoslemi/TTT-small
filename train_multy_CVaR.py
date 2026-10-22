@@ -8267,6 +8267,27 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
     return migrated
 
 
+def _prefetch_resume_parents(sampler, cfg, exp_dir, next_step, adapter_path,
+                             optimizer, spo_rs_tracker, *, problem,
+                             interrupted_artifacts=None):
+    """Start fresh-step selection before resumed trainer/generation startup."""
+    if (cfg.parent_selection != "llm" or next_step >= cfg.num_steps
+            or interrupted_artifacts is not None):
+        return sampler, None
+    if (cfg.advantage_mode == "spo-rs"
+            and _recoverable_pending_spo_rs_artifacts(exp_dir, next_step, cfg)
+            is not None):
+        return sampler, None
+    sampler = _migrate_parent_selection(
+        sampler, cfg, exp_dir, next_step, adapter_path,
+        optimizer, spo_rs_tracker, recovery_pending=False, problem=problem)
+    future = sampler.prefetch_states(
+        int(cfg.groups_per_step), selection_step=next_step)
+    print(f"[resume] LLM parent request for step {next_step} overlaps "
+          "trainer initialization and generation warm-up", flush=True)
+    return sampler, future
+
+
 def _legacy_resume_info(exp_dir):
     """Locate the safe restart point for a pre-checkpoint run directory."""
     matches = []
@@ -13414,19 +13435,6 @@ def main():
     print(f"[init] trainable params: {trainable:,} / total {total:,} "
           f"({100 * trainable / total:.2f}%)")
 
-    parallel_trainer = None
-    if use_replicated_training:
-        if use_process_distributed_training:
-            parallel_trainer = ProcessDistributedTrainer(
-                backend, model, tokenizer, optimizer, cfg, exp_dir,
-                dependency_log_path=dependency_log_path,
-            )
-        else:
-            parallel_trainer = ReplicatedDataParallelTrainer(
-                backend, model, tokenizer, optimizer, cfg,
-                dependency_log_path=dependency_log_path,
-            )
-
     # ---- sampler ----
     from sampler import can_migrate_parent_selection, make_sampler
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
@@ -13550,6 +13558,26 @@ def main():
         print(f"[checkpoint] removed {len(removed_adapters)} superseded "
               "adapter snapshot(s) while restoring the rolling checkpoint",
               flush=True)
+
+    resume_parent_prefetch = None
+    if resume_dir:
+        sampler, resume_parent_prefetch = _prefetch_resume_parents(
+            sampler, cfg, exp_dir, start_step, current_policy_adapter_path,
+            optimizer, spo_rs_tracker, problem=problem,
+            interrupted_artifacts=interrupted_spo_rs_artifacts)
+
+    parallel_trainer = None
+    if use_replicated_training:
+        if use_process_distributed_training:
+            parallel_trainer = ProcessDistributedTrainer(
+                backend, model, tokenizer, optimizer, cfg, exp_dir,
+                dependency_log_path=dependency_log_path,
+            )
+        else:
+            parallel_trainer = ReplicatedDataParallelTrainer(
+                backend, model, tokenizer, optimizer, cfg,
+                dependency_log_path=dependency_log_path,
+            )
 
     # ---- generation pool ----
     gen_pool = None
@@ -14000,6 +14028,15 @@ def main():
     restart_after_exact_recovery = False
     active_step = None
     try:
+        if (resume_parent_prefetch is not None
+                and cfg.generation_backend == "vllm"):
+            warmup_pool = (
+                strategy_pool
+                if (getattr(problem, "two_stage_rollouts", False)
+                    and cfg.strategy_backend == "local")
+                else gen_pool)
+            if warmup_pool is not None:
+                warmup_pool.prepare()
         if start_step >= cfg.num_steps:
             print(f"[resume] run already reached requested num_steps={cfg.num_steps}")
         for step in range(start_step, cfg.num_steps):
