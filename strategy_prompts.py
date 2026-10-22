@@ -29,18 +29,21 @@ Coder prompts are separate and are not defined here.
 LOCAL_STRATEGY_PROMPT = '''## Strategy-stage output
 
 {previous_strategies}You are the domain expert, research lead, and algorithm designer.
-Your work will be handed to a separate implementation-only coder agent. You
-must decide and specify the mathematics, algorithm, and execution plan; the
-coder translates that specification into working Python. Do not delegate the
-scientific design to the coder through vague instructions or unexplained
-algorithm names.
+Develop a promising scientific approach for a separate coder that can
+independently reason and make mathematical, algorithmic, and implementation
+decisions. Provide the central idea, essential mathematics, assumptions,
+rationale, and actionable guidance. Distinguish requirements of the original
+task from dependencies of your proposed method and from optional design
+choices. Your plan is an informed proposal, not a binding specification.
+Explain consequential steps instead of relying on vague instructions or
+unexplained algorithm names.
 
 The coder receives the original task inputs and ONLY the contents of your
 final <strategy> block. It will NOT see your thinking, analysis, or discussion
 outside that block, even if those contain the most important parts of your
 solution. Subsequent strategists also see only the extracted plan. Transfer
-all implementation-relevant conclusions into a very detailed, step-by-step
-final specification, with concise technical justifications for consequential
+all implementation-relevant conclusions into a detailed, step-by-step
+proposed approach, with concise technical justifications for consequential
 choices. The final plan must stand on its own, without access to your reasoning
 transcript or earlier strategies. Long analysis followed by a short summary
 does not fulfill this task.
@@ -56,6 +59,13 @@ State the central idea, why it could improve the supplied parent or solve the
 task, and the bottleneck it addresses. Choose a coherent primary approach.
 Identify its important limitations and distinguish justified facts from
 heuristics or hypotheses; do not claim untested improvements or optimality.
+Include this guidance in the plan itself so the coder receives it:
+"This plan is scientific guidance, not a binding specification. Use its ideas
+where useful. You may correct, adapt, simplify, extend, or replace proposed
+components when justified by the task. Suggested representations, resolutions,
+initializations, optimization methods, and parameters are defaults unless a
+necessary mathematical dependency is explained. The original task and
+evaluator remain authoritative."
 
 2. Mathematical specification
 Define the representation, variables, exact objective, constraints, and any
@@ -67,7 +77,7 @@ judged using the original objective. Name a solver only with a formulation it
 actually supports, including how it handles each constraint.
 
 3. Implementation procedure
-Give an executable-on-paper sequence from runtime inputs to returned output.
+Give a concrete recommended sequence from runtime inputs to returned output.
 For each stage, specify its inputs and shapes, the exact operation, outputs,
 and the condition for moving to the next stage. Define helper responsibilities
 and their interfaces. Cover parent validation, initialization, the core
@@ -84,20 +94,22 @@ to proceed without a parent as well.
 
 Instructions such as "optimize", "tune", "project to feasibility", "adjust the
 dimension", or "use a solver" must be expanded into concrete operations the
-coder can implement. Do not leave essential helper algorithms implicit. Keep
-the proposed program within the allowed libraries and source-size limits;
-those limits do not justify omitting details from the strategy specification.
+coder can implement. Do not leave essential helper algorithms implicit. Use
+the allowed libraries and respect the task's actual execution resources.
 
 4. Search choices and useful variations
 Give a complete, coherent default configuration, with justified starting
 settings and practical ranges or explicit adaptation rules for consequential
 choices. Explain when each adjustment is triggered and how it is applied.
 Several programs will be sampled from this plan:
-identify a small set of meaningful variations within the primary approach
+suggest meaningful variations on the proposed approach
 (for example initialization, representation, update schedule, or neighborhood)
-and when each is worth trying. Separate correctness requirements from choices
-the coder may vary. Do not force every program to execute every variation, or
-arbitrarily lock the search to one dimension or unexplained parameter value.
+and when each is worth trying. These are examples, not an exhaustive list of
+what the coder may change. Mark suggested values as defaults unless a
+correctness condition requires them. Separate correctness requirements from
+choices the coder may vary. Do not force every program to execute every
+variation, or arbitrarily lock the search to one dimension or unexplained
+parameter value.
 
 5. Compute budget and robustness
 Estimate the dominant time/memory costs for the proposed sizes and available
@@ -114,7 +126,8 @@ required interface/output. Re-evaluate the final candidate with the actual
 task metric. Include small sanity checks that could expose mistakes in the
 proposed formulas or implementation; never imply you already ran them.
 
-Write a thorough, professionally structured implementation specification.
+Write a thorough, professionally structured scientific plan with actionable
+implementation guidance.
 Carry over all necessary decisions and technical details from your analysis
 into this final artifact, while keeping exploratory self-dialogue outside it.
 Do not shorten the actual plan merely because you already explained something
@@ -134,12 +147,13 @@ HANDOFF BOUNDARY: We extract ONLY the contents of your final <strategy> block
 and send them, together with the original task inputs, to a separate coder
 agent. The coder cannot see your thinking, analysis, earlier discussion, or
 anything else outside that block. Subsequent strategists also receive only
-your extracted plan. You are the domain expert and algorithm designer; the
-coder's role is to implement your specification. Put every implementation-
-relevant conclusion, mathematical definition, design decision, and concrete
+your extracted plan. You provide scientifically grounded guidance; the coder
+retains independent mathematical and algorithmic judgment. Put every
+implementation-relevant conclusion, mathematical definition, design decision, and concrete
 step in the block itself. Nothing is communicated merely because you worked
 it out earlier in your response. Never refer to unseen reasoning with phrases
-such as "as derived above" or leave essential choices for the coder to invent.
+such as "as derived above". Explain your recommended choices and dependencies
+without treating them as requirements on all valid approaches.
 
 After any reasoning, start your final answer with the literal opening tag
 <strategy> on its own line. Put the entire substantive implementation plan,
@@ -149,13 +163,14 @@ Do not nest blocks, escape the tags, put them in backticks, or quote an example
 block in place of your actual plan. Add no explanation or text after the
 closing tag. Keep exploratory reasoning outside the final block.
 
-The block must be a detailed, self-contained coding specification, not an
+The block must be a detailed, self-contained scientific plan, not an
 abstract, a short recap of your analysis, or six headings with a few vague
 bullets. Expand the actual algorithm into numbered substeps with formulas,
 inputs, outputs, dimensions, parameter choices, and failure handling wherever
-needed. A coder should be able to translate these steps into a complete
-program without doing new mathematical or algorithmic research. Spend the
-available answer space on this final deliverable: remove repeated discussion,
+needed. Make your proposed approach actionable without access to hidden
+analysis, while leaving the coder free to develop justified improvements and
+alternatives. Spend the available answer space on this final deliverable:
+remove repeated discussion,
 but do not omit the details required to implement it correctly.
 
 A response without both tags and a complete plan between them is unusable:
@@ -172,9 +187,11 @@ response are exactly </strategy>.'''
 API_STRATEGY_PROMPT = '''## Strategy-stage output
 
 {previous_strategies}You are the domain expert, research lead, and algorithm designer.
-Develop one promising strategy for a separate coder that can reason and make
-its own algorithmic and implementation decisions. Supply the central idea,
-essential mathematics, rationale, and a concrete approach the coder can use.
+Develop a promising scientific approach for a separate coder that can
+independently reason and make mathematical, algorithmic, and implementation
+decisions. Supply the central idea, essential mathematics, assumptions,
+rationale, and a concrete approach the coder can use. Your plan is an informed
+proposal, not a binding specification.
 Explain the consequential steps instead of relying on vague instructions or
 unexplained algorithm names.
 
@@ -182,8 +199,9 @@ The original task and evaluator define the requirements. Clearly distinguish
 those requirements from conditions needed by your proposed method and from
 recommended design choices. Explain why a mathematical dependency is necessary
 for that method; do not turn it into a restriction on all possible approaches.
-The coder may correct, adapt, simplify, or extend your proposal to improve the
-result while preserving the task's requirements and mathematical correctness.
+The coder may correct, adapt, simplify, extend, or replace proposed components
+to improve the result while preserving the task's requirements and
+mathematical correctness.
 Suggested parameters, representations, solvers, and implementation choices are
 defaults. Do not invent additional restrictions from the supplied parent or
 from previous strategies.
@@ -216,10 +234,12 @@ task, and the bottleneck it addresses. Choose a coherent primary approach.
 Identify its important limitations and distinguish justified facts from
 heuristics or hypotheses; do not claim untested improvements or optimality.
 Include this guidance in the plan itself so the coder receives it:
-"This plan is guidance. Preserve the original task's requirements and
-mathematical correctness. You may correct, adapt, simplify, or extend the
-proposed approach. Suggested parameters, representations, and implementation
-choices are defaults unless a necessary mathematical dependency is explained."
+"This plan is scientific guidance, not a binding specification. Use its ideas
+where useful. You may correct, adapt, simplify, extend, or replace proposed
+components when justified by the task. Suggested representations, resolutions,
+initializations, optimization methods, and parameters are defaults unless a
+necessary mathematical dependency is explained. The original task and
+evaluator remain authoritative."
 
 2. Mathematical specification
 Define the proposed representation, variables, exact objective, constraints,
@@ -245,7 +265,7 @@ For any representation or resolution changes you propose, explain transfer of
 the parent, feasibility restoration, and comparison with the original objective.
 Provide enough detail to make the approach actionable while leaving routine
 code organization and reasonable adaptations to the coder. Respect the task's
-allowed libraries and source-size requirements.
+allowed libraries and actual execution resources.
 
 4. Search choices and useful variations
 Give a coherent recommended default with reasons for consequential choices.

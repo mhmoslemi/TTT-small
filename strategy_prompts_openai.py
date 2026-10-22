@@ -25,8 +25,9 @@ STRATEGY_PLAN_FORMAT = {
             "plan": {
                 "type": "string",
                 "description": (
-                    "The complete, detailed, self-contained implementation "
-                    "specification, with all six numbered sections."
+                    "The complete, detailed, self-contained scientific plan "
+                    "with actionable implementation guidance and all six "
+                    "numbered sections."
                 ),
             },
         },
