@@ -40,7 +40,8 @@ def checkpoint_layer_groups(layers, hidden, layer_kwargs, group_size):
     return hidden
 
 
-def grouped_qwen_hidden(decoder, input_ids, attention_mask):
+def grouped_qwen_hidden(decoder, input_ids, attention_mask, *, position_ids=None,
+                        group_size=None, force=False):
     """Exact no-cache text forward, or None when the normal forward is suitable.
 
     The mask/rotary/layer implementations come from the installed Transformers
@@ -50,9 +51,9 @@ def grouped_qwen_hidden(decoder, input_ids, attention_mask):
     https://github.com/huggingface/transformers/blob/v5.8.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
     """
     minimum = getattr(decoder, "_ttt_group_checkpoint_min_tokens", None)
-    if (minimum is None or not torch.is_grad_enabled()
-            or not decoder.training or not decoder.gradient_checkpointing
-            or input_ids.numel() < minimum):
+    if ((not force and (minimum is None or input_ids.numel() < minimum))
+            or not torch.is_grad_enabled()
+            or not decoder.training or not decoder.gradient_checkpointing):
         return None
     # Accelerate's layer-sharded fallback owns placement/routing hooks. Keep
     # its original forward; this optimization is for independent GPU replicas.
@@ -77,14 +78,18 @@ def grouped_qwen_hidden(decoder, input_ids, attention_mask):
     else:
         # CPU permits small exactness tests without requiring a GPU runtime.
         budget = 0
-    group_size = checkpoint_group_size(
-        len(layers), hidden.numel() * hidden.element_size(), budget)
+    if group_size is None:
+        group_size = checkpoint_group_size(
+            len(layers), hidden.numel() * hidden.element_size(), budget)
     if group_size == 1:
         return None
 
     implementation = importlib.import_module(type(decoder).__module__)
     positions = torch.arange(hidden.shape[1], device=hidden.device)
-    text_positions = positions.view(1, -1).expand(hidden.shape[0], -1)
+    text_positions = (positions.view(1, -1).expand(hidden.shape[0], -1)
+                      if position_ids is None else position_ids)
+    if text_positions.shape != input_ids.shape:
+        raise ValueError("checkpointed global positions must match the local input")
     rotary_positions = text_positions.unsqueeze(0).expand(3, -1, -1)
     mask_kwargs = dict(config=decoder.config, inputs_embeds=hidden,
                        attention_mask=attention_mask, past_key_values=None,

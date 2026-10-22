@@ -212,8 +212,8 @@ def broadcast_trainable_parameters(model, source_rank=0):
     del flat
 
 
-def reduce_trainable_gradients(model, destination_rank=0):
-    """Sum all LoRA gradients into rank 0 with one contiguous NCCL call."""
+def reduce_trainable_gradients(model, destination_rank=0, *, group=None):
+    """Sum LoRA gradients into the destination with one collective."""
     import torch
     import torch.distributed as dist
 
@@ -226,7 +226,7 @@ def reduce_trainable_gradients(model, destination_rank=0):
               dtype=torch.float32))
         for parameter in parameters
     ])
-    dist.reduce(flat, dst=int(destination_rank), op=dist.ReduceOp.SUM)
+    dist.reduce(flat, dst=int(destination_rank), op=dist.ReduceOp.SUM, group=group)
     if dist.get_rank() == int(destination_rank):
         offset = 0
         with torch.no_grad():
@@ -1209,6 +1209,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         broadcast_trainable_parameters(model, source_rank=0)
         result_queue.put({"event": "ready", "rank": int(rank)})
         offloaded = False
+        context_groups = None
 
         while True:
             command = command_queue.get()
@@ -1292,6 +1293,23 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     "event": "computed", "rank": int(rank),
                     "stats": stats,
                 })
+            elif kind == "init_context_parallel":
+                from context_parallel import initialize_groups
+
+                context_groups = initialize_groups(int(world_size))
+                result_queue.put({"event": "context_ready", "rank": int(rank)})
+            elif kind == "context_backward":
+                if offloaded or context_groups is None:
+                    raise RuntimeError("context-parallel training requires resident initialized replicas")
+                from context_parallel import compute_context_work
+
+                ranks = tuple(command["gpu_ids"])
+                result = compute_context_work(
+                    backend, tokenizer, command["example"],
+                    SimpleNamespace(**dict(command["step_cfg"])),
+                    context_groups[ranks], ranks)
+                result_queue.put({"event": "context_computed", "rank": int(rank),
+                                  "result": result})
             elif kind == "overflow_backward":
                 if not offloaded:
                     raise RuntimeError("cooperative overflow requires parked replicas")

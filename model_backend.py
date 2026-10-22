@@ -435,6 +435,11 @@ def _ttt_blockwise_attention_forward(
     """
     import torch.nn.functional as F
 
+    context = getattr(module, "_ttt_context_parallel", None)
+    if context is not None:
+        from context_parallel import attention
+        return attention(query, key, value, context, scale=scaling, dropout=dropout)
+
     # GPT-OSS normalizes every attention row together with a learned sink
     # logit. Plain SDPA/FlashAttention has no representation for that extra
     # denominator term, so accepting s_aux here would silently change both

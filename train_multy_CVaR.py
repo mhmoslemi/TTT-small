@@ -6797,7 +6797,9 @@ class ProcessDistributedTrainer:
             and not overflow_state.get("replica_checkpoint_groups_attempted", False)
             and any(hasattr(module, "_ttt_group_checkpoint_min_tokens")
                     for module in self.model.modules()))
-        if supports_warm_overflow(cfg) and not grouped_recovery:
+        from context_parallel import availability as context_parallel_availability
+        context_supported, _ = context_parallel_availability(self.model, cfg, self._world_size)
+        if supports_warm_overflow(cfg) and (context_supported or not grouped_recovery):
             return complete_warm_overflow(
                 self, examples, cfg, step_idx, overflow_state)
 

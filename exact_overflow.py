@@ -319,6 +319,11 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
     if trainer._closed or not trainer._workers_idle:
         raise RuntimeError("replicas must finish their current work before borrowing GPUs")
     training._validate_precomputed_exact_gradients(trainer.model, state, step_idx)
+    from context_parallel import complete_context_overflow
+
+    context_result = complete_context_overflow(trainer, examples, cfg, step_idx, state)
+    if context_result is not None:
+        return context_result
     by_key = {}
     for item in examples:
         key = trajectory_key(item)
