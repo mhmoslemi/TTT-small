@@ -68,7 +68,8 @@ class TinyDecoder(nn.Module):
             recurrent, _ = cp.head_parallel_delta(
                 *delta_args, **delta_kwargs, context=self.context, kernel=_recurrent_delta)
         hidden = hidden + recurrent.reshape_as(hidden)
-        q, k, v = [module(hidden).unsqueeze(1) for module in (self.query, self.key, self.value)]
+        q, k, v = [module(hidden).reshape(*hidden.shape[:2], 2, 4).transpose(1, 2)
+                   for module in (self.query, self.key, self.value)]
         if self.context is None:
             output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
             output = output.transpose(1, 2)
@@ -206,14 +207,35 @@ def _distributed_checks(rank, rendezvous):
         weights = torch.randn_like(source)
         local = source[:, rank * 4:(rank + 1) * 4].clone().requires_grad_()
         full = source.clone().requires_grad_()
+        full_heads = full.reshape(1, 8, 2, 2).transpose(1, 2)
+        local_heads = local.reshape(1, 4, 2, 2).transpose(1, 2)
         expected = torch.nn.functional.scaled_dot_product_attention(
-            full.unsqueeze(1), full.unsqueeze(1), full.unsqueeze(1), is_causal=True).squeeze(1)
-        actual, _ = cp.attention(local.unsqueeze(1), local.unsqueeze(1), local.unsqueeze(1), context)
+            full_heads, full_heads, full_heads, is_causal=True).transpose(1, 2).reshape_as(full)
+        actual, _ = cp.attention(local_heads, local_heads, local_heads, context)
         actual = actual.reshape_as(local)
         torch.testing.assert_close(actual, expected[:, rank * 4:(rank + 1) * 4], rtol=1e-10, atol=1e-10)
         (expected * weights).sum().backward()
         (actual * weights[:, rank * 4:(rank + 1) * 4]).sum().backward()
         torch.testing.assert_close(local.grad, full.grad[:, rank * 4:(rank + 1) * 4], rtol=1e-10, atol=1e-10)
+
+        # More ranks than KV heads: GQA replication must sum gradients back to
+        # the original KV head and preserve the ordinary full-sequence kernel.
+        qkv = [torch.randn(1, heads, 8, 4, dtype=torch.float64) for heads in (4, 1, 1)]
+        full_qkv = [item.clone().requires_grad_() for item in qkv]
+        local_qkv = [item[:, :, rank * 4:(rank + 1) * 4].clone().requires_grad_()
+                     for item in qkv]
+        from model_backend import _ttt_blockwise_attention_forward
+        native = lambda q, k, v, mask, **kw: _ttt_blockwise_attention_forward(
+            SimpleNamespace(training=False), q, k, v, mask, **kw)
+        expected, _ = native(*full_qkv, None)
+        actual, _ = cp.attention(*local_qkv, context, kernel=native)
+        torch.testing.assert_close(actual, expected[:, rank * 4:(rank + 1) * 4], rtol=1e-10, atol=1e-10)
+        head_weights = torch.randn_like(expected)
+        (expected * head_weights).sum().backward()
+        (actual * head_weights[:, rank * 4:(rank + 1) * 4]).sum().backward()
+        for full_input, local_input in zip(full_qkv, local_qkv):
+            torch.testing.assert_close(local_input.grad, full_input.grad[:, :, rank * 4:(rank + 1) * 4],
+                                       rtol=1e-10, atol=1e-10)
 
         # The previous rank's convolution halo must also receive the gradient.
         convolution = nn.Conv1d(4, 4, 3, groups=4, padding=2, bias=False).double()
@@ -259,6 +281,43 @@ def _distributed_checks(rank, rendezvous):
                     torch.testing.assert_close(second.grad, first.grad, rtol=1e-4, atol=1e-6)
                 else:
                     assert second.grad is None
+
+        # Exercise the production calibration, including behavior-score setup.
+        # Previously it discarded the supplied reference and did a second CP
+        # forward for old scores, so the losses being compared were different.
+        from contextlib import contextmanager
+        import fast_distributed
+        backend = SimpleNamespace(model=TinyModel())
+        backend.set_training_mode = backend.model.train
+        original_scores = cp.token_logprobs
+
+        @contextmanager
+        def tiny_context(model, group):
+            model.model.context = context
+            try:
+                yield context
+            finally:
+                model.model.context = None
+
+        def checked_scores(*args, **kwargs):
+            assert kwargs.get('with_grad', True), 'calibration must reuse reference behavior scores'
+            return original_scores(*args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(cp, 'hybrid_context', tiny_context)
+            patch.setattr(cp, 'token_logprobs', checked_scores)
+            patch.setattr(fast_distributed, 'set_long_rollout_memory_ceiling', lambda *args: None)
+            sample = dict(prompt_ids=prompt, response_ids=response, advantage=.73, sample_weight=1.)
+            assert cp.validate_context_group(backend, SimpleNamespace(pad_token_id=0), sample,
+                                             cfg, dist.group.WORLD, (0, 1)) is None
+
+            def bad_scores(*args, **kwargs):
+                scores, entropy = checked_scores(*args, **kwargs)
+                return scores + .2, entropy
+
+            patch.setattr(cp, 'token_logprobs', bad_scores)
+            assert cp.validate_context_group(backend, SimpleNamespace(pad_token_id=0), sample,
+                                             cfg, dist.group.WORLD, (0, 1)) is not None
     finally:
         dist.destroy_process_group()
 

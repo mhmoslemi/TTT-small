@@ -426,6 +426,21 @@ def _ttt_shared_prefix_attention_forward(
 def _ttt_blockwise_attention_forward(
         module, query, key, value, attention_mask, dropout=0.0,
         scaling=None, sliding_window=None, **kwargs):
+    context = getattr(module, "_ttt_context_parallel", None)
+    if context is not None:
+        from functools import partial
+        from context_parallel import attention
+        return attention(
+            query, key, value, context, scale=scaling, dropout=dropout,
+            kernel=partial(_ttt_local_attention_forward, module))
+    return _ttt_local_attention_forward(
+        module, query, key, value, attention_mask, dropout=dropout,
+        scaling=scaling, sliding_window=sliding_window, **kwargs)
+
+
+def _ttt_local_attention_forward(
+        module, query, key, value, attention_mask, dropout=0.0,
+        scaling=None, sliding_window=None, **kwargs):
     """Exact causal attention with a bounded score tensor and autograd.
 
     Small calls retain native SDPA speed. Large calls split only the query
@@ -434,11 +449,6 @@ def _ttt_blockwise_attention_forward(
     truncation—while peak score memory is O(query_block * sequence_length).
     """
     import torch.nn.functional as F
-
-    context = getattr(module, "_ttt_context_parallel", None)
-    if context is not None:
-        from context_parallel import attention
-        return attention(query, key, value, context, scale=scaling, dropout=dropout)
 
     # GPT-OSS normalizes every attention row together with a learned sink
     # logit. Plain SDPA/FlashAttention has no representation for that extra

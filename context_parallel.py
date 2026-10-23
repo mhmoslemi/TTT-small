@@ -1,8 +1,8 @@
 """Resident, exact context-parallel overflow for the hybrid Qwen HF trainer.
 
-Every rank retains its own model and computes a contiguous token shard. Full
-attention exchanges K/V with an autograd-aware gather; DeltaNet exchanges
-token shards for head shards and runs its ordinary full-sequence FLA kernel.
+Every rank retains its own model and computes a contiguous token shard. Both
+attention and DeltaNet exchange token shards for head shards and run their
+ordinary full-sequence kernels.
 Only token logprobs, not vocabulary logits, are
 gathered for the existing sequence-level policy loss.
 """
@@ -38,7 +38,6 @@ def availability(model, cfg, world_size):
         return False, "not a supported hybrid Qwen replicated SPO-RS layout"
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        from torch.nn.attention.bias import causal_lower_right
         from torch.nn.attention import SDPBackend, sdpa_kernel
     except (ImportError, AttributeError, ValueError) as error:
         return False, f"context-parallel kernels unavailable: {error}"
@@ -59,6 +58,8 @@ def availability(model, cfg, world_size):
             for module in attention_modules):
         return False, "context parallelism requires the registered exact attention backend"
     config = attention_modules[0].config
+    if int(config.num_attention_heads) % world_size:
+        return False, "attention query heads must divide evenly across the GPU group"
     rope = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
     if rope.get("rope_type", rope.get("type", "default")) not in ("default", "linear", "yarn"):
         return False, "sequence-dependent rotary scaling needs a shared global frequency update"
@@ -145,35 +146,26 @@ def head_parallel_delta(q, k, v, g, beta, *, context, kernel,
     return _Exchange.apply(output, context.group, 1, 2), None
 
 
-def attention(query, key, value, context, *, scale=None, dropout=0.0):
-    """Local queries attend their complete global causal prefix, including GQA."""
-    import torch.nn.functional as F
-
+def attention(query, key, value, context, *, scale=None, dropout=0.0, kernel=None):
+    """Use the ordinary square causal kernel over complete sequences per head."""
     if dropout:
         raise ValueError("context-parallel policy attention requires disabled dropout")
-    keys = gather(key, context.group, 2)
-    values = gather(value, context.group, 2)
-    prefix = (context.rank + 1) * query.shape[2]
-    keys, values = keys[:, :, :prefix], values[:, :, :prefix]
-    options = dict(dropout_p=0.0, scale=scale)
-    if query.is_cuda:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-        from torch.nn.attention.bias import causal_lower_right
-        # A lower-right causal bias preserves global positions without ever
-        # allocating a local_queries x global_tokens dense mask.
-        options.update(attn_mask=causal_lower_right(query.shape[2], prefix),
-                       enable_gqa=query.shape[1] != keys.shape[1])
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
-            result = F.scaled_dot_product_attention(query, keys, values, **options)
-    else:
-        # Small CPU equivalence tests only; CUDA is never allowed a math fallback.
-        repeats = query.shape[1] // keys.shape[1]
-        keys, values = (item.repeat_interleave(repeats, dim=1)
-                        for item in (keys, values))
-        positions = torch.arange(query.shape[2], device=query.device) + context.rank * query.shape[2]
-        options["attn_mask"] = torch.arange(prefix, device=query.device)[None, :] <= positions[:, None]
-        result = F.scaled_dot_product_attention(query, keys, values, **options)
-    return result.transpose(1, 2).contiguous(), None
+    size = context.size
+    if query.shape[1] % size or query.shape[1] % key.shape[1]:
+        raise ValueError("attention heads do not support this context-parallel group")
+    # Replicate only KV heads shared between GPU groups, preserving GQA within
+    # each group without gathering every head's full history on every GPU.
+    repeats = size // math.gcd(size, key.shape[1])
+    key, value = (item.repeat_interleave(repeats, dim=1) if repeats > 1 else item
+                  for item in (key, value))
+    query, key, value = (_Exchange.apply(item, context.group, 1, 2)
+                         for item in (query, key, value))
+    if kernel is None:
+        from model_backend import _ttt_local_attention_forward
+        kernel = partial(_ttt_local_attention_forward, SimpleNamespace(training=False))
+    result, _ = kernel(query, key, value, None, dropout=0.0, scaling=scale)
+    # Native attention returns B,T,H,D, so invert the exchange in that layout.
+    return _Exchange.apply(result, context.group, 1, 2).contiguous(), None
 
 
 def causal_convolution(x, weight, bias=None, *, activation=None, seq_idx=None,
@@ -375,7 +367,10 @@ def validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                                if parameter.requires_grad and parameter.grad is not None}
         model.zero_grad(set_to_none=True)
     dist.broadcast(old, src=ranks[0], group=group)
-    mini["old_policy_logprobs"] = old.detach().cpu()
+    # The worker initializes old_policy_logprobs from behavior_logprobs. Using
+    # only old_policy_logprobs silently rescored CP and compared different losses.
+    mini["behavior_logprobs"] = old.detach().cpu()
+    mini.pop("old_policy_logprobs", None)
     result = compute_context_work(backend, tokenizer, mini, cfg, group, ranks, validate=False)
     accepted = torch.ones(1, dtype=torch.int32, device=device)
     issue = None
