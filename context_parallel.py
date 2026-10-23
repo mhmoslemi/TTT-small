@@ -1,15 +1,15 @@
 """Resident, exact context-parallel overflow for the hybrid Qwen HF trainer.
 
 Every rank retains its own model and computes a contiguous token shard. Full
-attention exchanges K/V with an autograd-aware gather; FLA exchanges DeltaNet
-states in both directions. Only token logprobs, not vocabulary logits, are
+attention exchanges K/V with an autograd-aware gather; DeltaNet exchanges
+token shards for head shards and runs its ordinary full-sequence FLA kernel.
+Only token logprobs, not vocabulary logits, are
 gathered for the existing sequence-level policy loss.
 """
 
 from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
-import inspect
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,12 +37,9 @@ def availability(model, cfg, world_size):
             or world_size < 2 or world_size & (world_size - 1)):
         return False, "not a supported hybrid Qwen replicated SPO-RS layout"
     try:
-        from fla.ops.cp import build_cp_context
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         from torch.nn.attention.bias import causal_lower_right
         from torch.nn.attention import SDPBackend, sdpa_kernel
-        if "cp_context" not in inspect.signature(chunk_gated_delta_rule).parameters:
-            return False, "installed FLA does not expose DeltaNet context parallelism"
     except (ImportError, AttributeError, ValueError) as error:
         return False, f"context-parallel kernels unavailable: {error}"
     modules = [module for module in model.modules()
@@ -52,6 +49,9 @@ def availability(model, cfg, world_size):
                           or not callable(getattr(module, "chunk_gated_delta_rule", None))
                           for module in modules):
         return False, "hybrid layer contract differs from the supported Qwen implementation"
+    if any(int(getattr(module, "num_v_heads", 0)) < world_size
+           or int(module.num_v_heads) % world_size for module in modules):
+        return False, "DeltaNet value heads must divide evenly across the GPU group"
     attention_modules = [module for module in model.modules()
                          if type(module).__name__ == "Qwen3_5Attention"]
     if not attention_modules or any(
@@ -92,6 +92,57 @@ class _Gather(torch.autograd.Function):
 
 def gather(value, group, dim=0):
     return _Gather.apply(value, group, dim)
+
+
+def _exchange_layout(value, group, scatter_dim, gather_dim):
+    size = dist.get_world_size(group)
+    if value.shape[scatter_dim] % size:
+        raise ValueError("head/token exchange requires evenly divisible shards")
+    # Destination rank is the leading dimension; receive order is source rank.
+    outgoing = torch.stack(value.chunk(size, dim=scatter_dim)).contiguous()
+    incoming = torch.empty_like(outgoing)
+    dist.all_to_all_single(incoming, outgoing, group=group)
+    return torch.cat(incoming.unbind(0), dim=gather_dim)
+
+
+class _Exchange(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value, group, scatter_dim, gather_dim):
+        ctx.group, ctx.scatter_dim, ctx.gather_dim = group, scatter_dim, gather_dim
+        return _exchange_layout(value, group, scatter_dim, gather_dim)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        # This is a permutation, not a replication: invert it without averaging.
+        return (_exchange_layout(gradient, ctx.group, ctx.gather_dim, ctx.scatter_dim),
+                None, None, None)
+
+
+def head_parallel_delta(q, k, v, g, beta, *, context, kernel,
+                        initial_state=None, output_final_state=False,
+                        cu_seqlens=None, **kwargs):
+    """Run independent heads over the entire sequence, with native FLA numerics.
+
+    No affine approximation of boundary states and no detached recurrent cache.
+    The inverse exchange's backward returns gradients to the original tokens.
+    Projected activations keep the same element count per rank after exchange.
+    """
+    if initial_state is not None or output_final_state or cu_seqlens is not None:
+        raise ValueError("head-parallel DeltaNet requires one uncached training sequence")
+    if kwargs.get("cp_context") is not None or kwargs.get("use_gate_in_kernel", False):
+        raise ValueError("head-parallel DeltaNet expects the native Qwen precomputed gates")
+    # Some HF versions expand grouped query/key heads themselves; others leave
+    # GVA to FLA. Expand only when needed so every rank owns complete heads.
+    if q.shape[2] != k.shape[2] or v.shape[2] % q.shape[2]:
+        raise ValueError("incompatible DeltaNet grouped heads")
+    repeats = v.shape[2] // q.shape[2]
+    if repeats > 1:
+        q, k = (value.repeat_interleave(repeats, dim=2) for value in (q, k))
+    q, k, v, g, beta = (
+        _Exchange.apply(value, context.group, 2, 1) for value in (q, k, v, g, beta))
+    output, _ = kernel(q, k, v, g=g, beta=beta, initial_state=None,
+                       output_final_state=False, cu_seqlens=None, **kwargs)
+    return _Exchange.apply(output, context.group, 1, 2), None
 
 
 def attention(query, key, value, context, *, scale=None, dropout=0.0):
@@ -143,8 +194,7 @@ def causal_convolution(x, weight, bias=None, *, activation=None, seq_idx=None,
 
 
 @contextmanager
-def hybrid_context(model, group, total_tokens, kernel_size):
-    from fla.ops.cp import build_cp_context
+def hybrid_context(model, group):
     from model_backend import set_gradient_checkpointing
 
     checkpointed = bool(getattr(model, "is_gradient_checkpointing", False))
@@ -152,12 +202,8 @@ def hybrid_context(model, group, total_tokens, kernel_size):
     missing = object()
     try:
         set_gradient_checkpointing(model, True)
-        device = next(model.get_input_embeddings().parameters()).device
         context = SimpleNamespace(group=group, rank=dist.get_rank(group),
                                   size=dist.get_world_size(group))
-        context.fla_context = build_cp_context(
-            torch.tensor([0, total_tokens], device=device, dtype=torch.long),
-            group=group, conv1d_kernel_size=kernel_size)
         for module in model.modules():
             name = type(module).__name__
             if name not in ("Qwen3_5GatedDeltaNet", "Qwen3_5Attention"):
@@ -171,7 +217,7 @@ def hybrid_context(model, group, total_tokens, kernel_size):
                 module.causal_conv1d_fn = partial(
                     causal_convolution, context=context, kernel=module.causal_conv1d_fn)
                 module.chunk_gated_delta_rule = partial(
-                    module.chunk_gated_delta_rule, cp_context=context.fla_context)
+                    head_parallel_delta, context=context, kernel=module.chunk_gated_delta_rule)
         yield context
     finally:
         for module, originals in reversed(changed):
@@ -243,12 +289,9 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
         if not hasattr(backend, "_validated_context_groups"):
             backend._validated_context_groups = set()
         backend._validated_context_groups.add(ranks)
-    total = example["prompt_ids"].shape[1] + example["response_ids"].shape[1] - 1
-    part = math.ceil(total / (64 * len(ranks))) * 64
-    delta = next(module for module in model.modules() if type(module).__name__ == "Qwen3_5GatedDeltaNet")
     descriptor = example.get("_entropy_measurement")
     measure = bool(descriptor and not Path(descriptor["path"]).exists())
-    with hybrid_context(model, group, part * len(ranks), delta.conv1d.kernel_size[0]) as context:
+    with hybrid_context(model, group) as context:
         with training._policy_dropout_disabled(model):
             missing = training._initialize_behavior_logprobs([example])
             old = example.get("old_policy_logprobs")
@@ -439,7 +482,8 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
         trainer._collect_event("context_ready", range(1, trainer.world_size))
     print(f"[train-context] step {step_idx}: resident context parallelism for "
           f"{len(pending)} pending trajectories; measured local activation target="
-          f"{budget} tokens/GPU; full contexts and existing SPO-RS loss", flush=True)
+          f"{budget} tokens/GPU; native full-sequence DeltaNet head exchange; "
+          "full contexts and existing SPO-RS loss", flush=True)
     waves, processed = 0, 0
     try:
         while pending:

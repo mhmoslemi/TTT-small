@@ -60,17 +60,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     torch.testing.assert_close(untouched(x), expected)
     assert calls == []  # other model instances keep the original kernels
 
-    sentinel = object()
-    monkeypatch.setitem(sys.modules, 'fla.ops.cp', SimpleNamespace(
-        build_cp_context=lambda *a, **k: sentinel))
+    def head_exchange(*args, kernel, context, **kwargs):
+        calls.append(('head-exchange', context.size))
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(cp, 'head_parallel_delta', head_exchange)
     monkeypatch.setattr(cp.dist, 'get_rank', lambda *a: 0)
     monkeypatch.setattr(cp.dist, 'get_world_size', lambda *a: 2)
     monkeypatch.setattr(cp, 'gather', lambda value, *a: torch.cat((value, value), dim=2))
     monkeypatch.setattr(model_backend, 'set_gradient_checkpointing', lambda *a: None)
     with pytest.raises(RuntimeError, match='interrupted'):
-        with cp.hybrid_context(model, None, 128, 2):
+        with cp.hybrid_context(model, None):
             torch.testing.assert_close(layer(x), expected)
-            assert calls == [('conv', 'silu', 65), ('delta', sentinel)]
+            assert calls == [('conv', 'silu', 65), ('head-exchange', 2), ('delta', None)]
             raise RuntimeError('interrupted')
     assert layer.causal_conv1d_fn is conv
     assert layer.chunk_gated_delta_rule is delta

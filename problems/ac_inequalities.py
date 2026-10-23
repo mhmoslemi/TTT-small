@@ -190,7 +190,7 @@ class ACInequalities(Problem):
             self, messages: List[dict],
             previous_strategies: List[str] | None = None) -> List[dict]:
         common = '''
-Autocorrelation-specific implementation constraints:
+Autocorrelation-specific scientific and execution requirements:
 - Write the final plan as normal, readable English prose with ordinary spaces
   and line breaks. Never emit serialized tokenizer surfaces, escaped token
   streams, tool/backend error messages, execution traces, or mixed-language
@@ -198,9 +198,9 @@ Autocorrelation-specific implementation constraints:
   are present in order and readable independently of the reasoning transcript.
 - If a current construction exists, `height_sequence_1` is already supplied
   to the executed program as a one-dimensional NumPy array. Never copy,
-  serialize, reconstruct, or hard-code that array. Plan a compact algorithm
-  that reads it directly. Never propose a long explicit numeric table or an
-  unrolled pattern.
+  serialize, reconstruct, or hard-code that array. Read it directly as a
+  possible initialization; this does not require retaining its resolution
+  or construction family.
 - The entrypoint must return a non-empty Python `list` of finite real numbers.
   Keep the returned coefficients explicitly nonnegative and no larger than
   1000; do not depend on the evaluator's defensive clipping to repair a search
@@ -208,8 +208,10 @@ Autocorrelation-specific implementation constraints:
   and a concrete valid fallback throughout the run.
 - The authoritative evaluator uses full *linear* self-convolution, producing
   2*n-1 coefficients. It is not circular convolution. Derive every surrogate,
-  gradient, or convolution index against that definition and accept candidates
-  only by calling the supplied exact `evaluate_sequence`.
+  gradient, or convolution index against that definition. Verify updates to
+  the saved best candidate and the final return with `evaluate_sequence`.
+  Internal search iterates may worsen or use surrogates; do not mistake their
+  surrogate scores for verified improvements.
 - Positive rescaling below the coefficient cap leaves the objective unchanged.
   Do not claim that changing scale alone is an improvement, and do not let
   normalization interact with clipping in a way that changes the candidate.
@@ -217,21 +219,23 @@ Autocorrelation-specific implementation constraints:
   A direct CVXPY call is not a solution unless the stated subproblem satisfies
   the solver's rules. Explain any relaxation or alternating subproblem, how a
   candidate is recovered, and how it is checked by the original evaluator.
-- The supplied parents can contain several thousand coefficients. Never form a
-  dense n-by-n identity, Toeplitz/convolution operator, Hessian, or constraint
-  matrix, and never estimate a gradient with one evaluator call per
-  coordinate. Those constructions have quadratic memory or evaluation count
-  and are not feasible here. An LP is acceptable only with a genuinely sparse
-  or matrix-free operator whose storage and solver behavior you spell out.
-- The exact evaluator itself performs the authoritative full convolution, so
-  exact acceptance calls are the scarce resource. Use cheap vectorized or FFT
-  surrogates to propose candidates if useful, then spend a bounded number of
-  exact calls on acceptance. Adapt that count from measured elapsed time and
-  retain enough headroom to return the fallback.
-- Derive dimensions from runtime inputs. If changing resolution, specify the
-  exact interpolation/resampling rule, normalization, validity checks, and how
-  the new candidate is compared with the parent. Explain initialization when
-  no parent is available.'''
+- Choose algorithms for the actual problem size and execution resources.
+  Account for arrays, temporary copies, solver workspace, and evaluation cost.
+  Dense operators, finite differences, and LP methods are options when their
+  costs fit; for larger searches, consider structured, sparse, matrix-free,
+  FFT, analytic-gradient, or reduced-subproblem approaches as appropriate.
+  Explain the chosen formulation's scaling, rather than assuming a library
+  call makes a large allocation or solve affordable.
+- Schedule expensive evaluations and solver calls using elapsed time inside
+  the generated program. Surrogates may guide exploration, but leave time for
+  exact validation and returning the saved best valid candidate. Do not impose
+  an arbitrary number of evaluations independent of the actual runtime.
+- Sequence length and construction family are search choices, not fixed by
+  the parent, seed program, or literature example. Derive dimensions from the
+  candidate being evaluated. If changing resolution, explain the construction
+  or resampling rule, normalization, validity checks, and exact comparison.
+  Explain initialization when no parent is available. The coefficient cap of
+  1000 is a value bound, not a limit on the number of coefficients.'''
         if self.problem_type == "ac1":
             mathematical = '''
 AC1 mathematical checks for the final plan:
@@ -251,8 +255,9 @@ AC2 mathematical checks for the final plan:
   L1=sum(abs(c))/(m+1), and Linf=max(abs(c)). The exact higher-is-better
   objective is L2sq/(L1*Linf).
 - Keep L1 and Linf strictly positive and use the same endpoint convention and
-  spacing in any analytic gradient or surrogate. Re-evaluate every accepted
-  candidate with the supplied function rather than trusting an internal score.'''
+  spacing in any analytic gradient or surrogate. Verify the saved best and
+  final candidate with the supplied function rather than trusting an internal
+  score.'''
         staged = self._append_user_instruction(messages, common + mathematical)
         return super().build_strategy_messages(
             staged, previous_strategies=previous_strategies)
@@ -290,31 +295,18 @@ AC2 mathematical checks for the final plan:
         entrypoint = ("propose_candidate" if self.problem_type == "ac1"
                       else "construct_function")
         return self._append_user_instruction(staged, f'''
-## Mandatory compact-source contract
+## Complete-program output contract
 
 - `height_sequence_1` is runtime input when a parent construction exists.
   Reference it directly; NEVER assign a pasted copy of its values, serialize
   it, or reconstruct it as a literal. If no parent was announced, create a
   starting vector under a different name.
-- Do not emit any long numeric literal, lookup table, repeated-value list, or
-  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
-  values. Build every larger vector algorithmically with NumPy, a compact
-  formula, interpolation, tiling, or a loop.
-- Keep the complete source concise: at most 300 lines and about 12,000
-  characters. Spend tokens on a working algorithm, not comments or embedded
-  data. Finish `{entrypoint}`, return a non-empty Python list of finite
-  coefficients, and close the single Python fence well before the generation
-  limit.
+- There is no prescribed source-line, character, or numeric-literal count.
+  Provide the complete program, including `{entrypoint}` and any helpers it
+  needs. Return a non-empty Python list of finite coefficients and finish the
+  single Python fence within the available response budget.
 - Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
-  best-so-far fallback and return it before the configured deadline.
-- The expert plan has already done the mathematical design. Do not spend the
-  response re-deriving the problem on toy lengths or narrating alternatives.
-  Resolve only implementation details in private reasoning, then emit the
-  complete program. A simple executable implementation with the parent as a
-  fallback is preferable to an ambitious program that is never finished.
-
-These are hard output constraints even if the proposed strategy suggests
-otherwise.''')
+  best-so-far fallback and return it before the configured deadline.''')
 
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = self._state_ctx(parent)
@@ -360,7 +352,7 @@ before the response-token limit.'''
         )
 
         user = f'''You are an expert in harmonic analysis, autocorrelation
-inequalities, and numerical optimization. Write a compact search program whose
+inequalities, and numerical optimization. Write a search program whose
 returned nonnegative step-function heights {direction} {metric}.
 
 ## Authoritative evaluator
@@ -371,6 +363,16 @@ The evaluator below is read-only and is the only definition of the score:
 ```
 
 {literature}
+
+## Search freedom
+
+Choose the mathematical approach, representation, sequence length,
+initialization, and optimization method that best serve the exact objective.
+The parent, seed programs, and literature are starting points, not limits on
+resolution or construction family. You may refine, coarsen, or replace an
+initialization and combine or replace suggested methods. There is no prescribed
+source length or numeric-literal count. The evaluator's coefficient cap of
+1000 bounds individual values, not the number of coefficients.
 
 ## Budget & Resources
 - **Time budget**: {budget_s}s for your code to run
@@ -383,26 +385,25 @@ The evaluator below is read-only and is the only definition of the score:
   runs. Respect it: track elapsed time and return your best solution before it
   expires, rather than being killed with nothing to show
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
-- Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO
 - `evaluate_sequence()` and `height_sequence_1` (an initial construction, if
   available) are pre-imported
 - When `height_sequence_1` is available, use it directly. Never redefine it or
-  copy its entries into the response. Construct all large arrays
-  algorithmically; do not print long numeric literals or unrolled tables
+  copy its entries into the response.
 - Check the deadline inside expensive loops and solver calls, preserve the best
   exact-scoring valid candidate, and return it with headroom before the hard
   sandbox timeout
 - Candidate failure receives the configured failure reward; do not hide an
   error by returning an empty or non-finite sequence.
-- Construct large arrays algorithmically. Do not paste long numeric literals,
-  lookup tables, repeated-value lists, or unrolled patterns.
-- Runtime parent lengths are commonly in the thousands. Do not allocate dense
-  n-by-n matrices (including `np.eye(n)`), dense convolution/Toeplitz
-  operators, or use one finite-difference evaluation per coordinate. Generated
-  programs must keep auxiliary storage linear or near-linear in n. If using a
-  solver, use a truly sparse/matrix-free formulation and set an internal stop
-  condition that leaves time to return the saved fallback.
+- Match working memory and computation to the candidate's actual dimensions.
+  Include temporary arrays and solver workspace in cost estimates before
+  allocating large operators. Dense methods and finite differences are allowed
+  when feasible; use structured, sparse, matrix-free, analytic-gradient, or
+  smaller-subproblem methods when needed to fit the execution resources.
+  Bound solver calls so they leave time for final validation and return.
+- Internal search iterates need not improve monotonically. Surrogates and
+  exploratory moves are allowed; verify the saved best candidate and final
+  return with the supplied exact evaluator, not a surrogate score.
 - Your function must complete within budget_s seconds and return the best solution found
 - The extracted block must define `{entrypoint}` at top level. The harness
   prepends the pre-imported evaluator and optional parent construction before

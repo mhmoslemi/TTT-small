@@ -48,6 +48,8 @@ class TinyDecoder(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(31, 8)
         self.query, self.key, self.value = (nn.Linear(8, 8, bias=False) for _ in range(3))
+        self.decay = nn.Linear(8, 2, bias=False)
+        self.beta = nn.Linear(8, 2, bias=False)
         self.layers = nn.ModuleList([nn.Identity()])
         self.gradient_checkpointing = False
         self.context = None
@@ -56,6 +58,16 @@ class TinyDecoder(nn.Module):
         positions = (torch.arange(input_ids.shape[1])[None, :]
                      if position_ids is None else position_ids)
         hidden = self.embed_tokens(input_ids) + positions[..., None] * .005
+        # Exercise hybrid recurrence plus attention, not attention alone.
+        delta_args = [hidden.reshape(*hidden.shape[:2], 2, 4)] * 3
+        delta_kwargs = dict(g=-torch.nn.functional.softplus(self.decay(hidden)),
+                            beta=self.beta(hidden).sigmoid(), use_qk_l2norm_in_kernel=True)
+        if self.context is None:
+            recurrent, _ = _recurrent_delta(*delta_args, **delta_kwargs)
+        else:
+            recurrent, _ = cp.head_parallel_delta(
+                *delta_args, **delta_kwargs, context=self.context, kernel=_recurrent_delta)
+        hidden = hidden + recurrent.reshape_as(hidden)
         q, k, v = [module(hidden).unsqueeze(1) for module in (self.query, self.key, self.value)]
         if self.context is None:
             output = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -111,7 +123,6 @@ def test_bf16_halo_preserves_native_fused_rounding(monkeypatch):
 
 
 def test_hybrid_context_keeps_native_forward_and_restores_kernels(monkeypatch):
-    import sys
     import model_backend
 
     layer = type('Qwen3_5GatedDeltaNet', (nn.Module,), {})()
@@ -121,17 +132,16 @@ def test_hybrid_context_keeps_native_forward_and_restores_kernels(monkeypatch):
     native_forward = layer.forward
     model = nn.Sequential(nn.Embedding(3, 4), layer)
     model.get_input_embeddings = lambda: model[0]
-    sentinel = object()
-    monkeypatch.setitem(sys.modules, 'fla.ops.cp', SimpleNamespace(build_cp_context=lambda *a, **k: sentinel))
     monkeypatch.setattr(cp.dist, 'get_rank', lambda *a: 0)
     monkeypatch.setattr(cp.dist, 'get_world_size', lambda *a: 2)
     checkpoint_modes = []
     monkeypatch.setattr(model_backend, 'set_gradient_checkpointing',
                         lambda model, enabled: checkpoint_modes.append(enabled))
     with pytest.raises(RuntimeError, match='test interruption'):
-        with cp.hybrid_context(model, None, 128, 4) as context:
+        with cp.hybrid_context(model, None) as context:
             assert layer.forward == native_forward
-            assert layer.chunk_gated_delta_rule()['cp_context'] is sentinel
+            assert layer.chunk_gated_delta_rule.func is cp.head_parallel_delta
+            assert layer.chunk_gated_delta_rule.keywords == dict(context=context, kernel=delta)
             assert layer.causal_conv1d_fn.keywords['kernel'] is _native_convolution
             assert layer._ttt_context_parallel is context
             raise RuntimeError('test interruption')
@@ -142,12 +152,56 @@ def test_hybrid_context_keeps_native_forward_and_restores_kernels(monkeypatch):
     assert checkpoint_modes == [True, False]
 
 
+def _recurrent_delta(q, k, v, g, beta, *, initial_state=None,
+                     output_final_state=False, cu_seqlens=None,
+                     use_qk_l2norm_in_kernel=False):
+    """Small independent reference, including state dependence across shards."""
+    assert initial_state is None and not output_final_state and cu_seqlens is None
+    if use_qk_l2norm_in_kernel:
+        q, k = (torch.nn.functional.normalize(x, dim=-1) for x in (q, k))
+    repeats = v.shape[2] // q.shape[2]
+    q, k = (x.repeat_interleave(repeats, dim=2) for x in (q, k))
+    state = v.new_zeros(v.shape[0], v.shape[2], k.shape[-1], v.shape[-1])
+    outputs = []
+    for t in range(q.shape[1]):
+        state = state * g[:, t].exp()[..., None, None]
+        error = v[:, t] - (k[:, t, :, :, None] * state).sum(-2)
+        state = state + k[:, t, :, :, None] * (beta[:, t, :, None] * error)[..., None, :]
+        outputs.append((q[:, t, :, :, None] * state).sum(-2) / q.shape[-1] ** .5)
+    return torch.stack(outputs, dim=1), None
+
+
 def _distributed_checks(rank, rendezvous):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method=f'file://{rendezvous}', rank=rank, world_size=2)
     try:
         torch.manual_seed(91)
         context = SimpleNamespace(group=dist.group.WORLD, rank=rank, size=2)
+        # Both equal-head and grouped-value layouts must retain the complete
+        # recurrence and return later-token gradients to earlier token shards.
+        for query_heads in (2, 4):
+            inputs = [torch.randn(1, 128, query_heads, 3, dtype=torch.float64),
+                      torch.randn(1, 128, query_heads, 3, dtype=torch.float64),
+                      torch.randn(1, 128, 4, 5, dtype=torch.float64),
+                      -torch.rand(1, 128, 4, dtype=torch.float64),
+                      torch.rand(1, 128, 4, dtype=torch.float64)]
+            full_inputs = [x.clone().requires_grad_() for x in inputs]
+            local_inputs = [x[:, rank * 64:(rank + 1) * 64].clone().requires_grad_()
+                            for x in inputs]
+            expected, _ = _recurrent_delta(*full_inputs, use_qk_l2norm_in_kernel=True)
+            actual, _ = cp.head_parallel_delta(
+                *local_inputs, kernel=_recurrent_delta, context=context,
+                use_qk_l2norm_in_kernel=True)
+            torch.testing.assert_close(actual, expected[:, rank * 64:(rank + 1) * 64],
+                                       rtol=1e-10, atol=1e-10)
+            weights = torch.randn_like(expected)
+            (expected * weights).sum().backward()
+            (actual * weights[:, rank * 64:(rank + 1) * 64]).sum().backward()
+            for full_input, local_input in zip(full_inputs, local_inputs):
+                torch.testing.assert_close(local_input.grad,
+                                           full_input.grad[:, rank * 64:(rank + 1) * 64],
+                                           rtol=1e-9, atol=1e-9)
+
         source = torch.randn(1, 8, 4, dtype=torch.float64)
         weights = torch.randn_like(source)
         local = source[:, rank * 4:(rank + 1) * 4].clone().requires_grad_()

@@ -77,6 +77,10 @@ class CirclePacking(Problem):
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
         n = self.num_circles
+        timeout_s = self.cfg.get("sandbox_timeout_s")
+        execution_limit = (f"{float(timeout_s):g} seconds"
+                           if timeout_s is not None
+                           else "the configured sandbox timeout")
 
         user = f"""You are an expert mathematician specializing in circle packing problems and computational geometry.
 
@@ -92,14 +96,33 @@ We will run the below validation function (read-only, do not modify this):
 {state_ctx}
 {_ANALYSIS}
 
+Search freedom:
+- Choose the arrangement, parameterization, initialization, and optimization
+  method freely. Previous programs and the arrangements listed above are
+  examples, not requirements; you may refine them or use a different family.
+- A supplied strategy is guidance, not a binding specification. Adapt,
+  combine, or replace its ideas when justified by the task. Preserve the exact
+  circle count, objective, and validity requirements.
+- There is no prescribed source length or numeric-literal count. Provide a
+  complete program within the available response budget.
+
+Execution resources:
+- The hard execution limit is {execution_limit}, including program startup.
+  Track elapsed time inside the program, bound expensive optimizer calls, and
+  leave time for validation and returning the result before that limit.
+- The harness can execute the generated program using up to {self.eval_cpus} CPUs.
+- Account for working arrays and solver workspace at the chosen problem size.
+  Keep a separately copied, validated best nondegenerate packing. Exploratory
+  iterates may be worse or infeasible, but the returned packing must satisfy
+  the original validator and have finite coordinates and radii. Return the
+  best valid packing found and its actual sum of radii.
+
 Rules:
 - You must define the run_packing function: def run_packing() -> tuple[np.ndarray, np.ndarray, float]
 - Returns (centers, radii, sum_radii) where centers has shape ({n}, 2) and radii has shape ({n},).
 - You can use scientific libraries like scipy, numpy, cvxpy, math.
-- The harness can execute the generated program using up to {self.eval_cpus} CPUs.
 - Centers must lie within [0,1]^2 and radii must be nonnegative.
 - The pair (centers, radii) must satisfy non-overlap and boundary constraints.
-- Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
 - Do not catch exceptions in order to return a degenerate packing. A program that
   returns all-zero or near-zero radii when something goes wrong scores the same as
