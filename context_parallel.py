@@ -8,10 +8,11 @@ gathered for the existing sequence-level policy loss.
 
 from contextlib import contextmanager
 from datetime import timedelta
+from functools import partial
 import inspect
 import math
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -46,13 +47,9 @@ def availability(model, cfg, world_size):
         return False, f"context-parallel kernels unavailable: {error}"
     modules = [module for module in model.modules()
                if type(module).__name__ == "Qwen3_5GatedDeltaNet"]
-    required = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
-                "key_dim", "value_dim", "head_k_dim", "head_v_dim",
-                "num_v_heads", "num_k_heads", "A_log", "dt_bias", "norm", "out_proj",
-                "conv1d", "activation")
-    if not modules or any(not all(hasattr(module, name) for name in required)
-                          or not isinstance(module.conv1d, torch.nn.Conv1d)
-                          or module.activation not in ("silu", "swish")
+    if not modules or any(not isinstance(getattr(module, "conv1d", None), torch.nn.Conv1d)
+                          or not callable(getattr(module, "causal_conv1d_fn", None))
+                          or not callable(getattr(module, "chunk_gated_delta_rule", None))
                           for module in modules):
         return False, "hybrid layer contract differs from the supported Qwen implementation"
     attention_modules = [module for module in model.modules()
@@ -128,43 +125,21 @@ def attention(query, key, value, context, *, scale=None, dropout=0.0):
     return result.transpose(1, 2).contiguous(), None
 
 
-def causal_convolution(value, module, context):
-    """Exchange the causal halo with its gradient; never reset at a rank boundary."""
-    import torch.nn.functional as F
-
-    width = int(module.conv1d.kernel_size[0]) - 1
+def causal_convolution(x, weight, bias=None, *, activation=None, seq_idx=None,
+                       context, kernel):
+    """Keep the native fused convolution, including its BF16 rounding and backward."""
+    if seq_idx is not None:
+        raise ValueError("context-parallel convolution requires one logical sequence")
+    length, width = x.shape[-1], weight.shape[-1] - 1
     if width:
-        tails = gather(value[:, -width:], context.group, 1)
+        tails = gather(x[:, :, -width:], context.group, 2)
         start = max(0, context.rank - 1) * width
-        halo = tails[:, start:start + width] * int(context.rank > 0)
-        value = torch.cat((halo, value), dim=1)
-    output = F.conv1d(value.transpose(1, 2), module.conv1d.weight,
-                      module.conv1d.bias, groups=module.conv1d.groups)
-    return F.silu(output).transpose(1, 2)
-
-
-def _delta_forward(module, hidden_states, cache_params=None, attention_mask=None, **kwargs):
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-    import torch.nn.functional as F
-
-    if cache_params is not None or attention_mask is not None:
-        raise ValueError("context-parallel DeltaNet requires one unpadded logical sequence and no cache")
-    context = module._ttt_context_parallel
-    batch, length, _ = hidden_states.shape
-    mixed = causal_convolution(module.in_proj_qkv(hidden_states), module, context)
-    q, k, v = torch.split(mixed, (module.key_dim, module.key_dim, module.value_dim), dim=-1)
-    q, k = (item.reshape(batch, length, -1, module.head_k_dim) for item in (q, k))
-    v = v.reshape(batch, length, -1, module.head_v_dim)
-    repeats = module.num_v_heads // module.num_k_heads
-    q, k = (item.repeat_interleave(repeats, dim=2) for item in (q, k))
-    z = module.in_proj_z(hidden_states).reshape(-1, module.head_v_dim)
-    beta = module.in_proj_b(hidden_states).sigmoid()
-    decay = -module.A_log.float().exp() * F.softplus(module.in_proj_a(hidden_states).float() + module.dt_bias)
-    output, _ = chunk_gated_delta_rule(
-        q, k, v, g=decay, beta=beta, use_qk_l2norm_in_kernel=True,
-        output_final_state=False, cp_context=context.fla_context)
-    output = module.norm(output.reshape(-1, module.head_v_dim), z)
-    return module.out_proj(output.reshape(batch, length, -1))
+        halo = tails[:, :, start:start + width] * int(context.rank > 0)
+        x = torch.cat((halo.transpose(1, 2), x.transpose(1, 2)), dim=1).transpose(1, 2)
+    # F.conv1d(...).silu() rounds the intermediate convolution to BF16;
+    # the native kernel applies SiLU in FP32 before rounding just once.
+    return kernel(x=x, weight=weight, bias=bias, activation=activation,
+                  seq_idx=None)[:, :, -length:]
 
 
 @contextmanager
@@ -174,6 +149,7 @@ def hybrid_context(model, group, total_tokens, kernel_size):
 
     checkpointed = bool(getattr(model, "is_gradient_checkpointing", False))
     changed = []
+    missing = object()
     try:
         set_gradient_checkpointing(model, True)
         device = next(model.get_input_embeddings().parameters()).device
@@ -186,23 +162,24 @@ def hybrid_context(model, group, total_tokens, kernel_size):
             name = type(module).__name__
             if name not in ("Qwen3_5GatedDeltaNet", "Qwen3_5Attention"):
                 continue
-            previous = getattr(module, "_ttt_context_parallel", None)
-            original = module.__dict__.get("forward")
-            changed.append((module, previous, original))
+            names = ["_ttt_context_parallel"]
+            if name == "Qwen3_5GatedDeltaNet":
+                names.extend(("causal_conv1d_fn", "chunk_gated_delta_rule"))
+            changed.append((module, {key: module.__dict__.get(key, missing) for key in names}))
             module._ttt_context_parallel = context
             if name == "Qwen3_5GatedDeltaNet":
-                module.forward = MethodType(_delta_forward, module)
+                module.causal_conv1d_fn = partial(
+                    causal_convolution, context=context, kernel=module.causal_conv1d_fn)
+                module.chunk_gated_delta_rule = partial(
+                    module.chunk_gated_delta_rule, cp_context=context.fla_context)
         yield context
     finally:
-        for module, previous, original in reversed(changed):
-            if previous is None:
-                module.__dict__.pop("_ttt_context_parallel", None)
-            else:
-                module._ttt_context_parallel = previous
-            if original is None:
-                module.__dict__.pop("forward", None)
-            else:
-                module.forward = original
+        for module, originals in reversed(changed):
+            for name, original in originals.items():
+                if original is missing:
+                    module.__dict__.pop(name, None)
+                else:
+                    setattr(module, name, original)
         set_gradient_checkpointing(model, checkpointed)
 
 
@@ -369,7 +346,8 @@ def validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                     if name not in reference_gradients)
         relative = math.sqrt((difference + extra) / max(norm, 1e-30))
         logprob_error = float((result["logprobs"] - old.cpu()).abs().max())
-        if missing or not math.isfinite(relative) or relative > .03 or logprob_error > .05:
+        if (missing or not math.isfinite(relative) or not math.isfinite(logprob_error)
+                or relative > .03 or logprob_error > .05):
             accepted.zero_()
             issue = f"kernel equivalence check failed (gradient relative error={relative:.5g}, logprob error={logprob_error:.5g})"
         else:
@@ -384,14 +362,17 @@ def plan_context_wave(examples, world_size, local_token_budget):
     """Fit activation shards, not full trajectories; keep group layouts reusable."""
     from exact_overflow import trajectory_key
 
+    if world_size < 2 or world_size & (world_size - 1) or local_token_budget < 64:
+        raise ValueError("context waves require power-of-two GPU groups and a positive token target")
     ordered = []
     for item in examples:
         tokens = item["prompt_ids"].shape[1] + item["response_ids"].shape[1] - 1
         width = 2
-        while math.ceil(tokens / (64 * width)) * 64 > local_token_budget:
+        while width < world_size and math.ceil(tokens / (64 * width)) * 64 > local_token_budget:
             width *= 2
-        if width <= world_size:
-            ordered.append((width, tokens, trajectory_key(item), item))
+        # This estimate came from a different, full-sequence replica path.
+        # It chooses parallelism; it must not exclude full-context CP work.
+        ordered.append((width, tokens, trajectory_key(item), item))
     ordered.sort(key=lambda row: row[:3], reverse=True)
     selected, available = [], world_size
     for width, tokens, key, item in ordered:
@@ -463,10 +444,6 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
     try:
         while pending:
             wave = plan_context_wave([by_key[key] for key in pending], trainer.world_size, budget)
-            if not wave:
-                # Exceptional lengths can still use the existing exact layer
-                # sharding lane; never increase a local token budget blindly.
-                return None
             waves += 1
             started = time.time()
             print(f"[train-context] step {step_idx}: wave {waves}: " + ", ".join(

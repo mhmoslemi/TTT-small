@@ -25,7 +25,9 @@ def test_wave_sizes_use_observed_local_memory_and_reusable_groups():
     assert [len(ranks) for _, ranks in second] == [4, 2, 2]
     assert {key for _, ranks in second for key in ranks} == set(range(8))
     assert all(ranks in cp.context_parallel_groups(8) for _, ranks in second)
-    assert cp.plan_context_wave([example((0, 0), 1000000)], 8, 24000) == []
+    for tokens in (270000, 1000000):
+        full = example((0, 0), tokens)
+        assert cp.plan_context_wave([full], 8, 24000) == [(full, tuple(range(8)))]
     assert items[0]['response_ids'].shape[1] == 108000 - 16  # no truncation
 
 
@@ -78,6 +80,68 @@ class TinyModel(nn.Module):
         return self.head
 
 
+def _native_convolution(x, weight, bias=None, *, activation=None, seq_idx=None):
+    # Emulate the native CUDA kernel's FP32 convolution + SiLU accumulator.
+    dtype = x.dtype
+    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    result = torch.nn.functional.conv1d(
+        x.to(compute_dtype), weight.to(compute_dtype).unsqueeze(1),
+        None if bias is None else bias.to(compute_dtype),
+        padding=weight.shape[-1] - 1, groups=weight.shape[0])[:, :, :x.shape[-1]]
+    return torch.nn.functional.silu(result).to(dtype)
+
+
+def test_bf16_halo_preserves_native_fused_rounding(monkeypatch):
+    torch.manual_seed(19)
+    x = torch.randn(1, 4, 128).to(torch.bfloat16)
+    weight = torch.randn(4, 4).to(torch.bfloat16)
+    expected = _native_convolution(x, weight, activation='silu')
+    old = torch.nn.functional.silu(torch.nn.functional.conv1d(
+        x, weight.unsqueeze(1), padding=3, groups=4)[:, :, :128])
+    assert not torch.equal(expected, old), 'must exercise the premature BF16 rounding bug'
+    tails = torch.cat((x[:, :, 61:64], x[:, :, 125:128]), dim=2)
+    monkeypatch.setattr(cp, 'gather', lambda *args: tails)
+    for rank in range(2):
+        actual = cp.causal_convolution(
+            x[:, :, rank * 64:(rank + 1) * 64], weight,
+            activation='silu', kernel=_native_convolution,
+            context=SimpleNamespace(group=None, rank=rank))
+        torch.testing.assert_close(actual, expected[:, :, rank * 64:(rank + 1) * 64],
+                                   rtol=0, atol=0)
+
+
+def test_hybrid_context_keeps_native_forward_and_restores_kernels(monkeypatch):
+    import sys
+    import model_backend
+
+    layer = type('Qwen3_5GatedDeltaNet', (nn.Module,), {})()
+    layer.causal_conv1d_fn = _native_convolution
+    delta = lambda *args, **kwargs: kwargs
+    layer.chunk_gated_delta_rule = delta
+    native_forward = layer.forward
+    model = nn.Sequential(nn.Embedding(3, 4), layer)
+    model.get_input_embeddings = lambda: model[0]
+    sentinel = object()
+    monkeypatch.setitem(sys.modules, 'fla.ops.cp', SimpleNamespace(build_cp_context=lambda *a, **k: sentinel))
+    monkeypatch.setattr(cp.dist, 'get_rank', lambda *a: 0)
+    monkeypatch.setattr(cp.dist, 'get_world_size', lambda *a: 2)
+    checkpoint_modes = []
+    monkeypatch.setattr(model_backend, 'set_gradient_checkpointing',
+                        lambda model, enabled: checkpoint_modes.append(enabled))
+    with pytest.raises(RuntimeError, match='test interruption'):
+        with cp.hybrid_context(model, None, 128, 4) as context:
+            assert layer.forward == native_forward
+            assert layer.chunk_gated_delta_rule()['cp_context'] is sentinel
+            assert layer.causal_conv1d_fn.keywords['kernel'] is _native_convolution
+            assert layer._ttt_context_parallel is context
+            raise RuntimeError('test interruption')
+    assert layer.forward == native_forward
+    assert layer.causal_conv1d_fn is _native_convolution
+    assert layer.chunk_gated_delta_rule is delta
+    assert not hasattr(layer, '_ttt_context_parallel')
+    assert checkpoint_modes == [True, False]
+
+
 def _distributed_checks(rank, rendezvous):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method=f'file://{rendezvous}', rank=rank, world_size=2)
@@ -102,7 +166,9 @@ def _distributed_checks(rank, rendezvous):
         local = source[:, rank * 4:(rank + 1) * 4].clone().requires_grad_()
         full = source.clone().requires_grad_()
         expected = torch.nn.functional.silu(convolution(full.transpose(1, 2))[:, :, :8]).transpose(1, 2)
-        actual = cp.causal_convolution(local, SimpleNamespace(conv1d=convolution), context)
+        actual = cp.causal_convolution(
+            local.transpose(1, 2), convolution.weight.squeeze(1),
+            context=context, kernel=_native_convolution, activation='silu').transpose(1, 2)
         torch.testing.assert_close(actual, expected[:, rank * 4:(rank + 1) * 4], rtol=1e-10, atol=1e-10)
         (expected * weights).sum().backward()
         (actual * weights[:, rank * 4:(rank + 1) * 4]).sum().backward()
