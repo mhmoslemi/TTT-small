@@ -433,6 +433,18 @@ def _ttt_blockwise_attention_forward(
         return attention(
             query, key, value, context, scale=scaling, dropout=dropout,
             kernel=partial(_ttt_local_attention_forward, module))
+    # Calibration only: compare the same independent head-kernel shapes so
+    # BF16 rounding does not masquerade as a cross-GPU routing error.
+    width = getattr(module, "_ttt_calibration_heads", None)
+    if width is not None and query.shape[1] > width:
+        groups = query.shape[1] // key.shape[1]
+        key, value = (_repeat_kv_heads(item, groups) for item in (key, value))
+        outputs = [_ttt_local_attention_forward(
+            module, query[:, start:start + width], key[:, start:start + width],
+            value[:, start:start + width], attention_mask, dropout=dropout,
+            scaling=scaling, sliding_window=sliding_window, **kwargs)[0]
+            for start in range(0, query.shape[1], width)]
+        return torch.cat(outputs, dim=2), None
     return _ttt_local_attention_forward(
         module, query, key, value, attention_mask, dropout=dropout,
         scaling=scaling, sliding_window=sliding_window, **kwargs)

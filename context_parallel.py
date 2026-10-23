@@ -12,10 +12,86 @@ from datetime import timedelta
 from functools import partial
 import math
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch.distributed as dist
+
+
+@contextmanager
+def _stable_bf16_matmul():
+    """Keep BF16 shard GEMMs numerically consistent with the full sequence."""
+    if not torch.cuda.is_available():
+        yield
+        return
+    matmul = torch.backends.cuda.matmul
+    library = torch.backends.cuda.preferred_blas_library()
+    reduction = matmul.allow_bf16_reduced_precision_reduction
+    split_k = getattr(matmul, "allow_bf16_reduced_precision_reduction_split_k", None)
+    try:
+        # Disabling reduced precision alone still permits BF16 split-K rounding.
+        torch.backends.cuda.preferred_blas_library("cublaslt")
+        matmul.allow_bf16_reduced_precision_reduction = (
+            (False, False) if split_k is not None else False)
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = (
+            (reduction, split_k) if split_k is not None else reduction)
+        torch.backends.cuda.preferred_blas_library(library)
+
+
+def _calibration_linear(module, value):
+    shape = value.shape
+    rows = value.reshape(-1, shape[-1])
+    return torch.cat([
+        torch.nn.functional.linear(
+            torch.nn.functional.pad(block, (0, 0, 0, 64 - len(block))),
+            module.weight, module.bias)[:len(block)]
+        for block in rows.split(64)
+    ], dim=0).reshape(*shape[:-1], module.out_features)
+
+
+def _calibration_delta(q, k, v, *, g, beta, width, kernel, **kwargs):
+    if v.shape[2] <= width:
+        return kernel(q, k, v, g=g, beta=beta, **kwargs)
+    repeats = v.shape[2] // q.shape[2]
+    q, k = (value.repeat_interleave(repeats, dim=2) for value in (q, k))
+    outputs = [kernel(q[:, :, h:h + width], k[:, :, h:h + width],
+                      v[:, :, h:h + width], g=g[:, :, h:h + width],
+                      beta=beta[:, :, h:h + width], **kwargs)[0]
+               for h in range(0, v.shape[2], width)]
+    return torch.cat(outputs, dim=2), None
+
+
+@contextmanager
+def _calibration_shapes(model, size):
+    """Match BF16 kernel shapes on both sides of the probe, never real rollouts."""
+    changed = []
+    missing = object()
+    try:
+        for module in model.modules():
+            if type(module) is torch.nn.Linear:
+                name, value = "forward", MethodType(_calibration_linear, module)
+            elif type(module).__name__ == "Qwen3_5Attention":
+                name = "_ttt_calibration_heads"
+                value = int(module.config.num_attention_heads) // size
+            elif type(module).__name__ == "Qwen3_5GatedDeltaNet":
+                name = "chunk_gated_delta_rule"
+                value = partial(_calibration_delta, width=int(module.num_v_heads) // size,
+                                kernel=module.chunk_gated_delta_rule)
+            else:
+                continue
+            changed.append((module, name, module.__dict__.get(name, missing)))
+            setattr(module, name, value)
+        yield
+    finally:
+        for module, name, original in reversed(changed):
+            if original is missing:
+                module.__dict__.pop(name, None)
+            else:
+                setattr(module, name, original)
 
 
 def context_parallel_groups(world_size):
@@ -262,6 +338,7 @@ def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True, m
         return scores, entropies
 
 
+@_stable_bf16_matmul()
 def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, validate=True):
     """Same weighted sequence loss; sum token-shard adapter gradients once."""
     import train_multy_CVaR as training
@@ -329,7 +406,15 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
     return result
 
 
+@_stable_bf16_matmul()
 def validate_context_group(backend, tokenizer, example, cfg, group, ranks):
+    # BF16 reduction order changes with GEMM rows/attention heads; accumulated
+    # rounding across 64 layers otherwise rejects correct distributed math.
+    with _calibration_shapes(backend.model, len(ranks)):
+        return _validate_context_group(backend, tokenizer, example, cfg, group, ranks)
+
+
+def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
     """Check real-model forward AND adapter gradients before using a new group.
 
     This tiny calibration is not a training sample and never updates weights.
@@ -353,9 +438,15 @@ def validate_context_group(backend, tokenizer, example, cfg, group, ranks):
         print(f"[train-context] checking forward/gradient equivalence on GPUs {list(ranks)} "
               "before accepting context-parallel training", flush=True)
         with training._policy_dropout_disabled(model):
-            scores = training.compute_token_logprobs(
-                model, mini["prompt_ids"].to(device), mini["response_ids"].to(device),
-                with_grad=True, chunk=cfg.logprob_chunk)
+            prompt, response = mini["prompt_ids"].to(device), mini["response_ids"].to(device)
+            total = prompt.numel() + response.numel() - 1
+            source = torch.cat((prompt, response[:, :-1]), dim=1)
+            padded = math.ceil(total / (64 * len(ranks))) * 64 * len(ranks)
+            source = torch.nn.functional.pad(
+                source, (0, padded - total), value=tokenizer.pad_token_id)
+            scores = training._decoder_token_logprobs(
+                model, source, None, [(prompt.numel() - 1, total)], [response[0]],
+                with_grad=True, chunk=cfg.logprob_chunk, return_entropy=False)[0]
             old.copy_(scores.detach())
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
             loss, _ = training.clipped_policy_loss(
@@ -396,16 +487,18 @@ def validate_context_group(backend, tokenizer, example, cfg, group, ranks):
     return None if accepted.item() else (issue or "context-parallel kernel equivalence check failed")
 
 
-def plan_context_wave(examples, world_size, local_token_budget):
+def plan_context_wave(examples, world_size, local_token_budget, minimum_gpus=2):
     """Fit activation shards, not full trajectories; keep group layouts reusable."""
     from exact_overflow import trajectory_key
 
-    if world_size < 2 or world_size & (world_size - 1) or local_token_budget < 64:
+    if (world_size < 2 or world_size & (world_size - 1) or local_token_budget < 64
+            or minimum_gpus < 2 or minimum_gpus > world_size
+            or minimum_gpus & (minimum_gpus - 1)):
         raise ValueError("context waves require power-of-two GPU groups and a positive token target")
     ordered = []
     for item in examples:
         tokens = item["prompt_ids"].shape[1] + item["response_ids"].shape[1] - 1
-        width = 2
+        width = minimum_gpus
         while width < world_size and math.ceil(tokens / (64 * width)) * 64 > local_token_budget:
             width *= 2
         # This estimate came from a different, full-sequence replica path.
@@ -462,10 +555,17 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
     original = {tuple(key) for key in state["deferred_keys"]}
     lengths = [item["prompt_ids"].shape[1] + item["response_ids"].shape[1] - 1
                for key, item in by_key.items() if key in original]
+    # Reuse the existing queue routing next step instead of repeating the
+    # single-GPU OOM ladder for lengths already proven to require cooperation.
+    smallest = min(lengths) + 1
+    trainer._warm_overflow_min_tokens = min(
+        int(getattr(trainer, "_warm_overflow_min_tokens", smallest)), smallest)
     budget = max(64, int(min(lengths) * .8) // 64 * 64)
     budget = min(budget, state.get("context_local_token_budget", budget))
     state["context_local_token_budget"] = budget
-    first_wave = plan_context_wave([by_key[key] for key in pending], trainer.world_size, budget)
+    minimum_gpus = max(getattr(trainer, "_context_minimum_gpus", 2),
+                       state.get("context_minimum_gpus", 2))
+    first_wave = plan_context_wave([by_key[key] for key in pending], trainer.world_size, budget, minimum_gpus)
     if not first_wave:
         return None
     completed_before = tuple(state["completed_keys"])
@@ -482,7 +582,7 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
     waves, processed = 0, 0
     try:
         while pending:
-            wave = plan_context_wave([by_key[key] for key in pending], trainer.world_size, budget)
+            wave = plan_context_wave([by_key[key] for key in pending], trainer.world_size, budget, minimum_gpus)
             waves += 1
             started = time.time()
             print(f"[train-context] step {step_idx}: wave {waves}: " + ", ".join(
@@ -507,11 +607,13 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
                           if value.requires_grad}
             trainer.model.zero_grad(set_to_none=True)
             stats, successful, validation_issue = [], set(), None
+            failed_width = 0
             for item, ranks in wave:
                 result = results[ranks[0]]
                 if not result["completed"]:
                     validation_issue = result.get("validation_issue")
                     if validation_issue:
+                        failed_width = max(failed_width, len(ranks))
                         continue
                     raise RuntimeError("context-parallel backward did not complete; no partial update applied")
                 for name, value in unpack_cpu_gradients(result["gradient_pack"]).items():
@@ -539,6 +641,16 @@ def complete_context_overflow(trainer, examples, cfg, step_idx, state):
             pending.difference_update(successful)
             processed += len(successful)
             if validation_issue:
+                if failed_width < trainer.world_size:
+                    minimum_gpus = failed_width * 2
+                    trainer._context_minimum_gpus = minimum_gpus
+                    state["context_minimum_gpus"] = minimum_gpus
+                    training._write_exact_spo_rs_overflow_state(state)
+                    print(f"[train-context] {validation_issue}; retrying only unfinished "
+                          f"trajectories with at least {minimum_gpus} cooperating GPUs; "
+                          "completed gradients retained", flush=True)
+                    del results, messages, stats
+                    continue
                 trainer._context_disabled_reason = validation_issue
                 print(f"[train-context] {validation_issue}; unfinished samples retain the "
                       "existing exact overflow path; no partial optimizer update", flush=True)
