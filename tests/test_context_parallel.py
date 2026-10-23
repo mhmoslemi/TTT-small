@@ -12,6 +12,54 @@ import torch.multiprocessing as mp
 import context_parallel as cp
 
 
+@pytest.mark.parametrize('split_k_supported', [False, True])
+def test_bf16_shard_precision_restores_settings_even_on_failure(monkeypatch, split_k_supported):
+    from contextlib import nullcontext
+    import torch.nn.attention
+    flags = SimpleNamespace(allow_bf16_reduced_precision_reduction=True)
+    if split_k_supported:
+        flags.allow_bf16_reduced_precision_reduction_split_k = True
+    library = ['cublas']
+
+    def preferred(value=None):
+        if value is not None:
+            library[0] = value
+        return library[0]
+
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, 'matmul', flags)
+    monkeypatch.setattr(torch.backends.cuda, 'preferred_blas_library', preferred)
+    monkeypatch.setattr(torch.nn.attention, 'sdpa_kernel', lambda *args: nullcontext())
+    with pytest.raises(RuntimeError, match='injected'):
+        with cp._stable_bf16_matmul():
+            assert library[0] == 'cublaslt'
+            assert flags.allow_bf16_reduced_precision_reduction == (
+                (False, False) if split_k_supported else False)
+            raise RuntimeError('injected')
+    assert library[0] == 'cublas'
+    assert flags.allow_bf16_reduced_precision_reduction == (
+        (True, True) if split_k_supported else True)
+
+
+def test_calibration_shapes_keep_linear_values_gradients_and_restore():
+    layer = nn.Linear(7, 5).double()
+    value = torch.randn(2, 71, 7, dtype=torch.float64, requires_grad=True)
+    expected = layer(value)
+    expected.sum().backward()
+    gradients = [value.grad.clone(), layer.weight.grad.clone(), layer.bias.grad.clone()]
+    layer.zero_grad(set_to_none=True)
+    value.grad = None
+    with pytest.raises(RuntimeError, match='injected'):
+        with cp._calibration_shapes(layer, 8):
+            actual = layer(value)
+            torch.testing.assert_close(actual, expected)
+            actual.sum().backward()
+            for got, wanted in zip((value.grad, layer.weight.grad, layer.bias.grad), gradients):
+                torch.testing.assert_close(got, wanted)
+            raise RuntimeError('injected')
+    assert 'forward' not in layer.__dict__
+
+
 def example(key, tokens):
     return dict(_overlap_key=key, prompt_ids=SimpleNamespace(shape=(1, 17)),
                 response_ids=SimpleNamespace(shape=(1, tokens - 16)))
@@ -172,6 +220,22 @@ def _recurrent_delta(q, k, v, g, beta, *, initial_state=None,
     return torch.stack(outputs, dim=1), None
 
 
+def test_calibration_delta_preserves_grouped_heads_and_gradients():
+    torch.manual_seed(41)
+    q, k = [torch.randn(1, 9, 2, 3, dtype=torch.float64, requires_grad=True) for _ in range(2)]
+    v = torch.randn(1, 9, 4, 3, dtype=torch.float64, requires_grad=True)
+    g = (-torch.rand(1, 9, 4, dtype=torch.float64)).requires_grad_()
+    beta = torch.rand(1, 9, 4, dtype=torch.float64, requires_grad=True)
+    expected, _ = _recurrent_delta(q, k, v, g, beta, use_qk_l2norm_in_kernel=True)
+    actual, _ = cp._calibration_delta(q, k, v, g=g, beta=beta, width=2,
+                                     kernel=_recurrent_delta, use_qk_l2norm_in_kernel=True)
+    torch.testing.assert_close(actual, expected)
+    inputs = (q, k, v, g, beta)
+    for got, wanted in zip(torch.autograd.grad(actual.square().sum(), inputs),
+                           torch.autograd.grad(expected.square().sum(), inputs)):
+        torch.testing.assert_close(got, wanted)
+
+
 def _distributed_checks(rank, rendezvous):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method=f'file://{rendezvous}', rank=rank, world_size=2)
@@ -327,7 +391,7 @@ def test_distributed_attention_halo_tokens_entropy_and_actual_spo_rs_gradients(t
     mp.spawn(_distributed_checks, args=(str(tmp_path / 'rendezvous'),), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize('invalid_kernel', [False, True])
+@pytest.mark.parametrize('invalid_kernel', [False, True, 'narrow'])
 def test_coordinator_commits_each_trajectory_once_before_one_update(monkeypatch, tmp_path, invalid_kernel):
     import fast_distributed
     import train_multy_CVaR as training
@@ -353,8 +417,11 @@ def test_coordinator_commits_each_trajectory_once_before_one_update(monkeypatch,
         _command_queues={rank: SimpleNamespace(put=commands[rank].append) for rank in commands},
         _abort_workers=lambda: pytest.fail('unexpected abort'))
 
+    last_width = [2]
     def compute(*args):
-        if invalid_kernel:
+        if args:
+            last_width[0] = len(args[-1])
+        if invalid_kernel is True or (invalid_kernel == 'narrow' and last_width[0] < 4):
             return dict(completed=False, validation_issue='unsupported kernel')
         return dict(completed=True, stats=stats,
                     gradient_pack=pack_cpu_gradients({'weight': torch.full((1, 1), 4.)}))
@@ -367,7 +434,8 @@ def test_coordinator_commits_each_trajectory_once_before_one_update(monkeypatch,
     monkeypatch.setattr(fast_distributed, 'broadcast_trainable_parameters', lambda *args, **kwargs: None)
     cfg = SimpleNamespace(advantage_mode='spo-rs', grad_clip=1e6)
     result = cp.complete_context_overflow(trainer, items, cfg, 2, state)
-    if invalid_kernel:
+    assert trainer._warm_overflow_min_tokens == 30001  # source tokens plus final target
+    if invalid_kernel is True:
         assert result is None and state['remaining_keys'] == keys
         assert model.weight.item() == 10  # calibration never applies a partial update
         assert state['gradients']['weight'].item() == 2
@@ -378,4 +446,6 @@ def test_coordinator_commits_each_trajectory_once_before_one_update(monkeypatch,
         assert result['exact_overflow_context_parallel']
         saved = torch.load(state['path'], weights_only=False)
         assert saved['completed_keys'] == state['completed_keys']
+        if invalid_kernel == 'narrow':
+            assert trainer._context_minimum_gpus == saved['context_minimum_gpus'] == 4
     assert trainer._workers_idle
