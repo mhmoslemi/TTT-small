@@ -1309,26 +1309,15 @@ class HFBackend(_ModelPlacementBackend):
             trust_remote_code=True,
             attn_implementation=attention_implementation,
         )
+        qwen_training_kernels = None
         if str(getattr(self.cfg, "coder_model_profile", "")) == "qwen3.8-27b":
             # Qwen3.8 interleaves full attention with Gated DeltaNet. Its Hub
             # inference kernel does not provide the backward implementation we
             # need here. Require FLA's training-capable chunked GDN kernel and
             # the matching causal-convolution kernel so Transformers cannot
             # silently fall back to the token-by-token PyTorch recurrence.
-            missing = [
-                package for package in ("fla", "causal_conv1d")
-                if importlib.util.find_spec(package) is None
-            ]
-            if missing:
-                raise RuntimeError(
-                    "Qwen/Qwen3.8-27B exact training requires Hugging Face's "
-                    "training-capable flash-linear-attention and "
-                    "causal-conv1d packages. Missing imports: "
-                    f"{', '.join(missing)}. Install project requirements "
-                    "before launching; the slow recurrent fallback is "
-                    "deliberately not selected.")
-            print("[memory] Qwen3.8 exact chunked Gated DeltaNet training "
-                  "kernels ON (FLA + causal-conv1d)", flush=True)
+            from qwen_training_kernels import load_training_kernels
+            qwen_training_kernels = load_training_kernels()
         attention_detail = (
             "native SDPA + exact fused long-context attention + exact "
             "bounded fallback"
@@ -1357,6 +1346,11 @@ class HFBackend(_ModelPlacementBackend):
 
         model = AutoModelForCausalLM.from_pretrained(
             training_name, **model_kwargs)
+        if qwen_training_kernels is not None:
+            from qwen_training_kernels import install_training_kernels
+            count = install_training_kernels(model, qwen_training_kernels)
+            print(f"[memory] Qwen3.8 native training kernels bound to {count} "
+                  "DeltaNet layers (FLA + causal-conv1d)", flush=True)
         self._remember_training_placement(model)
         _validate_hf_training_attention(model, self.cfg)
 
