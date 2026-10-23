@@ -230,6 +230,67 @@ def test_archive_code_fallback_and_legacy_construction_import():
     assert copied.id not in {s.id for s in sampler._states}
 
 
+def test_checkpoint_cleanup_preserves_training_and_backs_up_before_puct_switch(tmp_path):
+    import torch
+    from dataclasses import asdict
+    from clean_sampler_archive import clean_archive
+
+    sampler = PUCTSampler(1, seed_value=1.)
+    parent = sampler._states[0]
+    explored = State.make(0, 2., "explored", construction=[.1, .2],
+                          parents=[dict(id=parent.id, timestep=0)])
+    copied = State.make(1, 3., "fresh copy", construction=[.1, .2],
+                        parents=[dict(id=parent.id, timestep=0)], raw_score=.3)
+    saved = sampler.state_dict()
+    saved.update(selection_mode="llm", states=saved["states"] + [asdict(copied), asdict(explored)],
+                 n={parent.id: 64, explored.id: 32}, m={parent.id: 3.}, T=64,
+                 best_raw_min=asdict(copied), best_raw_max=asdict(copied))
+    payload = dict(version=2, next_step=2, adapter_dir="adapter_step001", sampler=saved,
+                   optimizer={"state": {0: {"exp_avg": torch.tensor([1., 2.])}}},
+                   spo_rs_tracker={"v": 1.7, "step": 1})
+    path = tmp_path / "training_state.pt"
+    torch.save(payload, path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(dict(parent_selection="llm", uct=False, seed=42)))
+    old_bytes = path.read_bytes()
+    old_config = config_path.read_bytes()
+    clean_archive(tmp_path)
+    actual = torch.load(path, map_location="cpu", weights_only=False)
+    assert actual["next_step"] == 2 and actual["adapter_dir"] == payload["adapter_dir"]
+    assert actual["spo_rs_tracker"] == payload["spo_rs_tracker"]
+    assert torch.equal(actual["optimizer"]["state"][0]["exp_avg"],
+                       payload["optimizer"]["state"][0]["exp_avg"])
+    assert [row["id"] for row in actual["sampler"]["states"]] == [parent.id, explored.id]
+    for key in ("n", "m", "T", "best_raw_min", "best_raw_max"):
+        assert actual["sampler"][key] == saved[key]
+    assert actual["sampler"]["selection_mode"] == "puct"
+    assert json.loads(config_path.read_text()) == dict(parent_selection="puct", uct=False, seed=42)
+    backups = list(tmp_path.glob("archive_cleanup_backup_*"))
+    assert len(backups) == 1
+    assert (backups[0] / path.name).read_bytes() == old_bytes
+    assert (backups[0] / config_path.name).read_bytes() == old_config
+    clean_archive(tmp_path)  # Repeating a completed cleanup does not rewrite it.
+    assert list(tmp_path.glob("archive_cleanup_backup_*")) == backups
+
+
+def test_checkpoint_cleanup_refuses_to_change_an_interrupted_steps_parents(tmp_path):
+    import torch
+    from clean_sampler_archive import clean_archive
+
+    checkpoint = tmp_path / "training_state.pt"
+    payload = dict(version=2, next_step=2, adapter_dir="adapter_step001",
+                   sampler=PUCTSampler(1).state_dict(), optimizer={})
+    torch.save(payload, checkpoint)
+    (tmp_path / "config.json").write_text('{"parent_selection":"llm"}')
+    (tmp_path / "step02").mkdir()
+    (tmp_path / "step02" / "step02.parents.json").write_text('{}')
+    original = checkpoint.read_bytes()
+    with pytest.raises(ValueError, match="already started"):
+        clean_archive(tmp_path)
+    assert checkpoint.read_bytes() == original
+    assert not list(tmp_path.glob("archive_cleanup_backup_*"))
+
+
 @pytest.mark.parametrize("mode", ["puct", "uct"])
 def test_existing_pickers_and_checkpoint_format_unchanged(mode):
     original = PUCTSampler(3, use_uct=(mode == "uct"))
