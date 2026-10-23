@@ -178,6 +178,17 @@ class PUCTSampler:
                     or raw > float(self._best_raw_max.raw_score)):
                 self._best_raw_max = state
 
+    @staticmethod
+    def _archive_key(state):
+        """Exact construction identity; source is a fallback for code-only tasks.
+
+        Keep full numeric precision and sequence order. No rounding, similarity
+        threshold, or problem-specific symmetry is applied.
+        """
+        if state.construction is not None and len(state.construction):
+            return ("construction", tuple(state.construction))
+        return ("code", state.code) if state.code else None
+
     def _build_children_map(self):
         children = {}
         for s in self._states:
@@ -305,7 +316,8 @@ class PUCTSampler:
         Only children with valid (non-None) values should be passed.
 
         When strategy_keys is supplied, it must align one-for-one with
-        children_with_parents. After the existing exact-code deduplication,
+        children_with_parents. After exact-construction deduplication (or code
+        deduplication for tasks without a construction),
         at most strategy_top_r new children are admitted from each
         (parent, strategy) pair. The ordinary top-K-per-parent and global
         archive cap are then applied unchanged.
@@ -348,22 +360,25 @@ class PUCTSampler:
             for pid, best in parent_best.items():
                 self._m[pid] = max(self._m.get(pid, best), best)
 
-            # Incorporate children + dedup by exact code
-            existing_codes = {s.code for s in self._states if s.code}
+            # A different program producing the same construction must not
+            # create another fresh node with zero expansion history.
+            existing_keys = {self._archive_key(s) for s in self._states}
+            existing_keys.discard(None)
             new_entries = []
             for (child, parent), strategy_key in zip(
                     children_with_parents, strategy_keys):
                 if child.value is None:
                     continue
-                if child.code and child.code in existing_codes:
+                key = self._archive_key(child)
+                if key is not None and key in existing_keys:
                     continue  # exact dup
                 child.parents = (
                     [{"id": parent.id, "timestep": parent.timestep}]
                     + (parent.parents or [])
                 )
                 new_entries.append((child, parent, strategy_key))
-                if child.code:
-                    existing_codes.add(child.code)
+                if key is not None:
+                    existing_keys.add(key)
 
             unique_new = len(new_entries)
             if strategy_top_r > 0:
@@ -529,16 +544,18 @@ class PUCTSampler:
     def import_legacy_states(self, states, total_expansions: int = 0):
         """Best-effort archive import for runs created before checkpoints."""
         with self._lock:
-            existing_codes = {s.code for s in self._states if s.code}
+            existing_keys = {self._archive_key(s) for s in self._states}
+            existing_keys.discard(None)
             for state in states:
-                if state.code and state.code in existing_codes:
+                key = self._archive_key(state)
+                if key is not None and key in existing_keys:
                     self._record_raw_states([state])
                     continue
                 state.parents = []
                 self._states.append(state)
                 self._record_raw_states([state])
-                if state.code:
-                    existing_codes.add(state.code)
+                if key is not None:
+                    existing_keys.add(key)
             if len(self._states) > self.max_buffer_size:
                 seeds = [s for s in self._states if s.id in self._seed_ids]
                 others = [s for s in self._states if s.id not in self._seed_ids]

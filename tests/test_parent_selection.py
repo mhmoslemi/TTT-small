@@ -177,6 +177,59 @@ def children(sampler, parent, rewards, step=0):
     return batch
 
 
+@pytest.mark.parametrize("mode", ["puct", "uct", "thompson"])
+def test_archive_deduplicates_constructions_without_losing_outcomes(mode):
+    sampler = make_sampler(
+        parent_selection=mode, num_seeds=1, topk_children=0,
+        seed_states=[SimpleNamespace(value=1., code="seed", construction=[.1, .2])])
+    parent = sampler._states[0]
+    seed_copy = State.make(0, 1., "different seed code", construction=[.1, .2])
+    first = State.make(0, 2., "program A", construction=[.3, .4], raw_score=.5)
+    copied = State.make(0, 2., "program B", construction=[.3, .4], raw_score=.4)
+    # Equal source can produce distinct outcomes; exact nearby values and
+    # sequence order must remain distinct too.
+    changed = State.make(0, 2.1, "program A", construction=[.3, np.nextafter(.4, 1.)])
+    reversed_values = State.make(0, 2.2, "program A", construction=[.4, .3])
+    batch = [seed_copy, first, copied, changed, reversed_values]
+    sampler.record_expansion(parent, len(batch))
+    sampler.record_outcomes(parent, [s.value for s in batch], [True] * len(batch))
+    result = sampler.update([(s, parent) for s in batch],
+                            strategy_keys=[0, 0, 1, 1, 1], strategy_top_r=3)
+    assert result["submitted"] == 5 and result["unique_new"] == 3
+    assert {s.id for s in sampler._states} == {
+        parent.id, first.id, changed.id, reversed_values.id}
+    assert sampler._n[parent.id] == sampler._T == 5
+    assert sampler._m[parent.id] == 2.2
+    assert sampler.best_raw_state(maximize=False).id == copied.id
+    if mode == "thompson":
+        assert sampler._outcomes.attempts == 5
+
+    # Resume retains the existing identities/counts. New copies of those
+    # constructions cannot enter with a new zero-count identity.
+    payload = sampler.state_dict()
+    resumed = make_sampler(parent_selection=mode, num_seeds=1, topk_children=0)
+    resumed.load_state_dict(payload)
+    assert resumed.state_dict() == payload
+    copied_again = State.make(1, 2., "yet another program", construction=[.3, .4])
+    result = resumed.update([(copied_again, resumed._states[0])])
+    assert result["unique_new"] == 0
+    assert {s.id for s in resumed._states} == {s.id for s in sampler._states}
+    assert resumed._n == sampler._n and resumed._T == sampler._T
+
+
+def test_archive_code_fallback_and_legacy_construction_import():
+    sampler = PUCTSampler(1, topk_children=0)
+    parent = sampler._states[0]
+    first = State.make(0, 1., "code-only", construction=None)
+    duplicate = State.make(0, 1., "code-only", construction=[])
+    assert sampler.update([(first, parent), (duplicate, parent)])["unique_new"] == 1
+    imported = State.make(0, 2., "import A", construction=[1., 2.])
+    copied = State.make(0, 2., "import B", construction=[1., 2.])
+    sampler.import_legacy_states([imported, copied])
+    assert imported.id in {s.id for s in sampler._states}
+    assert copied.id not in {s.id for s in sampler._states}
+
+
 @pytest.mark.parametrize("mode", ["puct", "uct"])
 def test_existing_pickers_and_checkpoint_format_unchanged(mode):
     original = PUCTSampler(3, use_uct=(mode == "uct"))
