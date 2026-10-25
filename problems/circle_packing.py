@@ -100,11 +100,13 @@ Search freedom:
 - Choose the arrangement, parameterization, initialization, and optimization
   method freely. Previous programs and the arrangements listed above are
   examples, not requirements; you may refine them or use a different family.
-- A supplied strategy is guidance, not a binding specification. Adapt,
-  combine, or replace its ideas when justified by the task. Preserve the exact
-  circle count, objective, and validity requirements.
-- There is no prescribed source length or numeric-literal count. Provide a
-  complete program within the available response budget.
+- Treat the strategy as planning guidance: preserve useful ideas, but correct
+  any mistake or conflict with the task, required interface, or current parent
+  construction. Preserve the exact circle count, objective, and validity
+  requirements.
+- Keep the complete source concise. Spend tokens on a working algorithm, not
+  comments or embedded data. Finish `run_packing`, return the required tuple,
+  and close the single Python fence well before the generation limit.
 
 Execution resources:
 - The hard execution limit is {execution_limit}, including program startup.

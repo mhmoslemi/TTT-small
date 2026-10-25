@@ -196,14 +196,15 @@ class Problem(ABC):
 ## Code-stage output
 
 Use the task information and strategy above to produce the complete solution.
-Treat the strategy as scientific guidance, not a mandatory implementation
-specification. Use its ideas where useful. You may correct, adapt, simplify,
-extend, or replace proposed components, including the representation,
-resolution, initialization, and optimization method, when justified by the
-task. The original task and evaluator remain authoritative.
+Treat the strategy as planning guidance: preserve useful ideas, but correct any
+mistake or conflict with the task, required interface, or current parent
+construction.
 Do not output analysis, reasoning, a strategy, notes, or example usage.
 Return only exactly one fenced Python code block, beginning with
-```python and ending with ```."""
+```python and ending with ```.
+Keep the complete source concise. Spend tokens on a working algorithm, not
+comments or embedded data. Finish `{self.entrypoint}`, return the required
+output, and close the single Python fence well before the generation limit."""
         if staged and staged[-1].get("role") == "user":
             staged[-1]["content"] = (
                 str(staged[-1].get("content", "")).rstrip()

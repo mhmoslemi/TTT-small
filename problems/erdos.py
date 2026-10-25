@@ -119,9 +119,7 @@ class ErdosMinOverlap(Problem):
 Erdos-specific implementation constraint: `initial_h_values`, when a current
 construction is available, is already supplied to the executed program as a
 NumPy array. Never plan to copy, serialize, reconstruct, or hard-code that
-array. Describe the construction and implementation in enough detail for the
-coder to produce a complete executable program. There is no prescribed source
-length or algorithmic complexity.
+array.
 
 Erdos mathematical checks for the final plan:
 - The authoritative objective is max(np.correlate(h, 1-h, mode="full")) *
@@ -155,10 +153,9 @@ Erdos mathematical checks for the final plan:
   Reference it directly; NEVER assign to it, paste its values, serialize it,
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
-- Return one complete, executable Python program implementing your chosen
-  approach. There is no prescribed source length or algorithmic complexity.
-  Allocate your response space so the entire program is finished and the final
-  Python fence is closed within the available generation limit.
+- Keep the complete source concise. Spend tokens on a working algorithm, not
+  comments or embedded data. Finish `run`, return the required tuple, and close
+  the single Python fence well before the generation limit.
 
 These are hard output constraints even if the proposed strategy suggests
 otherwise.''')
@@ -199,10 +196,9 @@ limit.
   Reference it directly; NEVER assign to it, paste its values, serialize it,
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
-- Return one complete, executable Python program implementing your chosen
-  approach. There is no prescribed source length or algorithmic complexity.
-  Allocate your response space so the entire program is finished and the final
-  Python fence is closed within the available generation limit.
+- Keep the complete source concise. Spend tokens on a working algorithm, not
+  comments or embedded data. Finish `run`, return the required tuple, and close
+  the single Python fence well before the generation limit.
 
 These are hard output constraints.'''
 

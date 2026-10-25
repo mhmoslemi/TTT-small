@@ -301,10 +301,10 @@ AC2 mathematical checks for the final plan:
   Reference it directly; NEVER assign a pasted copy of its values, serialize
   it, or reconstruct it as a literal. If no parent was announced, create a
   starting vector under a different name.
-- There is no prescribed source-line, character, or numeric-literal count.
-  Provide the complete program, including `{entrypoint}` and any helpers it
-  needs. Return a non-empty Python list of finite coefficients and finish the
-  single Python fence within the available response budget.
+- Keep the complete source concise. Spend tokens on a working algorithm, not
+  comments or embedded data. Finish `{entrypoint}` and any helpers it needs,
+  return a non-empty Python list of finite coefficients, and close the single
+  Python fence well before the generation limit.
 - Use the supplied `evaluate_sequence` for final acceptance. Preserve a valid
   best-so-far fallback and return it before the configured deadline.''')
 
@@ -370,8 +370,9 @@ Choose the mathematical approach, representation, sequence length,
 initialization, and optimization method that best serve the exact objective.
 The parent, seed programs, and literature are starting points, not limits on
 resolution or construction family. You may refine, coarsen, or replace an
-initialization and combine or replace suggested methods. There is no prescribed
-source length or numeric-literal count. The evaluator's coefficient cap of
+initialization and combine or replace suggested methods. Keep the complete
+source concise. Spend tokens on a working algorithm, not comments or embedded
+data. The evaluator's coefficient cap of
 1000 bounds individual values, not the number of coefficients.
 
 ## Budget & Resources

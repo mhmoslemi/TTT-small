@@ -59,13 +59,6 @@ State the central idea, why it could improve the supplied parent or solve the
 task, and the bottleneck it addresses. Choose a coherent primary approach.
 Identify its important limitations and distinguish justified facts from
 heuristics or hypotheses; do not claim untested improvements or optimality.
-Include this guidance in the plan itself so the coder receives it:
-"This plan is scientific guidance, not a binding specification. Use its ideas
-where useful. You may correct, adapt, simplify, extend, or replace proposed
-components when justified by the task. Suggested representations, resolutions,
-initializations, optimization methods, and parameters are defaults unless a
-necessary mathematical dependency is explained. The original task and
-evaluator remain authoritative."
 
 2. Mathematical specification
 Define the representation, variables, exact objective, constraints, and any
@@ -96,20 +89,19 @@ Instructions such as "optimize", "tune", "project to feasibility", "adjust the
 dimension", or "use a solver" must be expanded into concrete operations the
 coder can implement. Do not leave essential helper algorithms implicit. Use
 the allowed libraries and respect the task's actual execution resources.
+Describe compact algorithmic construction using operations, formulas, loops,
+interpolation, or seeded random generation.
 
 4. Search choices and useful variations
 Give a complete, coherent default configuration, with justified starting
 settings and practical ranges or explicit adaptation rules for consequential
 choices. Explain when each adjustment is triggered and how it is applied.
 Several programs will be sampled from this plan:
-suggest meaningful variations on the proposed approach
+identify a set of meaningful variations within the primary approach
 (for example initialization, representation, update schedule, or neighborhood)
-and when each is worth trying. These are examples, not an exhaustive list of
-what the coder may change. Mark suggested values as defaults unless a
-correctness condition requires them. Separate correctness requirements from
-choices the coder may vary. Do not force every program to execute every
-variation, or arbitrarily lock the search to one dimension or unexplained
-parameter value.
+and when each is worth trying. Separate correctness requirements from choices
+the coder may vary. Do not force every program to execute every variation, or
+arbitrarily lock the search to one dimension or unexplained parameter value.
 
 5. Compute budget and robustness
 Estimate the dominant time/memory costs for the proposed sizes and available
@@ -147,13 +139,12 @@ HANDOFF BOUNDARY: We extract ONLY the contents of your final <strategy> block
 and send them, together with the original task inputs, to a separate coder
 agent. The coder cannot see your thinking, analysis, earlier discussion, or
 anything else outside that block. Subsequent strategists also receive only
-your extracted plan. You provide scientifically grounded guidance; the coder
-retains independent mathematical and algorithmic judgment. Put every
-implementation-relevant conclusion, mathematical definition, design decision, and concrete
+your extracted plan. You are the domain expert and algorithm designer; the
+coder's role is to implement your specification. Put every implementation-
+relevant conclusion, mathematical definition, design decision, and concrete
 step in the block itself. Nothing is communicated merely because you worked
 it out earlier in your response. Never refer to unseen reasoning with phrases
-such as "as derived above". Explain your recommended choices and dependencies
-without treating them as requirements on all valid approaches.
+such as "as derived above" or leave essential choices for the coder to invent.
 
 After any reasoning, start your final answer with the literal opening tag
 <strategy> on its own line. Put the entire substantive implementation plan,
@@ -233,13 +224,6 @@ State the central idea, why it could improve the supplied parent or solve the
 task, and the bottleneck it addresses. Choose a coherent primary approach.
 Identify its important limitations and distinguish justified facts from
 heuristics or hypotheses; do not claim untested improvements or optimality.
-Include this guidance in the plan itself so the coder receives it:
-"This plan is scientific guidance, not a binding specification. Use its ideas
-where useful. You may correct, adapt, simplify, extend, or replace proposed
-components when justified by the task. Suggested representations, resolutions,
-initializations, optimization methods, and parameters are defaults unless a
-necessary mathematical dependency is explained. The original task and
-evaluator remain authoritative."
 
 2. Mathematical specification
 Define the proposed representation, variables, exact objective, constraints,
@@ -266,17 +250,17 @@ the parent, feasibility restoration, and comparison with the original objective.
 Provide enough detail to make the approach actionable while leaving routine
 code organization and reasonable adaptations to the coder. Respect the task's
 allowed libraries and actual execution resources.
+Describe compact algorithmic construction using operations, formulas, loops,
+interpolation, or seeded random generation.
 
 4. Search choices and useful variations
 Give a coherent recommended default with reasons for consequential choices.
-Several programs will be sampled from this plan. Suggest a small set of
-meaningful variations and explain what each could explore or improve. Mark
-suggested values and ranges as recommendations unless a correctness condition
-requires them. The variations are examples, not an exhaustive list of what
-the coder is allowed to change. Do not require every program to execute every
-variation. Do not arbitrarily fix the dimension, representation, initialization,
-or solver because the parent or an earlier strategy used it. Explain any
-method-specific dependency without forbidding other valid formulations.
+Several programs will be sampled from this plan:
+identify a set of meaningful variations within the primary approach
+(for example initialization, representation, update schedule, or neighborhood)
+and when each is worth trying. Separate correctness requirements from choices
+the coder may vary. Do not force every program to execute every variation, or
+arbitrarily lock the search to one dimension or unexplained parameter value.
 
 5. Numerical robustness and memory use
 Describe material memory requirements for the proposed approach and execution
@@ -300,10 +284,12 @@ include test suites, benchmark scripts, or follow-up experiments.
 
 Your ONLY deliverable is a valid JSON object with a single string field "plan".
 Requests in the task context to write a program describe the downstream
-coder's job. Put all six sections and the guidance preserving the coder's
-judgment inside the plan string. Include the essential technical details and
-justifications there; never refer to unseen analysis or earlier plans for
-missing information. Keep exploratory reasoning outside the final plan.
+coder's job. You are the domain expert and algorithm designer; the coder's
+role is to implement your specification. Put all six sections inside the plan
+string. Include the essential technical details and justifications there.
+Never refer to unseen reasoning with phrases such as "as derived above" or
+leave essential choices for the coder to invent. Never refer to earlier plans
+for missing information. Keep exploratory reasoning outside the final plan.
 Do not output Python source, code fences, XML strategy tags, additional JSON
 keys, or text outside the JSON object. Finish the complete plan and close the
 JSON object.'''
