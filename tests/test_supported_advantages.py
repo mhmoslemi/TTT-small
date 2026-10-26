@@ -178,15 +178,68 @@ def test_qwen38_medium_pilots_and_phase2_with_saved_low():
     assert training._coder_effort_for_rollout_phase(cfg, "adaptive") == "low"
 
 
+def test_qwen38_phase2_effort_counts_and_exact_prompt_retries():
+    from output_retries import coder_retry_prompt_job
+
+    cfg = SimpleNamespace(
+        coder_template_kind="qwen3.8", coder_reasoning_effort="low",
+        phase2_low_programs_per_strategy=2,
+        phase2_medium_programs_per_strategy=-1,
+        phase2_xhigh_programs_per_strategy=1)
+    entries = training._coder_effort_entries(
+        [], [0, 1, 2], [7, 2, 0], cfg, 7, "adaptive")
+    assert entries == [(0, 1, "xhigh"), (1, 1, "xhigh"),
+                       (0, 4, "medium"), (0, 2, "low"), (1, 1, "low")]
+    jobs = [dict(messages=[], prompt_text="low", coder_reasoning_effort="low")]
+    cache = {}
+    retry_cache = {}
+    render = lambda messages, **options: options["reasoning_effort"]
+    for effort in ("low", "medium", "xhigh"):
+        index = training._phase_coder_prompt_job(
+            jobs, 0, "adaptive", cfg, render, cache, effort=effort)
+        assert jobs[index]["prompt_text"] == effort
+        assert jobs[index]["coder_reasoning_effort"] == effort
+        retry = coder_retry_prompt_job(
+            jobs, dict(job_idx=index, strategy_rollout_phase="adaptive"),
+            render, retry_cache, reasoning_effort=effort)
+        assert jobs[retry]["prompt_text"] == effort
+        assert jobs[retry]["coder_reasoning_effort"] == effort
+    assert jobs[0]["prompt_text"] == "low"
+    cfg.coder_template_kind = "gpt-oss"
+    assert training._coder_effort_entries(
+        [], [0], [7], cfg, 7, "adaptive") == [(0, 7, "low")]
+
+
+def test_qwen38_phase2_remainders_and_small_allocations():
+    for requested, count, expected in [
+        ((-1, 2, 1), 8, [(0, 1, "xhigh"), (0, 2, "medium"), (0, 5, "low")]),
+        ((1, 2, -1), 8, [(0, 5, "xhigh"), (0, 2, "medium"), (0, 1, "low")]),
+        ((4, 3, 2), 1, [(0, 1, "xhigh")]),
+        ((2, 1, 1), 7, [(0, 1, "xhigh"), (0, 1, "medium"), (0, 5, "low")]),
+        ((0, -1, 0), 0, []),
+    ]:
+        cfg = SimpleNamespace(coder_template_kind="qwen3.8", coder_reasoning_effort="low")
+        for effort, value in zip(("low", "medium", "xhigh"), requested):
+            setattr(cfg, f"phase2_{effort}_programs_per_strategy", value)
+        entries = training._coder_effort_entries([], [0], [count], cfg, 7, "adaptive")
+        assert entries == expected
+        assert sum(entry[1] for entry in entries) == count
+
+
 def test_resume_uses_current_yaml_pilot_effort_counts(load_config, tmp_path):
     options = ("--strategies", "--coder-model-name", "Qwen/Qwen3.8-27B")
     _, saved = load_config(extra=options)
     saved.pop("pilot_medium_programs_per_strategy", None)
     saved.update(coder_reasoning_effort="low", pilot_xhigh_programs_per_strategy=2)
+    saved.update(phase2_low_programs_per_strategy=-1,
+                 phase2_medium_programs_per_strategy=0,
+                 phase2_xhigh_programs_per_strategy=2)
     (tmp_path / "config.json").write_text(json.dumps(saved))
     resumed, _ = load_config(extra=(*options, "--resume", str(tmp_path)))
     current = yaml.safe_load((ROOT / "configs/erdos.yaml").read_text())
-    for key in ("pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy"):
+    for key in ("pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy",
+                "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
+                "phase2_xhigh_programs_per_strategy"):
         assert getattr(resumed, key) == current[key]
     assert training._coder_effort_for_rollout_phase(resumed, "adaptive") == "medium"
 
@@ -197,6 +250,19 @@ def test_pilot_effort_counts_reject_invalid_or_excess_budget():
         invalid = dict(values, pilot_medium_programs_per_strategy=count)
         with pytest.raises(ValueError, match="pilot.*(medium|xhigh)"):
             validate_problem_config(invalid)
+
+
+def test_phase2_effort_counts_reject_invalid_values():
+    for effort in ("low", "medium", "xhigh"):
+        for count in (-2, True, 1.5):
+            with pytest.raises(ValueError, match="phase2"):
+                validate_problem_config(
+                    {"problem": "erdos", f"phase2_{effort}_programs_per_strategy": count},
+                    require_complete=False)
+    with pytest.raises(ValueError, match="only one phase2"):
+        validate_problem_config(
+            {"problem": "erdos", "phase2_low_programs_per_strategy": -1,
+             "phase2_medium_programs_per_strategy": -1}, require_complete=False)
 
 
 def test_resume_migrates_retained_controls_and_drops_unused_options():

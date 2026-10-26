@@ -44,16 +44,7 @@ def propose_candidate(seed=42, budget_s={num_seconds}, **kwargs):
 AC1_LITERATURE = r"""A previous state of the art used the following approach. You can use it as inspiration, but you are not required to use it, and you are encouraged to explore.
 ```latex
 Starting from a nonnegative step function $f=(a_0,\dots,a_{n-1})$ normalized so that $\sum_j a_j=\sqrt{2n}$, set $M=\|f*f\|_\infty$. Next compute $g_0=(b_0,\dots,b_{n-1})$ by solving a linear program, i.e.\ maximizing $\sum_j b_j$ subject to $b_j\ge0$ and $\|f*g_0\|_\infty\le M$; as is standard, the optimum is attained at an extreme point determined by an active set of binding inequalities, here corresponding to important constraints where the convolution bound $(f*g_0)(x)\le M$ is tight and limiting. Rescale $g_0$ to match the normalization, $g=\frac{\sqrt{2n}}{\sum_j b_j}g_0$, and update $f\leftarrow (1-t)f+t g$ for a small $t>0$. Repeating this step produces a sequence with nonincreasing $\|f*f\|_\infty$, and the iteration is continued until it stabilizes.
-```
-
-Choose an implementation for the actual sequence length and available
-resources. Dense convolution operators have quadratic storage; account for
-temporary arrays and the solver's workspace and factorization costs as well.
-Dense formulations may fit small subproblems. At larger sizes, consider
-structured or matrix-free methods, sparse formulations where genuinely
-applicable, reduced subproblems, or a different search method. The literature
-does not prescribe the resolution or algorithm you must use.
-"""
+```"""
 
 
 AC1_EVAL_FUNCTION = '''```python

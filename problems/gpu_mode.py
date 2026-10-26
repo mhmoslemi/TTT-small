@@ -28,8 +28,7 @@ import multiprocessing as mp
 import os
 import sys
 from typing import Any, Dict, List, Optional
-from problems.base import (CODER_EXECUTION_CONTRACT,
-                           Problem, ParentContext, RewardResult, SeedState,
+from problems.base import (Problem, ParentContext, RewardResult, SeedState,
                            render_state_context)
 
 from examples.gpu_mode.prompt import (
@@ -406,7 +405,6 @@ Rules:
 {state_ctx}
 {MLA_DECODE_PROMPT_END}
 """
-        user += "\n" + CODER_EXECUTION_CONTRACT + "\n"
         return [{"role": "user", "content": user}]
 
     def preprocess(self, code: str, parent: ParentContext) -> str:

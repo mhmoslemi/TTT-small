@@ -147,15 +147,20 @@ Erdos mathematical checks for the final plan:
                             strategy: str) -> List[dict]:
         staged = super().build_code_messages(messages, strategy)
         return self._append_user_instruction(staged, '''
-## Complete-program contract
+## Mandatory compact-source contract
 
 - `initial_h_values` is runtime input when a parent construction exists.
   Reference it directly; NEVER assign to it, paste its values, serialize it,
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
-- Keep the complete source concise. Spend tokens on a working algorithm, not
-  comments or embedded data. Finish `run`, return the required tuple, and close
-  the single Python fence well before the generation limit.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 64 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- No need for commnets or embedded
+  data in the code. Finish `run`, return the required tuple, and close the single Python
+  fence.
+
 
 These are hard output constraints even if the proposed strategy suggests
 otherwise.''')
@@ -190,15 +195,19 @@ analysis, prose, notes, example usage, a second code block, or a partial
 snippet. Finish the program and close the fence well before the response-token
 limit.
 
-## Complete-program contract
+## Mandatory compact-source contract
 
 - `initial_h_values` is runtime input when a parent construction exists.
   Reference it directly; NEVER assign to it, paste its values, serialize it,
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
-- Keep the complete source concise. Spend tokens on a working algorithm, not
-  comments or embedded data. Finish `run`, return the required tuple, and close
-  the single Python fence well before the generation limit.
+- Do not emit any long numeric literal, lookup table, repeated-value list, or
+  unrolled pattern. A list/tuple/array literal may contain at most 64 scalar
+  values. Build every larger vector algorithmically with NumPy, a compact
+  formula, interpolation, tiling, or a loop.
+- No need for commnets or embedded
+  data in the code. Finish `run`, return the required tuple, and close the single Python
+  fence.
 
 These are hard output constraints.'''
 
@@ -222,7 +231,6 @@ With dx = 2.0 / n_points:
 
 The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
 
-Choose n_points freely to minimize the exact task objective. There is no preferred sample count, and the supplied parent’s resolution does not constrain your choice. Choose the resolution and optimization approach jointly, accounting for the actual execution resources. Judge candidates by their exact objective values, not by their size.
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
@@ -240,7 +248,8 @@ Choose n_points freely to minimize the exact task objective. There is no preferr
 - No filesystem or network IO
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
 - When `initial_h_values` is available, use it directly. Never redefine it or
-  copy its entries into the response.
+  copy its entries into the response. Construct all large arrays
+  algorithmically; do not print long numeric literals or unrolled tables
 - Your function must complete within budget_s seconds and return the best solution found
 - The extracted block must define `run` at top level. The harness prepends the
   pre-imported helpers and optional parent construction before execution; do

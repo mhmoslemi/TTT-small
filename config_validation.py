@@ -47,6 +47,8 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "training_layout",
     "phase2_allocation_method",
     "pilot_medium_programs_per_strategy",
+    "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
+    "phase2_xhigh_programs_per_strategy",
     "min_p", "strategy_min_p",
     "strategy_vllm_persistent_workers",
     "api_strategy", "strategy_backend", "strategy_api_base_url", "strategy_api_key_env",
@@ -261,6 +263,18 @@ def validate_problem_config(
             raise ValueError(
                 f"{_label(source)}: pilot medium + xhigh counts cannot exceed "
                 "pilot_programs_per_strategy")
+    phase2_remainders = 0
+    for effort in ("low", "medium", "xhigh"):
+        key = f"phase2_{effort}_programs_per_strategy"
+        count = data.get(key, -1 if effort == "medium" else 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < -1:
+            raise ValueError(
+                f"{_label(source)}: {key} must be a non-negative integer "
+                "or -1 for the remaining phase-2 allocation")
+        phase2_remainders += count == -1
+    if phase2_remainders > 1:
+        raise ValueError(
+            f"{_label(source)}: only one phase2 effort count may be -1")
     if "phase2_allocation_method" in data:
         allocation_method = str(data["phase2_allocation_method"]).strip().lower()
         if allocation_method not in {"rule_based", "bandit", "hurdle"}:

@@ -887,7 +887,7 @@ def _resolve_coder_token_limits(merged):
 
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
-    """Keep Qwen3.8 phase 2 at medium, independent of saved pilot defaults."""
+    """Keep the legacy phase-2 fallback; explicit splits use prompt variants."""
     if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
             and phase == "adaptive"):
         return "medium"
@@ -896,11 +896,11 @@ def _coder_effort_for_rollout_phase(cfg, phase=None):
 
 def _coder_effort_entries(
         prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
-    """Route Qwen3.8 pilots through the configured medium/xhigh counts.
+    """Route Qwen3.8 rollouts through the configured per-strategy counts.
 
     The split changes only the chat-template reasoning control. Every source
     keeps exactly its requested sample count, allocation identity, and pilot
-    status. Unassigned pilots retain the base effort; other models are unchanged.
+    status. Unassigned rollouts retain the base effort; other models are unchanged.
     """
     del prompt_jobs, step_idx
     base_effort = _coder_effort_for_rollout_phase(cfg, phase)
@@ -909,6 +909,33 @@ def _coder_effort_entries(
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
+    if (phase == "adaptive"
+            and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
+        requested = {
+            effort: int(getattr(cfg, f"phase2_{effort}_programs_per_strategy", default))
+            for effort, default in (("xhigh", 0), ("medium", -1), ("low", 0))
+        }
+        remainder_effort = next(
+            (effort for effort, count in requested.items() if count == -1),
+            _coder_effort_for_rollout_phase(cfg))
+        grouped = {effort: [] for effort in requested}
+        for source_idx, count, _effort in entries:
+            remaining = count
+            split = {}
+            # Match pilot priority when a strategy receives fewer than requested.
+            for effort, wanted in requested.items():
+                if wanted < 0:
+                    continue
+                allocated = min(wanted, remaining)
+                split[effort] = allocated
+                remaining -= allocated
+            if remaining:
+                split[remainder_effort] = split.get(remainder_effort, 0) + remaining
+            for effort, allocated in split.items():
+                if allocated:
+                    grouped.setdefault(effort, []).append(
+                        (source_idx, allocated, effort))
+        return [entry for group in grouped.values() for entry in group]
     xhigh_per_strategy = int(getattr(
         cfg, "pilot_xhigh_programs_per_strategy", 0))
     medium_per_strategy = int(getattr(
@@ -2244,10 +2271,13 @@ def load_config():
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
-        # Pilot effort counts are operator-controlled for future generations,
+        # Effort counts are operator-controlled for future generations,
         # including resumes; saved prompts and training artifacts stay intact.
         for key in ("pilot_medium_programs_per_strategy",
-                    "pilot_xhigh_programs_per_strategy"):
+                    "pilot_xhigh_programs_per_strategy",
+                    "phase2_low_programs_per_strategy",
+                    "phase2_medium_programs_per_strategy",
+                    "phase2_xhigh_programs_per_strategy"):
             if key in ydict:
                 merged[key] = ydict[key]
         # A run saved before adaptive pilots existed must resume its original
@@ -13211,10 +13241,17 @@ def main():
                 [], [0], [pilot_count], cfg, 0, "pilot")
             pilot_description = " + ".join(
                 f"{count} {effort}" for _, count, effort in pilot_efforts)
+            phase2_description = ", ".join(
+                f"{effort}={('remaining' if count == -1 else count)}"
+                for effort in ("low", "medium", "xhigh")
+                for count in [getattr(
+                    cfg, f"phase2_{effort}_programs_per_strategy",
+                    -1 if effort == "medium" else 0)])
             print(
                 "Coder reasoning:    pilot/strategy="
                 f"{pilot_description}; "
-                f"phase 2={_coder_effort_for_rollout_phase(cfg, 'adaptive')}")
+                f"phase 2/strategy: {phase2_description}; "
+                f"unassigned={base_effort}")
         else:
             print(f"Coder reasoning:    all rollout phases={base_effort}")
     else:

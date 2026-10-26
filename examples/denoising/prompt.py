@@ -38,11 +38,16 @@ Your output is evaluated using these exact functions:
 
 **Reward = MSE score only** (after passing Poisson constraint).
 
+## Budget & Resources
+
+- **Time budget**: 400s for your code to run. You should time your code and make sure it runs within the time budget.
+- **CPUs**: 2 available
+
 ## Function Signature to return
 
 ```python
 def magic_denoise(X, **kwargs):
-    # kwargs may include: random_state, knn, t, n_pca, solver, decay, knn_max, n_jobs
+    # kwargs may include: budget_s, random_state, knn, t, n_pca, solver, decay, knn_max, n_jobs
     # You can add your own parameters too
     # Your implementation
     return denoised_X  # same shape as X

@@ -316,6 +316,15 @@ def test_local_xml_contract_is_unchanged():
     assert normalize_strategy_plan(raw) == raw
 
 
+def test_local_strategy_prompt_matches_0544_exactly():
+    from hashlib import sha256
+    from strategy_prompts import LOCAL_STRATEGY_PROMPT
+
+    # Exact historical template, including its history placeholder and output contract.
+    assert sha256(LOCAL_STRATEGY_PROMPT.encode()).hexdigest() == (
+        "8f99ac584ba5ae04ff5e6455a975e891d90bb807d97a4b49eb3d3e3c3a95c1d7")
+
+
 @pytest.mark.parametrize("problem", ["erdos", "ac1", "ac2"])
 def test_openai_prompt_preserves_problem_specific_requirements(problem):
     from problems.erdos import ErdosMinOverlap
