@@ -34,6 +34,15 @@ from pathlib import Path
 _ROLLOUT_TOKEN_MAGIC = b"TTTtok1\0"
 _ROLLOUT_LOGPROB_MAGIC = b"TTTlp1\0\0"
 
+ROLLOUT_CONFIG_KEYS = (
+    "groups_per_step", "group_size", "strategies_per_parent",
+    "programs_per_strategy", "pilot_programs_per_strategy",
+    "pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy",
+    "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
+    "phase2_xhigh_programs_per_strategy",
+)
+ROLLOUT_BUDGET_KEYS = ROLLOUT_CONFIG_KEYS[:5]
+
 
 def save_rollout_token_ids(path, token_ids):
     """Atomically persist exact generated IDs in a compact portable format."""
@@ -231,6 +240,69 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
     return path
 
 
+def restart_changed_rollout_step(cfg, exp_dir, step):
+    """Move an unfinished step aside before regenerating with a new budget."""
+    import tempfile
+
+    run = Path(exp_dir)
+    directory = run / f"step{step:02d}"
+    parents_path = directory / f"step{step:02d}.parents.json"
+    request_path = directory / f"step{step:02d}.sampler.request.json"
+    if ((directory / f"step{step:02d}.summary.json").is_file()
+            or not (parents_path.is_file() or request_path.is_file())):
+        return None
+    if parents_path.is_file():
+        event = json.loads(parents_path.read_text())
+        saved = event.get("rollout_config")
+    else:
+        saved = None
+    if saved is None:
+        saved = json.loads((run / "config.json").read_text())
+    values = {key: int(saved[key]) for key in ROLLOUT_BUDGET_KEYS if key in saved}
+    values.setdefault("pilot_programs_per_strategy", -1)
+    if request_path.is_file():
+        values["groups_per_step"] = int(
+            json.loads(request_path.read_text())["num_parents"])
+    if all(getattr(cfg, key, None) == value for key, value in values.items()):
+        return None
+
+    # Partial gradients and a prefetched next-step decision belong to the
+    # discarded trajectories, not to the last completed policy checkpoint.
+    sidecars = [run / f".exact_spo_rs_overflow_step{step:04d}.pt"]
+    marker = run / ".exact_sharded_recovery.json"
+    if marker.is_file():
+        recovery = json.loads(marker.read_text())
+        if int(recovery["step"]) == step:
+            sidecars.insert(0, marker)
+            filename = recovery.get("overflow_gradient_file")
+            if filename:
+                if Path(filename).name != filename:
+                    raise ValueError("invalid overflow gradient filename")
+                sidecars.append(run / filename)
+    next_directory = run / f"step{step + 1:02d}"
+    next_request = next_directory / f"step{step + 1:02d}.sampler.request.json"
+    move_prefetch = (
+        next_request.is_file()
+        and not (next_directory / f"step{step + 1:02d}.parents.json").exists()
+        and not (next_directory / f"step{step + 1:02d}.summary.json").exists()
+        and not any(next_directory.glob(f"step{step + 1:02d}_group*")))
+    backup_root = run / "_restarted_steps"
+    backup_root.mkdir(exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=f"step{step:02d}_", dir=backup_root))
+    # Move the directory last so an interruption during these moves remains
+    # recognizable on the next resume. No checkpoint/adapter is changed.
+    for path in dict.fromkeys(sidecars):
+        if path.is_file():
+            path.rename(backup / path.name)
+    if move_prefetch:
+        next_directory.rename(backup / next_directory.name)
+    directory.rename(backup / directory.name)
+    print(f"[resume] rollout counts changed: restarting step {step} with "
+          f"{cfg.groups_per_step} parents x {cfg.group_size} rollouts; "
+          f"previous step artifacts moved to {backup}", flush=True)
+    return backup
+
+
 def save_rollout(
     exp_dir: Path,
     step: int,
@@ -352,7 +424,7 @@ def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
 
 
 def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
-                           parents: list, picks_info: list):
+                           parents: list, picks_info: list, *, rollout_config=None):
     """Persist the exact parents selected for a step before generation/training.
 
     The sampler checkpoint only contains nodes that survived archive pruning.
@@ -392,6 +464,11 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
         "sampler_type": str(sampler_type),
         "parents": selected,
     }
+    if rollout_config is not None:
+        payload["rollout_config"] = {
+            key: int(getattr(rollout_config, key)) for key in ROLLOUT_CONFIG_KEYS
+            if hasattr(rollout_config, key)
+        }
     path = step_dir / f"step{step:02d}.parents.json"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2))

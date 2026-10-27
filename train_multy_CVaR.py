@@ -1,6 +1,6 @@
 """TTT-Discover multi-problem runner with entropic and SPO-RS training.
 
-Configuration: self-contained problem YAML < resumed config < CLI flags.
+Configuration: saved run settings, current YAML rollout counts, then CLI flags.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
 """
@@ -2271,18 +2271,16 @@ def load_config():
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
-        # Effort counts are operator-controlled for future generations,
-        # including resumes; saved prompts and training artifacts stay intact.
-        for key in ("pilot_medium_programs_per_strategy",
-                    "pilot_xhigh_programs_per_strategy",
-                    "phase2_low_programs_per_strategy",
-                    "phase2_medium_programs_per_strategy",
-                    "phase2_xhigh_programs_per_strategy"):
+        # A changed rollout budget restarts the unfinished step; saved
+        # policy/optimizer/search state still comes from the last checkpoint.
+        from experiment_io import ROLLOUT_CONFIG_KEYS
+        for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
-        # A run saved before adaptive pilots existed must resume its original
-        # one-pass rollout schedule even if today's YAML enables pilots.
-        if "pilot_programs_per_strategy" not in saved:
+        # Preserve legacy one-pass generation only when neither source
+        # specifies a pilot budget.
+        if ("pilot_programs_per_strategy" not in saved
+                and "pilot_programs_per_strategy" not in ydict):
             merged["pilot_programs_per_strategy"] = -1
         # Runs created before selectable phase-2 allocation used the original
         # median-quadrant rule.  Do not silently switch a resumed run to a new
@@ -2297,8 +2295,9 @@ def load_config():
         # Introducing an API-enabled preset must not switch an older resumed
         # run to a paid service. An explicit CLI selector can still opt in.
         merged["api_strategy"] = saved.get("api_strategy", "")
-        print(f"[config] resuming original configuration from "
-              f"{resume_dir / 'config.json'}")
+        print(f"[config] resuming saved configuration from "
+              f"{resume_dir / 'config.json'}; current YAML rollout counts "
+              "override saved counts")
 
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
@@ -8245,14 +8244,15 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
     return target
 
 
-def _load_training_checkpoint(exp_dir):
+def _load_training_checkpoint(exp_dir, *, mmap=False):
     import torch
 
     path = Path(exp_dir) / "training_state.pt"
     if not path.is_file():
         return None
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = torch.load(path, map_location="cpu", weights_only=False,
+                             **({"mmap": True} if mmap else {}))
     except TypeError:
         payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
@@ -9724,7 +9724,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
                     else type(sampler).__name__)
     save_parent_selections(
-        exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info)
+        exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info,
+        rollout_config=cfg)
     setting_log_only(
         f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
         f"generation/training", flush=True)
@@ -13013,9 +13014,26 @@ def main():
 
         # Save the reusable base configuration before runtime-only adjustments.
         from experiment_io import (append_step_result, make_experiment_dir,
+                                   restart_changed_rollout_step,
                                    save_best_state_snapshot,
                                    save_final_summary, save_step_summary)
         resume_dir = merged.pop("_resume_dir", None)
+        if resume_dir:
+            # Read only the cursor via memory-mapped CPU storage before model
+            # loading, so stale overflow recovery cannot consume a new batch.
+            checkpoint = _load_training_checkpoint(resume_dir, mmap=True)
+            if checkpoint is not None:
+                restart_step = int(checkpoint["next_step"])
+            else:
+                try:
+                    restart_step, _ = _legacy_resume_info(resume_dir)
+                except FileNotFoundError:
+                    restart_step = 0
+            del checkpoint
+            if restart_changed_rollout_step(cfg, resume_dir, restart_step):
+                # Re-resolve layout without the old step's overflow marker.
+                cfg, merged = load_config()
+                merged.pop("_resume_dir", None)
         exp_dir = make_experiment_dir(
             cfg, resume_dir=resume_dir, config_dict=merged
         )
