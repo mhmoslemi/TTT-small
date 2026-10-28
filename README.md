@@ -4,14 +4,14 @@
 
 | Directory | Purpose |
 |---|---|
-| `models/` | Model loading, strategist profiles and model-specific training kernels. |
-| `training/` | RL objectives, parallel training and exact long-rollout handling. |
+| `models/` | Model loading, coder/strategist profiles and model-specific training kernels. |
+| `training/` | RL objectives, trainers, parallel workers and exact long-rollout recovery. |
 | `generation/` | Rollout workers, strategist prompts, API generation and output retries. |
 | `search/` | Parent selection, candidate archives and rollout-budget allocation. |
 | `evaluation/` | Python-code extraction and timed subprocess execution. |
 | `problems/` | Problem definitions, task prompts, seed constructions and scoring rules. |
-| `runtime/` | GPU placement, memory budgets and host-RAM management. |
-| `diagnostics/` | Startup displays, loading output and terminal/log routing. |
+| `runtime/` | CLI/YAML/resume configuration, GPU placement and memory management. |
+| `diagnostics/` | Startup displays, loading output and timestamped terminal/log routing. |
 | `analysis/` | Entropy measurements, solution plots, progress curves and search trees. |
 | `configs/` | Problem-specific YAML settings. |
 | `tests/` | Regression and integration tests. |

@@ -174,7 +174,7 @@ class StrategistModelsTests(unittest.TestCase):
         self.assertEqual(events, ["offload", "reserve", "load", "release"])
 
     def test_profile_does_not_override_yaml_sampling_or_token_limits(self):
-        source = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+        source = ast.parse((ROOT / "models/coder_profiles.py").read_text())
         method = next(n for n in source.body if isinstance(n, ast.FunctionDef)
                       and n.name == "_apply_strategy_model_profile")
         scope = dict(strategist_profile=models.strategist_profile,
@@ -193,7 +193,7 @@ class StrategistModelsTests(unittest.TestCase):
             self.assertEqual(cfg, before)
 
     def test_legacy_thinking_profile_keeps_unfiltered_sampling(self):
-        source = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+        source = ast.parse((ROOT / "models/coder_profiles.py").read_text())
         methods = [n for n in source.body if isinstance(n, ast.FunctionDef)
                    and n.name in {"_profile_default", "_apply_qwen3_8b_thinking_sampling"}]
         scope = dict(_is_qwen3_8b_sampling_model=lambda name: name == "Qwen/Qwen3-8B")

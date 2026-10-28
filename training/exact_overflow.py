@@ -9,6 +9,13 @@ the coordinator's responsibility.
 
 from contextlib import contextmanager
 import gc
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import time
 
 
 METRICS = ("loss", "policy_loss", "kl_estimate", "entropy_estimate",
@@ -188,7 +195,7 @@ def temporary_gpu_shards(backend, gpu_ids):
 def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
     """One unchanged trajectory loss; leave its gradients on the parked model."""
     import torch
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.fast_distributed import set_long_rollout_memory_ceiling
 
     model = backend.model
@@ -311,7 +318,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
     """Finish the missing gradients inside the existing job and update once."""
     import time
     import torch
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.fast_distributed import broadcast_trainable_parameters
 
     if state is None:
@@ -474,3 +481,508 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
         trainer._workers_idle = False
         trainer._abort_workers()
         raise
+
+
+_EXACT_SHARDED_RECOVERY_FILE = ".exact_sharded_recovery.json"
+_EXACT_OVERFLOW_GRADIENT_FILE = ".exact_spo_rs_overflow_step{step:04d}.pt"
+
+
+class ExactLongContextTrainingOOM(RuntimeError):
+    """One exact trajectory needs the automatic multi-GPU training path."""
+
+
+def _exact_sharded_recovery_path(run_dir):
+    return Path(run_dir) / _EXACT_SHARDED_RECOVERY_FILE
+
+
+def _read_exact_sharded_recovery(run_dir):
+    if run_dir is None:
+        return None
+    path = _exact_sharded_recovery_path(run_dir)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        step = int(payload["step"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid exact long-context recovery marker: {path}") from error
+    if step < 0:
+        raise RuntimeError(f"invalid exact long-context recovery step {step}: {path}")
+    return {**payload, "step": step, "path": str(path)}
+
+
+def _infer_exact_sharded_recovery(run_dir):
+    """Recognize a pre-fix exact-OOM crash without repeating its failed pass."""
+    if run_dir is None:
+        return None
+    log_path = Path(run_dir) / "temirnal.log"
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 4 * 1024 * 1024), os.SEEK_SET)
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    failure_offset = tail.rfind("exact long-context training failed for a ")
+    if failure_offset < 0:
+        return None
+    steps = re.findall(r"\[step (\d+)\]", tail[:failure_offset])
+    if not steps:
+        return None
+    step = int(steps[-1])
+    step_dir = Path(run_dir) / f"step{step:02d}"
+    summary = step_dir / f"step{step:02d}.summary.json"
+    rollout_pattern = f"step{step:02d}_group*_rollout*.meta.json"
+    if summary.is_file() or not any(step_dir.glob(rollout_pattern)):
+        return None
+    token_match = re.search(r"exact long-context training failed for a (\d+)-token rollout", tail[failure_offset:])
+    reason = "inferred from the previous exact single-GPU OOM"
+    if token_match is not None:
+        reason += f" ({int(token_match.group(1))}-token rollout)"
+    return {
+        "version": 1,
+        "step": step,
+        "reason": reason,
+    }
+
+
+def _write_exact_sharded_recovery(run_dir, step, error, **extra):
+    path = _exact_sharded_recovery_path(run_dir)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = {}
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if int(existing.get("step", -1)) == int(step):
+                payload.update(existing)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    payload.update({
+        "version": 2,
+        "step": int(step),
+        "reason": str(error),
+        "created_at": time.time(),
+    })
+    payload.update(extra)
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+def _clear_exact_sharded_recovery(run_dir):
+    path = _exact_sharded_recovery_path(run_dir)
+    overflow_path = None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        filename = payload.get("overflow_gradient_file")
+        if filename and Path(str(filename)).name == str(filename):
+            overflow_path = Path(run_dir) / str(filename)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    if overflow_path is not None:
+        try:
+            overflow_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_train_seconds=0.0):
+    """Durably retain completed replica gradients for selective recovery."""
+    import torch
+    from training.fast_distributed import trainable_parameter_signature
+
+    deferred_keys = sorted({
+        (int(key[0]), int(key[1]))
+        for stats in rank_stats
+        for key in stats.get("deferred_keys", ())
+    })
+    deferred_count = sum(int(stats.get("deferred_examples", 0)) for stats in rank_stats)
+    if deferred_count != len(deferred_keys) or not deferred_keys:
+        raise RuntimeError(
+            "exact SPO-RS overflow keys are missing or duplicated: "
+            f"count={deferred_count}, unique={len(deferred_keys)}")
+
+    metric_keys = (
+        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+        "ratio", "clipped_fraction",
+    )
+    normal_stats = {
+        "totals": {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in metric_keys},
+        "max_ratio": max(float(stats["max_ratio"]) for stats in rank_stats),
+        "max_prefix_ratio": max(float(stats["max_prefix_ratio"]) for stats in rank_stats),
+        "entropy_examples": sum(int(stats["entropy_examples"]) for stats in rank_stats),
+        "trained_examples": sum(int(stats["trained_examples"]) for stats in rank_stats),
+        "backward_batches": sum(int(stats["backward_batches"]) for stats in rank_stats),
+        "training_seconds": max(0.0, float(normal_train_seconds)),
+    }
+    gradients = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        gradient = parameter.grad
+        if gradient is None:
+            gradient = torch.zeros_like(parameter)
+        gradients[name] = gradient.detach().cpu().clone()
+
+    filename = _EXACT_OVERFLOW_GRADIENT_FILE.format(step=int(step))
+    destination = Path(run_dir) / filename
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    payload = {
+        "version": 2,
+        "step": int(step),
+        "parameter_signature": trainable_parameter_signature(model),
+        "deferred_keys": deferred_keys,
+        "remaining_keys": deferred_keys,
+        "completed_keys": [],
+        # These keys need cooperative GPU memory: the legacy CPU fallback
+        # failed, or the warm path deliberately bypassed it. Do not replay
+        # a huge CPU activation graph when resuming this residual tail.
+        "replica_offload_exhausted": True,
+        "replica_checkpoint_groups_attempted": any(
+            hasattr(module, "_ttt_group_checkpoint_min_tokens")
+            for module in model.modules()),
+        "normal_stats": normal_stats,
+        "overflow_stats": {
+            "totals": {key: 0.0 for key in metric_keys},
+            "max_ratio": 0.0,
+            "max_prefix_ratio": 0.0,
+            "entropy_examples": 0,
+            "trained_examples": 0,
+            "backward_batches": 0,
+            "training_seconds": 0.0,
+        },
+        "gradients": gradients,
+    }
+    with temporary.open("wb") as handle:
+        torch.save(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(destination)
+    del gradients, payload
+    marker = _write_exact_sharded_recovery(
+        run_dir, step,
+        f"{deferred_count} exact trajectory/trajectories require the "
+        "multi-GPU overflow lane",
+        overflow_gradient_file=filename,
+        deferred_keys=[list(key) for key in deferred_keys],
+        normal_trained_examples=int(normal_stats["trained_examples"]),
+        replica_offload_exhausted=True,
+        replica_checkpoint_groups_attempted=any(
+            hasattr(module, "_ttt_group_checkpoint_min_tokens")
+            for module in model.modules()),
+    )
+    return destination, marker, deferred_keys, normal_stats
+
+
+def _load_exact_spo_rs_overflow(run_dir, step):
+    """Load and validate a selectively deferred exact SPO-RS update."""
+    import torch
+
+    marker = _read_exact_sharded_recovery(run_dir)
+    if marker is None or int(marker["step"]) != int(step):
+        return None
+    filename = marker.get("overflow_gradient_file")
+    if not filename:
+        return None
+    filename = str(filename)
+    if Path(filename).name != filename:
+        raise RuntimeError('invalid exact SPO-RS overflow gradient filename in recovery marker')
+    path = Path(run_dir) / filename
+    if not path.is_file():
+        print(
+            f"[warn] exact SPO-RS overflow gradients are missing ({path}); "
+            "falling back to the complete exact model-sharded update",
+            flush=True,
+        )
+        return None
+    try:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+    except Exception as error:
+        print(
+            f"[warn] exact SPO-RS overflow gradients could not be loaded "
+            f"({error}); falling back to the complete exact model-sharded "
+            "update",
+            flush=True,
+        )
+        return None
+    if (not isinstance(payload, dict)
+            or int(payload.get("version", -1)) not in (1, 2)
+            or int(payload.get("step", -1)) != int(step)):
+        print(
+            f"[warn] invalid exact SPO-RS overflow gradient checkpoint "
+            f"({path}); falling back to the complete exact model-sharded "
+            "update",
+            flush=True,
+        )
+        return None
+    deferred_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("deferred_keys", ())})
+    if not deferred_keys:
+        print(
+            f"[warn] exact SPO-RS overflow checkpoint has no deferred keys "
+            f"({path}); falling back to the complete exact model-sharded "
+            "update",
+            flush=True,
+        )
+        return None
+    if int(payload.get("version", 1)) == 1:
+        payload["version"] = 2
+        payload["remaining_keys"] = list(deferred_keys)
+        payload["completed_keys"] = []
+    remaining_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("remaining_keys", deferred_keys)})
+    completed_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("completed_keys", ())})
+    if (set(remaining_keys) & set(completed_keys) or set(remaining_keys) | set(completed_keys) != set(deferred_keys)):
+        print(
+            f"[warn] exact SPO-RS overflow progress keys are inconsistent "
+            f"({path}); falling back to the complete exact model-sharded "
+            "update",
+            flush=True,
+        )
+        return None
+    metric_keys = (
+        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+        "ratio", "clipped_fraction",
+    )
+    overflow_stats = payload.get("overflow_stats")
+    if not isinstance(overflow_stats, dict):
+        overflow_stats = {}
+    overflow_totals = overflow_stats.get("totals")
+    if not isinstance(overflow_totals, dict):
+        overflow_totals = {}
+    payload["deferred_keys"] = deferred_keys
+    payload["remaining_keys"] = remaining_keys
+    payload["completed_keys"] = completed_keys
+    payload["overflow_stats"] = {
+        "totals": {key: float(overflow_totals.get(key, 0.0)) for key in metric_keys},
+        "max_ratio": float(overflow_stats.get("max_ratio", 0.0)),
+        "max_prefix_ratio": float(overflow_stats.get("max_prefix_ratio", 0.0)),
+        "entropy_examples": int(overflow_stats.get("entropy_examples", 0)),
+        "trained_examples": int(overflow_stats.get("trained_examples", len(completed_keys))),
+        "backward_batches": int(overflow_stats.get("backward_batches", len(completed_keys))),
+        "training_seconds": max(0.0, float(overflow_stats.get("training_seconds", 0.0))),
+    }
+    if payload["overflow_stats"]["trained_examples"] != len(completed_keys):
+        print(
+            f"[warn] exact SPO-RS overflow progress count is inconsistent "
+            f"({path}); falling back to the complete exact model-sharded "
+            "update",
+            flush=True,
+        )
+        return None
+    payload["path"] = str(path)
+    return payload
+
+
+def _write_exact_spo_rs_overflow_state(overflow_state):
+    """Atomically commit one exact-overflow progress checkpoint."""
+    import torch
+
+    path_value = overflow_state.get("path")
+    if not path_value:
+        raise RuntimeError("exact SPO-RS overflow state has no durable checkpoint path")
+    destination = Path(str(path_value))
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    payload = dict(overflow_state)
+    payload.pop("path", None)
+    with temporary.open("wb") as handle:
+        torch.save(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(destination)
+    try:
+        directory_fd = os.open(str(destination.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        # The file itself is already flushed and atomically installed. Some
+        # filesystems do not support fsync on a directory descriptor.
+        pass
+
+
+def _commit_exact_spo_rs_overflow_batch(
+        model, overflow_state, step_idx, trajectory_keys, batch_stats,
+        *, training_seconds):
+    """Merge one exact overflow batch and make its progress restart-durable.
+
+    The base replica gradients and every previously completed oversized
+    trajectory remain in the CPU checkpoint. ``model.grad`` is the already
+    reduced sum for exactly ``trajectory_keys``. The optimizer is deliberately
+    untouched until *all* trajectories have been merged, preserving the one
+    global clipped SPO-RS update exactly while allowing a replicated recovery
+    wave to commit many trajectories at once.
+    """
+    import torch
+
+    saved_gradients = _validate_precomputed_exact_gradients(model, overflow_state, step_idx)
+    trajectory_keys = {tuple(int(value) for value in key) for key in trajectory_keys}
+    if not trajectory_keys:
+        return len(overflow_state.get("remaining_keys", ()))
+    remaining = {tuple(int(value) for value in key) for key in overflow_state.get("remaining_keys", ())}
+    completed = {tuple(int(value) for value in key) for key in overflow_state.get("completed_keys", ())}
+    invalid = trajectory_keys - remaining
+    if invalid or trajectory_keys & completed:
+        raise RuntimeError(
+            "exact SPO-RS overflow batch progress is duplicated or out of "
+            f"order: {sorted(invalid or (trajectory_keys & completed))}")
+
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            saved = saved_gradients[name]
+            saved.add_(gradient.detach().to(device="cpu", dtype=saved.dtype))
+
+    metric_keys = (
+        "loss", "policy_loss", "kl_estimate", "entropy_estimate",
+        "ratio", "clipped_fraction",
+    )
+    overflow_stats = overflow_state["overflow_stats"]
+    totals = batch_stats["totals"]
+    for key in metric_keys:
+        overflow_stats["totals"][key] += float(totals[key])
+    overflow_stats["max_ratio"] = max(float(overflow_stats["max_ratio"]), float(batch_stats["max_ratio"]))
+    overflow_stats["max_prefix_ratio"] = max(
+        float(overflow_stats["max_prefix_ratio"]),
+        float(batch_stats["max_prefix_ratio"]))
+    overflow_stats["entropy_examples"] += int(batch_stats["entropy_examples"])
+    overflow_stats["trained_examples"] += len(trajectory_keys)
+    overflow_stats["backward_batches"] += int(batch_stats.get("backward_batches", len(trajectory_keys)))
+    overflow_stats["training_seconds"] += max(0.0, float(training_seconds))
+
+    remaining.difference_update(trajectory_keys)
+    completed.update(trajectory_keys)
+    overflow_state["version"] = 2
+    overflow_state["remaining_keys"] = sorted(remaining)
+    overflow_state["completed_keys"] = sorted(completed)
+    _write_exact_spo_rs_overflow_state(overflow_state)
+    try:
+        marker = _read_exact_sharded_recovery(Path(str(overflow_state["path"])).parent) or {}
+        _write_exact_sharded_recovery(
+            Path(str(overflow_state["path"])).parent,
+            step_idx,
+            marker.get("reason", "selective exact SPO-RS overflow recovery in progress"),
+            remaining_deferred_keys=[list(key) for key in sorted(remaining)],
+            completed_deferred_keys=[list(key) for key in sorted(completed)],
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        # The authoritative gradient checkpoint was already atomically
+        # committed. A stale human-readable marker does not invalidate it.
+        print(f'[warn] exact overflow progress marker could not be refreshed: {error}', flush=True)
+    return len(remaining)
+
+
+def _commit_exact_spo_rs_overflow_progress(
+        model, overflow_state, step_idx, trajectory_key, trajectory_stats,
+        *, training_seconds):
+    """Merge one finished oversized gradient and make it restart-durable."""
+    return _commit_exact_spo_rs_overflow_batch(
+        model, overflow_state, step_idx, [trajectory_key], trajectory_stats,
+        training_seconds=training_seconds)
+
+
+def _clip_sharded_grad_norm_(parameters, max_norm, *, error_if_nonfinite):
+    """Clip one model-sharded gradient using one exact global L2 norm.
+
+    ``torch.nn.utils.clip_grad_norm_`` is backend/version dependent when its
+    input spans several CUDA devices.  Compute one FP32 norm per parameter on
+    that parameter's own device, combine the scalar squares in host FP64, then
+    apply the same global coefficient to every shard.
+    """
+    import torch
+
+    parameters = [parameter for parameter in parameters if parameter.grad is not None]
+    squared_norms = []
+    for parameter in parameters:
+        gradient = parameter.grad.detach()
+        local_norm = torch.linalg.vector_norm(gradient, ord=2, dtype=torch.float32)
+        value = float(local_norm.item())
+        squared_norms.append(value * value)
+    total_norm = math.sqrt(math.fsum(squared_norms))
+    if error_if_nonfinite and not math.isfinite(total_norm):
+        raise RuntimeError(
+            f"The total norm of order 2.0 for gradients is non-finite, "
+            f"so it cannot be clipped. Total norm: {total_norm}")
+    coefficient = min(1.0, float(max_norm) / (total_norm + 1e-6))
+    if coefficient < 1.0:
+        with torch.no_grad():
+            for parameter in parameters:
+                parameter.grad.mul_(coefficient)
+    return total_norm
+
+
+def _resume_process_argv(run_dir):
+    """Rebuild this Python invocation with exactly one authoritative resume."""
+    original = list(sys.argv[1:])
+    filtered = []
+    index = 0
+    while index < len(original):
+        argument = original[index]
+        if argument in {"--resume", "--resume-from"}:
+            index += 2
+            continue
+        if (argument.startswith("--resume=") or argument.startswith("--resume-from=")):
+            index += 1
+            continue
+        filtered.append(argument)
+        index += 1
+    return [
+        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "train_multy_CVaR.py"),
+        *filtered,
+        "--resume",
+        str(Path(run_dir).resolve()),
+    ]
+
+
+def _restart_for_exact_resume(run_dir):
+    """Replace the current process after every child/GPU has been stopped."""
+    argv = _resume_process_argv(run_dir)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(sys.executable, argv, dict(os.environ))
+
+
+def _validate_precomputed_exact_gradients(model, overflow_state, step_idx):
+    """Validate and return a selective-overflow gradient mapping."""
+    import torch
+    from training.fast_distributed import trainable_parameter_signature
+
+    if int(overflow_state.get("step", -1)) != int(step_idx):
+        raise RuntimeError("exact SPO-RS overflow gradients belong to a different step")
+
+    def canonical_signature(value):
+        return tuple((str(name), tuple(int(size) for size in shape), str(dtype)) for name, shape, dtype in value)
+
+    saved_signature = canonical_signature(overflow_state.get("parameter_signature", ()))
+    current_signature = canonical_signature(trainable_parameter_signature(model))
+    if saved_signature != current_signature:
+        raise RuntimeError(
+            "exact SPO-RS overflow trainable-parameter layout changed; "
+            "refusing to combine mismatched gradients")
+    saved_gradients = overflow_state.get("gradients")
+    if not isinstance(saved_gradients, dict):
+        raise RuntimeError("exact SPO-RS overflow checkpoint has no gradient mapping")
+    expected_names = {name for name, _shape, _dtype in current_signature}
+    if set(saved_gradients) != expected_names:
+        raise RuntimeError('exact SPO-RS overflow gradient names do not match the loaded adapter')
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        saved = saved_gradients[name]
+        if (not torch.is_tensor(saved)
+                or tuple(saved.shape) != tuple(parameter.shape)
+                or not torch.isfinite(saved).all()):
+            raise RuntimeError(f"invalid saved exact SPO-RS gradient for {name}")
+    return saved_gradients

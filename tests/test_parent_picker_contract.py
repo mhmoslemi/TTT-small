@@ -33,7 +33,7 @@ class ParentPickerContractTests(unittest.TestCase):
     def test_registry_factory_cli_and_validation_agree(self):
         allowed = ("puct", "uct", "llm")
         self.assertEqual(self.scope["PARENT_SELECTION_MODES"], allowed)
-        source = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+        source = ast.parse((ROOT / "runtime/configuration.py").read_text())
         argument = next(node for node in ast.walk(source) if isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
                         and node.func.attr == "add_argument" and node.args

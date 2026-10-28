@@ -104,7 +104,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
 
     def test_yaml_counts_override_saved_but_cli_is_stronger(self):
         source = (Path(__file__).resolve().parents[1]
-                  / "train_multy_CVaR.py").read_text()
+                  / "runtime/configuration.py").read_text()
         load = next(n for n in ast.parse(source).body
                     if isinstance(n, ast.FunctionDef) and n.name == "load_config")
         overlay = next(n for n in load.body if isinstance(n, ast.If) and any(

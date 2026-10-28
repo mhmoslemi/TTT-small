@@ -1,6 +1,8 @@
 """Package/import/resource checks without loading models or CUDA libraries."""
 
 import ast
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import pickle
 import subprocess
@@ -14,13 +16,13 @@ from training.fast_distributed import worker_main
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = {
-    "models": "model_backend strategist_models qwen_training_kernels gpt_oss_training",
-    "training": "fast_distributed spo_rs advantage context_parallel exact_overflow training_checkpointing",
+    "models": "model_backend coder_profiles strategist_models qwen_training_kernels gpt_oss_training",
+    "training": "trainers fast_distributed spo_rs advantage context_parallel exact_overflow training_checkpointing",
     "generation": "gen_workers strategy_api strategy_prompts strategy_prompts_openai output_retries",
     "search": "sampler llm_sampler rollout_allocation",
     "evaluation": "reward sandbox",
-    "runtime": "gpu_runtime host_memory gpu_lease",
-    "diagnostics": "startup_logs loading_logs terminal_output",
+    "runtime": "configuration gpu_runtime host_memory gpu_lease",
+    "diagnostics": "console startup_logs loading_logs terminal_output",
     "analysis": "entropy_tools plot_erdos plot_ac plot_erdos_best_curve plot_parent_tree",
 }
 
@@ -106,6 +108,89 @@ def test_prompt_and_api_key_stay_at_project_root():
         namespace = {"Path": Path, "__file__": str(path)}
         exec(compile(ast.Module(body=[assignment], type_ignores=[]), relative, "exec"), namespace)
         assert namespace[setting] == expected
+
+
+def test_extracted_components_import_without_cli_or_cuda():
+    script = '''
+import importlib
+import pickle
+import sys
+from types import ModuleType
+sys.modules["numpy"] = ModuleType("numpy")
+sys.modules["yaml"] = ModuleType("yaml")
+from diagnostics import console
+from models import coder_profiles
+from runtime import configuration
+from training import exact_overflow, trainers
+assert "train_multy_CVaR" not in sys.modules
+entry = importlib.import_module("train_multy_CVaR")
+assert entry.load_config is configuration.load_config
+assert entry._coder_model_profile is coder_profiles._coder_model_profile
+assert entry._install_terminal_log is console._install_terminal_log
+assert entry._resume_process_argv is exact_overflow._resume_process_argv
+for cls in (trainers.ProcessDistributedTrainer, trainers.ReplicatedDataParallelTrainer):
+    assert getattr(entry, cls.__name__) is cls
+    assert pickle.loads(pickle.dumps(cls)) is cls
+assert "torch" not in sys.modules
+assert "transformers" not in sys.modules
+sys.argv = ["train_multy_CVaR.py", "--help"]
+try:
+    entry.main()
+except SystemExit as error:
+    assert error.code == 0
+else:
+    raise AssertionError("--help did not exit")
+assert "torch" not in sys.modules
+'''
+    result = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "--strategies" in result.stdout and "--resume" in result.stdout
+    for path in (ROOT / "training").glob("*.py"):
+        assert "import train_multy_CVaR" not in path.read_text(), path
+
+
+def test_extracted_config_and_restart_keep_project_root_paths(monkeypatch, tmp_path):
+    path = ROOT / "runtime/configuration.py"
+    tree = ast.parse(path.read_text())
+    assignment = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "config_dir"
+                              for target in node.targets))
+    namespace = {"Path": Path, "__file__": str(path)}
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), str(path), "exec"), namespace)
+    assert namespace["config_dir"] == ROOT / "configs"
+
+    from training.exact_overflow import _resume_process_argv
+    monkeypatch.setattr(sys, "argv", ["train_multy_CVaR.py", "--fast",
+                                      "--config", "configs/ac1.yaml", "--resume", "old-run"])
+    assert _resume_process_argv(tmp_path) == [
+        sys.executable, str(ROOT / "train_multy_CVaR.py"), "--fast",
+        "--config", "configs/ac1.yaml", "--resume", str(tmp_path.resolve())]
+
+
+def test_extracted_terminal_routing_preserves_visible_and_hidden_logs(monkeypatch, tmp_path):
+    from diagnostics import console, terminal_output
+
+    for name in ("_SETTING_LOG_PATH", "_SETTING_LOG_TIME_OFFSET"):
+        monkeypatch.setattr(terminal_output, name, getattr(terminal_output, name))
+    visible = io.StringIO()
+    sink = console._TerminalLogSink()
+    log = tmp_path / "temirnal.log"
+    sink.bind(log)
+    stream = console._TimestampedLineStream(console._TerminalTeeStream(visible, sink))
+    setting = tmp_path / "setting.log"
+    try:
+        console.bind_setting_log(setting)
+        with redirect_stdout(stream):
+            print("visible status")
+            console.setting_log_only("hidden status")
+        stream.flush()
+        assert "visible status" in visible.getvalue()
+        assert log.read_text() == visible.getvalue()
+        assert "hidden status" in setting.read_text()
+        assert "hidden status" not in log.read_text()
+    finally:
+        sink.log_file.close()
 
 
 def test_vllm_compat_hook_uses_project_root_after_move(monkeypatch):

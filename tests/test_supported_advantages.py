@@ -627,7 +627,7 @@ def test_spo_rs_cpu_optimizer_preserves_frozen_behavior(monkeypatch, load_config
             return [model.weight[0, 0] * torch.tensor([.5, 1.], dtype=torch.float64) - 1
                     for ex in batch]
 
-    monkeypatch.setattr(training, "compute_batched_token_logprobs", scores)
+    monkeypatch.setattr("training.trainers.compute_batched_token_logprobs", scores)
     expected = model.weight.detach().clone().requires_grad_()
     old = torch.tensor([-.95, -.9], dtype=torch.float64)
     for _ in range(epochs):

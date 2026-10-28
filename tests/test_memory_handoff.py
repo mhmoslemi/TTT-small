@@ -252,7 +252,7 @@ def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
     monkeypatch.setattr(fast_distributed, "set_total_memory_ceiling", lambda *a: None)
     monkeypatch.setattr(fast_distributed, "validate_model_device", lambda *a: None)
-    monkeypatch.setattr(training, "_restore_optimizer_state_to_parameters", lambda *a: None)
+    monkeypatch.setattr("training.trainers._restore_optimizer_state_to_parameters", lambda *a: None)
     monkeypatch.setattr(host_memory, "reclaim_unused_host_memory", lambda *a, **kw: None)
     trainer.restore_on_gpus([3, 7])
     assert calls == [("restore", 1), ("restore", 3), ("restored", {1, 3})]

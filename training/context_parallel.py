@@ -299,7 +299,7 @@ def hybrid_context(model, group):
 
 def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True, measure=False):
     """Preserve every response target, its predecessor and its global position."""
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.training_checkpointing import grouped_qwen_hidden
 
     decoder, head = training._causal_lm_decoder_and_head(model)
@@ -341,7 +341,7 @@ def token_logprobs(model, example, tokenizer, cfg, context, *, with_grad=True, m
 @_stable_bf16_matmul()
 def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, validate=True):
     """Same weighted sequence loss; sum token-shard adapter gradients once."""
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.exact_overflow import pack_cpu_gradients
     from training.fast_distributed import set_long_rollout_memory_ceiling
 
@@ -421,7 +421,7 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
     Incompatible kernel/model versions fall back before any new gradient is
     accepted into the durable accumulator.
     """
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.exact_overflow import unpack_cpu_gradients
 
     model = backend.model
@@ -530,7 +530,7 @@ def plan_context_wave(examples, world_size, local_token_budget, minimum_gpus=2):
 def complete_context_overflow(trainer, examples, cfg, step_idx, state):
     """Reuse the durable gradient accumulator and take the same one update."""
     import time
-    import train_multy_CVaR as training
+    import training.trainers as training
     from training.exact_overflow import METRICS, trajectory_key, unpack_cpu_gradients
     from training.fast_distributed import broadcast_trainable_parameters
 

@@ -282,7 +282,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                       defer_exact_oom=False):
     """Accumulate one rank's gradients and leave them attached to the model."""
     import torch
-    import train_multy_CVaR as training
+    import training.trainers as training
     from runtime.host_memory import reclaim_unused_host_memory
     from models.model_backend import fused_long_attention_is_active
     from training.exact_overflow import supports_warm_overflow
@@ -726,7 +726,7 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
     """
     from contextlib import nullcontext
     import torch
-    import train_multy_CVaR as training
+    import training.trainers as training
     from runtime.host_memory import reclaim_unused_host_memory
     from models.model_backend import fused_long_attention_is_active
 
@@ -1155,19 +1155,21 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
         import gc
         import os
         from datetime import timedelta
-        import train_multy_CVaR as training
+        import warnings
+        import diagnostics.console as console
 
-        training._install_console_timestamps()
-        terminal_log = training._install_terminal_log()
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        console._install_console_timestamps()
+        terminal_log = console._install_terminal_log()
         terminal_log_path = cfg_dict.get("_terminal_log_path")
         if terminal_log_path:
             terminal_log.bind(terminal_log_path)
         setting_log_path = cfg_dict.get("_setting_log_path")
         if setting_log_path:
-            # Use the compatibility binding exported by the training module.
+            # Use the compatibility binding exported by the console module.
             # Logging-version skew must not abort a distributed update after
             # rollout generation and evaluation have completed.
-            training.bind_setting_log(
+            console.bind_setting_log(
                 setting_log_path,
                 time_offset=cfg_dict.get("_log_time_offset_seconds", 0),
             )
@@ -1366,3 +1368,42 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 dist.destroy_process_group()
             except Exception:
                 pass
+
+
+
+
+def _move_optimizer_state(optimizer, device) -> None:
+    """Move Adam state recursively without replacing Parameter identities."""
+    import torch
+
+    def move(value):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        return value
+
+    for parameter, state in list(optimizer.state.items()):
+        optimizer.state[parameter] = move(state)
+
+def _restore_optimizer_state_to_parameters(optimizer) -> None:
+    """Return each optimizer tensor to the device of its sharded parameter."""
+    import torch
+
+    def move(value, device):
+        if torch.is_tensor(value):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item, device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [move(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move(item, device) for item in value)
+        return value
+
+    for parameter, state in list(optimizer.state.items()):
+        optimizer.state[parameter] = move(state, parameter.device)
