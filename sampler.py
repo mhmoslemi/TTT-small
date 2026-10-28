@@ -180,13 +180,7 @@ class PUCTSampler:
 
     @staticmethod
     def _archive_key(state):
-        """Exact construction identity; source is a fallback for code-only tasks.
-
-        Keep full numeric precision and sequence order. No rounding, similarity
-        threshold, or problem-specific symmetry is applied.
-        """
-        if state.construction is not None and len(state.construction):
-            return ("construction", tuple(state.construction))
+        """Match 0544: deduplicate exact source code, not its construction."""
         return ("code", state.code) if state.code else None
 
     def _build_children_map(self):
@@ -316,8 +310,7 @@ class PUCTSampler:
         Only children with valid (non-None) values should be passed.
 
         When strategy_keys is supplied, it must align one-for-one with
-        children_with_parents. After exact-construction deduplication (or code
-        deduplication for tasks without a construction),
+        children_with_parents. After exact-code deduplication,
         at most strategy_top_r new children are admitted from each
         (parent, strategy) pair. The ordinary top-K-per-parent and global
         archive cap are then applied unchanged.
@@ -360,8 +353,7 @@ class PUCTSampler:
             for pid, best in parent_best.items():
                 self._m[pid] = max(self._m.get(pid, best), best)
 
-            # A different program producing the same construction must not
-            # create another fresh node with zero expansion history.
+            # Equal code is a duplicate even when its stochastic output differs.
             existing_keys = {self._archive_key(s) for s in self._states}
             existing_keys.discard(None)
             new_entries = []

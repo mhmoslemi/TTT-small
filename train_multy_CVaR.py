@@ -1,6 +1,6 @@
 """TTT-Discover multi-problem runner with entropic and SPO-RS training.
 
-Configuration: saved run settings, current YAML rollout counts, then CLI flags.
+Configuration: saved settings, current YAML rollout/strategy controls, then CLI.
 Entropic training uses adaptive-beta, leave-one-out group advantages.
 SPO-RS uses a historical run-wide baseline and clipped policy updates.
 """
@@ -31,6 +31,11 @@ from output_retries import (coder_output_issue, coder_retry_gate,
                             coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
+from strategist_models import (
+    render_strategy_prompt, resolve_strategy_effort, resolve_strategy_model,
+    resolve_strategy_token_limits,
+    strategist_engine_options, strategist_profile, validate_strategist_runtime,
+)
 import terminal_output as _terminal_output
 
 
@@ -652,7 +657,7 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
         merged["strategy_sampling_min_p"] = float(
             merged["strategy_min_p"])
     else:
-        merged.setdefault("strategy_sampling_min_p", None)
+        merged["strategy_sampling_min_p"] = 0.0
     merged["qwen3_8b_thinking_sampling"] = False
     merged["strategy_qwen3_8b_thinking_sampling"] = False
 
@@ -680,8 +685,8 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
                 merged.get("strategy_model_name"))
             and bool(merged.get("strategy_thinking", False))):
         _profile_default(
-            merged, "strategy_temperature", 0.6, explicit_keys)
-        _profile_default(merged, "strategy_top_p", 0.95, explicit_keys)
+            merged, "strategy_temperature", 1.0, explicit_keys)
+        _profile_default(merged, "strategy_top_p", 1.0, explicit_keys)
         if ("strategy_min_p" not in explicit_keys
                 and "strategy_sampling_min_p" not in explicit_keys):
             merged["strategy_sampling_min_p"] = 0.0
@@ -723,6 +728,20 @@ def _strategy_model_name(cfg):
 def _apply_strategy_model_profile(
         merged, model_name, explicit_keys=frozenset()):
     """Apply model-native strategist defaults below explicit configuration."""
+    profile = strategist_profile(model_name)
+    if profile:
+        for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
+            _profile_default(merged, key, profile["context"], explicit_keys)
+        for key, value in (("strategy_reasoning_effort", "auto"),
+                           ("strategy_thinking", True),
+                           ("strategy_vllm_sleep_level", 1),
+                           ("strategy_vllm_staged_loading", False)):
+            _profile_default(merged, key, value, explicit_keys)
+        print(f"[model-profile] frozen {profile['family']} strategist: "
+              f"{model_name}; official efforts={','.join(profile['efforts'])}; "
+              "native checkpoint quantization; YAML sampling/token limits "
+              "take precedence")
+        return
     if (_model_basename(model_name)
             != _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME):
         return
@@ -736,8 +755,6 @@ def _apply_strategy_model_profile(
         merged, "strategy_max_new_tokens", 131_072, explicit_keys)
     _profile_default(
         merged, "strategy_max_seq_length", 131_072, explicit_keys)
-    _profile_default(merged, "strategy_temperature", 0.6, explicit_keys)
-    _profile_default(merged, "strategy_top_p", 0.95, explicit_keys)
     _profile_default(merged, "strategy_thinking", True, explicit_keys)
     _profile_default(
         merged, "strategy_reasoning_effort", "high", explicit_keys)
@@ -1912,10 +1929,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-strategy-thinking", dest="strategy_thinking",
                    action="store_const", const=False)
     p.add_argument("--strategy-reasoning-effort",
-                   choices=["none", "low", "medium", "high", "xhigh", "max"],
+                   choices=["auto", "none", "low", "medium", "high", "xhigh", "max"],
                    default=None,
-                   help="API reasoning effort; local GPT-OSS supports low, "
-                        "medium, or high.")
+                   help="Model-native reasoning level; auto selects its "
+                        "profile default. Qwen Flash-Next: low/medium/xhigh; "
+                        "DeepSeek V4 0731: low/high/max.")
     p.add_argument("--strategy-vllm-quantization", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--adam-beta1", type=float, default=None)
@@ -2277,6 +2295,13 @@ def load_config():
         for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
+        # Current strategist controls must not inherit stale resolved limits
+        # or sampling defaults from a previous checkpoint's config.json.
+        for key in ("strategy_max_seq_length", "strategy_max_new_tokens",
+                    "strategy_temperature", "strategy_top_p",
+                    "strategy_top_k", "strategy_min_p"):
+            if key in ydict:
+                merged[key] = ydict[key]
         # Preserve legacy one-pass generation only when neither source
         # specifies a pilot budget.
         if ("pilot_programs_per_strategy" not in saved
@@ -2297,7 +2322,7 @@ def load_config():
         merged["api_strategy"] = saved.get("api_strategy", "")
         print(f"[config] resuming saved configuration from "
               f"{resume_dir / 'config.json'}; current YAML rollout counts "
-              "override saved counts")
+              "and strategy limits/sampling override saved values")
 
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
@@ -2527,10 +2552,13 @@ def load_config():
         raise ValueError("strict_strategy_validation must be a boolean")
     merged["strict_strategy_validation"] = strict_strategy_validation
     if merged["strategies"]:
+        merged.setdefault("strategy_temperature", 1.0)
+        merged.setdefault("strategy_top_p", 1.0)
         strategy_model_name = str(
             merged.get("strategy_model_name") or merged["model_name"]
         ).strip()
         if not merged["api_strategy"]:
+            strategy_model_name = resolve_strategy_model(strategy_model_name)
             _apply_strategy_model_profile(
                 merged, strategy_model_name, profile_explicit_keys)
         strategy_backend = "api" if merged["api_strategy"] else str(
@@ -2538,6 +2566,10 @@ def load_config():
         ).strip().lower()
         if strategy_backend not in {"local", "api"}:
             raise ValueError("strategy_backend must be 'local' or 'api'")
+        if (strategy_backend == "local" and strategist_profile(strategy_model_name)
+                and generation_backend != "vllm"):
+            raise ValueError("Flash-Next / DeepSeek V4 local strategists require "
+                             "generation_backend=vllm")
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
         pilot_programs_per_strategy = int(
@@ -2546,14 +2578,19 @@ def load_config():
             merged.get("phase2_allocation_method") or "rule_based"
         ).strip().lower()
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
-        strategy_max_new_tokens = int(merged["strategy_max_new_tokens"])
+        native_strategy_context = None
         if merged["api_strategy"]:
             from strategy_api import OPENAI_MAX_OUTPUT_TOKENS
+            native_strategy_context = OPENAI_MAX_OUTPUT_TOKENS
+        strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
+            strategy_model_name, merged.get("strategy_max_seq_length", "auto"),
+            merged.get("strategy_max_new_tokens", "auto"),
+            native_context=native_strategy_context)
+        if merged["api_strategy"]:
             if strategy_max_new_tokens > OPENAI_MAX_OUTPUT_TOKENS:
                 print(f"[config] OpenAI strategy output budget capped at "
                       f"{OPENAI_MAX_OUTPUT_TOKENS} tokens (including reasoning)")
                 strategy_max_new_tokens = OPENAI_MAX_OUTPUT_TOKENS
-        strategy_max_seq_length = int(merged["strategy_max_seq_length"])
         strategy_temperature = float(merged["strategy_temperature"])
         strategy_top_p = float(merged["strategy_top_p"])
         if (strategies_per_parent < 1 or programs_per_strategy < 1
@@ -2611,9 +2648,9 @@ def load_config():
         merged["strategy_temperature"] = strategy_temperature
         merged["strategy_top_p"] = strategy_top_p
         merged["strategy_thinking"] = bool(merged["strategy_thinking"])
-        strategy_reasoning_effort = str(
-            merged.get("strategy_reasoning_effort") or "high"
-        ).strip().lower()
+        strategy_reasoning_effort = resolve_strategy_effort(
+            strategy_model_name if strategy_backend == "local" else "",
+            merged.get("strategy_reasoning_effort") or "high")
         if strategy_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             raise ValueError(
                 "strategy_reasoning_effort must be none, low, medium, high, xhigh, or max")
@@ -2621,6 +2658,13 @@ def load_config():
                 and strategy_reasoning_effort not in {"low", "medium", "high"}):
             raise ValueError("local GPT-OSS strategy reasoning supports low, medium, or high")
         merged["strategy_reasoning_effort"] = strategy_reasoning_effort
+        if (strategist_profile(strategy_model_name)
+                and "deepseek-v4-flash-0731" in strategy_model_name.lower()
+                and strategy_reasoning_effort == "max"
+                and strategy_max_seq_length < 393_216):
+            print("[config] DeepSeek Think Max recommends at least 393216 "
+                  "context tokens; keeping the configured strategy "
+                  f"limit {strategy_max_seq_length} unchanged")
         merged["strategy_vllm_quantization"] = str(merged.get('strategy_vllm_quantization') or '').strip()
         merged["strategy_api_base_url"] = str(
             merged.get("strategy_api_base_url")
@@ -2949,6 +2993,7 @@ def load_config():
             strategy_layout_cfg = dict(merged)
             strategy_layout_cfg.update({
                 "model_name": strategy_name,
+                "strategy_inference_profile": bool(strategist_profile(strategy_name)),
                 "max_seq_length": int(merged["strategy_max_seq_length"]),
                 "load_in_4bit": False,
                 "vllm_quantization": merged.get(
@@ -9838,6 +9883,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # or weights in this process.
             return [dict(message) for message in messages]
         strategy_name = str(getattr(cfg, "strategy_model_name", "")).lower()
+        if strategist_profile(strategy_name):
+            return render_strategy_prompt(
+                strategy_tokenizer, messages, cfg.strategy_model_name,
+                thinking=cfg.strategy_thinking,
+                effort=(cfg.strategy_reasoning_effort
+                        if reasoning_effort is None else reasoning_effort))
         template_options = {}
         if "gpt-oss" in strategy_name:
             template_options["reasoning_effort"] = str(
@@ -11457,6 +11508,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                           flush=True)
                     strategy_cfg = SimpleNamespace(**vars(cfg))
                     strategy_cfg.advantage_mode = "entropic"
+                    strategy_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
                     strategy_cfg.temperature = float(
                         cfg.strategy_temperature)
                     strategy_cfg.top_p = float(cfg.strategy_top_p)
@@ -13006,6 +13058,9 @@ def main():
     startup_log = StartupLog(time_offset=_LOG_TIME_OFFSET_SECONDS)
     with startup_log.capture():
         cfg, merged = load_config()
+        if cfg.strategies and cfg.strategy_backend == "local":
+            validate_strategist_runtime(
+                cfg.strategy_model_name, prepare_encoder=True)
         # This must precede every import path that can initialize CUDA. Worker
         # and evaluation children set their own physical groups before import.
         _pin_training_process(cfg.training_gpu_ids)
@@ -13977,6 +14032,8 @@ def main():
                     )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
+                    "vllm_engine_options": strategist_engine_options(
+                        cfg.strategy_model_name),
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
                     "gen_micro_batch": getattr(

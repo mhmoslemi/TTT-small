@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time exact archive deduplication and PUCT conversion for a stopped run."""
+"""One-time exact-code archive deduplication and PUCT conversion for a stopped run."""
 
 import argparse
 from datetime import datetime, timezone

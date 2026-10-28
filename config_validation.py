@@ -211,9 +211,11 @@ def validate_problem_config(
                 "num_seed_states", "max_new_tokens", "max_seq_length",
                 "train_examples_per_microbatch", "strategies_per_parent",
                 "programs_per_strategy", "strategy_archive_top_r",
-                "strategy_max_new_tokens",
-                "strategy_max_seq_length", "spo_rs_update_epochs"):
+                "spo_rs_update_epochs"):
         if key in data:
+            _positive_int(data, key, source)
+    for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
+        if key in data and data[key] != "auto":
             _positive_int(data, key, source)
     if "strategy_format_max_retries" in data:
         retries = data["strategy_format_max_retries"]
@@ -332,9 +334,9 @@ def validate_problem_config(
             f"{_label(source)}: strategy_thinking must be true or false")
     if ("strategy_reasoning_effort" in data
             and str(data["strategy_reasoning_effort"]).lower()
-            not in {"none", "low", "medium", "high", "xhigh", "max"}):
+            not in {"auto", "none", "low", "medium", "high", "xhigh", "max"}):
         raise ValueError(
-            f"{_label(source)}: strategy_reasoning_effort must be none, low, "
+            f"{_label(source)}: strategy_reasoning_effort must be auto, none, low, "
             "medium, high, xhigh, or max")
     if "api_strategy" in data:
         if not isinstance(data["api_strategy"], str):

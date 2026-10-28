@@ -120,8 +120,12 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         sampler = ModuleType("sampler")
         sampler.parent_selection_mode = lambda config: config.get("parent_selection", "puct")
         namespace = dict(
-            saved=dict(self.saved, learning_rate=0.01),
-            ydict=dict(self.current, learning_rate=0.02),
+            saved=dict(self.saved, learning_rate=0.01, strategy_max_seq_length=131072,
+                       strategy_max_new_tokens=65536, strategy_temperature=.6, strategy_top_p=.95,
+                       strategy_top_k=50, strategy_min_p=.1),
+            ydict=dict(self.current, learning_rate=0.02, strategy_max_seq_length="auto",
+                       strategy_max_new_tokens="auto", strategy_temperature=1., strategy_top_p=1.,
+                       strategy_top_k=0, strategy_min_p=0.),
             merged=dict(self.current), profile_explicit_keys=set(),
             RETIRED_BATCH_GROWTH_KEYS=set(), resume_dir=self.run,
             args=SimpleNamespace(groups_per_step=12), skip=set(),
@@ -134,6 +138,10 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             self.assertEqual(namespace["merged"]["programs_per_strategy"], 10)
             self.assertEqual(namespace["merged"]["pilot_programs_per_strategy"], 6)
             self.assertEqual(namespace["merged"]["learning_rate"], 0.01)
+            self.assertEqual(tuple(namespace["merged"][key] for key in (
+                "strategy_max_seq_length", "strategy_max_new_tokens", "strategy_temperature",
+                "strategy_top_p", "strategy_top_k", "strategy_min_p")),
+                ("auto", "auto", 1., 1., 0, 0.))
             exec(compile(ast.Module(body=[cli], type_ignores=[]),
                          "cli_overlay", "exec"), namespace)
         self.assertEqual(namespace["merged"]["groups_per_step"], 12)

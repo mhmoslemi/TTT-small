@@ -613,7 +613,7 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         max_num_batched_tokens=0,
                         enable_expert_parallel=False,
                         enable_sleep_mode=False,
-                        disable_custom_all_reduce=False):
+                        disable_custom_all_reduce=False, engine_options=None):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -691,6 +691,14 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         model_name, load_in_4bit, quantization)
     if quantization:
         kwargs["quantization"] = quantization
+    if engine_options:
+        kwargs.update(engine_options)
+        if quantization:
+            kwargs["quantization"] = quantization
+        if not kwargs.get("enable_lora", True):
+            for key in ("max_lora_rank", "max_loras", "max_cpu_loras",
+                        "fully_sharded_loras"):
+                kwargs.pop(key, None)
     return kwargs
 
 
@@ -850,7 +858,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       max_num_batched_tokens=0,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
-                      disable_custom_all_reduce=False):
+                      disable_custom_all_reduce=False, engine_options=None):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
     # engine failure, killing only the multiprocessing.Process can leave those
@@ -881,6 +889,17 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     async_loop = None
     RequestOutputKind = None
     try:
+        if engine_options:
+            from strategist_models import (strategist_profile,
+                                            validate_strategist_runtime)
+            validate_strategist_runtime(model_name)
+            profile = strategist_profile(model_name)
+            if profile and profile["nvfp4"]:
+                import torch
+                if any(torch.cuda.get_device_capability(i)[0] < 10
+                       for i in range(torch.cuda.device_count())):
+                    raise RuntimeError(
+                        f"{model_name}: NVFP4 requires NVIDIA Blackwell GPUs")
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
         try:
@@ -924,6 +943,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             # select its transient compatibility path.
             enable_sleep_mode=(enable_sleep_mode and sleep_api_available),
             disable_custom_all_reduce=disable_custom_all_reduce,
+            engine_options=engine_options,
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
@@ -1205,6 +1225,9 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             continue
 
         try:
+            if (engine_options and not engine_options.get("enable_lora", True)
+                    and adapter_path is not None):
+                raise RuntimeError("a frozen strategist cannot receive a LoRA adapter")
             lora_request = _lora_request(adapter_path)
 
             # One call gives vLLM the whole worker workload so its scheduler can
@@ -1213,7 +1236,14 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             runnable_jobs = []
             max_tokens_by_job = []
             for group_idx, prompt, count in jobs:
-                prompt_len = len(tokenizer.encode(prompt))
+                if engine_options and not engine_options.get("enable_lora", True):
+                    # Native strategy templates already include BOS. Pass
+                    # exact ids so the serving tokenizer cannot add it twice.
+                    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                    prompt_len = len(prompt_ids)
+                    prompt = {"prompt_token_ids": prompt_ids}
+                else:
+                    prompt_len = len(tokenizer.encode(prompt))
                 max_tokens = min(
                     int(gen_kwargs["max_new_tokens"]),
                     int(max_seq_length) - int(prompt_len),
@@ -1481,7 +1511,7 @@ class GenerationPool:
                  vllm_token_scoring=False,
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
-                 vllm_log_path=None):
+                 vllm_log_path=None, vllm_engine_options=None):
         self.model_name = model_name
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
@@ -1673,6 +1703,7 @@ class GenerationPool:
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": effective_max_batched_tokens,
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
+            "engine_options": vllm_engine_options,
             # Separate TP engines remap different physical GPU pairs to the
             # same local CUDA ordinals. vLLM 0.28's custom all-reduce IPC can
             # then fail while the second engine profiles CUDA graphs. Use the
@@ -2766,6 +2797,24 @@ class PhasedVLLMGenerationPool:
                 self._pool_kwargs.get("num_workers", 1) or 1)
         return True
 
+    def _create_pool(self, **options):
+        startup_reservation = nullcontext()
+        if (self.host_memory_admission is not None
+                and not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
+                    "enable_lora", True)):
+            from strategist_models import strategist_profile
+            profile = strategist_profile(self._pool_kwargs["model_name"])
+            cards = int(self._pool_kwargs["num_workers"])
+            # Lazy mmap shares one reclaimable checkpoint cache across
+            # replicas. Charge every rank's separate host lookup table and
+            # staging headroom, not a duplicate full checkpoint per replica.
+            host_gib = (profile["weights_gib"]
+                        + (profile["ple_gib"] + 4.0) * cards)
+            startup_reservation = self.host_memory_admission.reservation(
+                int(host_gib * 2**30 * 1.05), wait_for_external=False)
+        with startup_reservation:
+            return GenerationPool(**self._pool_kwargs, **options)
+
     def _ensure_started(self):
         if self._awake:
             return self._pool
@@ -2777,10 +2826,9 @@ class PhasedVLLMGenerationPool:
                 # then reloaded the same weights for step 0. More importantly,
                 # a broken initial sleep could hang before the run even began.
                 if self._force_transient:
-                    self._pool = GenerationPool(**self._pool_kwargs)
+                    self._pool = self._create_pool()
                 else:
-                    self._pool = GenerationPool(
-                        **self._pool_kwargs,
+                    self._pool = self._create_pool(
                         vllm_enable_sleep_mode=True,
                         vllm_sleep_level=self._sleep_level,
                     )
@@ -2847,15 +2895,14 @@ class PhasedVLLMGenerationPool:
                         "persistent level-1 sleep",
                         flush=True,
                     )
-                    self._pool = GenerationPool(
-                        **self._pool_kwargs,
+                    self._pool = self._create_pool(
                         vllm_enable_sleep_mode=True,
                         vllm_sleep_level=1,
                     )
                     self.num_workers = self._pool.num_workers
                     self._persistent = self._pool.sleep_supported
             else:
-                self._pool = GenerationPool(**self._pool_kwargs)
+                self._pool = self._create_pool()
                 self.num_workers = self._pool.num_workers
             self._awake = True
             return self._pool

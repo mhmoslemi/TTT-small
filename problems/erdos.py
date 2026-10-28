@@ -154,7 +154,7 @@ Erdos mathematical checks for the final plan:
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
 - Do not emit any long numeric literal, lookup table, repeated-value list, or
-  unrolled pattern. A list/tuple/array literal may contain at most 64 scalar
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
   values. Build every larger vector algorithmically with NumPy, a compact
   formula, interpolation, tiling, or a loop.
 - No need for commnets or embedded
@@ -202,7 +202,7 @@ limit.
   or reconstruct it as a literal. If no parent construction was announced,
   create a starting vector under a different name.
 - Do not emit any long numeric literal, lookup table, repeated-value list, or
-  unrolled pattern. A list/tuple/array literal may contain at most 64 scalar
+  unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
   values. Build every larger vector algorithmically with NumPy, a compact
   formula, interpolation, tiling, or a loop.
 - No need for commnets or embedded

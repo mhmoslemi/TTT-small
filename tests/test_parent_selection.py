@@ -178,7 +178,7 @@ def children(sampler, parent, rewards, step=0):
 
 
 @pytest.mark.parametrize("mode", ["puct", "uct", "thompson"])
-def test_archive_deduplicates_constructions_without_losing_outcomes(mode):
+def test_archive_deduplicates_code_without_losing_outcomes(mode):
     sampler = make_sampler(
         parent_selection=mode, num_seeds=1, topk_children=0,
         seed_states=[SimpleNamespace(value=1., code="seed", construction=[.1, .2])])
@@ -186,8 +186,7 @@ def test_archive_deduplicates_constructions_without_losing_outcomes(mode):
     seed_copy = State.make(0, 1., "different seed code", construction=[.1, .2])
     first = State.make(0, 2., "program A", construction=[.3, .4], raw_score=.5)
     copied = State.make(0, 2., "program B", construction=[.3, .4], raw_score=.4)
-    # Equal source can produce distinct outcomes; exact nearby values and
-    # sequence order must remain distinct too.
+    # 0544 rejects repeated source even when the returned construction changes.
     changed = State.make(0, 2.1, "program A", construction=[.3, np.nextafter(.4, 1.)])
     reversed_values = State.make(0, 2.2, "program A", construction=[.4, .3])
     batch = [seed_copy, first, copied, changed, reversed_values]
@@ -197,27 +196,28 @@ def test_archive_deduplicates_constructions_without_losing_outcomes(mode):
                             strategy_keys=[0, 0, 1, 1, 1], strategy_top_r=3)
     assert result["submitted"] == 5 and result["unique_new"] == 3
     assert {s.id for s in sampler._states} == {
-        parent.id, first.id, changed.id, reversed_values.id}
+        parent.id, seed_copy.id, first.id, copied.id}
     assert sampler._n[parent.id] == sampler._T == 5
     assert sampler._m[parent.id] == 2.2
     assert sampler.best_raw_state(maximize=False).id == copied.id
     if mode == "thompson":
         assert sampler._outcomes.attempts == 5
 
-    # Resume retains the existing identities/counts. New copies of those
-    # constructions cannot enter with a new zero-count identity.
+    # Resume retains identities/counts and the exact-code duplicate rule.
     payload = sampler.state_dict()
     resumed = make_sampler(parent_selection=mode, num_seeds=1, topk_children=0)
     resumed.load_state_dict(payload)
     assert resumed.state_dict() == payload
-    copied_again = State.make(1, 2., "yet another program", construction=[.3, .4])
+    copied_again = State.make(1, 2., "program A", construction=[.8, .9])
     result = resumed.update([(copied_again, resumed._states[0])])
     assert result["unique_new"] == 0
     assert {s.id for s in resumed._states} == {s.id for s in sampler._states}
     assert resumed._n == sampler._n and resumed._T == sampler._T
+    different_code = State.make(1, 2., "yet another program", construction=[.3, .4])
+    assert resumed.update([(different_code, resumed._states[0])])["unique_new"] == 1
 
 
-def test_archive_code_fallback_and_legacy_construction_import():
+def test_archive_code_identity_and_legacy_import():
     sampler = PUCTSampler(1, topk_children=0)
     parent = sampler._states[0]
     first = State.make(0, 1., "code-only", construction=None)
@@ -225,9 +225,11 @@ def test_archive_code_fallback_and_legacy_construction_import():
     assert sampler.update([(first, parent), (duplicate, parent)])["unique_new"] == 1
     imported = State.make(0, 2., "import A", construction=[1., 2.])
     copied = State.make(0, 2., "import B", construction=[1., 2.])
-    sampler.import_legacy_states([imported, copied])
+    duplicate_code = State.make(0, 2., "import A", construction=[3., 4.])
+    sampler.import_legacy_states([imported, copied, duplicate_code])
     assert imported.id in {s.id for s in sampler._states}
-    assert copied.id not in {s.id for s in sampler._states}
+    assert copied.id in {s.id for s in sampler._states}
+    assert duplicate_code.id not in {s.id for s in sampler._states}
 
 
 def test_checkpoint_cleanup_preserves_training_and_backs_up_before_puct_switch(tmp_path):
@@ -239,7 +241,7 @@ def test_checkpoint_cleanup_preserves_training_and_backs_up_before_puct_switch(t
     parent = sampler._states[0]
     explored = State.make(0, 2., "explored", construction=[.1, .2],
                           parents=[dict(id=parent.id, timestep=0)])
-    copied = State.make(1, 3., "fresh copy", construction=[.1, .2],
+    copied = State.make(1, 3., "explored", construction=[.3, .4],
                         parents=[dict(id=parent.id, timestep=0)], raw_score=.3)
     saved = sampler.state_dict()
     saved.update(selection_mode="llm", states=saved["states"] + [asdict(copied), asdict(explored)],

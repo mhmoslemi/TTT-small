@@ -52,10 +52,9 @@ def output_retry_messages(messages, kind, *, failed_response=None):
         contract = (
             "one complete <strategy>...</strategy> block containing the full "
             "detailed implementation plan requested above. Preserve the "
-            "mathematical specification, concrete algorithm, program safeguards, "
-            "and return contract; do not reduce it to a summary. "
-            "Only that block is handed to the one-shot coder, which can only "
-            "write source and cannot execute calculations or test code")
+            "mathematical specification, concrete algorithm, budget, and "
+            "validation needed by the coder; do not reduce it to a summary. "
+            "Only that block is handed to the next agent")
     elif kind == "coder":
         contract = (
             "one complete fenced Python block starting with ```python and "
