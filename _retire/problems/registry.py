@@ -26,11 +26,11 @@ def get_problem(name: str, cfg: dict):
     key = (name or "").strip().lower()
 
     if key in ("circle_packing", "circle", "circles"):
-        from problems.circle_packing import CirclePacking
+        from _retire.problems.circle_packing import CirclePacking
         return CirclePacking(cfg)
 
     if key in ("erdos", "erdos_min_overlap", "erdos_minimum_overlap"):
-        from problems.erdos import ErdosMinOverlap
+        from _retire.problems.erdos import ErdosMinOverlap
         return ErdosMinOverlap(cfg)
 
     if key in (
@@ -41,18 +41,18 @@ def get_problem(name: str, cfg: dict):
         return ErdosC4Uncertainty(cfg)
 
     if key in ("ac1", "ac2", "ac_inequalities", "autocorrelation", "autocorrelation_inequalities"):
-        from problems.ac_inequalities import ACInequalities
+        from _retire.problems.ac_inequalities import ACInequalities
         # problem_type lives in the config; the bare "ac1"/"ac2" name also sets it.
         if key in ("ac1", "ac2"):
             cfg = {**cfg, "problem_type": cfg.get("problem_type", key)}
         return ACInequalities(cfg)
 
     if key in ("denoising", "single_cell", "single_cell_analysis", "scrna"):
-        from problems.denoising import Denoising
+        from _retire.problems.denoising import Denoising
         return Denoising(cfg)
 
     if key in ("gpu_mode", "kernel", "kernel_engineering", "trimul", "mla_decode_nvidia", "mla"):
-        from problems.gpu_mode import GpuMode
+        from _retire.problems.gpu_mode import GpuMode
         if key in ("trimul", "mla_decode_nvidia"):
             cfg = {**cfg, "problem_type": cfg.get("problem_type", key)}
         elif key == "mla":

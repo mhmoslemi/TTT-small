@@ -276,7 +276,7 @@ def test_missing_checkpoint_cannot_relabel_a_legacy_tree(tmp_path):
         sampler.import_legacy_states([])
 
 
-@pytest.mark.parametrize("source", ["llm", "puct", "uct", "thompson"])
+@pytest.mark.parametrize("source", ["llm", "puct", "uct"])
 def test_resume_starts_selection_after_migration_before_runtime_startup(
         tmp_path, monkeypatch, source):
     import train_multy_CVaR as training
@@ -332,7 +332,7 @@ def test_resume_does_not_buy_unused_or_recovery_selections(tmp_path, monkeypatch
     assert result == (sampler, None)
 
 
-@pytest.mark.parametrize("source", ["puct", "uct", "thompson"])
+@pytest.mark.parametrize("source", ["puct", "uct"])
 def test_migration_preserves_training_state_and_defers_recovery(tmp_path, monkeypatch, source):
     import train_multy_CVaR as training
 

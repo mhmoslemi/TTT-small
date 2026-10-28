@@ -9988,7 +9988,7 @@ def _finalize_pending_spo_rs_artifacts(
 
     from experiment_io import save_rollout
     from gen_workers import make_progress_bar
-    from problems.base import ParentContext, RewardResult
+    from _retire.problems.base import ParentContext, RewardResult
     from sampler import State
 
     if cfg.generation_backend != "vllm":
@@ -10852,7 +10852,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
-    from problems.base import ParentContext, RewardResult, is_code_failure
+    from _retire.problems.base import ParentContext, RewardResult, is_code_failure
     from gen_workers import make_progress_bar
 
 
@@ -14576,7 +14576,7 @@ def main():
 
     # Build the problem from the merged config (the registry reads problem-only
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
-    from problems.registry import get_problem
+    from _retire.problems.registry import get_problem
     problem_config = merged
     if cfg.isolate_eval:
         # Prompts must describe the sandbox's real allocation. Keep the saved

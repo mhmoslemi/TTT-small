@@ -16,6 +16,6 @@ RewardEvaluator + create_initial_state:
 Use problems.get_problem(name, cfg) to construct one.
 """
 
-from problems.registry import get_problem, available_problems
+from _retire.problems.registry import get_problem, available_problems
 
 __all__ = ["get_problem", "available_problems"]

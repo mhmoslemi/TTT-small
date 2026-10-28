@@ -38,7 +38,7 @@ import numpy as np
 from dataclasses import asdict, dataclass, field
 
 
-PARENT_SELECTION_MODES = ("puct", "uct", "thompson", "llm")
+PARENT_SELECTION_MODES = ("puct", "uct", "llm")
 
 
 def parent_selection_mode(config):
@@ -47,13 +47,12 @@ def parent_selection_mode(config):
     if mode is None:
         mode = "uct" if config.get("uct", False) else "puct"
     if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
-        raise ValueError("parent_selection must be 'puct', 'uct', 'thompson', or 'llm'")
+        raise ValueError("parent_selection must be 'puct', 'uct', or 'llm'")
     return mode.lower()
 
 
 def can_migrate_parent_selection(source, target):
-    return ((target == "thompson" and source in ("puct", "uct"))
-            or (target == "llm" and source in ("puct", "uct", "thompson")))
+    return target == "llm" and source in ("puct", "uct")
 
 
 def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
@@ -62,9 +61,6 @@ def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
     if mode == "llm":
         from llm_sampler import LLMSampler
         return LLMSampler(exp_dir=exp_dir, problem=problem, **kwargs)
-    if mode == "thompson":
-        from thompson_sampler import ThompsonSampler
-        return ThompsonSampler(group_size=group_size, seed=seed, **kwargs)
     return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
 
 
@@ -442,13 +438,6 @@ class PUCTSampler:
         for aid in anc_ids:
             self._n[aid] = self._n.get(aid, 0) + count
         self._T += count
-
-    def record_outcomes(self, parent: State, rewards, valids):
-        """PUCT/UCT retain their existing valid-child-only update rule.
-
-        The Thompson subclass consumes every evaluation through this hook,
-        independently of archive deduplication and pruning.
-        """
 
     def reassign_seed_id(self, state: State, new_id: str):
         """Bind a freshly recreated step-zero seed to its durable artifact ID."""

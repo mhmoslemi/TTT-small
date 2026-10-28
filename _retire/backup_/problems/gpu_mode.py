@@ -28,7 +28,7 @@ import multiprocessing as mp
 import os
 import sys
 from typing import Any, Dict, List, Optional
-from problems.base import (Problem, ParentContext, RewardResult, SeedState,
+from _retire.problems.base import (Problem, ParentContext, RewardResult, SeedState,
                            render_state_context)
 
 from examples.gpu_mode.prompt import (

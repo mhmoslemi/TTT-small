@@ -18,7 +18,7 @@ import yaml
 import train_multy_CVaR as training
 from advantage import entropic_adaptive_advantages
 from config_validation import validate_problem_config
-from problems.base import RewardResult, SeedState
+from _retire.problems.base import RewardResult, SeedState
 from reward import extract_python_code
 from sampler import make_sampler
 from spo_rs import SPORSTracker
@@ -99,7 +99,7 @@ def test_help_and_new_policy_controls(load_config):
     assert cfg.spo_rs_clip_epsilon_low == cfg.spo_rs_clip_epsilon_high == .3
 
 
-@pytest.mark.parametrize("mode", ["puct", "uct", "thompson", "llm"])
+@pytest.mark.parametrize("mode", ["puct", "uct", "llm"])
 def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     cfg, values = load_config(extra=("--parent-selection", mode))
     assert cfg.parent_selection == mode and cfg.uct == (mode == "uct")
@@ -108,13 +108,9 @@ def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     (saved_dir / "config.json").write_text(json.dumps(values))
     cfg, _ = load_config(extra=("--resume", str(saved_dir)))
     assert cfg.parent_selection == mode
-    if mode in ("puct", "uct"):
-        with pytest.raises(ValueError, match="requires training_state.pt"):
-            load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
-        (saved_dir / "training_state.pt").touch()
-        cfg, _ = load_config(extra=("--resume", str(saved_dir), "--parent-selection", "thompson"))
-        assert cfg.parent_selection == "thompson" and not cfg.uct
     if mode != "llm":
+        with pytest.raises(ValueError, match="requires training_state.pt"):
+            load_config(extra=("--resume", str(saved_dir), "--parent-selection", "llm"))
         (saved_dir / "training_state.pt").touch()
         cfg, _ = load_config(extra=("--resume", str(saved_dir), "--parent-selection", "llm"))
         assert cfg.parent_selection == "llm" and not cfg.uct
@@ -568,32 +564,6 @@ def test_complete_step_with_cpu_generation_and_evaluation(
                        for prompt in remote_prompts[2:])
             if pooled_coder == "live":
                 assert worker_prepared.is_set() and coder_started.is_set()
-    if parent_selection == "thompson":
-        assert sampler._outcomes.attempts == expected_total
-        assert sampler._outcomes.valid == sum(bool(row["valid"]) for row in metadata)
-        for info in sampler.last_picks_info:
-            parent_node = sampler._nodes[info["thompson"]["path"][-1]]
-            assert parent_node.direct.attempts == cfg.group_size
-        if mode == "spo-rs":
-            # Recreate seeds with new UUIDs, as happens after a step-zero crash.
-            # Recovery must bind their saved identities, rebuild every outcome,
-            # and advance the RNG exactly as the ordinary step did.
-            recovered = make_sampler(
-                parent_selection="thompson", num_seeds=2, group_size=cfg.group_size,
-                seed=cfg.seed, seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
-            recovered_tracker = SPORSTracker(
-                entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
-            recovered_tracker.load_state_dict(initial_tracker)
-            artifacts = training._recoverable_spo_rs_artifacts(tmp_path, 0, cfg)
-            assert artifacts is not None
-            training._prepare_recoverable_response_tokens(None, TinyTokenizer(), artifacts)
-            cfg.strategies = allocation is not None
-            training._resume_spo_rs_step_from_artifacts(
-                backend, model, TinyTokenizer(), recovered, optimizer, 0, cfg, tmp_path,
-                problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts)
-            assert recovered.state_dict()["thompson"] == sampler.state_dict()["thompson"]
-            assert [s.id for s in recovered.sample_states(2, selection_step=1)] == [
-                s.id for s in sampler.sample_states(2, selection_step=1)]
     if parent_selection == "llm" and mode == "spo-rs":
         recovered = make_sampler(
             parent_selection="llm", num_seeds=2, exp_dir=tmp_path, problem=problem,
@@ -610,15 +580,6 @@ def test_complete_step_with_cpu_generation_and_evaluation(
             backend, model, TinyTokenizer(), recovered, optimizer, 0, cfg, tmp_path,
             problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts)
         assert recovered.state_dict() == sampler.state_dict()
-
-
-@pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
-@pytest.mark.parametrize("allocation", [None, "hurdle"])
-def test_thompson_full_step_and_spo_recovery(
-        monkeypatch, tmp_path, load_config, mode, allocation):
-    test_complete_step_with_cpu_generation_and_evaluation(
-        monkeypatch, tmp_path, load_config, mode, allocation,
-        remote_strategy=True, pooled_coder=True, parent_selection="thompson")
 
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])

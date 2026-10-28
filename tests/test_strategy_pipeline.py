@@ -9,7 +9,7 @@ import pytest
 
 import gen_workers
 from strategy_api import run_strategy_rounds
-from strategy_pipeline import StrategyArrivalStream
+from _retire.strategy_pipeline import StrategyArrivalStream
 
 
 class QuietBar:

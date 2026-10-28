@@ -327,8 +327,8 @@ def test_local_strategy_prompt_matches_0544_exactly():
 
 @pytest.mark.parametrize("problem", ["erdos", "ac1", "ac2"])
 def test_openai_prompt_preserves_problem_specific_requirements(problem):
-    from problems.erdos import ErdosMinOverlap
-    from problems.ac_inequalities import ACInequalities
+    from _retire.problems.erdos import ErdosMinOverlap
+    from _retire.problems.ac_inequalities import ACInequalities
     cfg = yaml.safe_load((ROOT / "configs" / f"{problem}.yaml").read_text())
     cfg["api_strategy"] = "gpt-6-luna"
     cls = ErdosMinOverlap if problem == "erdos" else ACInequalities

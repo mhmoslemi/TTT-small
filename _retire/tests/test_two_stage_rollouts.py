@@ -1,5 +1,5 @@
-from problems.base import ParentContext, Problem, RewardResult, SeedState
-from problems.erdos import ErdosMinOverlap
+from _retire.problems.base import ParentContext, Problem, RewardResult, SeedState
+from _retire.problems.erdos import ErdosMinOverlap
 from train_multy_CVaR import (
     _STRATEGY_FALLBACK,
     _apply_qwen3_8b_thinking_sampling,

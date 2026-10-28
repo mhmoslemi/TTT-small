@@ -1,4 +1,4 @@
-"""Problem-independent, hierarchical Thompson parent selection.
+"""Retired problem-independent, hierarchical Thompson parent selection.
 
 Each edge is a genealogy branch, not a problem-specific construction family.
 All evaluated attempts contribute to a Beta validity model. Valid child-minus-

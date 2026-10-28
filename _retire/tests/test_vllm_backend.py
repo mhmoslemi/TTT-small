@@ -1863,7 +1863,7 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertEqual(env[key], "6")
 
     def test_problem_passes_eval_cpu_budget_to_sandbox(self):
-        from problems.base import (ParentContext, Problem, RewardResult,
+        from _retire.problems.base import (ParentContext, Problem, RewardResult,
                                    SeedState)
 
         class ExampleProblem(Problem):

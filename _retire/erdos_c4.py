@@ -26,7 +26,7 @@ from typing import Any, List
 import numpy as np
 import sympy as sp
 
-from problems.base import (
+from _retire.problems.base import (
     ParentContext,
     Problem,
     RewardResult,

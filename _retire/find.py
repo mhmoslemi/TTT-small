@@ -23,8 +23,8 @@ matplotlib.use("Agg")            # headless: write files, never open a window
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from problems.registry import get_problem
-from problems.base import ParentContext
+from _retire.problems.registry import get_problem
+from _retire.problems.base import ParentContext
 from sandbox import run_code
 
 

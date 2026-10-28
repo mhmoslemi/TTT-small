@@ -14,7 +14,7 @@ Single-Cell Analysis (scRNA-seq denoising).
 from __future__ import annotations
 from typing import Any, List
 import numpy as np
-from problems.base import Problem, ParentContext, RewardResult, SeedState
+from _retire.problems.base import Problem, ParentContext, RewardResult, SeedState
 
 
 BASELINES = {

@@ -1902,9 +1902,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "from each generated strategy before applying the existing "
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
-    p.add_argument("--parent-selection", choices=("puct", "uct", "thompson", "llm"),
+    p.add_argument("--parent-selection", choices=("puct", "uct", "llm"),
                    default=None, help="Override the YAML picker; on resume, "
-                   "thompson or llm starts at the next fresh step. "
+                   "a switch to llm starts at the next fresh step. "
                    "llm uses GPT-6 Luna with maximum reasoning.")
     p.add_argument("--uct", dest="parent_selection", action="store_const",
                    const="uct", default=None,
@@ -2341,7 +2341,7 @@ def load_config():
                 parent_selection_mode(saved), merged["parent_selection"]):
             raise ValueError(
                 "cannot change parent_selection while resuming except "
-                "PUCT/UCT to Thompson or an existing picker to LLM")
+                "PUCT/UCT to LLM")
         if not (resume_dir / "training_state.pt").is_file():
             raise ValueError("parent-picker migration requires training_state.pt; "
                              "refusing to reset the trained run")
@@ -8326,22 +8326,13 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
               f"{cfg.parent_selection.upper()} starts at the next fresh step",
               flush=True)
         return sampler
-    if cfg.parent_selection == "llm":
-        from llm_sampler import LLMSampler
-        migrated = LLMSampler(
-            num_seeds=0, exp_dir=exp_dir, problem=problem,
-            puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
-            topk_children=sampler.topk_children)
-        migrated.load_state_dict(dict(sampler.state_dict(), selection_mode="llm"))
-        detail = "the full evaluated tree is available for LLM selection"
-    else:
-        from thompson_sampler import ThompsonSampler
-        migrated = ThompsonSampler(
-            num_seeds=1, group_size=int(cfg.group_size), seed=int(cfg.seed),
-            puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
-            topk_children=sampler.topk_children)
-        count = migrated.migrate_state_dict(sampler.state_dict(), exp_dir, next_step)
-        detail = f"rebuilt evidence from {count} evaluated attempts"
+    from llm_sampler import LLMSampler
+    migrated = LLMSampler(
+        num_seeds=0, exp_dir=exp_dir, problem=problem,
+        puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
+        topk_children=sampler.topk_children)
+    migrated.load_state_dict(dict(sampler.state_dict(), selection_mode="llm"))
+    detail = "the full evaluated tree is available for LLM selection"
     # Persist intent first: a crash before checkpoint replacement repeats the
     # migration, never recovers new-picker decisions with the legacy picker.
     path = Path(exp_dir) / "config.json"
@@ -8838,7 +8829,7 @@ def _finalize_pending_spo_rs_artifacts(
 
     from experiment_io import save_rollout
     from gen_workers import make_progress_bar
-    from problems.base import ParentContext, RewardResult
+    from _retire.problems.base import ParentContext, RewardResult
     from sampler import State
 
     if cfg.generation_backend != "vllm":
@@ -8893,11 +8884,6 @@ def _finalize_pending_spo_rs_artifacts(
         if row is None:
             raise RuntimeError(
                 f"generated-step recovery is missing parent group {group}")
-        if (sampler.selection_mode == "thompson" and step_idx == 0
-                and parent.id in sampler._seed_ids
-                and row.get("parent_id") is not None
-                and str(row["parent_id"]) != parent.id):
-            sampler.reassign_seed_id(parent, str(row["parent_id"]))
         if (str(row.get("parent_id")) != str(parent.id)
                 or int(row.get("parent_timestep", -1))
                 != int(parent.timestep)
@@ -9491,15 +9477,6 @@ def _resume_spo_rs_step_from_artifacts(
             overflow_state = None
             recovery_examples = all_examples
 
-    # Rebuild search evidence from every durable outcome, including failures,
-    # retries, duplicates and candidates excluded by the archive limits.
-    for parent_group, parent in enumerate(parents):
-        outcomes = [item["meta"] for item in artifacts
-                    if int(item["meta"].get("parent_group", item["meta"]["group"]))
-                    == parent_group]
-        sampler.record_outcomes(
-            parent, [row["reward"] for row in outcomes],
-            [row["valid"] for row in outcomes])
     archive_stats = sampler.update(
         all_children,
         strategy_keys=(strategy_keys if bool(cfg.strategies) else None),
@@ -9713,7 +9690,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
-    from problems.base import ParentContext, RewardResult, is_code_failure
+    from _retire.problems.base import ParentContext, RewardResult, is_code_failure
     from gen_workers import make_progress_bar
 
 
@@ -9749,13 +9726,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             print(f"  parent {i} [{tag}] raw={parents[i].raw_score!r} "
                   f"Luna rank={detail['rank']} ({detail['role']}): "
                   f"{detail['reason']}")
-            continue
-        if info.get("selection_mode") == "thompson":
-            detail = info["thompson"]
-            print(f"  parent {i} [{tag}]  value={info['value']:.9f}  "
-                  f"observed={info['n']}  direct={detail['direct_attempts']}  "
-                  f"Thompson expected gain={info['score']:.9g}  "
-                  f"depth={len(detail['path']) - 1}")
             continue
         prior_label = ("" if info.get("selection_mode") == "uct"
                        else f"  P={info['P']:.9f}")
@@ -12346,7 +12316,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if rewards_np.size == 0:
             print(f"  group {g}: no rollouts returned; no update for this group")
             continue
-        sampler.record_outcomes(parent, rewards, valids)
         adv_mode = active_advantage_mode
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
@@ -13196,7 +13165,7 @@ def main():
 
     # Build the problem from the merged config (the registry reads problem-only
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
-    from problems.registry import get_problem
+    from _retire.problems.registry import get_problem
     problem_config = merged
     if cfg.isolate_eval:
         # Prompts must describe the sandbox's real allocation. Keep the saved
@@ -13266,9 +13235,7 @@ def main():
     print(f"Steps:              {cfg.num_steps}")
     selection = cfg.parent_selection
     selection_detail = ("gpt-6-luna, reasoning=max; first pick=best raw score"
-                        if selection == "llm" else (
-                        "hierarchical expected-best" if selection == "thompson"
-                        else f"c={cfg.puct_c}"))
+                        if selection == "llm" else f"c={cfg.puct_c}")
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     print(f"Groups per step:    {cfg.groups_per_step}")

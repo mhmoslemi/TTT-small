@@ -26,7 +26,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, List
 import numpy as np
-from problems.base import (
+from _retire.problems.base import (
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 
