@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-import gpu_runtime
+import runtime.gpu_runtime as gpu_runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +28,7 @@ def blackwell_cards(total_gib=94.97):
 ])
 def test_gpt_oss_layout_and_worker_share_bounded_startup_contract(
         total_gib, quantization, expected_tp):
-    from gen_workers import _vllm_engine_kwargs
+    from generation.gen_workers import _vllm_engine_kwargs
 
     cfg = dict(model_name="openai/gpt-oss-120b", max_seq_length=131072,
                vllm_gpu_memory_utilization=.9,
@@ -87,7 +87,7 @@ def test_erdos_gpt_oss_config_uses_eight_coders(monkeypatch, tmp_path, resume):
 
 
 def test_qwen_keeps_original_worker_and_parallel_layout():
-    from gen_workers import _vllm_engine_kwargs
+    from generation.gen_workers import _vllm_engine_kwargs
 
     cfg = dict(model_name="Qwen/Qwen3.8-27B", max_seq_length=131072,
                vllm_gpu_memory_utilization=.9, vllm_runtime_reserve_gib=15.)

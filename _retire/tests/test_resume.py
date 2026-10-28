@@ -4,7 +4,7 @@ import sys
 from types import SimpleNamespace
 import yaml
 
-from sampler import PUCTSampler, State
+from search.sampler import PUCTSampler, State
 from experiment_io import (load_rollout_logprobs, make_experiment_dir,
                            save_rollout_logprobs, save_rollout_token_ids)
 from train_multy_CVaR import (

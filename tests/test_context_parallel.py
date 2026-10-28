@@ -9,7 +9,7 @@ from torch import nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-import context_parallel as cp
+import training.context_parallel as cp
 
 
 @pytest.mark.parametrize('split_k_supported', [False, True])
@@ -172,7 +172,7 @@ def test_bf16_halo_preserves_native_fused_rounding(monkeypatch):
 
 
 def test_hybrid_context_keeps_native_forward_and_restores_kernels(monkeypatch):
-    import model_backend
+    import models.model_backend as model_backend
 
     layer = type('Qwen3_5GatedDeltaNet', (nn.Module,), {})()
     layer.causal_conv1d_fn = _native_convolution
@@ -288,7 +288,7 @@ def _distributed_checks(rank, rendezvous):
         full_qkv = [item.clone().requires_grad_() for item in qkv]
         local_qkv = [item[:, :, rank * 4:(rank + 1) * 4].clone().requires_grad_()
                      for item in qkv]
-        from model_backend import _ttt_blockwise_attention_forward
+        from models.model_backend import _ttt_blockwise_attention_forward
         native = lambda q, k, v, mask, **kw: _ttt_blockwise_attention_forward(
             SimpleNamespace(training=False), q, k, v, mask, **kw)
         expected, _ = native(*full_qkv, None)
@@ -318,7 +318,7 @@ def _distributed_checks(rank, rendezvous):
         reference = TinyModel()
         parallel = deepcopy(reference)
         parallel.model.context = context
-        from fast_distributed import reduce_trainable_gradients
+        from training.fast_distributed import reduce_trainable_gradients
         # Also exercise a padding-only rank: it must join all backward collectives.
         for response_length in (113, 5):
             reference.zero_grad(set_to_none=True)
@@ -350,7 +350,7 @@ def _distributed_checks(rank, rendezvous):
         # Previously it discarded the supplied reference and did a second CP
         # forward for old scores, so the losses being compared were different.
         from contextlib import contextmanager
-        import fast_distributed
+        import training.fast_distributed as fast_distributed
         backend = SimpleNamespace(model=TinyModel())
         backend.set_training_mode = backend.model.train
         original_scores = cp.token_logprobs
@@ -393,9 +393,9 @@ def test_distributed_attention_halo_tokens_entropy_and_actual_spo_rs_gradients(t
 
 @pytest.mark.parametrize('invalid_kernel', [False, True, 'narrow'])
 def test_coordinator_commits_each_trajectory_once_before_one_update(monkeypatch, tmp_path, invalid_kernel):
-    import fast_distributed
+    import training.fast_distributed as fast_distributed
     import train_multy_CVaR as training
-    from exact_overflow import METRICS, pack_cpu_gradients
+    from training.exact_overflow import METRICS, pack_cpu_gradients
 
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(10)

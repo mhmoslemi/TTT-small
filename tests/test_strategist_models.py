@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-import gen_workers
-import gpu_runtime
-import strategist_models as models
+import generation.gen_workers as gen_workers
+import runtime.gpu_runtime as gpu_runtime
+import models.strategist_models as models
 from config_validation import validate_problem_config
 
 

@@ -13,8 +13,8 @@ from unittest.mock import Mock, patch
 
 from experiment_io import (StepPlotter, load_best_state_snapshot,
                            save_best_state_snapshot)
-from plot_ac import main as plot_ac_main, pick as pick_ac
-from plot_erdos_best_curve import _display_target, load_best_curve
+from analysis.plot_ac import main as plot_ac_main, pick as pick_ac
+from analysis.plot_erdos_best_curve import _display_target, load_best_curve
 
 
 class StepPlotTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class StepPlotTests(unittest.TestCase):
                 self.assertEqual(call.kwargs["timeout"], 120)
             self.assertIn("--saved-only", mocked.call_args_list[0].args[0])
             self.assertEqual(Path(mocked.call_args_list[1].args[0][1]).name,
-                             "plot_erdos_best_curve.py")
+                             'analysis/plot_erdos_best_curve.py')
         self.assertIn("completed step 1", (self.root / "plots.log").read_text())
 
     def test_non_erdos_gets_generic_curve_only(self):
@@ -61,7 +61,7 @@ class StepPlotTests(unittest.TestCase):
             plotter.close()
         self.assertEqual(run.call_count, 1)
         self.assertEqual(Path(run.call_args.args[0][1]).name,
-                         "plot_erdos_best_curve.py")
+                         'analysis/plot_erdos_best_curve.py')
 
     def test_ac_gets_exact_solution_plot_and_generic_curve(self):
         for problem in ("ac1", "ac2"):
@@ -75,7 +75,7 @@ class StepPlotTests(unittest.TestCase):
                 scripts = [Path(call.args[0][1]).name
                            for call in run.call_args_list]
                 self.assertEqual(
-                    scripts, ["plot_ac.py", "plot_erdos_best_curve.py"])
+                    scripts, ['analysis/plot_ac.py', 'analysis/plot_erdos_best_curve.py'])
                 for call in run.call_args_list:
                     self.assertEqual(call.args[0][3:5], ["--max-step", "2"])
 
@@ -104,7 +104,7 @@ class StepPlotTests(unittest.TestCase):
 
     def _solution_functions(self):
         # Exercise routing without needing numpy or matplotlib on this Mac.
-        source = (Path(__file__).resolve().parents[1] / "plot_erdos.py").read_text()
+        source = (Path(__file__).resolve().parents[1] / 'analysis/plot_erdos.py').read_text()
         functions = [node for node in ast.parse(source).body
                      if isinstance(node, ast.FunctionDef)
                      and node.name in {"load_metas", "pick", "main"}]
@@ -113,7 +113,7 @@ class StepPlotTests(unittest.TestCase):
                      extract_code=Mock(),
                      load_best_state_snapshot=lambda *_args, **_kwargs: None)
         exec(compile(ast.Module(body=functions, type_ignores=[]),
-                     "plot_erdos.py", "exec"), scope)
+                     'analysis/plot_erdos.py', "exec"), scope)
         return scope
 
     def test_both_loaders_exclude_later_steps(self):
@@ -210,11 +210,11 @@ class StepPlotTests(unittest.TestCase):
         loaded = load_best_state_snapshot(self.root, max_step=0)
         self.assertEqual(loaded["state_id"], "seed-best")
 
-        with patch.object(sys, "argv", ["plot_ac.py", str(self.root),
+        with patch.object(sys, "argv", ['analysis/plot_ac.py', str(self.root),
                                          "--max-step", "0"]):
-            with patch("plot_ac.evaluated_sequence_and_score",
+            with patch('analysis.plot_ac.evaluated_sequence_and_score',
                        return_value=([1.0, 2.0], 1.5)):
-                with patch("plot_ac.plot_sequence") as plot:
+                with patch('analysis.plot_ac.plot_sequence') as plot:
                     with patch("sys.stdout", new=io.StringIO()):
                         plot_ac_main()
         self.assertEqual(plot.call_args.args[0], [1.0, 2.0])
@@ -224,7 +224,7 @@ class StepPlotTests(unittest.TestCase):
     def test_missing_construction_never_replays_in_auto_mode(self):
         self._metas()
         scope = self._solution_functions()
-        with patch.object(sys, "argv", ["plot_erdos.py", str(self.root),
+        with patch.object(sys, "argv", ['analysis/plot_erdos.py', str(self.root),
                                          "--max-step", "0", "--saved-only"]):
             with patch("sys.stdout", new=io.StringIO()):
                 with self.assertRaisesRegex(SystemExit, "forbids program replay"):

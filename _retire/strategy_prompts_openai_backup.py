@@ -11,8 +11,8 @@ from copy import deepcopy
 import json
 import re
 
-from output_retries import final_answer_scope
-from strategy_prompts import API_STRATEGY_PROMPT
+from generation.output_retries import final_answer_scope
+from generation.strategy_prompts import API_STRATEGY_PROMPT
 
 
 STRATEGY_PLAN_FORMAT = {

@@ -11,7 +11,7 @@ import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
-from loading_logs import quiet_replica_load
+from diagnostics.loading_logs import quiet_replica_load
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +23,7 @@ class LoadingLogTests(unittest.TestCase):
             log = Path(directory) / "worker.log"
             script = textwrap.dedent(r"""
                 import os, sys
-                from loading_logs import quiet_replica_load
+                from diagnostics.loading_logs import quiet_replica_load
                 print('first replica loading details', flush=True)
                 with quiet_replica_load(sys.argv[1]):
                     print('duplicate loading details', flush=True)
@@ -100,7 +100,7 @@ class LoadingLogTests(unittest.TestCase):
 
     def test_quiet_context_is_only_for_additional_replica_loading(self):
         trainer = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
-        worker_tree = ast.parse((ROOT / "fast_distributed.py").read_text())
+        worker_tree = ast.parse((ROOT / 'training/fast_distributed.py').read_text())
         worker = next(n for n in worker_tree.body
                       if isinstance(n, ast.FunctionDef) and n.name == "worker_main")
         def quiet_blocks(tree):

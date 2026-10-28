@@ -145,12 +145,12 @@ class StepPlotter:
         import subprocess
         import sys
 
-        scripts = [("plot_erdos_best_curve.py", []),
-                   ("plot_parent_tree.py", [])]
+        scripts = [("analysis.plot_erdos_best_curve", []),
+                   ("analysis.plot_parent_tree", [])]
         if self.problem in {"erdos", "erdos_min_overlap", "erdos_minimum_overlap"}:
-            scripts.insert(0, ("plot_erdos.py", ["--saved-only"]))
+            scripts.insert(0, ("analysis.plot_erdos", ["--saved-only"]))
         elif self.problem in {"ac1", "ac2"}:
-            scripts.insert(0, ("plot_ac.py", []))
+            scripts.insert(0, ("analysis.plot_ac", []))
         environment = dict(os.environ)
         environment.update({
             "MPLBACKEND": "Agg", "CUDA_VISIBLE_DEVICES": "",
@@ -167,9 +167,9 @@ class StepPlotter:
                     log.flush()
                     try:
                         result = subprocess.run(
-                            [sys.executable, str(script_dir / script),
+                            [sys.executable, "-m", script,
                              str(self.run_dir), "--max-step", str(step), *options],
-                            env=environment, stdin=subprocess.DEVNULL,
+                            cwd=script_dir, env=environment, stdin=subprocess.DEVNULL,
                             stdout=log, stderr=subprocess.STDOUT,
                             timeout=120, check=False,
                         )

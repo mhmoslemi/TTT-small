@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from spo_rs import (BOUNDED_SHAPING_VERSION, BoundedSPORSTracker,
+from training.spo_rs import (BOUNDED_SHAPING_VERSION, BoundedSPORSTracker,
                     SPORSTracker, validate_shaping_resume)
 
 

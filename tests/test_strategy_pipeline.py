@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import gen_workers
-from strategy_api import run_strategy_rounds
+import generation.gen_workers as gen_workers
+from generation.strategy_api import run_strategy_rounds
 from _retire.strategy_pipeline import StrategyArrivalStream
 
 

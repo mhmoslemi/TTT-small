@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from experiment_io import StepPlotter
-from plot_parent_tree import (_best_path, load_genealogy, load_plot_genealogy,
+from analysis.plot_parent_tree import (_best_path, load_genealogy, load_plot_genealogy,
                               tree_layout, write_svg, write_tree_log)
 
 
@@ -47,10 +47,12 @@ def test_every_problem_refreshes_the_parent_tree(tmp_path):
     with patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
         plotter.submit(4)
         plotter.close()
-    scripts = [Path(call.args[0][1]).name for call in run.call_args_list]
-    assert scripts == ["plot_ac.py", "plot_erdos_best_curve.py",
-                       "plot_parent_tree.py"]
-    assert all(call.args[0][3:5] == ["--max-step", "4"]
+    scripts = [call.args[0][2] for call in run.call_args_list]
+    assert scripts == ["analysis.plot_ac", "analysis.plot_erdos_best_curve",
+                       "analysis.plot_parent_tree"]
+    assert all(call.args[0][1] == "-m" and call.args[0][4:6] == ["--max-step", "4"]
+               for call in run.call_args_list)
+    assert all(call.kwargs["cwd"] == Path(__file__).resolve().parents[1]
                for call in run.call_args_list)
 
 

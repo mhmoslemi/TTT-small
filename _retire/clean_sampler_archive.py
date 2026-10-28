@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 
-from sampler import PUCTSampler, State
+from search.sampler import PUCTSampler, State
 
 
 def deduplicate_sampler(saved):

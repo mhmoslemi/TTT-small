@@ -14,7 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAINER = "train_multy_CVaR.py"
-WORKER = "fast_distributed.py"
+WORKER = 'training/fast_distributed.py'
 
 
 def previous_source(path):

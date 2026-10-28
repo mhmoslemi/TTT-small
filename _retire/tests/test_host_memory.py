@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import host_memory
-from gen_workers import PhasedVLLMGenerationPool
+import runtime.host_memory as host_memory
+from generation.gen_workers import PhasedVLLMGenerationPool
 
 
 class _FakeCuda:
@@ -56,10 +56,10 @@ class HostMemoryTests(unittest.TestCase):
         healthy = {"total": 100 * host_memory.GIB,
                    "available": 80 * host_memory.GIB}
 
-        with (patch("host_memory.host_memory_info", return_value=healthy),
-              patch("host_memory.process_rss_bytes", return_value=123),
-              patch("host_memory.gc.collect"),
-              patch("host_memory._malloc_trim", return_value=True)):
+        with (patch('runtime.host_memory.host_memory_info', return_value=healthy),
+              patch('runtime.host_memory.process_rss_bytes', return_value=123),
+              patch('runtime.host_memory.gc.collect'),
+              patch('runtime.host_memory._malloc_trim', return_value=True)):
             result = host_memory.reclaim_unused_host_memory(
                 fake_torch, cuda_devices=(3,), force=False)
 
@@ -76,8 +76,8 @@ class HostMemoryTests(unittest.TestCase):
         healthy = {"total": 100 * host_memory.GIB,
                    "available": 80 * host_memory.GIB}
 
-        with (patch("host_memory.host_memory_info", return_value=healthy),
-              patch("host_memory.process_rss_bytes", return_value=123)):
+        with (patch('runtime.host_memory.host_memory_info', return_value=healthy),
+              patch('runtime.host_memory.process_rss_bytes', return_value=123)):
             result = host_memory.reclaim_unused_host_memory(
                 fake_torch, cuda_devices=(0,), force=False)
 

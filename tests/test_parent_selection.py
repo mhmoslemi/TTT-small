@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from config_validation import validate_problem_config
-from sampler import PUCTSampler, State, make_sampler, parent_selection_mode
+from search.sampler import PUCTSampler, State, make_sampler, parent_selection_mode
 
 
 def children(sampler, parent, rewards, step=0):

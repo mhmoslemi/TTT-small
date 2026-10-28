@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-import strategy_api
-from strategy_api import StrategyAPIGenerationPool, run_strategy_rounds
-from strategy_prompts_openai import (
+import generation.strategy_api as strategy_api
+from generation.strategy_api import StrategyAPIGenerationPool, run_strategy_rounds
+from generation.strategy_prompts_openai import (
     STRATEGY_PLAN_FORMAT, build_openai_strategy_messages,
     normalize_strategy_plan, openai_strategy_retry_messages,
 )
@@ -318,7 +318,7 @@ def test_local_xml_contract_is_unchanged():
 
 def test_local_strategy_prompt_matches_0544_exactly():
     from hashlib import sha256
-    from strategy_prompts import LOCAL_STRATEGY_PROMPT
+    from generation.strategy_prompts import LOCAL_STRATEGY_PROMPT
 
     # Exact historical template, including its history placeholder and output contract.
     assert sha256(LOCAL_STRATEGY_PROMPT.encode()).hexdigest() == (
@@ -327,8 +327,8 @@ def test_local_strategy_prompt_matches_0544_exactly():
 
 @pytest.mark.parametrize("problem", ["erdos", "ac1", "ac2"])
 def test_openai_prompt_preserves_problem_specific_requirements(problem):
-    from _retire.problems.erdos import ErdosMinOverlap
-    from _retire.problems.ac_inequalities import ACInequalities
+    from problems.erdos import ErdosMinOverlap
+    from problems.ac_inequalities import ACInequalities
     cfg = yaml.safe_load((ROOT / "configs" / f"{problem}.yaml").read_text())
     cfg["api_strategy"] = "gpt-6-luna"
     cls = ErdosMinOverlap if problem == "erdos" else ACInequalities
@@ -363,8 +363,8 @@ def config(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-never-sent")
     monkeypatch.setenv("AVAILABLE_GPUS", "0,1")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setattr("gpu_runtime.query_gpu_memory", lambda: {})
-    monkeypatch.setattr("gpu_runtime.detect_attention_heads", lambda name: 32)
+    monkeypatch.setattr('runtime.gpu_runtime.query_gpu_memory', lambda: {})
+    monkeypatch.setattr('runtime.gpu_runtime.detect_attention_heads', lambda name: 32)
 
     def load(*extra, filename="erdos.yaml"):
         monkeypatch.setattr(sys, "argv", ["train_multy_CVaR.py", "--config",

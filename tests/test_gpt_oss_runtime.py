@@ -11,8 +11,8 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from gpt_oss_training import install_attention_layout_guards
-from model_backend import (
+from models.gpt_oss_training import install_attention_layout_guards
+from models.model_backend import (
     _is_packed_mxfp4, _require_packed_mxfp4_training_runtime)
 from train_multy_CVaR import _coder_vllm_persistent_workers
 

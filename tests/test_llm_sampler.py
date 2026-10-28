@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from experiment_io import save_parent_selections
-from llm_sampler import LLMSampler
-from sampler import make_sampler
+from search.llm_sampler import LLMSampler
+from search.sampler import make_sampler
 
 
 def problem(maximize=False):

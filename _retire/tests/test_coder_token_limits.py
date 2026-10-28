@@ -199,8 +199,8 @@ class CoderTokenLimitTests(unittest.TestCase):
         with TemporaryDirectory() as directory, \
              patch.dict(sys.modules, {"numpy": numpy, "yaml": yaml}), \
              patch.dict(os.environ, {"AVAILABLE_GPUS": "0,1"}), \
-             patch("gpu_runtime.query_gpu_memory", return_value={}), \
-             patch("gpu_runtime.detect_attention_heads", return_value=24):
+             patch('runtime.gpu_runtime.query_gpu_memory', return_value={}), \
+             patch('runtime.gpu_runtime.detect_attention_heads', return_value=24):
             config_path = Path(directory) / "config.yaml"
             config_path.write_text("# fixture parsed by mocked yaml\n")
             resume_dir = Path(directory) / "resume"

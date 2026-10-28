@@ -19,7 +19,7 @@ from unittest.mock import patch
 from contextlib import nullcontext, redirect_stdout
 
 from experiment_io import save_strategy_response
-from output_retries import (coder_output_issue, coder_retry_gate,
+from generation.output_retries import (coder_output_issue, coder_retry_gate,
                             coder_retry_prompt_job,
                             final_answer_scope, output_retry_messages,
                             retry_metadata, strategy_retry_needed)
@@ -626,7 +626,7 @@ class StrategySchedulerTests(unittest.TestCase):
             deque=deque, queue=queue, make_progress_bar=Bar,
             setting_log_only=lambda *args, **kwargs: None,
         )
-        functions_from_file("gen_workers.py", {"run_sequential_chains"}, scope)
+        functions_from_file('generation/gen_workers.py', {"run_sequential_chains"}, scope)
         results = queue.Queue()
         dispatched = []
         class TaskQueue:
@@ -676,7 +676,7 @@ class StrategySchedulerTests(unittest.TestCase):
         self.assertEqual(len(dispatched), 4)
 
     def test_phased_pool_exhaustion_stops_workers_without_sleep(self):
-        tree = ast.parse((ROOT / "gen_workers.py").read_text())
+        tree = ast.parse((ROOT / 'generation/gen_workers.py').read_text())
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                    and node.name == "PhasedVLLMGenerationPool")
         method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)

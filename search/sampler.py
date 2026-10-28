@@ -1,0 +1,568 @@
+"""
+PUCT/UCT state archive.
+
+For each candidate state s in the archive, PUCT uses:
+
+    score(s) = Q(s) + c * scale * P(s) * sqrt(1 + T) / (1 + n(s))
+
+UCT uses the same c and reward scale but removes the prior:
+
+    score(s) = Q(s) + c * scale * sqrt(log(1 + T) / (1 + n(s)))
+
+  Q(s)   = max child reward seen so far from s (or R(s) if never expanded)
+  P(s)   = rank-based prior over the archive.
+  scale  = max(R) - min(R) over the non-seed archive
+  T      = total expansions performed
+  n(s)   = expansions of s OR ANY DESCENDANT (so a successful lineage
+           gets dampened, not just one node)
+
+When selecting a batch of B parents, we also exclude the full ancestor
+AND descendant set of each picked state from being picked again in the
+same batch ("lineage blocking").
+
+After each batch:
+  - Push the new children into the archive
+  - Keep top-K children per parent (K=2 by default)
+  - Cap the archive at MAX_BUFFER_SIZE by reward (seeds always kept)
+
+State carries two optional problem-agnostic payloads:
+  - raw_score:   the TRUE metric for prompt display (separate from `value`).
+  - construction: an injected global threaded parent -> child for warm starts.
+
+Archive reads, updates, and checkpoint serialization are guarded by an RLock.
+"""
+
+import threading
+import uuid
+import numpy as np
+from dataclasses import asdict, dataclass, field
+
+
+PARENT_SELECTION_MODES = ("puct", "uct", "llm")
+
+
+def parent_selection_mode(config):
+    """Resolve the new selector while accepting old ``uct: true`` configs."""
+    mode = config.get("parent_selection")
+    if mode is None:
+        mode = "uct" if config.get("uct", False) else "puct"
+    if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
+        raise ValueError("parent_selection must be 'puct', 'uct', or 'llm'")
+    return mode.lower()
+
+
+def can_migrate_parent_selection(source, target):
+    return target == "llm" and source in ("puct", "uct")
+
+
+def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
+                 exp_dir=None, problem=None, **kwargs):
+    mode = parent_selection_mode({"parent_selection": parent_selection})
+    if mode == "llm":
+        from search.llm_sampler import LLMSampler
+        return LLMSampler(exp_dir=exp_dir, problem=problem, **kwargs)
+    return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
+
+
+@dataclass
+class State:
+    id: str
+    timestep: int          # training step when this state was first created
+    value: float           # reward of this state (always higher=better)
+    code: str              # the code that produced it
+    parents: list = field(default_factory=list)   # [{"id": ..., "timestep": ...}]
+    is_seed: bool = False  # True for initial seed states
+    raw_score: float = None      # true metric for prompt display (may equal value)
+    construction: list = None    # injected global threaded parent -> child
+
+    @staticmethod
+    def make(timestep, value, code, parents=None, is_seed=False,
+             raw_score=None, construction=None):
+        return State(
+            id=str(uuid.uuid4()),
+            timestep=timestep,
+            value=value,
+            code=code,
+            parents=parents or [],  # all the parents not just one
+            is_seed=is_seed,
+            raw_score=raw_score,
+            construction=construction,
+        )
+
+
+class PUCTSampler:
+    def __init__(
+        self,
+        num_seeds: int,
+        puct_c: float = 1.0,
+        max_buffer_size: int = 1000,
+        topk_children: int = 2,
+        seed_value: float = 0.0,
+        seed_states: list = None,
+        use_uct: bool = False,
+    ):
+        self.puct_c = float(puct_c)
+        self.use_uct = bool(use_uct)
+        self.max_buffer_size = max_buffer_size
+        self.topk_children = topk_children
+
+        # PUCT statistics
+        self._n = {}   # state.id -> visit count (incl. descendants)
+        self._m = {}   # state.id -> best child reward seen
+        self._T = 0    # total expansions
+
+        # Archive starts with seeds
+        self._states = []
+        self._seed_ids = set()
+
+        self._lock = threading.RLock()
+
+        if seed_states:
+            for ss in seed_states:
+                s = State.make(
+                    timestep=0,
+                    value=getattr(ss, "value", seed_value),
+                    code=getattr(ss, "code", "") or "",
+                    is_seed=True,
+                    raw_score=getattr(ss, "raw_score", None),
+                    construction=getattr(ss, "construction", None),
+                )
+                self._states.append(s)
+                self._seed_ids.add(s.id)
+        else:
+            for _ in range(num_seeds):
+                s = State.make(timestep=0, value=seed_value, code="", is_seed=True)
+                self._states.append(s)
+                self._seed_ids.add(s.id)
+
+        # Independent records of the raw extrema. They are updated before code
+        # deduplication and archive pruning, so "best ever" cannot regress when
+        # a stochastic rerun of identical code obtains a better native metric.
+        self._best_raw_min = None
+        self._best_raw_max = None
+        self._record_raw_states(self._states)
+
+        # Stats from last sample_states call (for printing)
+        self.last_picks_info = []
+
+    @property
+    def selection_mode(self):
+        return "uct" if self.use_uct else "puct"
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _finite_raw(state):
+        if state.raw_score is None:
+            return None
+        try:
+            raw = float(state.raw_score)
+        except (TypeError, ValueError):
+            return None
+        return raw if np.isfinite(raw) else None
+
+    def _record_raw_states(self, states):
+        for state in states:
+            raw = self._finite_raw(state)
+            if raw is None:
+                continue
+            if (self._best_raw_min is None
+                    or raw < float(self._best_raw_min.raw_score)):
+                self._best_raw_min = state
+            if (self._best_raw_max is None
+                    or raw > float(self._best_raw_max.raw_score)):
+                self._best_raw_max = state
+
+    @staticmethod
+    def _archive_key(state):
+        """Match 0544: deduplicate exact source code, not its construction."""
+        return ("code", state.code) if state.code else None
+
+    def _build_children_map(self):
+        children = {}
+        for s in self._states:
+            for p in s.parents:
+                children.setdefault(p["id"], set()).add(s.id)
+        return children
+
+    def _full_lineage(self, state, children_map):
+        """Ancestors + descendants + self."""
+        lineage = {state.id}
+        for p in state.parents:
+            lineage.add(p["id"])
+        queue = [state.id]
+        visited = {state.id}
+        while queue:
+            sid = queue.pop(0)
+            for c in children_map.get(sid, []):
+                if c not in visited:
+                    visited.add(c)
+                    lineage.add(c)
+                    queue.append(c)
+        return lineage
+
+    def _scale(self):
+        vals = np.array([
+            s.value for s in self._states
+            if s.id not in self._seed_ids and s.value is not None
+        ])
+        if vals.size == 0:
+            return 1.0
+        return float(max(vals.max() - vals.min(), 1e-6))
+
+    def _prior(self, values):
+        """Rank-based: best gets (N), worst gets 1; normalize to a distribution."""
+        if len(values) == 0:
+            return np.array([])
+        N = len(values)
+        order = np.argsort(np.argsort(-values))  # rank 0 = best
+        w = (N - order).astype(np.float64)
+        return w / w.sum()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def sample_states(self, num_states: int, *, selection_step=None):
+        """Pick `num_states` parent states for the next batch."""
+        if not self._states:
+            return []
+
+        values = np.array([s.value if s.value is not None else -np.inf
+                           for s in self._states])
+        scale = self._scale()
+        if self.use_uct:
+            # This archive has one global expansion count rather than a local
+            # tree-parent count, so T and n(s) are the direct archive analogues
+            # of the usual UCT N(parent) and N(parent, action).
+            P = np.zeros(len(values), dtype=np.float64)
+            uct_numerator = np.log1p(self._T)
+        else:
+            P = self._prior(values)
+            sqrtT = np.sqrt(1.0 + self._T)
+
+        scored = []
+        for i, s in enumerate(self._states):
+            n = self._n.get(s.id, 0)
+            m = self._m.get(s.id, values[i])
+            Q = m if n > 0 else values[i]
+            if self.use_uct:
+                bonus = self.puct_c * scale * np.sqrt(
+                    uct_numerator / (1.0 + n))
+            else:
+                bonus = self.puct_c * scale * P[i] * sqrtT / (1.0 + n)
+            scored.append((Q + bonus, values[i], s, n, Q, P[i], bonus))
+
+        # Sort by (score, value) descending
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        # Lineage blocking across the batch
+        children_map = self._build_children_map()
+        blocked = set()
+        picks = []
+        info = []
+        for entry in scored:
+            s = entry[2]
+            if s.id in blocked:
+                continue
+            picks.append(s)
+            info.append({
+                "value": entry[1], "n": entry[3], "Q": entry[4],
+                "P": None if self.use_uct else entry[5],
+                "bonus": entry[6], "score": entry[0],
+                "selection_mode": "uct" if self.use_uct else "puct",
+                "is_seed": s.id in self._seed_ids,
+            })
+            blocked.update(self._full_lineage(s, children_map))
+            if len(picks) >= num_states:
+                break
+
+        # If we couldn't fill the batch with blocking, top up without blocking
+        if len(picks) < num_states:
+            picked_ids = {s.id for s in picks}
+            for entry in scored:
+                if len(picks) >= num_states:
+                    break
+                s = entry[2]
+                if s.id in picked_ids:
+                    continue
+                picks.append(s)
+                info.append({
+                    "value": entry[1], "n": entry[3], "Q": entry[4],
+                    "P": None if self.use_uct else entry[5],
+                    "bonus": entry[6], "score": entry[0],
+                    "selection_mode": "uct" if self.use_uct else "puct",
+                    "is_seed": s.id in self._seed_ids,
+                })
+
+        self.last_picks_info = info
+        return picks
+
+    def update(self, children_with_parents, *, strategy_keys=None,
+               strategy_top_r: int = 0):
+        """
+        Push new children into the archive and update PUCT stats.
+        children_with_parents: list of (child_state, parent_state).
+        Only children with valid (non-None) values should be passed.
+
+        When strategy_keys is supplied, it must align one-for-one with
+        children_with_parents. After exact-code deduplication,
+        at most strategy_top_r new children are admitted from each
+        (parent, strategy) pair. The ordinary top-K-per-parent and global
+        archive cap are then applied unchanged.
+
+        The whole body is guarded so checkpoint reads cannot observe a
+        partially rebuilt archive.
+        """
+        children_with_parents = list(children_with_parents)
+        strategy_top_r = int(strategy_top_r or 0)
+        if strategy_top_r < 0:
+            raise ValueError("strategy_top_r must be nonnegative")
+        if strategy_keys is None:
+            strategy_keys = [None] * len(children_with_parents)
+        else:
+            strategy_keys = list(strategy_keys)
+            if len(strategy_keys) != len(children_with_parents):
+                raise ValueError(
+                    "strategy_keys must align with children_with_parents")
+            if strategy_top_r > 0 and any(
+                    key is None for key in strategy_keys):
+                raise ValueError(
+                    "strategy_keys cannot contain None when strategy_top_r "
+                    "is enabled")
+
+        with self._lock:
+            # Do this before deduplication/pruning: every successfully evaluated
+            # child counts toward the run's problem-native best-ever value.
+            self._record_raw_states(
+                child for child, _parent in children_with_parents
+                if child.value is not None
+            )
+
+            # Update m for parents (best child reward)
+            parent_best = {}
+            for child, parent in children_with_parents:
+                if child.value is None:
+                    continue
+                pid = parent.id
+                parent_best[pid] = max(parent_best.get(pid, -np.inf), float(child.value))
+            for pid, best in parent_best.items():
+                self._m[pid] = max(self._m.get(pid, best), best)
+
+            # Equal code is a duplicate even when its stochastic output differs.
+            existing_keys = {self._archive_key(s) for s in self._states}
+            existing_keys.discard(None)
+            new_entries = []
+            for (child, parent), strategy_key in zip(
+                    children_with_parents, strategy_keys):
+                if child.value is None:
+                    continue
+                key = self._archive_key(child)
+                if key is not None and key in existing_keys:
+                    continue  # exact dup
+                child.parents = (
+                    [{"id": parent.id, "timestep": parent.timestep}]
+                    + (parent.parents or [])
+                )
+                new_entries.append((child, parent, strategy_key))
+                if key is not None:
+                    existing_keys.add(key)
+
+            unique_new = len(new_entries)
+            if strategy_top_r > 0:
+                by_parent_strategy = {}
+                for child, parent, strategy_key in new_entries:
+                    key = (parent.id, strategy_key)
+                    by_parent_strategy.setdefault(key, []).append(
+                        (child, parent, strategy_key))
+                admitted_entries = []
+                for candidates in by_parent_strategy.values():
+                    candidates.sort(
+                        key=lambda entry: (
+                            entry[0].value
+                            if entry[0].value is not None else -np.inf),
+                        reverse=True,
+                    )
+                    admitted_entries.extend(candidates[:strategy_top_r])
+            else:
+                admitted_entries = new_entries
+
+            new_states = [entry[0] for entry in admitted_entries]
+            self._states.extend(new_states)
+
+            # Enforce top-K children per parent (excluding seeds)
+            if self.topk_children > 0:
+                by_parent = {}
+                no_parent = []
+                for s in self._states:
+                    if s.id in self._seed_ids or not s.parents:
+                        no_parent.append(s)
+                        continue
+                    pid = s.parents[0]["id"]
+                    by_parent.setdefault(pid, []).append(s)
+                filtered = list(no_parent)
+                for children in by_parent.values():
+                    children.sort(
+                        key=lambda x: x.value if x.value is not None else -np.inf,
+                        reverse=True,
+                    )
+                    filtered.extend(children[: self.topk_children])
+                self._states = filtered
+
+            # Cap archive size, always keeping seeds
+            if len(self._states) > self.max_buffer_size:
+                seeds = [s for s in self._states if s.id in self._seed_ids]
+                non_seeds = [s for s in self._states if s.id not in self._seed_ids]
+                non_seeds.sort(
+                    key=lambda x: x.value if x.value is not None else -np.inf,
+                    reverse=True,
+                )
+                keep_non_seeds = non_seeds[: self.max_buffer_size - len(seeds)]
+                self._states = seeds + keep_non_seeds
+
+            retained_ids = {state.id for state in self._states}
+            return {
+                "submitted": len(children_with_parents),
+                "unique_new": unique_new,
+                "strategy_top_r": strategy_top_r,
+                "strategy_admitted": len(new_states),
+                "retained_new": sum(
+                    state.id in retained_ids for state in new_states),
+                "archive_size": len(self._states),
+            }
+
+    def record_expansion(self, parent: State, count: int = 1):
+        """Called once per parent per step. Pass count=group_size so n and T
+        grow per-ROLLOUT (matching discover). count=1 gives per-parent growth."""
+        anc_ids = [parent.id] + [p["id"] for p in (parent.parents or [])]
+        for aid in anc_ids:
+            self._n[aid] = self._n.get(aid, 0) + count
+        self._T += count
+
+    def reassign_seed_id(self, state: State, new_id: str):
+        """Bind a freshly recreated step-zero seed to its durable artifact ID."""
+        with self._lock:
+            if state.id not in self._seed_ids:
+                raise ValueError("only fresh seed identities can be rebound")
+            self._seed_ids.remove(state.id)
+            state.id = str(new_id)
+            self._seed_ids.add(state.id)
+
+    def best_state(self):
+        with self._lock:
+            non_seeds = [s for s in self._states if s.id not in self._seed_ids]
+            if not non_seeds:
+                return None
+            return max(non_seeds,
+                       key=lambda s: s.value if s.value is not None else -np.inf)
+
+    def best_raw_state(self, maximize: bool = True):
+        """Best state ever evaluated in the problem's native metric direction.
+
+        Seeds are included because a generated candidate has not necessarily
+        beaten the initial construction. The record is independent of archive
+        deduplication/pruning and is included in sampler checkpoints.
+        """
+        with self._lock:
+            return self._best_raw_max if maximize else self._best_raw_min
+
+    def archive_size(self):
+        return len(self._states)
+
+    def state_dict(self):
+        """Return all search state required to continue in another process."""
+        with self._lock:
+            return {
+                "version": 1,
+                "states": [asdict(s) for s in self._states],
+                "seed_ids": sorted(self._seed_ids),
+                "n": dict(self._n),
+                "m": dict(self._m),
+                "T": int(self._T),
+                "selection_mode": self.selection_mode,
+                "best_raw_min": (asdict(self._best_raw_min)
+                                 if self._best_raw_min is not None else None),
+                "best_raw_max": (asdict(self._best_raw_max)
+                                 if self._best_raw_max is not None else None),
+            }
+
+    def load_state_dict(self, payload):
+        """Restore a snapshot produced by :meth:`state_dict`."""
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("unsupported or invalid sampler checkpoint")
+        saved_mode = payload.get("selection_mode")
+        current_mode = self.selection_mode
+        if saved_mode is not None and saved_mode != current_mode:
+            raise ValueError(
+                f"sampler checkpoint uses {saved_mode}, but this run uses "
+                f"{current_mode}")
+        states = payload.get("states")
+        if not isinstance(states, list) or not states:
+            raise ValueError("sampler checkpoint contains no states")
+
+        restored = [State(**item) for item in states]
+        restored_ids = {s.id for s in restored}
+        seed_ids = set(payload.get("seed_ids", ()))
+        if not seed_ids.issubset(restored_ids):
+            raise ValueError("sampler checkpoint references missing seed states")
+
+        with self._lock:
+            self._states = restored
+            self._seed_ids = seed_ids
+            self._n = {str(k): int(v) for k, v in payload.get("n", {}).items()}
+            self._m = {str(k): float(v) for k, v in payload.get("m", {}).items()}
+            self._T = int(payload.get("T", 0))
+            raw_min = payload.get("best_raw_min")
+            raw_max = payload.get("best_raw_max")
+            self._best_raw_min = State(**raw_min) if raw_min else None
+            self._best_raw_max = State(**raw_max) if raw_max else None
+            # Backward compatibility for checkpoints written before the raw
+            # extrema were persisted.
+            if self._best_raw_min is None or self._best_raw_max is None:
+                self._record_raw_states(self._states)
+            self.last_picks_info = []
+
+    def import_legacy_states(self, states, total_expansions: int = 0):
+        """Best-effort archive import for runs created before checkpoints."""
+        with self._lock:
+            existing_keys = {self._archive_key(s) for s in self._states}
+            existing_keys.discard(None)
+            for state in states:
+                key = self._archive_key(state)
+                if key is not None and key in existing_keys:
+                    self._record_raw_states([state])
+                    continue
+                state.parents = []
+                self._states.append(state)
+                self._record_raw_states([state])
+                if key is not None:
+                    existing_keys.add(key)
+            if len(self._states) > self.max_buffer_size:
+                seeds = [s for s in self._states if s.id in self._seed_ids]
+                others = [s for s in self._states if s.id not in self._seed_ids]
+                others.sort(
+                    key=lambda s: s.value if s.value is not None else -np.inf,
+                    reverse=True,
+                )
+                self._states = seeds + others[:self.max_buffer_size - len(seeds)]
+            self._T = max(self._T, int(total_expansions))
+
+if __name__ == "__main__":
+    sampler = PUCTSampler(num_seeds=3, puct_c=1.0)
+    print("Initial archive:", sampler.archive_size())
+
+    picks = sampler.sample_states(2)
+    print(f"Picked {len(picks)} parents (all seeds):", [s.is_seed for s in picks])
+
+    children = []
+    for p in picks:
+        sampler.record_expansion(p)
+        child = State.make(timestep=1, value=np.random.rand() * 2.5,
+                           code=f"code_{uuid.uuid4().hex[:6]}")
+        children.append((child, p))
+    sampler.update(children)
+    print("After update:", sampler.archive_size())
+
+    picks2 = sampler.sample_states(2)
+    print(f"Pick info: {sampler.last_picks_info}")
+    print("Best state value:", sampler.best_state().value)

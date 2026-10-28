@@ -5,12 +5,12 @@ import pytest
 import torch
 from torch import nn
 
-import context_parallel as cp
-import qwen_training_kernels as kernels
+import training.context_parallel as cp
+import models.qwen_training_kernels as kernels
 
 
 def test_module_function_interface_routes_native_forward_and_context(monkeypatch):
-    import model_backend
+    import models.model_backend as model_backend
 
     # Reproduce modern Transformers' global kernel calls, not the legacy
     # self.causal_conv1d_fn interface that the previous tests covered alone.

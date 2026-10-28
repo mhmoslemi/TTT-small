@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class ParentPickerContractTests(unittest.TestCase):
     def setUp(self):
-        source = ast.parse((ROOT / "sampler.py").read_text())
+        source = ast.parse((ROOT / 'search/sampler.py').read_text())
         names = {"parent_selection_mode", "can_migrate_parent_selection", "make_sampler"}
         nodes = [node for node in source.body
                  if (isinstance(node, ast.FunctionDef) and node.name in names)
@@ -43,9 +43,9 @@ class ParentPickerContractTests(unittest.TestCase):
         statement = ast.copy_location(ast.Expr(argument), argument)
         exec(compile(ast.Module(body=[statement], type_ignores=[]),
                      "picker_cli", "exec"), {"p": parser})
-        remote = ModuleType("llm_sampler")
+        remote = ModuleType('search.llm_sampler')
         remote.LLMSampler = Mock()
-        with patch.dict(sys.modules, {"llm_sampler": remote}):
+        with patch.dict(sys.modules, {'search.llm_sampler': remote}):
             for mode in allowed:
                 self.assertEqual(parser.parse_args(["--parent-selection", mode]).parent_selection, mode)
                 validate_problem_config(dict(problem="erdos", parent_selection=mode),
@@ -84,16 +84,16 @@ class ParentPickerContractTests(unittest.TestCase):
         checkpoint = Mock()
         scope = dict(json=json, Path=Path, _save_training_checkpoint=checkpoint)
         exec(compile(ast.Module(body=[method], type_ignores=[]), "migration", "exec"), scope)
-        sampler_module = ModuleType("sampler")
+        sampler_module = ModuleType('search.sampler')
         sampler_module.can_migrate_parent_selection = self.scope["can_migrate_parent_selection"]
-        remote = ModuleType("llm_sampler")
+        remote = ModuleType('search.llm_sampler')
         migrated = SimpleNamespace(selection_mode="llm", load_state_dict=Mock())
         remote.LLMSampler = Mock(return_value=migrated)
         old = SimpleNamespace(selection_mode="puct", puct_c=1., max_buffer_size=2000,
                               topk_children=8, state_dict=lambda: {"states": ["saved-parent"]})
         optimizer, tracker, problem = object(), object(), object()
         with tempfile.TemporaryDirectory() as folder, \
-                patch.dict(sys.modules, {"sampler": sampler_module, "llm_sampler": remote}), \
+                patch.dict(sys.modules, {'search.sampler': sampler_module, 'search.llm_sampler': remote}), \
                 redirect_stdout(io.StringIO()):
             run = Path(folder)
             config = run / "config.json"

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from training_checkpointing import (
+from training.training_checkpointing import (
     checkpoint_group_size, checkpoint_layer_groups, grouped_qwen_hidden,
 )
 
@@ -92,7 +92,7 @@ def test_real_qwen_grouped_forward_loss_and_gradients(padded, monkeypatch):
     grouped = deepcopy(model)
     # Exercise the production MLP/norm tile checkpoints nested inside layer
     # checkpoints, not only vanilla Transformers layers.
-    import model_backend
+    import models.model_backend as model_backend
     monkeypatch.setattr(model_backend, "_EXACT_MLP_PROJECTION_TILE_BYTES", 2048)
     monkeypatch.setattr(model_backend, "_EXACT_GATED_NORM_TILE_BYTES", 2048)
     profile = SimpleNamespace(coder_model_profile="qwen3.8-27b",
@@ -124,8 +124,8 @@ def test_real_qwen_grouped_forward_loss_and_gradients(padded, monkeypatch):
 @pytest.mark.parametrize("one_still_oversized", [False, True])
 def test_saved_overflow_tries_all_replicas_and_commits_only_once(
         monkeypatch, tmp_path, one_still_oversized):
-    import exact_overflow
-    import fast_distributed
+    import training.exact_overflow as exact_overflow
+    import training.fast_distributed as fast_distributed
     import train_multy_CVaR as training
 
     model = nn.Linear(1, 1, bias=False)

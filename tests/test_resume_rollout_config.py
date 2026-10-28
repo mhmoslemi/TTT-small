@@ -117,7 +117,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                    and isinstance(n.target, ast.Tuple)
                    and any(isinstance(v, ast.Name) and v.id == "arg_name"
                            for v in n.target.elts))
-        sampler = ModuleType("sampler")
+        sampler = ModuleType('search.sampler')
         sampler.parent_selection_mode = lambda config: config.get("parent_selection", "puct")
         namespace = dict(
             saved=dict(self.saved, learning_rate=0.01, strategy_max_seq_length=131072,
@@ -131,7 +131,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             args=SimpleNamespace(groups_per_step=12), skip=set(),
             _CLI_TO_CFG={}, parser=SimpleNamespace(get_default=lambda key: None),
         )
-        with patch.dict(sys.modules, {"sampler": sampler}), redirect_stdout(io.StringIO()):
+        with patch.dict(sys.modules, {'search.sampler': sampler}), redirect_stdout(io.StringIO()):
             exec(compile(ast.Module(body=[overlay], type_ignores=[]),
                          "resume_overlay", "exec"), namespace)
             self.assertEqual(namespace["merged"]["groups_per_step"], 10)

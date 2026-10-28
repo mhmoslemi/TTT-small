@@ -16,12 +16,12 @@ import torch
 import yaml
 
 import train_multy_CVaR as training
-from advantage import entropic_adaptive_advantages
+from training.advantage import entropic_adaptive_advantages
 from config_validation import validate_problem_config
-from _retire.problems.base import RewardResult, SeedState
-from reward import extract_python_code
-from sampler import make_sampler
-from spo_rs import SPORSTracker
+from problems.base import RewardResult, SeedState
+from evaluation.reward import extract_python_code
+from search.sampler import make_sampler
+from training.spo_rs import SPORSTracker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,8 +40,8 @@ def test_auto_training_backend_follows_coder_model(model_name, expected):
 def load_config(monkeypatch):
     monkeypatch.setenv("AVAILABLE_GPUS", "0,1")
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setattr("gpu_runtime.query_gpu_memory", lambda: {})
-    monkeypatch.setattr("gpu_runtime.detect_attention_heads", lambda name: 32)
+    monkeypatch.setattr('runtime.gpu_runtime.query_gpu_memory', lambda: {})
+    monkeypatch.setattr('runtime.gpu_runtime.detect_attention_heads', lambda name: 32)
 
     def load(mode="entropic", filename="erdos.yaml", extra=()):
         monkeypatch.setattr(sys, "argv", [
@@ -175,7 +175,7 @@ def test_qwen38_medium_pilots_and_phase2_with_saved_low():
 
 
 def test_qwen38_phase2_effort_counts_and_exact_prompt_retries():
-    from output_retries import coder_retry_prompt_job
+    from generation.output_retries import coder_retry_prompt_job
 
     cfg = SimpleNamespace(
         coder_template_kind="qwen3.8", coder_reasoning_effort="low",
@@ -406,7 +406,7 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     coder_started = threading.Event()
     worker_prepared = threading.Event()
     if remote_strategy and allocation is not None:
-        from strategy_prompts_openai import build_openai_strategy_messages
+        from generation.strategy_prompts_openai import build_openai_strategy_messages
         cfg.api_strategy = "gpt-6-luna"
         cfg.strategy_backend = "api"
         problem.build_strategy_messages = build_openai_strategy_messages

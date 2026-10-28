@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import exact_overflow as overflow
+import training.exact_overflow as overflow
 import train_multy_CVaR as training
 
 
@@ -55,7 +55,7 @@ def test_unsupported_backends_keep_existing_path():
 
 
 def test_parking_ram_is_checked_before_allocating(monkeypatch):
-    import host_memory
+    import runtime.host_memory as host_memory
     model = torch.nn.Linear(2, 1)
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: {
         "total": 1024 * host_memory.GIB, "available": 100 * host_memory.GIB})
@@ -135,7 +135,7 @@ class FakeTrainer:
 
 def test_parallel_tail_widens_only_failures_and_applies_same_adam_update(
         tmp_path, monkeypatch):
-    import fast_distributed
+    import training.fast_distributed as fast_distributed
     cfg = config()
     model = torch.nn.Linear(2, 1, bias=False)
     baseline = torch.nn.Linear(2, 1, bias=False)
@@ -267,7 +267,7 @@ def test_resume_keeps_replicas_even_after_legacy_offload_exhaustion(tmp_path, mo
     import sys
     from pathlib import Path
     import yaml
-    import gpu_runtime
+    import runtime.gpu_runtime as gpu_runtime
 
     saved = yaml.safe_load((Path(training.__file__).parent / "configs/erdos.yaml").read_text())
     saved.update(model_name="Qwen/Qwen3.8-27B", coder_model_name="Qwen/Qwen3.8-27B",
@@ -297,8 +297,8 @@ def test_temporary_placement_unwinds_without_replacing_parameters(monkeypatch, f
     import accelerate
     import accelerate.hooks
     import accelerate.utils
-    import fast_distributed
-    import host_memory
+    import training.fast_distributed as fast_distributed
+    import runtime.host_memory as host_memory
 
     model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1))
     identities = dict(model.named_parameters())

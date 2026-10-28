@@ -8,13 +8,13 @@ import threading
 
 import pytest
 
-import host_memory
-from host_memory import GIB, HostMemoryAdmission, TokenWeightedActivationOffloadGate
+import runtime.host_memory as host_memory
+from runtime.host_memory import GIB, HostMemoryAdmission, TokenWeightedActivationOffloadGate
 
 
 def test_unsloth_offload_releases_storage_and_buffers_can_regrow(monkeypatch):
     import torch
-    from model_backend import UnslothBackend, _ModelPlacementBackend
+    from models.model_backend import UnslothBackend, _ModelPlacementBackend
 
     buffers = [torch.ones(4096) for _ in range(3)]
     buffers[1].resize_(0)
@@ -47,8 +47,8 @@ def test_unsloth_offload_releases_storage_and_buffers_can_regrow(monkeypatch):
 
 
 def test_wake_oom_recovery_uses_live_budget_and_keeps_eight_workers(monkeypatch, capsys):
-    import gen_workers
-    import gpu_runtime
+    import generation.gen_workers as gen_workers
+    import runtime.gpu_runtime as gpu_runtime
 
     monkeypatch.setattr(gpu_runtime, "query_gpu_memory", lambda: {
         gpu: SimpleNamespace(total_gib=95.6, free_gib=77.4) for gpu in range(8)})
@@ -132,7 +132,7 @@ def test_activation_offload_shares_live_ram_gate_and_never_under_reserves(monkey
 
 
 def test_sleep_waves_restore_trainers_before_more_host_copies(monkeypatch):
-    from gen_workers import GenerationPool
+    from generation.gen_workers import GenerationPool
 
     memory = {"total": 1700 * GIB, "available": 1100 * GIB}
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
@@ -199,7 +199,7 @@ def test_sleep_extension_uses_pageable_backups_and_reclaims_only_unused_cache(mo
 
 
 def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
-    from gen_workers import GenerationPool
+    from generation.gen_workers import GenerationPool
 
     memory = {"total": 200 * GIB, "available": 30 * GIB}
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
@@ -226,7 +226,7 @@ def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
 
 def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     import torch
-    import fast_distributed
+    import training.fast_distributed as fast_distributed
     import train_multy_CVaR as training
 
     calls = []
@@ -266,7 +266,7 @@ def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
 
 
 def test_shutdown_does_not_allocate_sleep_backups():
-    from gen_workers import PhasedVLLMGenerationPool
+    from generation.gen_workers import PhasedVLLMGenerationPool
 
     calls = []
     pool = object.__new__(PhasedVLLMGenerationPool)
@@ -278,7 +278,7 @@ def test_shutdown_does_not_allocate_sleep_backups():
 
 
 def test_transient_handoff_restores_every_trainer_without_sleep():
-    from gen_workers import PhasedVLLMGenerationPool
+    from generation.gen_workers import PhasedVLLMGenerationPool
 
     calls = []
     pool = PhasedVLLMGenerationPool(lambda: None, lambda: None,

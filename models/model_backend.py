@@ -1,0 +1,1497 @@
+
+
+import importlib.util
+import os
+import torch
+import types
+import weakref
+import diagnostics.terminal_output as _terminal_output
+
+
+setting_log_only = getattr(
+    _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
+
+
+_FUSED_LONG_ATTENTION = False
+_FUSED_LONG_ATTENTION_DISABLED = False
+_FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
+_FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
+_SHARED_PREFIX_ATTENTION_LAYOUTS = {}
+_CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = None
+
+# Bound one dense MLP projection tile to 128 MiB. Long decoder trajectories
+# otherwise ask each gate/up LoRA projection to materialize an output for every
+# token at once (several GiB for Qwen3.8). The MLP is position-wise, so slicing
+# only its token dimension preserves every token and the exact autograd graph.
+_EXACT_MLP_PROJECTION_TILE_BYTES = 128 * 1024 * 1024
+
+# Qwen3.8 flattens every token/value-head pair before its gated RMSNorm.  The
+# stock fallback casts that entire matrix and its SiLU gate to FP32 at once.
+# At 100K+ tokens that single elementwise operation needs several additional
+# GiB even though the surrounding Gated DeltaNet and MLP are already bounded.
+# Tile the flattened row dimension so each exact FP32 norm/gate call stays
+# bounded as well.
+_EXACT_GATED_NORM_TILE_BYTES = 128 * 1024 * 1024
+
+
+def register_shared_prefix_attention_mask(mask, prefix_end, branches):
+    """Associate a compact packed-branch mask with its contiguous layout.
+
+    The registry keeps only a weak reference.  Gradient checkpointing retains
+    ``mask`` until the backward recomputation has finished; once that graph is
+    released, the callback deletes the temporary layout automatically.
+    """
+    if (not torch.is_tensor(mask) or mask.ndim != 3
+            or tuple(mask.shape[:2]) != (1, 2)):
+        raise ValueError("shared-prefix attention mask must have shape (1, 2, T)")
+    prefix_end = int(prefix_end)
+    normalized = tuple((int(start), int(end)) for start, end in branches)
+    total = int(mask.shape[-1])
+    if prefix_end < 1 or prefix_end > total:
+        raise ValueError("shared-prefix boundary is outside the packed sequence")
+    cursor = prefix_end
+    for start, end in normalized:
+        if start != cursor or end < start or end > total:
+            raise ValueError("shared-prefix branches must be contiguous")
+        cursor = end
+    if cursor != total:
+        raise ValueError("shared-prefix layout does not cover the packed sequence")
+    key = (str(mask.device), int(mask.data_ptr()))
+
+    def discard(reference, *, registry_key=key):
+        current = _SHARED_PREFIX_ATTENTION_LAYOUTS.get(registry_key)
+        if current is not None and current[0] is reference:
+            _SHARED_PREFIX_ATTENTION_LAYOUTS.pop(registry_key, None)
+
+    reference = weakref.ref(mask, discard)
+    _SHARED_PREFIX_ATTENTION_LAYOUTS[key] = (
+        reference, prefix_end, normalized)
+    # Training performs one synchronous forward/backward at a time in each
+    # process.  Accelerate may create one mask copy per sharded decoder layer;
+    # this device-independent entry lets those copies recover the current
+    # layout without a GPU-to-CPU synchronization on every layer.
+    global _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT
+    _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT = (
+        total, prefix_end, normalized)
+
+
+def _shared_prefix_attention_layout(mask):
+    if (not torch.is_tensor(mask) or mask.ndim != 3
+            or tuple(mask.shape[:2]) != (1, 2)):
+        return None
+    key = (str(mask.device), int(mask.data_ptr()))
+    entry = _SHARED_PREFIX_ATTENTION_LAYOUTS.get(key)
+    if entry is not None and entry[0]() is mask:
+        return entry[1], entry[2]
+
+    current = _CURRENT_SHARED_PREFIX_ATTENTION_LAYOUT
+    if (current is not None
+            and int(mask.shape[-1]) == current[0]
+            and mask.dtype in (
+                torch.int8, torch.int16, torch.int32,
+                torch.int64, torch.uint8)):
+        return current[1], current[2]
+    raise RuntimeError("unregistered shared-prefix attention mask")
+
+
+# ======================================================================
+# Common helpers
+# ======================================================================
+def _ensure_pad_token(tokenizer):
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def set_gradient_checkpointing(model, enabled):
+    """Toggle transformer checkpointing without changing training mode.
+
+    PEFT and Unsloth wrappers normally forward these methods to the underlying
+    Transformers model.  Keeping this compatibility shim here lets the shared
+    OOM controller select checkpointing per workload instead of forcing its
+    recomputation cost on every update.
+    """
+    method_name = (
+        "gradient_checkpointing_enable"
+        if bool(enabled) else
+        "gradient_checkpointing_disable"
+    )
+    method = getattr(model, method_name, None)
+    if not callable(method):
+        getter = getattr(model, "get_base_model", None)
+        if callable(getter):
+            try:
+                method = getattr(getter(), method_name, None)
+            except (AttributeError, TypeError):
+                method = None
+    if not callable(method):
+        return False
+    if enabled:
+        try:
+            method(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            method()
+    else:
+        method()
+    return True
+
+
+def _training_model_name(cfg):
+    return str(getattr(cfg, "training_model_name",
+                       getattr(cfg, "model_name", "")))
+
+
+def _lora_rank(cfg):
+    return int(cfg.lora_rank)
+
+
+def _requires_unsloth_gpt_oss_loader(model_name):
+    name = str(model_name).strip().lower()
+    return "gpt-oss" in name and "unsloth-bnb-4bit" in name
+
+
+def _training_device_map(cfg):
+    """Choose replicated data parallelism or single-process model sharding."""
+    replica_device = getattr(cfg, "training_replica_device", None)
+    if replica_device is not None:
+        return {"": int(replica_device)}
+    count = int(getattr(cfg, "num_training_gpus", 1) or 1)
+    return "balanced" if count > 1 else {"": 0}
+
+
+def _training_max_memory(cfg):
+    budgets = list(getattr(cfg, "training_max_memory_gib", None) or [])
+    if not budgets:
+        return None
+    replica_device = getattr(cfg, "training_replica_device", None)
+    if replica_device is not None:
+        logical_id = int(replica_device)
+        if logical_id >= len(budgets):
+            return None
+        return {logical_id: f"{float(budgets[logical_id]):.1f}GiB"}
+    return {logical_id: f"{float(gib):.1f}GiB"
+            for logical_id, gib in enumerate(budgets)}
+
+
+def _quantization_method(model_config):
+    quantization = getattr(model_config, "quantization_config", None)
+    if not quantization:
+        return ""
+    if isinstance(quantization, dict):
+        method = quantization.get("quant_method", "")
+        load_4bit = quantization.get("load_in_4bit",
+                                     quantization.get("_load_in_4bit", False))
+    else:
+        method = getattr(quantization, "quant_method", "")
+        load_4bit = getattr(quantization, "load_in_4bit",
+                            getattr(quantization, "_load_in_4bit", False))
+    method = str(method or "").lower()
+    if method == "bitsandbytes" and load_4bit:
+        return "bitsandbytes-4bit"
+    return method
+
+
+def _is_packed_mxfp4(model):
+    """Check expert storage: modern Unsloth keeps it packed with dequantize=True."""
+    from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+
+    experts = [module for name, module in model.named_modules()
+               if name.endswith(".experts")]
+    layers = int(getattr(model.config, "num_hidden_layers", 0))
+    if layers < 1 or len(experts) != layers:
+        return False
+    for module in experts:
+        for name in ("gate_up_proj", "down_proj"):
+            weight = module._parameters.get(name)
+            if not is_mxfp4_expert_param(weight):
+                return False
+            scales = weight.mxfp4_scales
+            if (weight.dtype != torch.uint8 or weight.ndim != 4
+                    or weight.shape[-1] != 16 or weight.requires_grad
+                    or weight.device.type == "meta"
+                    or not torch.is_tensor(scales)
+                    or scales.dtype != torch.uint8
+                    or scales.shape != weight.shape[:-1]
+                    or scales.device != weight.device):
+                return False
+    return True
+
+
+def _use_training_4bit(
+        cfg, *, native_quantization=False, prequantized_bnb=False):
+    """Resolve the requested QLoRA mode without affecting vLLM."""
+    model_name = _training_model_name(cfg)
+    if prequantized_bnb:
+        if importlib.util.find_spec("bitsandbytes") is None:
+            raise RuntimeError(
+                f"{model_name} is a trainable BitsAndBytes checkpoint, but "
+                "bitsandbytes is not installed")
+        print(f"[precision] {model_name} is already BitsAndBytes 4-bit")
+        return True
+    if not bool(getattr(cfg, "load_in_4bit", False)):
+        return False
+    if native_quantization:
+        print(f"[precision] {model_name} has checkpoint-native quantization; "
+              "not applying BitsAndBytes 4-bit again")
+        return False
+    if importlib.util.find_spec("bitsandbytes") is None:
+        print("[precision] bitsandbytes is unavailable; using checkpoint/default "
+              "precision instead of requested 4-bit")
+        return False
+    return True
+
+
+def _hf_training_attention_implementation():
+    """Internal exact attention backend; no flash-attn package is required."""
+    return "ttt_blockwise_attention"
+
+
+def _configure_fused_long_attention(enabled):
+    global _FUSED_LONG_ATTENTION
+    global _FUSED_LONG_ATTENTION_DISABLED
+    global _FUSED_LONG_ATTENTION_ACTIVE_REPORTED
+    global _FUSED_LONG_ATTENTION_FALLBACK_REPORTED
+
+    _FUSED_LONG_ATTENTION = bool(enabled)
+    _FUSED_LONG_ATTENTION_DISABLED = False
+    _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = False
+    _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = False
+
+
+def _disable_fused_long_attention(reason):
+    global _FUSED_LONG_ATTENTION_DISABLED
+    global _FUSED_LONG_ATTENTION_FALLBACK_REPORTED
+
+    _FUSED_LONG_ATTENTION_DISABLED = True
+    if not _FUSED_LONG_ATTENTION_FALLBACK_REPORTED:
+        print(f"[memory] fused long attention unavailable ({reason}); "
+              "using exact blockwise fallback", flush=True)
+        _FUSED_LONG_ATTENTION_FALLBACK_REPORTED = True
+
+
+def fused_long_attention_is_active():
+    """Whether scheduling should still isolate long full-sequence calls."""
+    return bool(_FUSED_LONG_ATTENTION and not _FUSED_LONG_ATTENTION_DISABLED)
+
+
+def _try_fused_long_attention(query, key, value, *, dropout, scale, groups):
+    """Return exact fused causal attention, or None when unsupported.
+
+    This path is called only for full, unmasked self-attention. Forcing the
+    FLASH_ATTENTION SDPA backend prevents PyTorch from silently selecting the
+    quadratic-memory math kernel. GQA is kept native so long key/value tensors
+    are not physically repeated across query heads.
+    """
+    global _FUSED_LONG_ATTENTION_ACTIVE_REPORTED
+
+    if not _FUSED_LONG_ATTENTION or _FUSED_LONG_ATTENTION_DISABLED:
+        return None
+    try:
+        import torch.nn.functional as F
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except (ImportError, AttributeError) as error:
+        _disable_fused_long_attention(type(error).__name__)
+        return None
+
+    try:
+        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            output = F.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=None,
+                dropout_p=float(dropout),
+                scale=scale,
+                is_causal=True,
+                enable_gqa=bool(groups != 1),
+            )
+    except torch.OutOfMemoryError:
+        # This can be an activation/model-memory OOM rather than a failure of
+        # Flash SDPA itself.  Keep the fused kernel enabled so the outer
+        # trainer can retry the same exact attention with checkpointing and
+        # additional allocator headroom.  Permanently falling back here makes
+        # every later long rollout use the much slower blockwise kernel.
+        raise
+    except (TypeError, RuntimeError) as error:
+        message = str(error).lower()
+        if "out of memory" in message:
+            # Some PyTorch/CUDA combinations surface allocator failures as a
+            # plain RuntimeError rather than torch.OutOfMemoryError.
+            raise
+        unsupported = (
+            isinstance(error, TypeError)
+            or "no available kernel" in message
+            or "no viable backend" in message
+            or "flash attention" in message
+            or "flash_attention" in message
+            or "enable_gqa" in message
+            or "grouped query" in message
+            or "not supported" in message
+        )
+        if not unsupported:
+            raise
+        _disable_fused_long_attention(
+            str(error).strip().splitlines()[0] or type(error).__name__)
+        return None
+
+    if not _FUSED_LONG_ATTENTION_ACTIVE_REPORTED:
+        setting_log_only(
+            f"[memory] fused exact long attention active: "
+            f"sequence={int(query.shape[2])} tokens, "
+            f"query_heads={int(query.shape[1])}, "
+            f"kv_heads={int(key.shape[1])}", flush=True)
+        _FUSED_LONG_ATTENTION_ACTIVE_REPORTED = True
+    return output
+
+
+def _raw_padding_attention_mask(*args, attention_mask=None, **kwargs):
+    """Keep the compact padding or registered shared-prefix mask intact."""
+    return attention_mask
+
+
+def _repeat_kv_heads(hidden_states, repetitions):
+    if repetitions == 1:
+        return hidden_states
+    batch, heads, length, width = hidden_states.shape
+    expanded = hidden_states[:, :, None, :, :].expand(
+        batch, heads, repetitions, length, width)
+    return expanded.reshape(batch, heads * repetitions, length, width)
+
+
+def _attention_allowed_mask(attention_mask, *, batch, query_start,
+                            query_end, query_offset, key_length, device,
+                            sliding_window=None):
+    """Build only one query block of the causal/padding mask."""
+    query_positions = (
+        torch.arange(query_start, query_end, device=device) + query_offset)
+    key_positions = torch.arange(key_length, device=device)
+    allowed = key_positions[None, :] <= query_positions[:, None]
+    if sliding_window is not None:
+        allowed = allowed & (
+            key_positions[None, :]
+            > query_positions[:, None] - int(sliding_window))
+    allowed = allowed[None, None, :, :]
+    additive = None
+    if attention_mask is None:
+        return allowed, additive
+    if attention_mask.ndim == 2:
+        padding = attention_mask[:, None, None, :key_length].bool()
+        return allowed & padding, additive
+    if attention_mask.ndim == 4:
+        block = attention_mask[
+            :, :, query_start:query_end, :key_length]
+        if block.dtype == torch.bool:
+            return allowed & block, additive
+        additive = block
+        return allowed, additive
+    raise ValueError(
+        "ttt blockwise attention accepts a 2D padding or 4D attention mask")
+
+
+def _ttt_shared_prefix_attention_forward(
+        module, query, key, value, layout, *, dropout, scaling,
+        sliding_window, **kwargs):
+    """Attend one shared prompt plus mutually isolated response branches."""
+    prefix_end, branches = layout
+    prefix_query = query[:, :, :prefix_end, :]
+    prefix_key = key[:, :, :prefix_end, :]
+    prefix_value = value[:, :, :prefix_end, :]
+    prefix_output, _ = _ttt_blockwise_attention_forward(
+        module, prefix_query, prefix_key, prefix_value, None,
+        dropout=dropout, scaling=scaling,
+        sliding_window=sliding_window, **kwargs)
+    outputs = [prefix_output]
+    cursor = int(prefix_end)
+    for start, end in branches:
+        if start != cursor:
+            raise RuntimeError("noncontiguous shared-prefix attention branch")
+        cursor = end
+        if end == start:
+            continue
+        branch_query = query[:, :, start:end, :]
+        branch_key = torch.cat(
+            (prefix_key, key[:, :, start:end, :]), dim=2)
+        branch_value = torch.cat(
+            (prefix_value, value[:, :, start:end, :]), dim=2)
+        branch_output, _ = _ttt_blockwise_attention_forward(
+            module, branch_query, branch_key, branch_value, None,
+            dropout=dropout, scaling=scaling,
+            sliding_window=sliding_window, **kwargs)
+        outputs.append(branch_output)
+    if cursor != int(query.shape[2]):
+        raise RuntimeError("shared-prefix attention layout length mismatch")
+    # AttentionInterface outputs are (batch, sequence, heads, width), even
+    # though its query/key/value inputs are (batch, heads, sequence, width).
+    return torch.cat(outputs, dim=1), None
+
+
+def _ttt_blockwise_attention_forward(
+        module, query, key, value, attention_mask, dropout=0.0,
+        scaling=None, sliding_window=None, **kwargs):
+    context = getattr(module, "_ttt_context_parallel", None)
+    if context is not None:
+        from functools import partial
+        from training.context_parallel import attention
+        return attention(
+            query, key, value, context, scale=scaling, dropout=dropout,
+            kernel=partial(_ttt_local_attention_forward, module))
+    # Calibration only: compare the same independent head-kernel shapes so
+    # BF16 rounding does not masquerade as a cross-GPU routing error.
+    width = getattr(module, "_ttt_calibration_heads", None)
+    if width is not None and query.shape[1] > width:
+        groups = query.shape[1] // key.shape[1]
+        key, value = (_repeat_kv_heads(item, groups) for item in (key, value))
+        outputs = [_ttt_local_attention_forward(
+            module, query[:, start:start + width], key[:, start:start + width],
+            value[:, start:start + width], attention_mask, dropout=dropout,
+            scaling=scaling, sliding_window=sliding_window, **kwargs)[0]
+            for start in range(0, query.shape[1], width)]
+        return torch.cat(outputs, dim=2), None
+    return _ttt_local_attention_forward(
+        module, query, key, value, attention_mask, dropout=dropout,
+        scaling=scaling, sliding_window=sliding_window, **kwargs)
+
+
+def _ttt_local_attention_forward(
+        module, query, key, value, attention_mask, dropout=0.0,
+        scaling=None, sliding_window=None, **kwargs):
+    """Exact causal attention with a bounded score tensor and autograd.
+
+    Small calls retain native SDPA speed. Large calls split only the query
+    dimension, attend each block to the complete key/value history, and
+    checkpoint each block. This is mathematically full attention—not context
+    truncation—while peak score memory is O(query_block * sequence_length).
+    """
+    import torch.nn.functional as F
+
+    # GPT-OSS normalizes every attention row together with a learned sink
+    # logit. Plain SDPA/FlashAttention has no representation for that extra
+    # denominator term, so accepting s_aux here would silently change both
+    # forward probabilities and LoRA gradients. GPT-OSS is deliberately kept
+    # on Unsloth's sink-aware implementation instead.
+    attention_sinks = kwargs.get("s_aux", getattr(module, "sinks", None))
+    if attention_sinks is not None:
+        raise RuntimeError(
+            "ttt_blockwise_attention cannot preserve learned attention "
+            "sinks; use the GPT-OSS sink-aware Unsloth training backend")
+
+    shared_layout = _shared_prefix_attention_layout(attention_mask)
+    if shared_layout is not None:
+        if int(query.shape[0]) != 1:
+            raise ValueError("shared-prefix attention requires batch size one")
+        return _ttt_shared_prefix_attention_forward(
+            module, query, key, value, shared_layout,
+            dropout=dropout, scaling=scaling,
+            sliding_window=sliding_window, **kwargs)
+
+    batch, query_heads, query_length, head_dim = query.shape
+    key_heads = int(key.shape[1])
+    key_length = int(key.shape[2])
+    if query_heads % key_heads:
+        raise ValueError(
+            "query attention heads must be divisible by key/value heads")
+    groups = query_heads // key_heads
+    scale = float(scaling) if scaling is not None else head_dim ** -0.5
+    query_offset = key_length - query_length
+    score_elements = batch * query_heads * query_length * key_length
+    native_limit = 134_217_728
+
+    fused_eligible = bool(
+        score_elements > native_limit
+        and batch == 1
+        and attention_mask is None
+        and sliding_window is None
+        and query_length == key_length
+        and query_length > 1
+        # Different fused/blockwise dropout kernels consume RNG differently.
+        # Restrict the interchangeable fast path to deterministic attention;
+        # all supported large-coder checkpoints configure dropout=0.
+        and float(dropout) == 0.0
+    )
+    if fused_eligible:
+        fused = _try_fused_long_attention(
+            query, key, value,
+            dropout=dropout, scale=scale, groups=groups)
+        if fused is not None:
+            return fused.transpose(1, 2).contiguous(), None
+
+    if score_elements <= native_limit:
+        native_key = _repeat_kv_heads(key, groups)
+        native_value = _repeat_kv_heads(value, groups)
+        native_mask = None
+        is_causal = bool(
+            attention_mask is None and sliding_window is None
+            and query_length == key_length and query_length > 1)
+        if not is_causal:
+            allowed, additive = _attention_allowed_mask(
+                attention_mask, batch=batch, query_start=0,
+                query_end=query_length, query_offset=query_offset,
+                key_length=key_length, device=query.device,
+                sliding_window=sliding_window)
+            native_mask = allowed if additive is None else additive.masked_fill(
+                ~allowed, torch.finfo(additive.dtype).min)
+        output = F.scaled_dot_product_attention(
+            query, native_key, native_value, attn_mask=native_mask,
+            dropout_p=float(dropout), scale=scale, is_causal=is_causal)
+        return output.transpose(1, 2).contiguous(), None
+
+    # Bound the FP32 probability block to roughly 256 MiB (and the BF16/FP16
+    # score block to roughly 128 MiB).
+    score_budget = 67_108_864
+    denominator = max(1, batch * query_heads * key_length)
+    query_block = max(1, min(256, score_budget // denominator))
+
+    def attend_block(query_part, key_states, value_states, start, end):
+        local_query = query_part.reshape(
+            batch, key_heads, groups, end - start, head_dim)
+        scores = torch.matmul(
+            local_query,
+            key_states[:, :, None, :, :].transpose(-2, -1),
+        ) * scale
+        allowed, additive = _attention_allowed_mask(
+            attention_mask, batch=batch, query_start=start, query_end=end,
+            query_offset=query_offset, key_length=key_length,
+            device=query.device, sliding_window=sliding_window)
+        allowed = allowed[:, :, None, :, :]
+        scores = scores.masked_fill(
+            ~allowed, torch.finfo(scores.dtype).min)
+        if additive is not None:
+            scores = scores + additive[:, :, None, :, :]
+        probabilities = F.softmax(
+            scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        if dropout:
+            probabilities = F.dropout(
+                probabilities, p=float(dropout), training=module.training)
+        result = torch.matmul(
+            probabilities, value_states[:, :, None, :, :])
+        return result.reshape(
+            batch, query_heads, end - start, head_dim)
+
+    output_blocks = []
+    needs_grad = bool(
+        torch.is_grad_enabled()
+        and (query.requires_grad or key.requires_grad or value.requires_grad))
+    for start in range(0, query_length, query_block):
+        end = min(start + query_block, query_length)
+        if needs_grad:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(
+                attend_block, query[:, :, start:end, :], key, value,
+                start, end, use_reentrant=False)
+        else:
+            output = attend_block(
+                query[:, :, start:end, :], key, value, start, end)
+        output_blocks.append(output)
+    output = torch.cat(output_blocks, dim=2)
+    return output.transpose(1, 2).contiguous(), None
+
+
+def _register_ttt_attention_backend(*, fused_long_attention=False):
+    """Register runtime and mask functions before Transformers builds a model."""
+    from transformers import AttentionInterface
+    from transformers.masking_utils import AttentionMaskInterface
+
+    _configure_fused_long_attention(fused_long_attention)
+    name = _hf_training_attention_implementation()
+    AttentionInterface.register(name, _ttt_blockwise_attention_forward)
+    AttentionMaskInterface.register(name, _raw_padding_attention_mask)
+
+
+class _ModelPlacementBackend:
+    """Move a possibly sharded trainer out for an all-GPU vLLM phase."""
+
+    def _remember_training_placement(self, loaded_model):
+        self._placement_model = loaded_model
+        device_map = getattr(loaded_model, "hf_device_map", None) or {}
+        # A whole-model explicit device_map is not guaranteed to survive on
+        # every Transformers/Accelerate combination. Replicated training owns
+        # an unambiguous logical device, so retain it directly instead of
+        # allowing restore_after_generation() to fall back to cuda:0. Without
+        # this, all replicas can collapse onto GPU 0 after the first vLLM phase.
+        replica_device = getattr(
+            getattr(self, "cfg", None), "training_replica_device", None)
+        if replica_device is not None:
+            device_map = {"": int(replica_device)}
+        self._training_device_map = dict(device_map)
+        cpu_targets = [name for name, target in self._training_device_map.items()
+                       if str(target).lower() in ("cpu", "disk")]
+        if cpu_targets:
+            raise RuntimeError(
+                "the balanced training device map spilled model modules to "
+                f"CPU/disk ({cpu_targets[:4]}). Reduce context/batch memory or "
+                "provide more training GPUs; silent spill would be unstable")
+        self._trainer_is_offloaded = False
+
+    def offload_for_generation(self):
+        if getattr(self, "_trainer_is_offloaded", False):
+            return
+        placement_model = getattr(self, "_placement_model", self.model)
+        if getattr(self, "_training_device_map", None):
+            # Remove Accelerate's routing hooks before collapsing the sharded
+            # model to host memory. They are reconstructed during restore.
+            try:
+                from accelerate.hooks import remove_hook_from_submodules
+                remove_hook_from_submodules(placement_model)
+            except (ImportError, AttributeError):
+                pass
+        try:
+            self.model.to("cpu")
+            self._trainer_is_offloaded = True
+        except Exception:
+            # A quantized module can fail after earlier layers already moved.
+            # Mark it offloaded so the normal placement restore can repair the
+            # partially moved model before the original exception propagates.
+            self._trainer_is_offloaded = True
+            try:
+                self.restore_after_generation()
+            except Exception:
+                pass
+            raise
+
+    def restore_after_generation(self):
+        if not getattr(self, "_trainer_is_offloaded", False):
+            return
+        device_map = getattr(self, "_training_device_map", None) or {}
+        placement_model = getattr(self, "_placement_model", self.model)
+        devices = {str(target) for target in device_map.values()
+                   if str(target).lower() not in ("cpu", "disk")}
+        if len(devices) > 1:
+            from accelerate import dispatch_model
+            dispatch_model(
+                placement_model, device_map=device_map, force_hooks=True)
+        else:
+            target = next(iter(devices), "0")
+            target = target if str(target).startswith("cuda:") else f"cuda:{target}"
+            self.model.to(target)
+        self._trainer_is_offloaded = False
+
+
+def _offline_mode() -> bool:
+    truthy = {"1", "true", "yes", "on"}
+    return any(str(os.environ.get(name, "")).strip().lower() in truthy
+               for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
+
+
+def _expert_count(model_config) -> int:
+    for _ in range(2):
+        if model_config is None:
+            break
+        for name in ("num_experts", "num_local_experts", "n_routed_experts"):
+            value = getattr(model_config, name, None)
+            if value:
+                return int(value)
+        model_config = getattr(model_config, "text_config", None)
+    return 0
+
+
+def _prepare_sparse_moe_for_kbit_training(model):
+    """Freeze a partly quantized MoE without changing its forward dtypes.
+
+    Some MoE implementations store all expert projections in packed 3-D
+    Parameters instead of ``nn.Linear`` modules.  BitsAndBytes therefore leaves
+    those frozen tensors in checkpoint precision.  PEFT's generic k-bit
+    preparation casts every non-4-bit FP16/BF16 Parameter to FP32, which can
+    nearly double a sparse model's resident size even though those expert
+    weights will never be trained.  Mixing FP32 norm vectors with checkpoint-
+    precision router/expert matrices is also invalid for implementations such
+    as Qwen3-MoE: the norm promotes hidden states to FP32, then the BF16 router
+    receives mismatched inputs.  Keep every frozen base tensor in its original
+    dtype; LoRA parameters are attached separately below.
+    """
+    retained_parameters = 0
+    retained_values = 0
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+        if parameter.dtype in (torch.float16, torch.bfloat16):
+            retained_parameters += 1
+            retained_values += int(parameter.numel())
+    print(
+        "[memory] sparse-MoE k-bit preparation: froze base weights; "
+        f"kept {retained_parameters} FP16/BF16 tensors "
+        f"({retained_values:,} values) in checkpoint precision so norms, "
+        "routers, and experts use compatible dtypes",
+        flush=True,
+    )
+    return model
+
+
+def _resolve_lora_target_modules(cfg, model_config):
+    """Avoid allocating a separate large LoRA across every MoE expert."""
+    targets = list(cfg.target_modules)
+    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+        # Qwen3.8's full-attention blocks use q/k/v/o_proj, while each Gated
+        # DeltaNet block uses four input projections plus out_proj. Keep both
+        # members of every vLLM packed-LoRA group together (qkv+z and b+a), so
+        # the adapter is applied identically by PEFT during training and vLLM
+        # during the following rollout step.
+        for name in (
+                "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+                "out_proj"):
+            if name not in targets:
+                targets.append(name)
+    experts = _expert_count(model_config)
+    expert_mlp_targets = {"gate_proj", "up_proj", "down_proj"}
+    removed = [name for name in targets if name in expert_mlp_targets]
+    kept = [name for name in targets if name not in expert_mlp_targets]
+    if experts >= 64 and removed and kept:
+        print(f"[memory] large MoE ({experts} experts): excluding expert-wide "
+              f"LoRA targets {removed}; keeping {kept} at rank {_lora_rank(cfg)}")
+        targets = kept
+    cfg.effective_target_modules = tuple(targets)
+    return targets
+
+
+def _projection_output_width(projection):
+    """Best-effort output width for Linear or PEFT Linear wrappers."""
+    candidates = [projection]
+    get_base_layer = getattr(projection, "get_base_layer", None)
+    if callable(get_base_layer):
+        try:
+            candidates.append(get_base_layer())
+        except (AttributeError, TypeError):
+            pass
+    base_layer = getattr(projection, "base_layer", None)
+    if base_layer is not None:
+        candidates.append(base_layer)
+    for candidate in candidates:
+        width = getattr(candidate, "out_features", None)
+        if width is not None and int(width) > 0:
+            return int(width)
+        weight = getattr(candidate, "weight", None)
+        shape = getattr(weight, "shape", ())
+        if len(shape) >= 2 and int(shape[0]) > 0:
+            return int(shape[0])
+    return None
+
+
+def _projection_output_element_bytes(projection, fallback):
+    """Account for FP32 trainable LoRA outputs on a BF16 base model."""
+    size = max(1, int(fallback))
+    parameters = getattr(projection, "parameters", None)
+    if not callable(parameters):
+        return size
+    for parameter in parameters():
+        element_size = getattr(parameter, "element_size", None)
+        if callable(element_size):
+            size = max(size, int(element_size()))
+    return size
+
+
+def _exact_mlp_token_chunk_size(module, hidden_states):
+    """Choose an automatic token tile from the real dtype and MLP width."""
+    sequence = int(hidden_states.shape[-2])
+    hidden = max(1, int(hidden_states.shape[-1]))
+    leading_rows = max(
+        1, int(hidden_states.numel()) // max(1, sequence * hidden))
+    width = max(
+        filter(None, (
+            _projection_output_width(module.gate_proj),
+            _projection_output_width(module.up_proj),
+        )),
+        default=hidden,
+    )
+    element_bytes = max(
+        _projection_output_element_bytes(
+            module.gate_proj, hidden_states.element_size()),
+        _projection_output_element_bytes(
+            module.up_proj, hidden_states.element_size()),
+    )
+    bytes_per_token = max(1, leading_rows * width * element_bytes)
+    tokens = max(1, _EXACT_MLP_PROJECTION_TILE_BYTES // bytes_per_token)
+    # Multiples of 128 retain efficient GEMM shapes without ever enlarging the
+    # memory-derived tile. Very wide layers may legitimately need fewer.
+    if tokens >= 128:
+        tokens = (tokens // 128) * 128
+    return max(1, min(sequence, int(tokens)))
+
+
+def _exact_chunked_qwen35_mlp_forward(module, hidden_states):
+    """Run Qwen3.8's position-wise MLP in exact checkpointed token tiles.
+
+    No context, token, loss term, or gradient is removed. Each slice executes
+    the checkpoint's original gate/up/activation/down formula, and outputs are
+    concatenated in their original order. Checkpointing each slice prevents a
+    decoder-layer checkpoint recomputation from recreating all wide MLP
+    intermediates simultaneously during backward.
+    """
+    if hidden_states.ndim < 3:
+        return module._ttt_exact_mlp_original_forward(hidden_states)
+    sequence = int(hidden_states.shape[-2])
+    minimum = int(getattr(module, "_ttt_exact_mlp_min_tokens", 0) or 0)
+    original = module._ttt_exact_mlp_original_forward
+    if sequence < minimum:
+        return original(hidden_states)
+
+    chunk = _exact_mlp_token_chunk_size(module, hidden_states)
+    if chunk >= sequence:
+        return original(hidden_states)
+
+    def project(token_slice):
+        return module.down_proj(
+            module.act_fn(module.gate_proj(token_slice))
+            * module.up_proj(token_slice)
+        )
+
+    outputs = []
+    use_checkpoint = bool(
+        torch.is_grad_enabled() and hidden_states.requires_grad)
+    for start in range(0, sequence, chunk):
+        token_slice = hidden_states[..., start:start + chunk, :]
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(project, token_slice, use_reentrant=False)
+        else:
+            output = project(token_slice)
+        outputs.append(output)
+    return torch.cat(outputs, dim=-2)
+
+
+def _install_exact_qwen38_mlp_chunking(model, cfg):
+    """Patch dense Qwen3.8 MLPs after PEFT so base and LoRA paths are tiled."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
+        return 0
+    minimum = int(getattr(
+        cfg, "long_training_headroom_min_tokens", 32_768))
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5MLP":
+            continue
+        if hasattr(module, "_ttt_exact_mlp_original_forward"):
+            installed += 1
+            continue
+        required = ("gate_proj", "up_proj", "down_proj", "act_fn")
+        if not all(hasattr(module, name) for name in required):
+            raise RuntimeError(
+                "Qwen3.8 MLP no longer exposes the position-wise "
+                "gate/up/down contract required for exact token chunking")
+        module._ttt_exact_mlp_original_forward = module.forward
+        module._ttt_exact_mlp_min_tokens = minimum
+        module.forward = types.MethodType(
+            _exact_chunked_qwen35_mlp_forward, module)
+        installed += 1
+    if installed < 1:
+        raise RuntimeError(
+            "Qwen3.8 exact long training found no Qwen3_5MLP modules to "
+            "token-chunk; refusing an unbounded long-sequence MLP path")
+    print(
+        "[memory] Qwen3.8 exact token-chunked MLP training ON "
+        f"({installed} layers; activates from {minimum} tokens; "
+        "all tokens and gradients retained)",
+        flush=True,
+    )
+    return installed
+
+
+def _exact_gated_norm_row_chunk_size(hidden_states, gate):
+    """Bound one FP32 gated-normalization tile using its actual row width."""
+    width = max(1, int(hidden_states.shape[-1]), int(gate.shape[-1]))
+    # Both operands are explicitly promoted to FP32 by the checkpoint's
+    # original implementation, regardless of their input dtype.
+    rows = max(1, _EXACT_GATED_NORM_TILE_BYTES // (width * 4))
+    if rows >= 128:
+        rows = (rows // 128) * 128
+    return max(1, min(int(hidden_states.shape[-2]), int(rows)))
+
+
+def _exact_chunked_qwen35_gated_norm_forward(module, hidden_states, gate):
+    """Run Qwen3.8's gated RMSNorm in exact checkpointed row tiles.
+
+    Qwen3.8 passes a two-dimensional ``(tokens * value_heads, head_dim)``
+    matrix here.  RMS normalization and SiLU gating are independent per row,
+    so slicing only that row dimension changes neither values nor gradients.
+    Per-tile checkpointing prevents backward recomputation from materializing
+    the original multi-GiB FP32 gate for the complete trajectory.
+    """
+    original = module._ttt_exact_gated_norm_original_forward
+    if hidden_states.ndim < 2 or gate.ndim != hidden_states.ndim:
+        return original(hidden_states, gate)
+    if tuple(hidden_states.shape) != tuple(gate.shape):
+        return original(hidden_states, gate)
+    rows = int(hidden_states.shape[-2])
+    minimum = int(getattr(
+        module, "_ttt_exact_gated_norm_min_rows", 0) or 0)
+    if rows < minimum:
+        return original(hidden_states, gate)
+
+    chunk = _exact_gated_norm_row_chunk_size(hidden_states, gate)
+    if chunk >= rows:
+        return original(hidden_states, gate)
+
+    def normalize(hidden_slice, gate_slice):
+        return original(hidden_slice, gate_slice)
+
+    outputs = []
+    use_checkpoint = bool(
+        torch.is_grad_enabled()
+        and (hidden_states.requires_grad or gate.requires_grad))
+    for start in range(0, rows, chunk):
+        hidden_slice = hidden_states[..., start:start + chunk, :]
+        gate_slice = gate[..., start:start + chunk, :]
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            output = checkpoint(
+                normalize, hidden_slice, gate_slice, use_reentrant=False)
+        else:
+            output = normalize(hidden_slice, gate_slice)
+        outputs.append(output)
+    return torch.cat(outputs, dim=-2)
+
+
+def _install_exact_qwen38_gated_norm_chunking(model, cfg):
+    """Patch Qwen3.8's FP32 gated-norm fallback with exact bounded tiles."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "qwen3.8-27b":
+        return 0
+    # The module receives value-head rows rather than decoder-token rows.  Use
+    # the memory-derived tile for every nontrivial matrix; short calls remain a
+    # single original forward when they already fit under the tile bound.
+    installed = 0
+    for module in model.modules():
+        if type(module).__name__ != "Qwen3_5RMSNormGated":
+            continue
+        if hasattr(module, "_ttt_exact_gated_norm_original_forward"):
+            installed += 1
+            continue
+        # Older Transformers hard-code SiLU instead of exposing `activation`.
+        # Row tiling invokes the original forward, preserving either variant.
+        required = ("weight", "variance_epsilon")
+        if not all(hasattr(module, name) for name in required):
+            raise RuntimeError(
+                "Qwen3.8 gated RMSNorm no longer exposes the exact "
+                "normalization/gating contract required for row chunking")
+        module._ttt_exact_gated_norm_original_forward = module.forward
+        module._ttt_exact_gated_norm_min_rows = 1
+        module.forward = types.MethodType(
+            _exact_chunked_qwen35_gated_norm_forward, module)
+        installed += 1
+    if installed < 1:
+        raise RuntimeError(
+            "Qwen3.8 exact long training found no Qwen3_5RMSNormGated "
+            "modules to row-chunk; refusing an unbounded FP32 gate path")
+    print(
+        "[memory] Qwen3.8 exact token-chunked gated RMSNorm training ON "
+        f"({installed} layers; all tokens and gradients retained)",
+        flush=True,
+    )
+    return installed
+
+
+def _configure_exact_long_training(model, cfg):
+    """Attach the model-profile execution policy used by every trainer path."""
+    if not bool(getattr(cfg, "strict_exact_long_training", False)):
+        return model
+    model._ttt_strict_exact_long_training = True
+    model._ttt_gradient_checkpointing_min_work = int(getattr(
+        cfg, "long_training_checkpoint_min_tokens", 16_384))
+    model._ttt_reserved_headroom_min_work = int(getattr(
+        cfg, "long_training_headroom_min_tokens", 32_768))
+    cpu_offload_threshold = getattr(
+        cfg, "long_training_cpu_offload_min_tokens", None)
+    model._ttt_activation_offload_min_work = (
+        None if cpu_offload_threshold is None
+        else int(cpu_offload_threshold))
+    _install_exact_qwen38_mlp_chunking(model, cfg)
+    _install_exact_qwen38_gated_norm_chunking(model, cfg)
+    if str(getattr(cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+        for module in model.modules():
+            if type(module).__name__ == "Qwen3_5TextModel":
+                module._ttt_group_checkpoint_min_tokens = int(getattr(
+                    cfg, "long_training_headroom_min_tokens", 32_768))
+    offload_description = (
+        "CPU activation offload only after a proven OOM"
+        if model._ttt_activation_offload_min_work is None else
+        "offload saved activations from "
+        f"{model._ttt_activation_offload_min_work}"
+    )
+    print(
+        "[memory] exact long-context policy: checkpoint from "
+        f"{model._ttt_gradient_checkpointing_min_work} work tokens, reserve "
+        f"headroom from {model._ttt_reserved_headroom_min_work}, "
+        f"{offload_description}; "
+        "trajectory exclusion disabled",
+        flush=True,
+    )
+    return model
+
+
+def _validate_gpt_oss_training_attention(model, cfg):
+    """Refuse attention backends that drop GPT-OSS's pretrained semantics."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
+        return
+
+    config = getattr(model, "config", None)
+    if str(getattr(config, "model_type", "")).lower() != "gpt_oss":
+        raise RuntimeError(
+            "GPT-OSS coder profile loaded a non-GPT-OSS training config")
+
+    layer_types = tuple(getattr(config, "layer_types", ()) or ())
+    if not ({"full_attention", "sliding_attention"} <= set(layer_types)):
+        raise RuntimeError(
+            "GPT-OSS training config lost its alternating full/sliding "
+            "attention layout")
+    sink_modules = sum(
+        1 for module in model.modules()
+        if getattr(module, "sinks", None) is not None)
+    if sink_modules < 1:
+        raise RuntimeError(
+            "GPT-OSS training model has no learned attention-sink modules")
+
+    implementation = getattr(config, "_attn_implementation", None)
+    if isinstance(implementation, dict):
+        implementation = (
+            implementation.get("")
+            or implementation.get("text_config")
+            or implementation.get("model")
+        )
+    implementation = str(implementation or "eager").lower()
+    unsafe = (
+        implementation == "sdpa"
+        or implementation == _hf_training_attention_implementation()
+        or implementation.startswith("flash_attention")
+    )
+    if unsafe:
+        raise RuntimeError(
+            f"GPT-OSS training selected {implementation!r}, which cannot "
+            "preserve learned attention sinks during backward; expected "
+            "Unsloth's sink-aware eager/flex implementation")
+
+    model._ttt_attention_backend = f"gpt-oss-sink-aware:{implementation}"
+    print(
+        "[memory] GPT-OSS exact long attention: sink-aware "
+        f"{implementation} via Unsloth; generic Flash-SDPA is prohibited",
+        flush=True,
+    )
+
+
+def _validate_hf_training_attention(model, cfg):
+    """Validate the structural assumptions behind exact fused Qwen training."""
+    profile = str(getattr(cfg, "coder_model_profile", ""))
+    if profile not in {
+            "qwen3-30b-a3b-thinking-2507", "qwen3.8-27b"}:
+        return
+
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        try:
+            text_config = get_text_config()
+        except (AttributeError, TypeError):
+            text_config = config
+    else:
+        text_config = getattr(config, "text_config", None) or config
+
+    implementation = getattr(text_config, "_attn_implementation", None)
+    if isinstance(implementation, dict):
+        implementation = (
+            implementation.get("")
+            or implementation.get("text_config")
+            or implementation.get("model")
+        )
+    if str(implementation) != _hf_training_attention_implementation():
+        raise RuntimeError(
+            f"{profile} did not install the exact TTT attention backend "
+            f"(got {implementation!r})")
+
+    attention_dropout = float(
+        getattr(text_config, "attention_dropout", 0.0) or 0.0)
+    if attention_dropout != 0.0:
+        raise RuntimeError(
+            f"{profile} now configures attention_dropout="
+            f"{attention_dropout}; fused and blockwise dropout consume "
+            "different RNG streams, so refusing to claim equivalent "
+            "training behavior")
+
+    if any(getattr(module, "sinks", None) is not None
+           for module in model.modules()):
+        raise RuntimeError(
+            f"{profile} unexpectedly contains learned attention sinks; "
+            "generic Flash-SDPA cannot preserve their normalization")
+
+    layer_types = tuple(getattr(text_config, "layer_types", ()) or ())
+    if profile == "qwen3.8-27b":
+        if not ({"linear_attention", "full_attention"} <= set(layer_types)):
+            raise RuntimeError(
+                "Qwen3.8 training config lost its expected hybrid "
+                "Gated-DeltaNet/full-attention layout")
+        detail = (
+            "Flash-SDPA for eligible full-attention layers; exact FLA "
+            "Gated-DeltaNet; independent rollout states")
+    else:
+        if "linear_attention" in layer_types:
+            raise RuntimeError(
+                f"{profile} unexpectedly contains stateful linear-attention "
+                "layers")
+        detail = "Flash-SDPA for eligible full-attention calls"
+
+    model._ttt_attention_backend = f"qwen-exact:{implementation}"
+    print(f"[memory] {profile} exact long attention: {detail}; "
+          "exact bounded fallback retained", flush=True)
+
+
+def _require_packed_mxfp4_training_runtime(cfg):
+    """Fail before model loading if exact GPT-OSS training is unavailable."""
+    if str(getattr(cfg, "coder_model_profile", "")) != "gpt-oss-120b":
+        return
+
+    # The training-capable path decodes per layer from Mxfp4ExpertParam.
+    # NO_DEQUANTIZE selects an older native path; it is not the storage check.
+    os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] = "1"
+
+    from importlib.metadata import PackageNotFoundError, version
+    from packaging.version import InvalidVersion, Version
+
+    minimums = (("unsloth", "2026.9.12"), ("unsloth_zoo", "2026.9.8"),
+                ("transformers", "5.0.0"))
+    failures = []
+    for package, minimum in minimums:
+        try:
+            installed = version(package)
+        except PackageNotFoundError:
+            failures.append(f"{package} is not installed")
+            continue
+        try:
+            too_old = Version(installed) < Version(minimum)
+        except InvalidVersion:
+            failures.append(f"{package} has unreadable version {installed!r}")
+            continue
+        if too_old:
+            failures.append(f"{package} {installed} < {minimum}")
+    if failures:
+        raise RuntimeError(
+            "Exact packed-MXFP4 GPT-OSS LoRA training is unavailable: "
+            + "; ".join(failures)
+            + ". Update once before launching: uv pip install --upgrade "
+              "'unsloth>=2026.9.12' 'unsloth-zoo>=2026.9.8' "
+              "'transformers>=5.0.0'")
+
+
+# ======================================================================
+# Unsloth backend
+# ======================================================================
+class UnslothBackend(_ModelPlacementBackend):
+    name = "unsloth"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.model = None
+        self.tokenizer = None
+        self._FastLanguageModel = None
+
+    def load(self):
+        _require_packed_mxfp4_training_runtime(self.cfg)
+        # Unsloth must be imported BEFORE transformers/trl/peft
+        from unsloth import FastLanguageModel
+        self._FastLanguageModel = FastLanguageModel
+
+        training_name = _training_model_name(self.cfg)
+        prequantized_bnb = "bnb-4bit" in training_name.lower()
+        use_4bit = _use_training_4bit(
+            self.cfg, prequantized_bnb=prequantized_bnb)
+        self.cfg.effective_load_in_4bit = use_4bit
+        packed_mxfp4 = bool(
+            str(getattr(self.cfg, "coder_model_profile", ""))
+            == "gpt-oss-120b" and not use_4bit)
+
+        device_map = _training_device_map(self.cfg)
+        print(f"[backend=unsloth] loading {training_name} across "
+              f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
+        offline = _offline_mode()
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=training_name,
+            max_seq_length=self.cfg.max_seq_length,
+            load_in_4bit=use_4bit,
+            dtype=torch.bfloat16,
+            # Keep GPT-OSS on the exact checkpoint used by vLLM. Modern
+            # Unsloth leaves its published MXFP4 experts packed for backward.
+            use_exact_model_name=offline or packed_mxfp4,
+            local_files_only=offline,
+            device_map=device_map,
+            **({"max_memory": _training_max_memory(self.cfg)}
+               if _training_max_memory(self.cfg) else {}),
+        )
+        self._remember_training_placement(model)
+        if packed_mxfp4 and not _is_packed_mxfp4(model):
+            raise RuntimeError(
+                "GPT-OSS training requires Mxfp4ExpertParam bytes and E8M0 "
+                "scales for both projections in every expert layer. The "
+                "loaded model does not satisfy this storage contract; "
+                "refusing a BF16/NF4 or partially converted model. "
+                "Check Unsloth's packed-expert/grouped_mm loading path.")
+        if packed_mxfp4:
+            print("[precision] verified packed MXFP4 bytes and scales in all "
+                  f"{model.config.num_hidden_layers} expert layers", flush=True)
+        _validate_gpt_oss_training_attention(model, self.cfg)
+        target_modules = _resolve_lora_target_modules(
+            self.cfg, getattr(model, "config", None))
+        print("[backend=unsloth] attaching LoRA ...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=_lora_rank(self.cfg),
+            lora_alpha=self.cfg.lora_alpha,
+            lora_dropout=self.cfg.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=self.cfg.seed,
+        )
+        set_gradient_checkpointing(model, False)
+        if str(getattr(self.cfg, "coder_model_profile", "")) == "gpt-oss-120b":
+            from models.gpt_oss_training import install_attention_layout_guards
+            install_attention_layout_guards(model)
+            print("[memory] GPT-OSS compiled rotary/flex attention: "
+                  "stable Q/K/V and rotary cos/sin layouts; fused kernels "
+                  "retained", flush=True)
+        _configure_exact_long_training(model, self.cfg)
+        tokenizer = _ensure_pad_token(tokenizer)
+
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            model.generation_config.max_length = None
+
+        self.model = model
+        self.tokenizer = tokenizer
+
+        return model, tokenizer
+
+    def set_inference_mode(self):
+        self._FastLanguageModel.for_inference(self.model)
+
+    def offload_for_generation(self):
+        if (not getattr(self, "_trainer_is_offloaded", False)
+                and str(getattr(self.cfg, "coder_model_profile", ""))
+                == "gpt-oss-120b"):
+            from models.gpt_oss_training import release_checkpoint_workspaces
+            release_checkpoint_workspaces()
+        super().offload_for_generation()
+
+    def set_training_mode(self):
+        self._FastLanguageModel.for_training(self.model)
+
+    def disable_adapter(self):
+        return self.model.disable_adapter()
+
+
+# ======================================================================
+# Plain HF + PEFT backend (fallback)
+# ======================================================================
+class HFBackend(_ModelPlacementBackend):
+    name = "hf"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.model = None
+        self.tokenizer = None
+
+    def load(self):
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+        training_name = _training_model_name(self.cfg)
+        device_map = _training_device_map(self.cfg)
+        replica_device = getattr(self.cfg, "training_replica_device", None)
+        if replica_device is None:
+            placement = (
+                f"across {int(getattr(self.cfg, 'num_training_gpus', 1))} "
+                "GPU(s)"
+            )
+        else:
+            placement = (
+                "as one replicated trainer on logical GPU "
+                f"{int(replica_device)}"
+            )
+        setting_log_only(
+            f"[backend=hf] loading {training_name} {placement} ...",
+            flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            training_name, trust_remote_code=True)
+        hf_config = AutoConfig.from_pretrained(
+            training_name, trust_remote_code=True)
+        quantization_method = _quantization_method(hf_config)
+        if quantization_method == "mxfp4":
+            raise RuntimeError(
+                f"{training_name} uses native MXFP4 weights. Train it with "
+                "the profiled Unsloth packed-MXFP4 backend; vanilla "
+                "Transformers cannot preserve that packed training path.")
+        prequantized_bnb = quantization_method == "bitsandbytes-4bit"
+        native_quantization = bool(
+            getattr(hf_config, "quantization_config", None)
+            and not prequantized_bnb)
+        use_4bit = _use_training_4bit(
+            self.cfg, native_quantization=native_quantization,
+            prequantized_bnb=prequantized_bnb)
+        self.cfg.effective_load_in_4bit = use_4bit
+
+        # GPU-mode's exclusive evaluation card was removed from visibility by
+        # role allocation. "balanced" therefore uses every rollout/training GPU
+        # without ever placing weights on the benchmark card.
+        fused_long_attention = bool(
+            getattr(self.cfg, "fused_long_attention", False))
+        _register_ttt_attention_backend(
+            fused_long_attention=fused_long_attention)
+        attention_implementation = _hf_training_attention_implementation()
+        model_kwargs = dict(
+            dtype=torch.bfloat16,
+            device_map=device_map,
+            trust_remote_code=True,
+            attn_implementation=attention_implementation,
+        )
+        qwen_training_kernels = None
+        if str(getattr(self.cfg, "coder_model_profile", "")) == "qwen3.8-27b":
+            # Qwen3.8 interleaves full attention with Gated DeltaNet. Its Hub
+            # inference kernel does not provide the backward implementation we
+            # need here. Require FLA's training-capable chunked GDN kernel and
+            # the matching causal-convolution kernel so Transformers cannot
+            # silently fall back to the token-by-token PyTorch recurrence.
+            from models.qwen_training_kernels import load_training_kernels
+            qwen_training_kernels = load_training_kernels()
+        attention_detail = (
+            "native SDPA + exact fused long-context attention + exact "
+            "bounded fallback"
+            if fused_long_attention else
+            "native SDPA + exact bounded long-context blocks"
+        )
+        print(f"[memory] HF training attention: "
+              f"{attention_implementation} ({attention_detail}; "
+              "no external package)")
+        max_memory = _training_max_memory(self.cfg)
+        if max_memory:
+            model_kwargs["max_memory"] = max_memory
+        if use_4bit and not prequantized_bnb:
+            try:
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            except ImportError:
+                use_4bit = False
+                self.cfg.effective_load_in_4bit = False
+                print("[backend=hf] bitsandbytes not available; using default precision")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            training_name, **model_kwargs)
+        if qwen_training_kernels is not None:
+            from models.qwen_training_kernels import install_training_kernels
+            count = install_training_kernels(model, qwen_training_kernels)
+            print(f"[memory] Qwen3.8 native training kernels bound to {count} "
+                  "DeltaNet layers (FLA + causal-conv1d)", flush=True)
+        self._remember_training_placement(model)
+        _validate_hf_training_attention(model, self.cfg)
+
+        if use_4bit:
+            if _expert_count(hf_config) > 0:
+                model = _prepare_sparse_moe_for_kbit_training(model)
+            else:
+                model = prepare_model_for_kbit_training(model)
+
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+        target_modules = _resolve_lora_target_modules(self.cfg, hf_config)
+        print("[backend=hf] attaching LoRA ...")
+        peft_cfg = LoraConfig(
+            r=_lora_rank(self.cfg),
+            lora_alpha=self.cfg.lora_alpha,
+            lora_dropout=self.cfg.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_cfg)
+        set_gradient_checkpointing(model, False)
+        _configure_exact_long_training(model, self.cfg)
+        model.print_trainable_parameters()
+
+        tokenizer = _ensure_pad_token(tokenizer)
+
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            model.generation_config.max_length = None
+
+        self.model = model
+        self.tokenizer = tokenizer
+        return model, tokenizer
+
+    def set_inference_mode(self):
+        self.model.eval()
+
+    def set_training_mode(self):
+        self.model.train()
+
+    def disable_adapter(self):
+        return self.model.disable_adapter()
+
+
+# ======================================================================
+# Factory with automatic fallback
+# ======================================================================
+def load_backend(name: str, cfg):
+    """
+    name in {"unsloth", "hf", "auto"}.
+
+    "auto": use plain HF in offline mode; otherwise use Unsloth when installed.
+    Importing Unsloth mutates Transformers classes globally, so a failed
+    Unsloth load cannot safely fall back to HF in the same interpreter.
+    """
+    requires_unsloth = _requires_unsloth_gpt_oss_loader(
+        _training_model_name(cfg))
+    if name == "hf" and requires_unsloth:
+        raise RuntimeError(
+            f"{_training_model_name(cfg)} uses Unsloth's split quantized "
+            "GPT-OSS expert layout and cannot be loaded safely by vanilla "
+            "Transformers. Select backend: unsloth; normal configuration "
+            "loading performs this routing automatically.")
+    if name == "auto" and requires_unsloth:
+        print("[backend=auto] GPT-OSS Unsloth BNB checkpoint requires the "
+              "patched Unsloth loader")
+        return UnslothBackend(cfg)
+    if name == "hf":
+        return HFBackend(cfg)
+    if name == "unsloth":
+        return UnslothBackend(cfg)
+    if name == "auto":
+        if _offline_mode():
+            print("[backend=auto] offline mode: selecting HF before importing "
+                  "Unsloth (avoids uncached Unsloth checkpoint remapping)")
+            return HFBackend(cfg)
+        if importlib.util.find_spec("unsloth") is not None:
+            print("[backend=auto] Unsloth installed; selecting Unsloth")
+            return _AutoFallbackBackend(cfg)
+        print("[backend=auto] Unsloth is not installed; selecting HF")
+        return HFBackend(cfg)
+    raise ValueError(f"Unknown backend: {name}")
+
+
+class _AutoFallbackBackend:
+    """Online auto-selected Unsloth with a safe post-patch failure message."""
+    name = "auto"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._inner = None
+
+    def load(self):
+        try:
+            inner = UnslothBackend(self.cfg)
+            m, t = inner.load()
+            self._inner = inner
+            return m, t
+        except Exception as e:
+            print(f"[backend=auto] Unsloth load failed: {e!r}")
+            raise RuntimeError(
+                "Unsloth patched Transformers before its model load failed, so "
+                "an in-process HF fallback would be unsafe. Re-run with "
+                "backend: hf (or fix/cache the Unsloth checkpoint and use "
+                "backend: unsloth).") from e
+
+    def set_inference_mode(self):
+        self._inner.set_inference_mode()
+
+    def set_training_mode(self):
+        self._inner.set_training_mode()
+
+    def disable_adapter(self):
+        return self._inner.disable_adapter()
+
+    def offload_for_generation(self):
+        return self._inner.offload_for_generation()
+
+    def restore_after_generation(self):
+        return self._inner.restore_after_generation()

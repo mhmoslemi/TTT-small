@@ -4,8 +4,8 @@ import math
 
 import pytest
 
-from _retire.problems.ac_inequalities import ACInequalities
-from _retire.problems.base import ParentContext
+from problems.ac_inequalities import ACInequalities
+from problems.base import ParentContext
 
 
 def make_problem(problem_type):

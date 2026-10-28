@@ -5,7 +5,7 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from output_retries import coder_retry_prompt_job
+from generation.output_retries import coder_retry_prompt_job
 
 
 def _runtime_scope(kind="qwen3.8", backend="vllm"):

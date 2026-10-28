@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sampler import PUCTSampler, State
+from search.sampler import PUCTSampler, State
 
 
 @dataclass

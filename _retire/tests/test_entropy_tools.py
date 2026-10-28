@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-import entropy_tools as entropy
+import analysis.entropy_tools as entropy
 
 
 class EntropyToolsTests(unittest.TestCase):

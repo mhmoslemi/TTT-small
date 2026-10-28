@@ -23,9 +23,9 @@ matplotlib.use("Agg")            # headless: write files, never open a window
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from _retire.problems.registry import get_problem
-from _retire.problems.base import ParentContext
-from sandbox import run_code
+from problems.registry import get_problem
+from problems.base import ParentContext
+from evaluation.sandbox import run_code
 
 
 # Known state-of-the-art for the current problem (circle packing n=26).
@@ -130,7 +130,7 @@ def extract_centers_radii(code: str, prob, timeout_s):
     """Run the rollout's code through the sandbox (same preprocess as scoring)
     and pull (centers, radii) out of the return value, so the plot matches what
     the evaluator saw. Returns (centers, radii) or (None, None)."""
-    from reward import extract_python_code
+    from evaluation.reward import extract_python_code
     src = extract_python_code(code)
     if src is None:
         return None, None

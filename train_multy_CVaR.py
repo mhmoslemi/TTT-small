@@ -20,32 +20,29 @@ import re
 import shutil
 import threading
 import time
-from contextlib import (contextmanager, nullcontext, redirect_stderr,
-                        redirect_stdout)
+from contextlib import (contextmanager, nullcontext, redirect_stderr, redirect_stdout)
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import yaml
-from entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
-from output_retries import (coder_output_issue, coder_retry_gate,
+from analysis.entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
+from generation.output_retries import (coder_output_issue, coder_retry_gate,
                             coder_retry_prompt_job, final_answer_scope,
                             output_retry_messages, retry_metadata,
                             strategy_retry_needed)
-from strategist_models import (
+from models.strategist_models import (
     render_strategy_prompt, resolve_strategy_effort, resolve_strategy_model,
     resolve_strategy_token_limits,
     strategist_engine_options, strategist_profile, validate_strategist_runtime,
 )
-import terminal_output as _terminal_output
+import diagnostics.terminal_output as _terminal_output
 
 
 # Logging is diagnostic and must never make an otherwise valid trainer update
 # fail.  Accept the pre-setting.log helper module during a rolling/mixed
 # deployment; a complete deployment still uses the direct setting.log sink.
-setting_log_only = getattr(
-    _terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
-_native_bind_setting_log = getattr(
-    _terminal_output, "bind_setting_log", None)
+setting_log_only = getattr(_terminal_output, "setting_log_only", _terminal_output.terminal_log_only)
+_native_bind_setting_log = getattr(_terminal_output, "bind_setting_log", None)
 
 
 def bind_setting_log(path, *, time_offset=0):
@@ -83,11 +80,9 @@ _QWEN3_8B_MODEL_ID = "qwen/qwen3-8b"
 _QWEN3_8B_MODEL_BASENAME = "qwen3-8b"
 _QWEN3_30B_A3B_MODEL_BASENAME = "qwen3-30b-a3b"
 _GPT_OSS_120B_MODEL_BASENAME = "gpt-oss-120b"
-_QWEN3_30B_A3B_THINKING_MODEL_BASENAME = (
-    "qwen3-30b-a3b-thinking-2507")
+_QWEN3_30B_A3B_THINKING_MODEL_BASENAME = ("qwen3-30b-a3b-thinking-2507")
 _QWEN38_27B_MODEL_BASENAME = "qwen3.8-27b"
-_DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = (
-    "deepseek-r1-0528-qwen3-8b")
+_DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME = ("deepseek-r1-0528-qwen3-8b")
 _FUSED_LONG_SINGLETON_MIN_TOKENS = 8192
 _EXACT_SHARDED_RECOVERY_FILE = ".exact_sharded_recovery.json"
 _EXACT_OVERFLOW_GRADIENT_FILE = ".exact_spo_rs_overflow_step{step:04d}.pt"
@@ -114,11 +109,9 @@ def _read_exact_sharded_recovery(run_dir):
         payload = json.loads(path.read_text(encoding="utf-8"))
         step = int(payload["step"])
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"invalid exact long-context recovery marker: {path}") from error
+        raise RuntimeError(f"invalid exact long-context recovery marker: {path}") from error
     if step < 0:
-        raise RuntimeError(
-            f"invalid exact long-context recovery step {step}: {path}")
+        raise RuntimeError(f"invalid exact long-context recovery step {step}: {path}")
     return {**payload, "step": step, "path": str(path)}
 
 
@@ -147,9 +140,7 @@ def _infer_exact_sharded_recovery(run_dir):
     rollout_pattern = f"step{step:02d}_group*_rollout*.meta.json"
     if summary.is_file() or not any(step_dir.glob(rollout_pattern)):
         return None
-    token_match = re.search(
-        r"exact long-context training failed for a (\d+)-token rollout",
-        tail[failure_offset:])
+    token_match = re.search(r"exact long-context training failed for a (\d+)-token rollout", tail[failure_offset:])
     reason = "inferred from the previous exact single-GPU OOM"
     if token_match is not None:
         reason += f" ({int(token_match.group(1))}-token rollout)"
@@ -178,8 +169,7 @@ def _write_exact_sharded_recovery(run_dir, step, error, **extra):
         "created_at": time.time(),
     })
     payload.update(extra)
-    temporary.write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
     return path
 
@@ -205,19 +195,17 @@ def _clear_exact_sharded_recovery(run_dir):
             pass
 
 
-def _save_exact_spo_rs_overflow(
-        run_dir, step, model, rank_stats, *, normal_train_seconds=0.0):
+def _save_exact_spo_rs_overflow(run_dir, step, model, rank_stats, *, normal_train_seconds=0.0):
     """Durably retain completed replica gradients for selective recovery."""
     import torch
-    from fast_distributed import trainable_parameter_signature
+    from training.fast_distributed import trainable_parameter_signature
 
     deferred_keys = sorted({
         (int(key[0]), int(key[1]))
         for stats in rank_stats
         for key in stats.get("deferred_keys", ())
     })
-    deferred_count = sum(
-        int(stats.get("deferred_examples", 0)) for stats in rank_stats)
+    deferred_count = sum(int(stats.get("deferred_examples", 0)) for stats in rank_stats)
     if deferred_count != len(deferred_keys) or not deferred_keys:
         raise RuntimeError(
             "exact SPO-RS overflow keys are missing or duplicated: "
@@ -228,19 +216,12 @@ def _save_exact_spo_rs_overflow(
         "ratio", "clipped_fraction",
     )
     normal_stats = {
-        "totals": {
-            key: sum(float(stats["totals"][key]) for stats in rank_stats)
-            for key in metric_keys
-        },
+        "totals": {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in metric_keys},
         "max_ratio": max(float(stats["max_ratio"]) for stats in rank_stats),
-        "max_prefix_ratio": max(
-            float(stats["max_prefix_ratio"]) for stats in rank_stats),
-        "entropy_examples": sum(
-            int(stats["entropy_examples"]) for stats in rank_stats),
-        "trained_examples": sum(
-            int(stats["trained_examples"]) for stats in rank_stats),
-        "backward_batches": sum(
-            int(stats["backward_batches"]) for stats in rank_stats),
+        "max_prefix_ratio": max(float(stats["max_prefix_ratio"]) for stats in rank_stats),
+        "entropy_examples": sum(int(stats["entropy_examples"]) for stats in rank_stats),
+        "trained_examples": sum(int(stats["trained_examples"]) for stats in rank_stats),
+        "backward_batches": sum(int(stats["backward_batches"]) for stats in rank_stats),
         "training_seconds": max(0.0, float(normal_train_seconds)),
     }
     gradients = {}
@@ -314,9 +295,7 @@ def _load_exact_spo_rs_overflow(run_dir, step):
         return None
     filename = str(filename)
     if Path(filename).name != filename:
-        raise RuntimeError(
-            "invalid exact SPO-RS overflow gradient filename in recovery "
-            "marker")
+        raise RuntimeError('invalid exact SPO-RS overflow gradient filename in recovery marker')
     path = Path(run_dir) / filename
     if not path.is_file():
         print(
@@ -327,8 +306,7 @@ def _load_exact_spo_rs_overflow(run_dir, step):
         return None
     try:
         try:
-            payload = torch.load(
-                path, map_location="cpu", weights_only=True)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
         except TypeError:
             payload = torch.load(path, map_location="cpu")
     except Exception as error:
@@ -349,10 +327,7 @@ def _load_exact_spo_rs_overflow(run_dir, step):
             flush=True,
         )
         return None
-    deferred_keys = sorted({
-        (int(key[0]), int(key[1]))
-        for key in payload.get("deferred_keys", ())
-    })
+    deferred_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("deferred_keys", ())})
     if not deferred_keys:
         print(
             f"[warn] exact SPO-RS overflow checkpoint has no deferred keys "
@@ -365,17 +340,9 @@ def _load_exact_spo_rs_overflow(run_dir, step):
         payload["version"] = 2
         payload["remaining_keys"] = list(deferred_keys)
         payload["completed_keys"] = []
-    remaining_keys = sorted({
-        (int(key[0]), int(key[1]))
-        for key in payload.get("remaining_keys", deferred_keys)
-    })
-    completed_keys = sorted({
-        (int(key[0]), int(key[1]))
-        for key in payload.get("completed_keys", ())
-    })
-    if (set(remaining_keys) & set(completed_keys)
-            or set(remaining_keys) | set(completed_keys)
-            != set(deferred_keys)):
+    remaining_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("remaining_keys", deferred_keys)})
+    completed_keys = sorted({(int(key[0]), int(key[1])) for key in payload.get("completed_keys", ())})
+    if (set(remaining_keys) & set(completed_keys) or set(remaining_keys) | set(completed_keys) != set(deferred_keys)):
         print(
             f"[warn] exact SPO-RS overflow progress keys are inconsistent "
             f"({path}); falling back to the complete exact model-sharded "
@@ -397,21 +364,13 @@ def _load_exact_spo_rs_overflow(run_dir, step):
     payload["remaining_keys"] = remaining_keys
     payload["completed_keys"] = completed_keys
     payload["overflow_stats"] = {
-        "totals": {
-            key: float(overflow_totals.get(key, 0.0))
-            for key in metric_keys
-        },
+        "totals": {key: float(overflow_totals.get(key, 0.0)) for key in metric_keys},
         "max_ratio": float(overflow_stats.get("max_ratio", 0.0)),
-        "max_prefix_ratio": float(
-            overflow_stats.get("max_prefix_ratio", 0.0)),
-        "entropy_examples": int(
-            overflow_stats.get("entropy_examples", 0)),
-        "trained_examples": int(
-            overflow_stats.get("trained_examples", len(completed_keys))),
-        "backward_batches": int(
-            overflow_stats.get("backward_batches", len(completed_keys))),
-        "training_seconds": max(
-            0.0, float(overflow_stats.get("training_seconds", 0.0))),
+        "max_prefix_ratio": float(overflow_stats.get("max_prefix_ratio", 0.0)),
+        "entropy_examples": int(overflow_stats.get("entropy_examples", 0)),
+        "trained_examples": int(overflow_stats.get("trained_examples", len(completed_keys))),
+        "backward_batches": int(overflow_stats.get("backward_batches", len(completed_keys))),
+        "training_seconds": max(0.0, float(overflow_stats.get("training_seconds", 0.0))),
     }
     if payload["overflow_stats"]["trained_examples"] != len(completed_keys):
         print(
@@ -431,8 +390,7 @@ def _write_exact_spo_rs_overflow_state(overflow_state):
 
     path_value = overflow_state.get("path")
     if not path_value:
-        raise RuntimeError(
-            "exact SPO-RS overflow state has no durable checkpoint path")
+        raise RuntimeError("exact SPO-RS overflow state has no durable checkpoint path")
     destination = Path(str(path_value))
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     payload = dict(overflow_state)
@@ -468,21 +426,12 @@ def _commit_exact_spo_rs_overflow_batch(
     """
     import torch
 
-    saved_gradients = _validate_precomputed_exact_gradients(
-        model, overflow_state, step_idx)
-    trajectory_keys = {
-        tuple(int(value) for value in key) for key in trajectory_keys
-    }
+    saved_gradients = _validate_precomputed_exact_gradients(model, overflow_state, step_idx)
+    trajectory_keys = {tuple(int(value) for value in key) for key in trajectory_keys}
     if not trajectory_keys:
         return len(overflow_state.get("remaining_keys", ()))
-    remaining = {
-        tuple(int(value) for value in key)
-        for key in overflow_state.get("remaining_keys", ())
-    }
-    completed = {
-        tuple(int(value) for value in key)
-        for key in overflow_state.get("completed_keys", ())
-    }
+    remaining = {tuple(int(value) for value in key) for key in overflow_state.get("remaining_keys", ())}
+    completed = {tuple(int(value) for value in key) for key in overflow_state.get("completed_keys", ())}
     invalid = trajectory_keys - remaining
     if invalid or trajectory_keys & completed:
         raise RuntimeError(
@@ -497,8 +446,7 @@ def _commit_exact_spo_rs_overflow_batch(
             if gradient is None:
                 continue
             saved = saved_gradients[name]
-            saved.add_(gradient.detach().to(
-                device="cpu", dtype=saved.dtype))
+            saved.add_(gradient.detach().to(device="cpu", dtype=saved.dtype))
 
     metric_keys = (
         "loss", "policy_loss", "kl_estimate", "entropy_estimate",
@@ -508,19 +456,14 @@ def _commit_exact_spo_rs_overflow_batch(
     totals = batch_stats["totals"]
     for key in metric_keys:
         overflow_stats["totals"][key] += float(totals[key])
-    overflow_stats["max_ratio"] = max(
-        float(overflow_stats["max_ratio"]),
-        float(batch_stats["max_ratio"]))
+    overflow_stats["max_ratio"] = max(float(overflow_stats["max_ratio"]), float(batch_stats["max_ratio"]))
     overflow_stats["max_prefix_ratio"] = max(
         float(overflow_stats["max_prefix_ratio"]),
         float(batch_stats["max_prefix_ratio"]))
-    overflow_stats["entropy_examples"] += int(
-        batch_stats["entropy_examples"])
+    overflow_stats["entropy_examples"] += int(batch_stats["entropy_examples"])
     overflow_stats["trained_examples"] += len(trajectory_keys)
-    overflow_stats["backward_batches"] += int(
-        batch_stats.get("backward_batches", len(trajectory_keys)))
-    overflow_stats["training_seconds"] += max(
-        0.0, float(training_seconds))
+    overflow_stats["backward_batches"] += int(batch_stats.get("backward_batches", len(trajectory_keys)))
+    overflow_stats["training_seconds"] += max(0.0, float(training_seconds))
 
     remaining.difference_update(trajectory_keys)
     completed.update(trajectory_keys)
@@ -529,25 +472,18 @@ def _commit_exact_spo_rs_overflow_batch(
     overflow_state["completed_keys"] = sorted(completed)
     _write_exact_spo_rs_overflow_state(overflow_state)
     try:
-        marker = _read_exact_sharded_recovery(
-            Path(str(overflow_state["path"])).parent) or {}
+        marker = _read_exact_sharded_recovery(Path(str(overflow_state["path"])).parent) or {}
         _write_exact_sharded_recovery(
             Path(str(overflow_state["path"])).parent,
             step_idx,
-            marker.get(
-                "reason",
-                "selective exact SPO-RS overflow recovery in progress"),
+            marker.get("reason", "selective exact SPO-RS overflow recovery in progress"),
             remaining_deferred_keys=[list(key) for key in sorted(remaining)],
             completed_deferred_keys=[list(key) for key in sorted(completed)],
         )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         # The authoritative gradient checkpoint was already atomically
         # committed. A stale human-readable marker does not invalidate it.
-        print(
-            f"[warn] exact overflow progress marker could not be refreshed: "
-            f"{error}",
-            flush=True,
-        )
+        print(f'[warn] exact overflow progress marker could not be refreshed: {error}', flush=True)
     return len(remaining)
 
 
@@ -570,13 +506,11 @@ def _clip_sharded_grad_norm_(parameters, max_norm, *, error_if_nonfinite):
     """
     import torch
 
-    parameters = [parameter for parameter in parameters
-                  if parameter.grad is not None]
+    parameters = [parameter for parameter in parameters if parameter.grad is not None]
     squared_norms = []
     for parameter in parameters:
         gradient = parameter.grad.detach()
-        local_norm = torch.linalg.vector_norm(
-            gradient, ord=2, dtype=torch.float32)
+        local_norm = torch.linalg.vector_norm(gradient, ord=2, dtype=torch.float32)
         value = float(local_norm.item())
         squared_norms.append(value * value)
     total_norm = math.sqrt(math.fsum(squared_norms))
@@ -602,8 +536,7 @@ def _resume_process_argv(run_dir):
         if argument in {"--resume", "--resume-from"}:
             index += 2
             continue
-        if (argument.startswith("--resume=")
-                or argument.startswith("--resume-from=")):
+        if (argument.startswith("--resume=") or argument.startswith("--resume-from=")):
             index += 1
             continue
         filtered.append(argument)
@@ -626,8 +559,7 @@ def _restart_for_exact_resume(run_dir):
 
 
 def _is_exact_qwen3_8b(model_name):
-    return (str(model_name or "").strip().rstrip("/").lower()
-            == _QWEN3_8B_MODEL_ID)
+    return (str(model_name or "").strip().rstrip("/").lower() == _QWEN3_8B_MODEL_ID)
 
 
 def _is_qwen3_8b_sampling_model(model_name):
@@ -654,15 +586,13 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
         merged.setdefault("sampling_min_p", None)
     merged["strategy_sampling_top_k"] = 0
     if "strategy_min_p" in merged:
-        merged["strategy_sampling_min_p"] = float(
-            merged["strategy_min_p"])
+        merged["strategy_sampling_min_p"] = float(merged["strategy_min_p"])
     else:
         merged["strategy_sampling_min_p"] = 0.0
     merged["qwen3_8b_thinking_sampling"] = False
     merged["strategy_qwen3_8b_thinking_sampling"] = False
 
-    if (_is_qwen3_8b_sampling_model(merged.get("model_name"))
-            and bool(merged.get("thinking", False))):
+    if (_is_qwen3_8b_sampling_model(merged.get("model_name")) and bool(merged.get("thinking", False))):
         # Coder temperature and nucleus sampling are experiment controls and
         # therefore come straight from YAML/config.  Qwen3-8B's automatic
         # runtime contract only enforces the project's deliberately
@@ -681,14 +611,11 @@ def _apply_qwen3_8b_thinking_sampling(merged, explicit_keys=frozenset()):
             "(temperature/top_p from YAML/config; filters disabled)")
 
     if (bool(merged.get("strategies", False))
-            and _is_qwen3_8b_sampling_model(
-                merged.get("strategy_model_name"))
+            and _is_qwen3_8b_sampling_model(merged.get("strategy_model_name"))
             and bool(merged.get("strategy_thinking", False))):
-        _profile_default(
-            merged, "strategy_temperature", 1.0, explicit_keys)
+        _profile_default(merged, "strategy_temperature", 1.0, explicit_keys)
         _profile_default(merged, "strategy_top_p", 1.0, explicit_keys)
-        if ("strategy_min_p" not in explicit_keys
-                and "strategy_sampling_min_p" not in explicit_keys):
+        if ("strategy_min_p" not in explicit_keys and "strategy_sampling_min_p" not in explicit_keys):
             merged["strategy_sampling_min_p"] = 0.0
         merged["strategy_qwen3_8b_thinking_sampling"] = bool(
             float(merged["strategy_temperature"]) == 0.6
@@ -711,8 +638,7 @@ def _is_exact_qwen3_30b_a3b(model_name):
     while excluding Instruct-2507, Thinking-2507, Base, and quantized variants.
     """
     normalized = str(model_name or "").strip().rstrip("/").replace("\\", "/")
-    return normalized.rsplit("/", 1)[-1].lower() == (
-        _QWEN3_30B_A3B_MODEL_BASENAME)
+    return normalized.rsplit("/", 1)[-1].lower() == (_QWEN3_30B_A3B_MODEL_BASENAME)
 
 
 def _model_basename(model_name):
@@ -725,8 +651,7 @@ def _strategy_model_name(cfg):
     return getattr(cfg, "api_strategy", "") or cfg.strategy_model_name
 
 
-def _apply_strategy_model_profile(
-        merged, model_name, explicit_keys=frozenset()):
+def _apply_strategy_model_profile(merged, model_name, explicit_keys=frozenset()):
     """Apply model-native strategist defaults below explicit configuration."""
     profile = strategist_profile(model_name)
     if profile:
@@ -742,8 +667,7 @@ def _apply_strategy_model_profile(
               "native checkpoint quantization; YAML sampling/token limits "
               "take precedence")
         return
-    if (_model_basename(model_name)
-            != _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME):
+    if (_model_basename(model_name) != _DEEPSEEK_R1_0528_QWEN3_8B_MODEL_BASENAME):
         return
 
     # DeepSeek evaluates this checkpoint with 64K generations, but its native
@@ -751,25 +675,19 @@ def _apply_strategy_model_profile(
     # subtracts the actual prompt length, so prompt + completion never exceeds
     # 131072. It is a native reasoning model: thinking stays enabled and
     # `high` is the strongest effort label exposed by this runner.
-    _profile_default(
-        merged, "strategy_max_new_tokens", 131_072, explicit_keys)
-    _profile_default(
-        merged, "strategy_max_seq_length", 131_072, explicit_keys)
+    _profile_default(merged, "strategy_max_new_tokens", 131_072, explicit_keys)
+    _profile_default(merged, "strategy_max_seq_length", 131_072, explicit_keys)
     _profile_default(merged, "strategy_thinking", True, explicit_keys)
-    _profile_default(
-        merged, "strategy_reasoning_effort", "high", explicit_keys)
-    _profile_default(
-        merged, "strategy_vllm_quantization", "", explicit_keys)
+    _profile_default(merged, "strategy_reasoning_effort", "high", explicit_keys)
+    _profile_default(merged, "strategy_vllm_quantization", "", explicit_keys)
 
     # At 8B, the exact model fits without quantization. The topology planner
     # keeps independent TP=1 replicas while the live parent-chain frontier can
     # feed them, and folds otherwise-idle replicas into TP ranks when it cannot.
     # Retain every selected engine's level-1 backup between phases.
     _profile_default(merged, "strategy_vllm_sleep_level", 1, explicit_keys)
-    _profile_default(
-        merged, "strategy_vllm_staged_loading", False, explicit_keys)
-    _profile_default(
-        merged, "strategy_vllm_persistent_workers", None, explicit_keys)
+    _profile_default(merged, "strategy_vllm_staged_loading", False, explicit_keys)
+    _profile_default(merged, "strategy_vllm_persistent_workers", None, explicit_keys)
     print("[model-profile] DeepSeek-R1-0528-Qwen3-8B strategist: "
           f"native reasoning, max_new={merged['strategy_max_new_tokens']}, "
           f"max_seq={merged['strategy_max_seq_length']}, "
@@ -850,8 +768,7 @@ def _coder_model_profile(model_name):
 
 def _coder_vllm_persistent_workers(cfg):
     """Release GPT-OSS coder engines completely during adapter training."""
-    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b"
-            and not bool(getattr(cfg, "no_train", False))):
+    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b" and not bool(getattr(cfg, "no_train", False))):
         return 0
     return None
 
@@ -882,8 +799,7 @@ def _resolve_coder_token_limits(merged):
                     continue
                 for key in ("max_position_embeddings", "n_positions", "max_seq_len"):
                     value = candidate.get(key)
-                    if (isinstance(value, int) and not isinstance(value, bool)
-                            and value > 0):
+                    if (isinstance(value, int) and not isinstance(value, bool) and value > 0):
                         context = value
                         break
                 if context is not None:
@@ -905,14 +821,12 @@ def _resolve_coder_token_limits(merged):
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
     """Keep the legacy phase-2 fallback; explicit splits use prompt variants."""
-    if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-            and phase == "adaptive"):
+    if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8" and phase == "adaptive"):
         return "medium"
     return getattr(cfg, "coder_reasoning_effort", None)
 
 
-def _coder_effort_entries(
-        prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
+def _coder_effort_entries(prompt_jobs, source_job_indices, counts, cfg, step_idx, phase):
     """Route Qwen3.8 rollouts through the configured per-strategy counts.
 
     The split changes only the chat-template reasoning control. Every source
@@ -926,8 +840,7 @@ def _coder_effort_entries(
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
-    if (phase == "adaptive"
-            and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
+    if (phase == "adaptive" and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
         requested = {
             effort: int(getattr(cfg, f"phase2_{effort}_programs_per_strategy", default))
             for effort, default in (("xhigh", 0), ("medium", -1), ("low", 0))
@@ -950,15 +863,11 @@ def _coder_effort_entries(
                 split[remainder_effort] = split.get(remainder_effort, 0) + remaining
             for effort, allocated in split.items():
                 if allocated:
-                    grouped.setdefault(effort, []).append(
-                        (source_idx, allocated, effort))
+                    grouped.setdefault(effort, []).append((source_idx, allocated, effort))
         return [entry for group in grouped.values() for entry in group]
-    xhigh_per_strategy = int(getattr(
-        cfg, "pilot_xhigh_programs_per_strategy", 0))
-    medium_per_strategy = int(getattr(
-        cfg, "pilot_medium_programs_per_strategy", 0))
-    if (str(phase) != "pilot"
-            or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
+    xhigh_per_strategy = int(getattr(cfg, "pilot_xhigh_programs_per_strategy", 0))
+    medium_per_strategy = int(getattr(cfg, "pilot_medium_programs_per_strategy", 0))
+    if (str(phase) != "pilot" or getattr(cfg, "coder_template_kind", "generic") != "qwen3.8"):
         return entries
 
     xhigh_entries = []
@@ -972,16 +881,14 @@ def _coder_effort_entries(
         if medium_count:
             medium_entries.append((source_idx, medium_count, "medium"))
         if count > xhigh_count + medium_count:
-            base_entries.append(
-                (source_idx, count - xhigh_count - medium_count, base_effort))
+            base_entries.append((source_idx, count - xhigh_count - medium_count, base_effort))
     # Keep all xhigh variants in the same scheduler call and place those groups
     # first so round-robin assignment spreads the longer requests across the
     # available engines. This adds no rollout or allocation budget.
     return xhigh_entries + medium_entries + base_entries
 
 
-def _phase_coder_prompt_job(
-        prompt_jobs, source_idx, phase, cfg, render, cache, *, effort=None):
+def _phase_coder_prompt_job(prompt_jobs, source_idx, phase, cfg, render, cache, *, effort=None):
     """Return an immutable phase-specific prompt ID without changing pilots.
 
     Records must retain the exact prompt used at generation for old/reference
@@ -998,9 +905,7 @@ def _phase_coder_prompt_job(
         source = prompt_jobs[int(source_idx)]
         variant = {
             **source,
-            "prompt_text": render(
-                source["messages"], rollout_phase=phase,
-                reasoning_effort=effort),
+            "prompt_text": render(source["messages"], rollout_phase=phase, reasoning_effort=effort),
             "coder_reasoning_effort": effort,
             # This is a prompt alias, not a new allocation. Phase generation
             # supplies the actual counts explicitly to the existing scheduler.
@@ -1027,18 +932,14 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     merged["coder_model_profile"] = str(profile["name"])
     merged["coder_template_kind"] = str(profile["template_kind"])
     if "reasoning_effort" in profile:
-        _profile_default(
-            merged, "coder_reasoning_effort",
-            str(profile["reasoning_effort"]), explicit_keys)
+        _profile_default(merged, "coder_reasoning_effort", str(profile["reasoning_effort"]), explicit_keys)
     else:
         # Qwen3-8B exposes only the real enable_thinking switch; it has no
         # native low/medium/high reasoning-effort control.
         merged.pop("coder_reasoning_effort", None)
-    merged["coder_preserve_thinking"] = bool(
-        profile["template_kind"] == "qwen3.8")
+    merged["coder_preserve_thinking"] = bool(profile["template_kind"] == "qwen3.8")
     _profile_default(merged, "max_seq_length", native_context, explicit_keys)
-    _profile_default(
-        merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
+    _profile_default(merged, "max_new_tokens", int(profile["max_output"]), explicit_keys)
     if bool(profile.get("force_thinking", False)):
         # This project uses Qwen3-8B only in its thinking mode.  Unlike
         # temperature/top-p, this is part of the selected model contract.
@@ -1048,12 +949,9 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
 
     # Quantization and placement describe only the differentiable copy. The
     # aligned GPT-OSS profile keeps the original checkpoint name on both sides.
-    _profile_default(
-        merged, "load_in_4bit", bool(profile["training_4bit"]), explicit_keys)
+    _profile_default(merged, "load_in_4bit", bool(profile["training_4bit"]), explicit_keys)
     _profile_default(merged, "training_model_name", "", explicit_keys)
-    _profile_default(
-        merged, "training_layout", str(profile["training_layout"]),
-        explicit_keys)
+    _profile_default(merged, "training_layout", str(profile["training_layout"]), explicit_keys)
     _profile_default(
         merged, "training_memory_fraction",
         float(profile.get("training_memory_fraction", 0.80)), explicit_keys)
@@ -1062,14 +960,11 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
     # and the bounded exact-token projection. The layout planner also accounts
     # for startup weight conversion before choosing the smallest fitting TP
     # group. Qwen3.8 needs a larger projection reserve than the other profiles.
-    _profile_default(
-        merged, "vllm_gpu_memory_utilization", 0.965, explicit_keys)
+    _profile_default(merged, "vllm_gpu_memory_utilization", 0.965, explicit_keys)
     _profile_default(merged, "vllm_quantization", "", explicit_keys)
     _profile_default(merged, "gen_micro_batch", "auto", explicit_keys)
-    _profile_default(
-        merged, "vllm_max_num_batched_tokens", "auto", explicit_keys)
-    merged["vllm_runtime_reserve_override_gib"] = float(
-        profile["vllm_runtime_reserve_gib"])
+    _profile_default(merged, "vllm_max_num_batched_tokens", "auto", explicit_keys)
+    merged["vllm_runtime_reserve_override_gib"] = float(profile["vllm_runtime_reserve_gib"])
     _profile_default(merged, "vllm_staged_loading", True, explicit_keys)
     # Discard the obsolete hardware-name bypass, including resumed runs.
     # Admission now depends on the bounded-conversion worker contract in
@@ -1095,8 +990,7 @@ def _apply_coder_model_profile(merged, explicit_keys=frozenset()):
         if profile["name"] == "qwen3-8b"
         else "explicit YAML/config values take precedence"
     )
-    reasoning_label = merged.get(
-        "coder_reasoning_effort", "thinking on/off only")
+    reasoning_label = merged.get("coder_reasoning_effort", "thinking on/off only")
     print(
         f"[model-profile] {profile['name']}: context limit="
         f"{merged['max_seq_length']}, max generated tokens="
@@ -1114,8 +1008,7 @@ def _uses_sequence_level_policy_ratio(cfg):
     return _is_exact_qwen3_30b_a3b(getattr(cfg, "model_name", ""))
 
 
-def _detached_behavior_importance_ratio(cfg, current_logprobs,
-                                        behavior_logprobs):
+def _detached_behavior_importance_ratio(cfg, current_logprobs, behavior_logprobs):
     """Return the existing token ratios or the A3B trajectory ratio.
 
     Entropic updates use a detached importance weight rather
@@ -1126,8 +1019,7 @@ def _detached_behavior_importance_ratio(cfg, current_logprobs,
     import torch
 
     current = current_logprobs.detach()
-    behavior = torch.as_tensor(
-        behavior_logprobs, dtype=current.dtype, device=current.device)
+    behavior = torch.as_tensor(behavior_logprobs, dtype=current.dtype, device=current.device)
     log_ratios = current - behavior
     if _uses_sequence_level_policy_ratio(cfg):
         return log_ratios.mean().exp()
@@ -1161,7 +1053,7 @@ def _extract_final_strategy(response_text, *, strict=False):
     hands the coder the explicit no-strategy fallback instead of aborting the
     entire rollout step.
     """
-    from strategy_prompts_openai import normalize_strategy_plan
+    from generation.strategy_prompts_openai import normalize_strategy_plan
     raw = final_answer_scope(normalize_strategy_plan(response_text)).strip()
     if not raw:
         return _STRATEGY_FALLBACK, "empty response"
@@ -1247,10 +1139,7 @@ class _TimestampedLineStream:
         progress_stream = getattr(self.stream, "progress_stream", None)
         route_progress = bool(
             progress_stream is not None
-            and ("\r" in value
-                 or (self._dynamic_progress
-                     and "\n" in value
-                     and not value.strip())))
+            and ("\r" in value or (self._dynamic_progress and "\n" in value and not value.strip())))
         if route_progress:
             with self._lock:
                 progress_stream.write(value)
@@ -1264,11 +1153,7 @@ class _TimestampedLineStream:
         with self._lock:
             for index, part in enumerate(parts):
                 if part and self._line_start:
-                    timestamp = time.strftime(
-                        "[%H:%M:%S] ",
-                        time.localtime(
-                            time.time() + _LOG_TIME_OFFSET_SECONDS),
-                    )
+                    timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
                     self.stream.write(timestamp)
                 if part:
                     self.stream.write(part)
@@ -1293,10 +1178,7 @@ class _TimestampedLineStream:
         rendered = []
         for index, part in enumerate(parts):
             if part:
-                timestamp = time.strftime(
-                    "[%H:%M:%S] ",
-                    time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS),
-                )
+                timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
                 rendered.extend((timestamp, part))
             if index + 1 < len(parts):
                 rendered.append("\n")
@@ -1419,10 +1301,7 @@ class _TerminalLogSink:
         self._remove_visible_progress()
         self.log_file.seek(0, os.SEEK_END)
         self._progress_offset = self.log_file.tell()
-        timestamp = time.strftime(
-            "[%H:%M:%S] ",
-            time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS),
-        )
+        timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
         self.log_file.write(timestamp + self._progress_text)
         self.log_file.truncate()
         self.log_file.seek(0, os.SEEK_END)
@@ -1471,8 +1350,7 @@ class _TerminalLogSink:
             if self.log_file is not None:
                 return
             mode = "r+" if os.path.exists(log_path) else "w+"
-            self.log_file = open(
-                log_path, mode, buffering=1, encoding="utf-8")
+            self.log_file = open(log_path, mode, buffering=1, encoding="utf-8")
             self.log_file.seek(0, os.SEEK_END)
             if self.pending:
                 pending = list(self.pending)
@@ -1527,21 +1405,14 @@ class _NoticeRoutingStream:
         self._setting_log_line = False
 
     def _diagnostic_is_open(self):
-        return (self.diagnostic is not None
-                and not bool(getattr(self.diagnostic, "closed", False)))
+        return (self.diagnostic is not None and not bool(getattr(self.diagnostic, "closed", False)))
 
     def write(self, value):
         for piece in str(value).splitlines(keepends=True):
-            setting_only = (
-                self._setting_log_line
-                or any(marker in piece
-                       for marker in _SETTING_LOG_ONLY_NOTICES)
-            )
+            setting_only = (self._setting_log_line or any(marker in piece for marker in _SETTING_LOG_ONLY_NOTICES))
             route = (self._diagnostic_is_open()
                      and not setting_only
-                     and (self._routing_line
-                          or any(marker in piece
-                                 for marker in _ROUTED_DEPENDENCY_NOTICES)))
+                     and (self._routing_line or any(marker in piece for marker in _ROUTED_DEPENDENCY_NOTICES)))
             if setting_only:
                 setting_log_only(piece, end="")
             elif route:
@@ -1550,10 +1421,8 @@ class _NoticeRoutingStream:
                 self.diagnostic.write(piece)
             else:
                 self.visible.write(piece)
-            self._setting_log_line = bool(
-                setting_only and not piece.endswith(("\n", "\r")))
-            self._routing_line = bool(
-                route and not piece.endswith(("\n", "\r")))
+            self._setting_log_line = bool(setting_only and not piece.endswith(("\n", "\r")))
+            self._routing_line = bool(route and not piece.endswith(("\n", "\r")))
         return len(value)
 
     def flush(self):
@@ -1608,10 +1477,8 @@ def _route_dependency_notices(log_path):
         yield
         return
     with open(log_path, "a", buffering=1, encoding="utf-8") as diagnostic:
-        stdout = _NoticeRoutingStream(
-            sys.stdout, diagnostic, "trainer dependency stdout")
-        stderr = _NoticeRoutingStream(
-            sys.stderr, diagnostic, "trainer dependency stderr")
+        stdout = _NoticeRoutingStream(sys.stdout, diagnostic, "trainer dependency stdout")
+        stderr = _NoticeRoutingStream(sys.stderr, diagnostic, "trainer dependency stderr")
         try:
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 yield
@@ -1655,8 +1522,7 @@ def _normalize_saved_advantage_config(saved):
     saved = dict(saved)
     mode = str(saved.get("advantage_mode") or "entropic").lower()
     if mode not in ADVANTAGE_MODES or saved.get("binary_coder_training", False):
-        raise ValueError("saved run uses an unsupported training objective; "
-                         "only entropic and spo-rs can be resumed")
+        raise ValueError('saved run uses an unsupported training objective; only entropic and spo-rs can be resumed')
     if mode == "spo-rs" and "rank_update_epochs" in saved:
         saved.setdefault("spo_rs_update_epochs", saved["rank_update_epochs"])
     if mode == "entropic":
@@ -1677,7 +1543,7 @@ def compute_group_advantages(rewards_np):
 
     SPO-RS obtains advantages from its frozen historical tracker instead.
     """
-    from advantage import entropic_adaptive_advantages
+    from training.advantage import entropic_adaptive_advantages
     return entropic_adaptive_advantages(rewards_np)
 
 
@@ -1713,8 +1579,7 @@ def _resolve_spo_rs_options(merged):
 
     epochs = merged.get("spo_rs_update_epochs")
     epochs = SPO_RS_UPDATE_EPOCHS_DEFAULT if epochs is None else epochs
-    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer))
-            or epochs < 1):
+    if (isinstance(epochs, bool) or not isinstance(epochs, (int, np.integer)) or epochs < 1):
         raise ValueError("spo_rs_update_epochs must be a positive integer")
     merged["spo_rs_update_epochs"] = int(epochs)
     raw_clip_epsilon = merged.get("spo_rs_clip_epsilon")
@@ -1737,16 +1602,13 @@ def _resolve_spo_rs_options(merged):
     if not isinstance(adaptive_beta, bool):
         raise ValueError("spo_rs_adaptive_beta must be true or false")
     merged["spo_rs_adaptive_beta"] = bool(adaptive_beta)
-    from spo_rs import BOUNDED_SHAPING_VERSION
+    from training.spo_rs import BOUNDED_SHAPING_VERSION
     # The old adaptive-beta estimator did not have a historical baseline.
-    merged["spo_rs_reward_shaping"] = (
-        BOUNDED_SHAPING_VERSION if adaptive_beta else "exponential")
+    merged["spo_rs_reward_shaping"] = (BOUNDED_SHAPING_VERSION if adaptive_beta else "exponential")
     if merged["spo_rs_d_half"] <= 0.0:
         raise ValueError("spo_rs_d_half must be positive")
-    if not (0.0 < merged["spo_rs_rho_min"]
-            <= merged["spo_rs_rho_max"] < 1.0):
-        raise ValueError(
-            "SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
+    if not (0.0 < merged["spo_rs_rho_min"] <= merged["spo_rs_rho_max"] < 1.0):
+        raise ValueError("SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
     if not 0.0 < merged["spo_rs_clip_epsilon"] < 1.0:
         raise ValueError("spo_rs_clip_epsilon must be in (0, 1)")
     side_defaults = {
@@ -1757,8 +1619,7 @@ def _resolve_spo_rs_options(merged):
         name = f"spo_rs_clip_epsilon_{side}"
         raw = merged.get(name)
         if raw is None:
-            value = (merged["spo_rs_clip_epsilon"]
-                     if raw_clip_epsilon is not None else default)
+            value = (merged["spo_rs_clip_epsilon"] if raw_clip_epsilon is not None else default)
         else:
             value = float(raw)
         if not math.isfinite(value) or not 0.0 < value < 1.0:
@@ -1774,8 +1635,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "is given. Defaults to erdos. "
                         "One of: circle_packing, "
                         "erdos, erdos-c4, ac1, ac2, denoising, gpu_mode.")
-    p.add_argument("--config", default=None,
-                   help="Explicit path to a YAML config (overrides the --problem lookup).")
+    p.add_argument("--config", default=None, help="Explicit path to a YAML config (overrides the --problem lookup).")
     p.add_argument("--resume", "--resume-from", dest="resume", default=None,
                    metavar="RUN_DIR",
                    help="Continue an existing run directory from its latest "
@@ -1879,12 +1739,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-circles", type=int, default=None)
     p.add_argument("--target", type=float, default=None)
     p.add_argument("--sandbox-timeout-s", type=float, default=None)
-    p.add_argument("--num-steps", type=int, default=None,
-                   help="Number of TTT-Discover steps (paper: 50)")
-    p.add_argument("--groups-per-step", type=int, default=None,
-                   help='Parent states per step.')
-    p.add_argument("--group-size", type=int, default=None,
-                   help='Rollouts per parent group.')
+    p.add_argument("--num-steps", type=int, default=None, help="Number of TTT-Discover steps (paper: 50)")
+    p.add_argument("--groups-per-step", type=int, default=None, help='Parent states per step.')
+    p.add_argument("--group-size", type=int, default=None, help='Rollouts per parent group.')
     p.add_argument("--strategies-per-parent", type=int, default=None,
                    help="Sequential diverse strategies generated per parent.")
     p.add_argument("--programs-per-strategy", type=int, default=None,
@@ -1924,10 +1781,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy-max-seq-length", type=int, default=None)
     p.add_argument("--strategy-temperature", type=float, default=None)
     p.add_argument("--strategy-top-p", type=float, default=None)
-    p.add_argument("--strategy-thinking", dest="strategy_thinking",
-                   action="store_const", const=True, default=None)
-    p.add_argument("--no-strategy-thinking", dest="strategy_thinking",
-                   action="store_const", const=False)
+    p.add_argument("--strategy-thinking", dest="strategy_thinking", action="store_const", const=True, default=None)
+    p.add_argument("--no-strategy-thinking", dest="strategy_thinking", action="store_const", const=False)
     p.add_argument("--strategy-reasoning-effort",
                    choices=["auto", "none", "low", "medium", "high", "xhigh", "max"],
                    default=None,
@@ -2063,13 +1918,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--vllm-enforce-eager", dest="vllm_enforce_eager",
                    action="store_const", const=True, default=None,
                    help="Disable CUDA graphs in vLLM.")
-    p.add_argument("--no-vllm-enforce-eager", dest="vllm_enforce_eager",
-                   action="store_const", const=False)
+    p.add_argument("--no-vllm-enforce-eager", dest="vllm_enforce_eager", action="store_const", const=False)
     p.add_argument("--vllm-prefix-caching", dest="vllm_enable_prefix_caching",
                    action="store_const", const=True, default=None)
-    p.add_argument("--no-vllm-prefix-caching",
-                   dest="vllm_enable_prefix_caching",
-                   action="store_const", const=False)
+    p.add_argument("--no-vllm-prefix-caching", dest="vllm_enable_prefix_caching", action="store_const", const=False)
     p.add_argument("--vllm-tensor-parallel-size", type=int, default=None)
     p.add_argument("--vllm-pipeline-parallel-size", type=int, default=None)
     p.add_argument("--vllm-quantization", type=str, default=None,
@@ -2143,17 +1995,13 @@ def _resolve_training_backend(backend, training_model_name):
     checkpoint = str(training_model_name).strip().lower()
     if resolved == "auto":
         return "unsloth" if "gpt-oss" in checkpoint else "hf"
-    requires_unsloth = (
-        "gpt-oss" in checkpoint
-        and "unsloth-bnb-4bit" in checkpoint
-    )
+    requires_unsloth = ("gpt-oss" in checkpoint and "unsloth-bnb-4bit" in checkpoint)
     if requires_unsloth and resolved in ("auto", "hf"):
         return "unsloth"
     return resolved
 
 
-def _resolve_training_memory_budgets(training_gpu_ids, memory, *,
-                                     max_fraction=0.90):
+def _resolve_training_memory_budgets(training_gpu_ids, memory, *, max_fraction=0.90):
     """Reserve host/runtime headroom and cap checkpoint placement per card."""
     if not memory or any(gpu_id not in memory for gpu_id in training_gpu_ids):
         return []
@@ -2162,15 +2010,12 @@ def _resolve_training_memory_budgets(training_gpu_ids, memory, *,
         gpu = memory[gpu_id]
         # Keep at least 6 GiB outside Accelerate's weight placement for CUDA,
         # activations, temporary quantization buffers, and LoRA optimizer state.
-        usable = min(
-            float(gpu.total_gib) * float(max_fraction),
-            float(gpu.free_gib) - 6.0)
+        usable = min(float(gpu.total_gib) * float(max_fraction), float(gpu.free_gib) - 6.0)
         budgets.append(round(max(1.0, usable), 1))
     return budgets
 
 
-def _validate_known_training_capacity(
-        training_model_name, budgets, *, replicated=False):
+def _validate_known_training_capacity(training_model_name, budgets, *, replicated=False):
     """Fail before loading a known giant checkpoint that cannot fit at all."""
     if not budgets:
         return
@@ -2222,17 +2067,12 @@ def load_config():
             raise FileNotFoundError(f"--resume directory not found: {resume_dir}")
         saved_config_path = resume_dir / "config.json"
         if not saved_config_path.is_file():
-            raise FileNotFoundError(
-                f"--resume directory has no config.json: {resume_dir}"
-            )
-        saved = _normalize_saved_advantage_config(
-            json.loads(saved_config_path.read_text()))
+            raise FileNotFoundError(f"--resume directory has no config.json: {resume_dir}")
+        saved = _normalize_saved_advantage_config(json.loads(saved_config_path.read_text()))
 
     # The launcher defaults to erdos. Direct Python calls use the same selection
     # when neither --config nor --problem is provided.
-    problem_name = (saved.get("problem") if saved
-                    else (args.problem if args.problem is not None
-                          else "erdos"))
+    problem_name = (saved.get("problem") if saved else (args.problem if args.problem is not None else "erdos"))
 
     # 1) Complete, self-contained problem YAML.
     config_dir = Path(__file__).resolve().parent / "configs"
@@ -2248,8 +2088,7 @@ def load_config():
         ydict = yaml.safe_load(f) or {}
     if not isinstance(ydict, dict) or not ydict:
         raise ValueError(f"problem config must be a non-empty mapping: {cfg_path}")
-    from config_validation import (RETIRED_BATCH_GROWTH_KEYS,
-                                   validate_problem_config)
+    from config_validation import (RETIRED_BATCH_GROWTH_KEYS, validate_problem_config)
     for key in RETIRED_BATCH_GROWTH_KEYS:
         ydict.pop(key, None)
     # Old external configs may retain the retired repair-feature settings.
@@ -2259,9 +2098,7 @@ def load_config():
     validate_problem_config(
         ydict,
         source=cfg_path,
-        require_complete=(
-            Path(cfg_path).expanduser().resolve().parent == config_dir.resolve()
-        ),
+        require_complete=(Path(cfg_path).expanduser().resolve().parent == config_dir.resolve()),
     )
     merged = dict(ydict)
     # Automatic model profiles provide defaults only. Track every value that
@@ -2304,18 +2141,16 @@ def load_config():
                 merged[key] = ydict[key]
         # Preserve legacy one-pass generation only when neither source
         # specifies a pilot budget.
-        if ("pilot_programs_per_strategy" not in saved
-                and "pilot_programs_per_strategy" not in ydict):
+        if ("pilot_programs_per_strategy" not in saved and "pilot_programs_per_strategy" not in ydict):
             merged["pilot_programs_per_strategy"] = -1
         # Runs created before selectable phase-2 allocation used the original
         # median-quadrant rule.  Do not silently switch a resumed run to a new
         # allocator merely because its current problem YAML selects one.
         if "phase2_allocation_method" not in saved:
             merged["phase2_allocation_method"] = "rule_based"
-        merged["spo_rs_adaptive_beta"] = bool(
-            saved.get("spo_rs_adaptive_beta", False))
+        merged["spo_rs_adaptive_beta"] = bool(saved.get("spo_rs_adaptive_beta", False))
         # A new YAML selector must not switch an old resumed run's search.
-        from sampler import parent_selection_mode
+        from search.sampler import parent_selection_mode
         merged["parent_selection"] = parent_selection_mode(saved)
         # Introducing an API-enabled preset must not switch an older resumed
         # run to a paid service. An explicit CLI selector can still opt in.
@@ -2333,18 +2168,14 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
-    from sampler import can_migrate_parent_selection, parent_selection_mode
+    from search.sampler import can_migrate_parent_selection, parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
-        if not can_migrate_parent_selection(
-                parent_selection_mode(saved), merged["parent_selection"]):
-            raise ValueError(
-                "cannot change parent_selection while resuming except "
-                "PUCT/UCT to LLM")
+        if not can_migrate_parent_selection(parent_selection_mode(saved), merged["parent_selection"]):
+            raise ValueError('cannot change parent_selection while resuming except PUCT/UCT to LLM')
         if not (resume_dir / "training_state.pt").is_file():
-            raise ValueError("parent-picker migration requires training_state.pt; "
-                             "refusing to reset the trained run")
+            raise ValueError('parent-picker migration requires training_state.pt; refusing to reset the trained run')
     if (saved and args.spo_rs_adaptive_beta is not None
             and bool(saved.get("spo_rs_adaptive_beta", False))
             != bool(args.spo_rs_adaptive_beta)):
@@ -2352,7 +2183,7 @@ def load_config():
             "cannot change fixed/adaptive SPO beta mode while resuming; "
             "start a fresh run for a different objective")
     if saved:
-        from spo_rs import validate_shaping_resume
+        from training.spo_rs import validate_shaping_resume
         validate_shaping_resume(saved)
     if args.spo_rs_clip_epsilon is not None:
         if args.spo_rs_clip_epsilon_low is None:
@@ -2369,8 +2200,7 @@ def load_config():
     if merged["api_strategy"] not in {"", "gpt-6-luna"}:
         raise ValueError("api_strategy supports gpt-6-luna or ''")
     merged["strategies"] = bool(args.strategies) or bool(merged["api_strategy"])
-    if (saved.get("api_strategy") and args.api_strategy == ""
-            and args.strategy_backend is None):
+    if (saved.get("api_strategy") and args.api_strategy == "" and args.strategy_backend is None):
         merged["strategy_backend"] = ydict.get("strategy_backend", "local")
     merged["fused_long_attention"] = bool(args.fused_long_attention)
     merged["measure_entropy"] = bool(args.measure_entropy)
@@ -2395,15 +2225,11 @@ def load_config():
     exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
     if exact_sharded_recovery is not None:
         recovery_step = int(exact_sharded_recovery["step"])
-        completed_summary = (
-            Path(resume_dir) / f"step{recovery_step:02d}"
-            / f"step{recovery_step:02d}.summary.json")
+        completed_summary = (Path(resume_dir) / f"step{recovery_step:02d}" / f"step{recovery_step:02d}.summary.json")
         if completed_summary.is_file():
             _clear_exact_sharded_recovery(resume_dir)
             exact_sharded_recovery = None
-            print(
-                "[recovery] removed a stale exact sharded marker for an "
-                "already checkpointed step")
+            print('[recovery] removed a stale exact sharded marker for an already checkpointed step')
     if exact_sharded_recovery is None:
         exact_sharded_recovery = _infer_exact_sharded_recovery(resume_dir)
         if exact_sharded_recovery is not None:
@@ -2425,13 +2251,12 @@ def load_config():
         # serial model-sharded lane is reserved for a trajectory that also
         # exhausts that bounded fallback. Legacy markers first replay only
         # backward on the fast replicas so they can be upgraded likewise.
-        selective_overflow = bool(
-            exact_sharded_recovery.get("overflow_gradient_file"))
+        selective_overflow = bool(exact_sharded_recovery.get("overflow_gradient_file"))
         replicated_layout = bool(
             merged.get("fast", False)
             and str(merged.get("training_layout", "")).lower()
             == "replicated")
-        from exact_overflow import supports_warm_overflow
+        from training.exact_overflow import supports_warm_overflow
         warm_recovery = bool(
             selective_overflow and replicated_layout
             and supports_warm_overflow(SimpleNamespace(**{
@@ -2442,20 +2267,15 @@ def load_config():
         can_recover_on_replicas = bool(
             selective_overflow
             and replicated_layout
-            and not exact_sharded_recovery.get(
-                "replica_offload_exhausted", False))
-        can_capture_selectively = bool(
-            not selective_overflow
-            and replicated_layout)
+            and not exact_sharded_recovery.get("replica_offload_exhausted", False))
+        can_capture_selectively = bool(not selective_overflow and replicated_layout)
         if warm_recovery:
-            merged["_exact_inprocess_recovery_step"] = int(
-                exact_sharded_recovery["step"])
+            merged["_exact_inprocess_recovery_step"] = int(exact_sharded_recovery["step"])
             print("[recovery] saved overflow gradients will finish in-process; "
                   "Qwen checkpoint groups try all GPU replicas before "
                   "cooperative overflow when the saved work predates that mode")
         elif can_recover_on_replicas:
-            merged["_exact_replica_recovery_step"] = int(
-                exact_sharded_recovery["step"])
+            merged["_exact_replica_recovery_step"] = int(exact_sharded_recovery["step"])
             print(
                 "[recovery] selective exact overflow will reuse completed "
                 "gradients and dispatch only the remaining trajectories "
@@ -2466,18 +2286,13 @@ def load_config():
             # gradients. Recompute its already-evaluated update once on the
             # fast replicas; the new overflow path will retain all successful
             # gradients and send only the oversized tail to sharded recovery.
-            merged["_exact_replica_capture_step"] = int(
-                exact_sharded_recovery["step"])
-            failed_length = re.search(
-                r"(\d+)-token rollout",
-                str(exact_sharded_recovery.get("reason", "")))
-            if (failed_length is not None
-                    and merged.get("coder_model_profile") != "qwen3.8-27b"):
+            merged["_exact_replica_capture_step"] = int(exact_sharded_recovery["step"])
+            failed_length = re.search(r"(\d+)-token rollout", str(exact_sharded_recovery.get("reason", "")))
+            if (failed_length is not None and merged.get("coder_model_profile") != "qwen3.8-27b"):
                 # Token sidecars are exact for current runs; the tiny margin
                 # also covers legacy text recovery restoring an EOS/control
                 # token without replaying the already-proven OOM workload.
-                merged["_exact_replica_overflow_min_tokens"] = max(
-                    1, int(failed_length.group(1)) - 16)
+                merged["_exact_replica_overflow_min_tokens"] = max(1, int(failed_length.group(1)) - 16)
             print(
                 "[recovery] legacy exact-OOM step will replay only adapter "
                 "backward on the fast replicas; generation and evaluation "
@@ -2486,8 +2301,7 @@ def load_config():
         else:
             merged["training_layout"] = "sharded"
             merged["fast"] = False
-            merged["_exact_sharded_recovery_step"] = int(
-                exact_sharded_recovery["step"])
+            merged["_exact_sharded_recovery_step"] = int(exact_sharded_recovery["step"])
         if selective_overflow and not can_recover_on_replicas and not warm_recovery:
             print(
                 "[recovery] selective exact overflow will reuse completed "
@@ -2500,11 +2314,9 @@ def load_config():
                 "model sharded across all training GPUs; ordinary fast "
                 "replicated training resumes after this step")
 
-    training_layout = str(
-        merged.get("training_layout") or "auto").strip().lower()
+    training_layout = str(merged.get("training_layout") or "auto").strip().lower()
     if training_layout not in {"auto", "replicated", "sharded"}:
-        raise ValueError(
-            "training_layout must be 'auto', 'replicated', or 'sharded'")
+        raise ValueError("training_layout must be 'auto', 'replicated', or 'sharded'")
     merged["training_layout"] = training_layout
     if training_layout == "sharded" and merged["fast"]:
         # --fast is process-per-GPU data parallelism: every process needs one
@@ -2546,41 +2358,32 @@ def load_config():
             or strategy_format_max_retries < 0):
         raise ValueError("strategy_format_max_retries must be a non-negative integer")
     merged["strategy_format_max_retries"] = strategy_format_max_retries
-    strict_strategy_validation = merged.get(
-        "strict_strategy_validation", False)
+    strict_strategy_validation = merged.get("strict_strategy_validation", False)
     if not isinstance(strict_strategy_validation, bool):
         raise ValueError("strict_strategy_validation must be a boolean")
     merged["strict_strategy_validation"] = strict_strategy_validation
     if merged["strategies"]:
         merged.setdefault("strategy_temperature", 1.0)
         merged.setdefault("strategy_top_p", 1.0)
-        strategy_model_name = str(
-            merged.get("strategy_model_name") or merged["model_name"]
-        ).strip()
+        strategy_model_name = str(merged.get("strategy_model_name") or merged["model_name"]).strip()
         if not merged["api_strategy"]:
             strategy_model_name = resolve_strategy_model(strategy_model_name)
-            _apply_strategy_model_profile(
-                merged, strategy_model_name, profile_explicit_keys)
+            _apply_strategy_model_profile(merged, strategy_model_name, profile_explicit_keys)
         strategy_backend = "api" if merged["api_strategy"] else str(
             merged.get("strategy_backend") or "local"
         ).strip().lower()
         if strategy_backend not in {"local", "api"}:
             raise ValueError("strategy_backend must be 'local' or 'api'")
-        if (strategy_backend == "local" and strategist_profile(strategy_model_name)
-                and generation_backend != "vllm"):
-            raise ValueError("Flash-Next / DeepSeek V4 local strategists require "
-                             "generation_backend=vllm")
+        if (strategy_backend == "local" and strategist_profile(strategy_model_name) and generation_backend != "vllm"):
+            raise ValueError('Flash-Next / DeepSeek V4 local strategists require generation_backend=vllm')
         strategies_per_parent = int(merged["strategies_per_parent"])
         programs_per_strategy = int(merged["programs_per_strategy"])
-        pilot_programs_per_strategy = int(
-            merged.get("pilot_programs_per_strategy", -1))
-        phase2_allocation_method = str(
-            merged.get("phase2_allocation_method") or "rule_based"
-        ).strip().lower()
+        pilot_programs_per_strategy = int(merged.get("pilot_programs_per_strategy", -1))
+        phase2_allocation_method = str(merged.get("phase2_allocation_method") or "rule_based").strip().lower()
         strategy_archive_top_r = int(merged["strategy_archive_top_r"])
         native_strategy_context = None
         if merged["api_strategy"]:
-            from strategy_api import OPENAI_MAX_OUTPUT_TOKENS
+            from generation.strategy_api import OPENAI_MAX_OUTPUT_TOKENS
             native_strategy_context = OPENAI_MAX_OUTPUT_TOKENS
         strategy_max_seq_length, strategy_max_new_tokens = resolve_strategy_token_limits(
             strategy_model_name, merged.get("strategy_max_seq_length", "auto"),
@@ -2597,39 +2400,23 @@ def load_config():
                 or strategy_archive_top_r < 1
                 or strategy_max_new_tokens < 1
                 or strategy_max_seq_length < 1):
-            raise ValueError(
-                "strategy counts and token limits must be positive")
-        if (pilot_programs_per_strategy == 0
-                or pilot_programs_per_strategy < -1):
-            raise ValueError(
-                "pilot_programs_per_strategy must be -1 (disabled) or a "
-                "positive integer")
+            raise ValueError("strategy counts and token limits must be positive")
+        if (pilot_programs_per_strategy == 0 or pilot_programs_per_strategy < -1):
+            raise ValueError('pilot_programs_per_strategy must be -1 (disabled) or a positive integer')
         if pilot_programs_per_strategy > programs_per_strategy:
-            raise ValueError(
-                "pilot_programs_per_strategy cannot exceed "
-                "programs_per_strategy")
-        if (sum(pilot_effort_counts.values()) > 0
-                and pilot_programs_per_strategy < 1):
-            raise ValueError(
-                "positive pilot medium/xhigh counts require "
-                "adaptive pilots to be enabled")
-        if (pilot_programs_per_strategy > 0
-                and sum(pilot_effort_counts.values())
-                > pilot_programs_per_strategy):
-            raise ValueError(
-                "pilot medium + xhigh counts cannot exceed "
-                "pilot_programs_per_strategy")
+            raise ValueError('pilot_programs_per_strategy cannot exceed programs_per_strategy')
+        if (sum(pilot_effort_counts.values()) > 0 and pilot_programs_per_strategy < 1):
+            raise ValueError('positive pilot medium/xhigh counts require adaptive pilots to be enabled')
+        if (pilot_programs_per_strategy > 0 and sum(pilot_effort_counts.values()) > pilot_programs_per_strategy):
+            raise ValueError('pilot medium + xhigh counts cannot exceed pilot_programs_per_strategy')
         if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
-            raise ValueError(
-                "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
+            raise ValueError("phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
         if strategy_temperature <= 0.0:
             raise ValueError("strategy_temperature must be positive")
         if not 0.0 < strategy_top_p <= 1.0:
             raise ValueError("strategy_top_p must be in (0, 1]")
-        effective_group_size = (
-            strategies_per_parent * programs_per_strategy)
-        if (int(merged.get("group_size", effective_group_size))
-                != effective_group_size):
+        effective_group_size = (strategies_per_parent * programs_per_strategy)
+        if (int(merged.get("group_size", effective_group_size)) != effective_group_size):
             print(f"[config] hierarchical rollout group size derived as "
                   f"{strategies_per_parent} strategies x "
                   f"{programs_per_strategy} programs = "
@@ -2639,8 +2426,7 @@ def load_config():
         merged["strategy_backend"] = strategy_backend
         merged["strategies_per_parent"] = strategies_per_parent
         merged["programs_per_strategy"] = programs_per_strategy
-        merged["pilot_programs_per_strategy"] = (
-            pilot_programs_per_strategy)
+        merged["pilot_programs_per_strategy"] = (pilot_programs_per_strategy)
         merged["phase2_allocation_method"] = phase2_allocation_method
         merged["strategy_archive_top_r"] = strategy_archive_top_r
         merged["strategy_max_new_tokens"] = strategy_max_new_tokens
@@ -2652,8 +2438,7 @@ def load_config():
             strategy_model_name if strategy_backend == "local" else "",
             merged.get("strategy_reasoning_effort") or "high")
         if strategy_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-            raise ValueError(
-                "strategy_reasoning_effort must be none, low, medium, high, xhigh, or max")
+            raise ValueError("strategy_reasoning_effort must be none, low, medium, high, xhigh, or max")
         if (strategy_backend == "local" and "gpt-oss" in strategy_model_name.lower()
                 and strategy_reasoning_effort not in {"low", "medium", "high"}):
             raise ValueError("local GPT-OSS strategy reasoning supports low, medium, or high")
@@ -2669,16 +2454,12 @@ def load_config():
         merged["strategy_api_base_url"] = str(
             merged.get("strategy_api_base_url")
             or "https://api.deepseek.com").strip().rstrip("/")
-        merged["strategy_api_key_env"] = str(
-            merged.get("strategy_api_key_env")
-            or "DEEPSEEK_API_KEY").strip()
+        merged["strategy_api_key_env"] = str(merged.get("strategy_api_key_env") or "DEEPSEEK_API_KEY").strip()
         if merged["api_strategy"]:
             merged["strategy_api_base_url"] = "https://api.openai.com/v1"
             merged["strategy_api_key_env"] = "OPENAI_API_KEY"
-        merged["strategy_api_concurrency"] = int(
-            merged.get("strategy_api_concurrency") or merged["groups_per_step"])
-        merged["strategy_api_timeout_s"] = float(
-            merged.get("strategy_api_timeout_s") or 1800.0)
+        merged["strategy_api_concurrency"] = int(merged.get("strategy_api_concurrency") or merged["groups_per_step"])
+        merged["strategy_api_timeout_s"] = float(merged.get("strategy_api_timeout_s") or 1800.0)
         merged["strategy_api_max_retries"] = int(
             merged.get("strategy_api_max_retries")
             if merged.get("strategy_api_max_retries") is not None else 5)
@@ -2693,7 +2474,7 @@ def load_config():
         if merged["strategy_api_max_retries"] < 0:
             raise ValueError("strategy_api_max_retries must be >= 0")
         if strategy_backend == "api":
-            from strategy_api import strategy_api_key
+            from generation.strategy_api import strategy_api_key
             strategy_api_key(merged["strategy_api_key_env"])
         merged["group_size"] = effective_group_size
     # This ablation intentionally keeps two independent Qwen3-8B engines per
@@ -2701,8 +2482,7 @@ def load_config():
     # coder that receives the current LoRA adapter. Keep the switch derived
     # rather than user-configurable so every other model pairing retains the
     # existing alternating-pool behavior.
-    merged["dual_resident_qwen3_8b_strategy_coder_pools"] = (
-        _dual_resident_qwen3_8b_strategy_coder_pools(merged))
+    merged["dual_resident_qwen3_8b_strategy_coder_pools"] = (_dual_resident_qwen3_8b_strategy_coder_pools(merged))
     # This profile is derived after coder/strategist selection. Clipped-policy
     # resolvers below remain authoritative when they require full-policy
     # sampling for an exact likelihood ratio.
@@ -2723,25 +2503,20 @@ def load_config():
         if value not in (1, 2):
             raise ValueError(f"{key} must be 1 or 2")
         merged[key] = value
-    merged["vllm_staged_loading"] = bool(
-        merged.get("vllm_staged_loading", True))
-    merged["strategy_vllm_staged_loading"] = bool(
-        merged.get("strategy_vllm_staged_loading", True))
-    strategy_persistent_workers = merged.get(
-        "strategy_vllm_persistent_workers")
+    merged["vllm_staged_loading"] = bool(merged.get("vllm_staged_loading", True))
+    merged["strategy_vllm_staged_loading"] = bool(merged.get("strategy_vllm_staged_loading", True))
+    strategy_persistent_workers = merged.get("strategy_vllm_persistent_workers")
     if strategy_persistent_workers is not None:
         strategy_persistent_workers = int(strategy_persistent_workers)
         if strategy_persistent_workers < 0:
-            raise ValueError(
-                "strategy_vllm_persistent_workers must be nonnegative")
-    merged["strategy_vllm_persistent_workers"] = (
-        strategy_persistent_workers)
+            raise ValueError("strategy_vllm_persistent_workers must be nonnegative")
+    merged["strategy_vllm_persistent_workers"] = (strategy_persistent_workers)
 
     # Resolve every physical role from one ordered inventory. run.sh exports
     # AVAILABLE_GPUS and that environment value is authoritative over old YAML
     # and resumed role fields. Direct Python invocations fall back to the legacy
     # inventory key, CUDA visibility, then one training device.
-    from gpu_runtime import (align_vllm_layout_to_concurrency,
+    from runtime.gpu_runtime import (align_vllm_layout_to_concurrency,
                              allocate_gpu_roles,
                              derive_vllm_parallel_layout,
                              detect_attention_heads, parse_gpu_ids,
@@ -2763,8 +2538,7 @@ def load_config():
         print("[config] warning: AVAILABLE_GPUS is unset; use run.sh so the "
               "ordered physical inventory is authoritative")
 
-    available_gpu_ids = parse_gpu_ids(
-        inventory_value, field=inventory_source)
+    available_gpu_ids = parse_gpu_ids(inventory_value, field=inventory_source)
     roles = allocate_gpu_roles(available_gpu_ids, merged["problem"])
     if merged["isolate_eval"]:
         if roles.gpu_problem:
@@ -2794,9 +2568,7 @@ def load_config():
     ]
     for flag, actual, expected in assertions:
         if actual is not None and actual != expected:
-            raise ValueError(
-                f"{flag}={actual} conflicts with {inventory_source}; "
-                f"derived value is {expected}")
+            raise ValueError(f'{flag}={actual} conflicts with {inventory_source}; derived value is {expected}')
     if args.gpu_ids is not None:
         asserted = parse_gpu_ids(args.gpu_ids, field="--gpu-ids")
         if asserted != gpu_ids:
@@ -2809,8 +2581,7 @@ def load_config():
             f"{inventory_source}; derived evaluation GPU is {evaluation_gpu_id}")
 
     merged["training_gpu_id"] = training_gpu_id
-    merged["training_gpu_ids"] = ",".join(
-        str(x) for x in training_gpu_ids)
+    merged["training_gpu_ids"] = ",".join(str(x) for x in training_gpu_ids)
     merged["num_training_gpus"] = len(training_gpu_ids)
     merged["available_gpu_ids"] = ",".join(str(x) for x in roles.available)
     merged["gpu_ids"] = ",".join(str(x) for x in gpu_ids)
@@ -2818,8 +2589,7 @@ def load_config():
     merged["evaluation_gpu_id"] = evaluation_gpu_id
     merged["sequential_generation"] = roles.sequential_generation
     merged["evaluation_shares_generation"] = roles.evaluation_shares_generation
-    merged["reserve_last_gpu_for_evaluation"] = bool(
-        roles.gpu_problem and evaluation_gpu_id != training_gpu_id)
+    merged["reserve_last_gpu_for_evaluation"] = bool(roles.gpu_problem and evaluation_gpu_id != training_gpu_id)
 
     if roles.gpu_problem:
         if not str(merged.get('gpu_type') or '').strip():
@@ -2827,8 +2597,7 @@ def load_config():
             print("[config] gpu_mode gpu_type not set; defaulting explicitly to H100")
         merged["kernel_gpu_id"] = evaluation_gpu_id
         if int(merged.get('reward_workers') or 0) != 1:
-            print("[config] gpu_mode forces reward_workers=1 for serialized, "
-                  "stable benchmark measurements")
+            print('[config] gpu_mode forces reward_workers=1 for serialized, stable benchmark measurements')
         merged["reward_workers"] = 1
 
     memory = query_gpu_memory()
@@ -2843,69 +2612,53 @@ def load_config():
               f"{merged['training_model_name']} (generation remains "
               f"{merged.get('model_name')})")
     requested_backend = str(merged["backend"]).strip().lower()
-    merged["backend"] = _resolve_training_backend(
-        requested_backend, merged["training_model_name"])
+    merged["backend"] = _resolve_training_backend(requested_backend, merged["training_model_name"])
     if merged["backend"] != requested_backend:
         print("[backend] GPT-OSS Unsloth BNB checkpoints require the patched "
               f"expert loader; switching {requested_backend} -> "
               f"{merged['backend']}")
     if merged.get("coder_model_profile") == "gpt-oss-120b":
-        if (merged["training_model_name"] != merged.get("model_name")
-                or bool(merged.get("load_in_4bit", False))):
+        if (merged["training_model_name"] != merged.get("model_name") or bool(merged.get("load_in_4bit", False))):
             raise ValueError(
                 "GPT-OSS-120B rollout and training must use the same original "
                 "checkpoint. Remove coder_training_model_name and set "
                 "load_in_4bit: false; modern Unsloth keeps the checkpoint's "
                 "native MXFP4 experts packed during LoRA training.")
         if merged["backend"] != "unsloth":
-            raise ValueError(
-                "GPT-OSS-120B aligned training requires backend: unsloth")
+            raise ValueError("GPT-OSS-120B aligned training requires backend: unsloth")
         if merged["training_layout"] != "replicated":
-            raise ValueError(
-                "GPT-OSS-120B packed-MXFP4 training requires "
-                "training_layout: replicated")
+            raise ValueError('GPT-OSS-120B packed-MXFP4 training requires training_layout: replicated')
     if merged["training_layout"] == "sharded":
         if merged["backend"] != "hf":
-            raise ValueError(
-                "training_layout=sharded currently requires backend=hf")
+            raise ValueError("training_layout=sharded currently requires backend=hf")
         if int(merged["num_training_gpus"]) < 2:
-            raise ValueError(
-                "training_layout=sharded requires at least two training GPUs")
+            raise ValueError("training_layout=sharded requires at least two training GPUs")
         if bool(merged.get("load_in_4bit", False)):
             raise ValueError(
                 "training_layout=sharded expects an unquantized trainable "
                 "checkpoint; set load_in_4bit: false")
-    training_memory_fraction = float(
-        merged.get("training_memory_fraction", 0.80))
+    training_memory_fraction = float(merged.get("training_memory_fraction", 0.80))
     if not 0.0 < training_memory_fraction <= 0.90:
-        raise ValueError(
-            "training_memory_fraction must be in (0, 0.90]")
+        raise ValueError("training_memory_fraction must be in (0, 0.90]")
     merged["training_memory_fraction"] = training_memory_fraction
-    replicated_weight_budget = bool(
-        merged["fast"] or merged["training_layout"] == "replicated")
+    replicated_weight_budget = bool(merged["fast"] or merged["training_layout"] == "replicated")
     training_budgets = _resolve_training_memory_budgets(
         training_gpu_ids, memory,
-        max_fraction=(
-            training_memory_fraction if replicated_weight_budget else 0.90))
+        max_fraction=(training_memory_fraction if replicated_weight_budget else 0.90))
     _validate_known_training_capacity(
         merged["training_model_name"], training_budgets,
         replicated=replicated_weight_budget)
     merged["training_max_memory_gib"] = training_budgets
     if training_budgets:
-        print(f"[memory] training weight budgets by logical GPU: "
-              f"{training_budgets} GiB")
+        print(f'[memory] training weight budgets by logical GPU: {training_budgets} GiB')
 
     if merged["fast"] and not merged["no_train"]:
-        fast_clipped_policy = bool(
-            _uses_clipped_policy_loss(merged['advantage_mode'])
-        )
-        if (fast_clipped_policy
-                and int(merged["spo_rs_update_epochs"]) != 1):
+        fast_clipped_policy = bool(_uses_clipped_policy_loss(merged['advantage_mode']))
+        if (fast_clipped_policy and int(merged["spo_rs_update_epochs"]) != 1):
             raise ValueError("--fast requires one clipped-policy update epoch")
         fast_backend_supported = bool(
             merged["backend"] == "hf"
-            or (merged["backend"] == "unsloth"
-                and merged.get("coder_model_profile") == "gpt-oss-120b")
+            or (merged["backend"] == "unsloth" and merged.get("coder_model_profile") == "gpt-oss-120b")
         )
         if not (int(merged["num_training_gpus"]) > 1
                 and fast_backend_supported
@@ -2923,8 +2676,7 @@ def load_config():
         separate_local_strategy_pool = bool(
             merged["strategies"]
             and merged.get("strategy_backend", "local") == "local"
-            and (str(merged.get("strategy_model_name")
-                     or merged.get("model_name"))
+            and (str(merged.get("strategy_model_name") or merged.get("model_name"))
                  != str(merged.get("model_name"))
                  or merged["dual_resident_qwen3_8b_strategy_coder_pools"]))
         # This must match GenerationPool's two runtime flags.  The old layout
@@ -2935,23 +2687,20 @@ def load_config():
             co_resident_sleep=separate_local_strategy_pool,
             token_scoring=not bool(merged["no_train"]),
         )
-        profile_runtime_reserve = merged.get(
-            "vllm_runtime_reserve_override_gib")
+        profile_runtime_reserve = merged.get("vllm_runtime_reserve_override_gib")
         merged["vllm_runtime_reserve_gib"] = (
             automatic_runtime_reserve
             if profile_runtime_reserve is None else
             float(profile_runtime_reserve)
         )
         known_heads = detect_attention_heads(merged.get("model_name", ""))
-        layout = derive_vllm_parallel_layout(
-            merged, roles, memory, known_heads)
+        layout = derive_vllm_parallel_layout(merged, roles, memory, known_heads)
         if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
             # The coder needs one independent TP=1 engine per selected card;
             # the strategy topology is derived separately below from its own
             # model and context memory needs. Refuse an unsafe host rather than silently
             # weakening coder rollout parallelism.
-            if (layout.tensor_parallel_size != 1
-                    or layout.pipeline_parallel_size != 1):
+            if (layout.tensor_parallel_size != 1 or layout.pipeline_parallel_size != 1):
                 raise ValueError(
                     "the dual-resident Qwen3-8B strategy/coder ablation "
                     "requires one coder engine per GPU (TP=1, PP=1), but "
@@ -2959,11 +2708,7 @@ def load_config():
                     "at the configured context")
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
-        validate_attention_heads(
-            known_heads,
-            merged["vllm_tensor_parallel_size"],
-            merged.get("model_name", ""),
-        )
+        validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], merged.get("model_name", ""))
         if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
             print(f"[config] Qwen3-8B strategist/coder ablation: two "
                   "independent co-resident pools; coder keeps "
@@ -2986,26 +2731,19 @@ def load_config():
                   f"about {layout.unsharded_stage_required_gib:.1f} GiB/GPU "
                   f"within the {layout.budget_gib:.1f} GiB budget")
 
-        if (merged["strategies"]
-                and merged.get("strategy_backend", "local") == "local"):
-            strategy_name = str(
-                merged.get("strategy_model_name") or merged.get("model_name"))
+        if (merged["strategies"] and merged.get("strategy_backend", "local") == "local"):
+            strategy_name = str(merged.get("strategy_model_name") or merged.get("model_name"))
             strategy_layout_cfg = dict(merged)
             strategy_layout_cfg.update({
                 "model_name": strategy_name,
                 "strategy_inference_profile": bool(strategist_profile(strategy_name)),
                 "max_seq_length": int(merged["strategy_max_seq_length"]),
                 "load_in_4bit": False,
-                "vllm_quantization": merged.get(
-                    "strategy_vllm_quantization", ""),
-                "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(
-                    co_resident_sleep=True,
-                    token_scoring=False,
-                ),
+                "vllm_quantization": merged.get("strategy_vllm_quantization", ""),
+                "vllm_runtime_reserve_gib": vllm_runtime_reserve_gib(co_resident_sleep=True, token_scoring=False),
             })
             strategy_heads = detect_attention_heads(strategy_name)
-            memory_strategy_layout = derive_vllm_parallel_layout(
-                strategy_layout_cfg, roles, memory, strategy_heads)
+            memory_strategy_layout = derive_vllm_parallel_layout(strategy_layout_cfg, roles, memory, strategy_heads)
             # Strategies inside one parent are sequential, so the number of
             # parents, rather than strategies_per_parent, is the largest live
             # request frontier. Fold replicas above it into TP/PP ranks rather
@@ -3018,23 +2756,15 @@ def load_config():
                 strategy_heads,
                 strategy_frontier,
             )
-            strategy_layout_cfg["vllm_tensor_parallel_size"] = (
-                strategy_layout.tensor_parallel_size)
-            strategy_layout_cfg["vllm_pipeline_parallel_size"] = (
-                strategy_layout.pipeline_parallel_size)
-            for note in resolve_memory_settings(
-                    strategy_layout_cfg, roles, memory):
+            strategy_layout_cfg["vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
+            strategy_layout_cfg["vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
+            for note in resolve_memory_settings(strategy_layout_cfg, roles, memory):
                 print(f"[memory] auto strategy: {note}")
-            merged["strategy_vllm_tensor_parallel_size"] = (
-                strategy_layout.tensor_parallel_size)
-            merged["strategy_vllm_pipeline_parallel_size"] = (
-                strategy_layout.pipeline_parallel_size)
-            merged["strategy_gen_micro_batch"] = int(
-                strategy_layout_cfg["gen_micro_batch"])
-            merged["strategy_vllm_max_num_batched_tokens"] = int(
-                strategy_layout_cfg["vllm_max_num_batched_tokens"])
-            merged["strategy_vllm_runtime_reserve_gib"] = float(
-                strategy_layout_cfg["vllm_runtime_reserve_gib"])
+            merged["strategy_vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
+            merged["strategy_vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
+            merged["strategy_gen_micro_batch"] = int(strategy_layout_cfg["gen_micro_batch"])
+            merged["strategy_vllm_max_num_batched_tokens"] = int(strategy_layout_cfg["vllm_max_num_batched_tokens"])
+            merged["strategy_vllm_runtime_reserve_gib"] = float(strategy_layout_cfg["vllm_runtime_reserve_gib"])
             merged["strategy_generation_frontier"] = strategy_frontier
             merged["separate_strategy_inference_pool"] = bool(
                 strategy_name != str(merged.get("model_name"))
@@ -3044,11 +2774,7 @@ def load_config():
                 or strategy_layout.pipeline_parallel_size
                 != layout.pipeline_parallel_size
             )
-            validate_attention_heads(
-                strategy_heads,
-                strategy_layout.tensor_parallel_size,
-                strategy_name,
-            )
+            validate_attention_heads(strategy_heads, strategy_layout.tensor_parallel_size, strategy_name)
             frontier_note = ""
             if strategy_layout != memory_strategy_layout:
                 frontier_note = (
@@ -3063,12 +2789,9 @@ def load_config():
                   f"{frontier_note}")
     elif (merged["strategies"]
           and merged.get("strategy_backend", "local") == "local"
-          and str(merged.get("strategy_model_name")
-                  or merged.get("model_name"))
+          and str(merged.get("strategy_model_name") or merged.get("model_name"))
           != str(merged.get("model_name"))):
-        raise ValueError(
-            "a distinct strategy_model_name currently requires "
-            "generation_backend=vllm")
+        raise ValueError('a distinct strategy_model_name currently requires generation_backend=vllm')
 
     for note in resolve_memory_settings(merged, roles, memory):
         print(f"[memory] auto: {note}")
@@ -3078,10 +2801,8 @@ def load_config():
             and merged.get("generation_backend") == "vllm"):
         # AC responses can exceed 64K tokens; bound vLLM's exact FP32
         # prompt-logprob projection without shortening or approximating them.
-        merged["vllm_max_num_batched_tokens"] = min(
-            int(merged["vllm_max_num_batched_tokens"]), 2048)
-        print("[memory] AC GPT-OSS exact scoring: vLLM max batched "
-              "tokens=2048")
+        merged["vllm_max_num_batched_tokens"] = min(int(merged["vllm_max_num_batched_tokens"]), 2048)
+        print('[memory] AC GPT-OSS exact scoring: vLLM max batched tokens=2048')
 
     print(f"[config] AVAILABLE_GPUS={roles.available} ({inventory_source})")
     print(f"[config] GPU roles: train={training_gpu_ids}, "
@@ -3109,8 +2830,7 @@ def load_config():
         print(f"[config] vLLM engines: {int(cfg.num_gpus or 0) // engine_gpus} "
               f"replica(s), TP={resolved_tp}, PP={pp}, "
               f"{engine_gpus} GPU(s)/engine")
-    print(f"[config] rollout thinking: "
-          f"{'enabled' if cfg.thinking else 'disabled'}")
+    print(f"[config] rollout thinking: {('enabled' if cfg.thinking else 'disabled')}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
     return cfg, merged
 
@@ -3126,8 +2846,7 @@ def _pin_training_process(training_gpu_ids) -> None:
     os.environ["TTT_TRAINING_GPU_ID"] = str(ids[0])
     os.environ["TTT_TRAINING_GPU_IDS"] = visible
     logical = ",".join(f"cuda:{idx}" for idx in range(len(ids)))
-    print(f"[gpu] trainer model-parallel group: physical {ids} "
-          f"(logical {logical})")
+    print(f'[gpu] trainer model-parallel group: physical {ids} (logical {logical})')
 
 
 def _move_optimizer_state(optimizer, device) -> None:
@@ -3191,13 +2910,12 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
     (text, gen_token_ids).
     """
     import torch
-    from gen_workers import _canonical_generated_text
+    from generation.gen_workers import _canonical_generated_text
 
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id or eos_id
 
-    max_new_tokens = min(
-        int(cfg.max_new_tokens), int(cfg.max_seq_length) - int(input_len))
+    max_new_tokens = min(int(cfg.max_new_tokens), int(cfg.max_seq_length) - int(input_len))
     if max_new_tokens < 1:
         return [("", []) for _ in range(int(n_samples))]
 
@@ -3208,8 +2926,7 @@ def _generate_batch(model, tokenizer, inputs, input_len, n_samples, cfg):
         policy_sampling["top_k"] = int(sampling_top_k)
     if sampling_min_p is not None:
         policy_sampling["min_p"] = float(sampling_min_p)
-    if (_uses_clipped_policy_loss(
-            getattr(cfg, "advantage_mode", "entropic"))
+    if (_uses_clipped_policy_loss(getattr(cfg, "advantage_mode", "entropic"))
             or _uses_sequence_level_policy_ratio(cfg)):
         policy_sampling.update(top_k=0, repetition_penalty=1.0)
 
@@ -3294,12 +3011,11 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
             policy_cfg.max_new_tokens = int(max_new_tokens)
         for group_idx, (prompt, count) in enumerate(zip(prompts_by_group, counts_by_group)):
             if int(count) > 0:
-                responses, _ = generate_responses(
-                    model, tokenizer, prompt, int(count), policy_cfg)
+                responses, _ = generate_responses(model, tokenizer, prompt, int(count), policy_cfg)
                 yield group_idx, responses
         return
 
-    from gen_workers import _iter_hf_job_batches
+    from generation.gen_workers import _iter_hf_job_batches
     jobs = [
         (group_idx, prompt, int(count))
         for group_idx, (prompt, count)
@@ -3307,17 +3023,13 @@ def generate_prompt_jobs(model, tokenizer, prompts_by_group, counts_by_group,
         if int(count) > 0
     ]
     gen_kwargs = {
-        "max_new_tokens": int(max_new_tokens if max_new_tokens is not None
-                              else cfg.max_new_tokens),
-        "temperature": float(temperature if temperature is not None
-                             else cfg.temperature),
+        "max_new_tokens": int(max_new_tokens if max_new_tokens is not None else cfg.max_new_tokens),
+        "temperature": float(temperature if temperature is not None else cfg.temperature),
         "top_p": float(top_p if top_p is not None else cfg.top_p),
         "micro_batch": int(getattr(cfg, 'gen_micro_batch', 0) or 0),
     }
-    resolved_top_k = (top_k if top_k is not None
-                      else getattr(cfg, "sampling_top_k", None))
-    resolved_min_p = (min_p if min_p is not None
-                      else getattr(cfg, "sampling_min_p", None))
+    resolved_top_k = (top_k if top_k is not None else getattr(cfg, "sampling_top_k", None))
+    resolved_min_p = (min_p if min_p is not None else getattr(cfg, "sampling_min_p", None))
     if resolved_top_k is not None:
         gen_kwargs["top_k"] = int(resolved_top_k)
     if resolved_min_p is not None:
@@ -3358,8 +3070,7 @@ def _causal_lm_decoder_and_head(model):
     return decoder, head
 
 
-def _score_hidden_token_chunks(hidden_states, targets, output_head, *,
-                               chunk, with_grad, return_entropy):
+def _score_hidden_token_chunks(hidden_states, targets, output_head, *, chunk, with_grad, return_entropy):
     """Project hidden states in checkpointed vocabulary-sized chunks.
 
     CausalLM.forward normally materializes logits for every token at once.
@@ -3383,12 +3094,10 @@ def _score_hidden_token_chunks(hidden_states, targets, output_head, *,
         # the input embeddings. Align indices with the actual projected scores
         # here, including when checkpoint recomputes this chunk in backward.
         target_chunk = target_chunk.to(device=log_probs.device)
-        chosen = log_probs.gather(
-            1, target_chunk.unsqueeze(-1)).squeeze(-1)
+        chosen = log_probs.gather(1, target_chunk.unsqueeze(-1)).squeeze(-1)
         if not return_entropy:
             return chosen
-        entropy = _token_entropy(
-            log_probs, detached=(return_entropy == "measure"))
+        entropy = _token_entropy(log_probs, detached=(return_entropy == "measure"))
         return chosen, entropy
 
     chosen_parts = []
@@ -3399,8 +3108,7 @@ def _score_hidden_token_chunks(hidden_states, targets, output_head, *,
         target_chunk = targets[start:end]
         if with_grad and hidden_chunk.requires_grad:
             from torch.utils.checkpoint import checkpoint
-            result = checkpoint(
-                project, hidden_chunk, target_chunk, use_reentrant=False)
+            result = checkpoint(project, hidden_chunk, target_chunk, use_reentrant=False)
         else:
             result = project(hidden_chunk, target_chunk)
         if return_entropy:
@@ -3423,16 +3131,10 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
     if components is None:
         return None
     decoder, output_head = components
-    from training_checkpointing import grouped_qwen_hidden
-    hidden = (grouped_qwen_hidden(decoder, input_ids, attention_mask)
-              if with_grad else None)
+    from training.training_checkpointing import grouped_qwen_hidden
+    hidden = (grouped_qwen_hidden(decoder, input_ids, attention_mask) if with_grad else None)
     if hidden is None:
-        outputs = decoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
+        outputs = decoder(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
         hidden = getattr(outputs, "last_hidden_state", None)
         if hidden is None:
             try:
@@ -3441,8 +3143,7 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
                 return None
     scored = []
     entropies = []
-    for row, ((start, end), targets) in enumerate(
-            zip(response_ranges, response_targets)):
+    for row, ((start, end), targets) in enumerate(zip(response_ranges, response_targets)):
         result = _score_hidden_token_chunks(
             hidden[row, start:end, :], targets, output_head,
             chunk=chunk, with_grad=with_grad,
@@ -3456,8 +3157,7 @@ def _decoder_token_logprobs(model, input_ids, attention_mask,
     return (scored, entropies) if return_entropy else scored
 
 
-def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
-                                  return_entropy):
+def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad, return_entropy):
     """Score response branches while evaluating their common prompt once.
 
     The packed sequence contains one prompt followed by isolated response
@@ -3477,8 +3177,7 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
         return None
     decoder, output_head = components
     decoder_config = getattr(decoder, "config", None)
-    if str(getattr(decoder_config, "_attn_implementation", "")) != (
-            "ttt_blockwise_attention"):
+    if str(getattr(decoder_config, "_attn_implementation", "")) != ("ttt_blockwise_attention"):
         return None
     # Hybrid Gated-DeltaNet layers carry a recurrent state along the sequence.
     # A custom mask isolates the full-attention layers, but cannot reset that
@@ -3505,17 +3204,14 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
         return None
     device = prompt.device
     input_parts = [prompt[0]]
-    segment_parts = [torch.zeros(
-        prompt_length, dtype=torch.long, device=device)]
-    position_parts = [torch.arange(
-        prompt_length, dtype=torch.long, device=device)]
+    segment_parts = [torch.zeros(prompt_length, dtype=torch.long, device=device)]
+    position_parts = [torch.arange(prompt_length, dtype=torch.long, device=device)]
     response_ranges = []
     attention_branches = []
     cursor = prompt_length
     for branch_index, example in enumerate(examples, start=1):
         response = example["response_ids"]
-        if (response.ndim != 2 or int(response.shape[0]) != 1
-                or int(response.shape[1]) < 1):
+        if (response.ndim != 2 or int(response.shape[0]) != 1 or int(response.shape[1]) < 1):
             return None
         branch_input = response[0, :-1]
         branch_length = int(branch_input.shape[0])
@@ -3524,9 +3220,7 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
         response_ranges.append((start, end))
         if branch_length:
             input_parts.append(branch_input)
-            segment_parts.append(torch.full(
-                (branch_length,), branch_index,
-                dtype=torch.long, device=device))
+            segment_parts.append(torch.full((branch_length,), branch_index, dtype=torch.long, device=device))
             position_parts.append(torch.arange(
                 prompt_length, prompt_length + branch_length,
                 dtype=torch.long, device=device))
@@ -3537,9 +3231,8 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
     segments = torch.cat(segment_parts, dim=0)
     positions = torch.cat(position_parts, dim=0)
     compact_mask = torch.stack((segments, positions), dim=0).unsqueeze(0)
-    from model_backend import register_shared_prefix_attention_mask
-    register_shared_prefix_attention_mask(
-        compact_mask, prompt_length, attention_branches)
+    from models.model_backend import register_shared_prefix_attention_mask
+    register_shared_prefix_attention_mask(compact_mask, prompt_length, attention_branches)
 
     context = torch.enable_grad() if with_grad else torch.no_grad()
     with context:
@@ -3560,8 +3253,7 @@ def _shared_prefix_token_logprobs(model, examples, *, chunk, with_grad,
         scored = []
         entropies = []
         for example, (start, end) in zip(examples, response_ranges):
-            prediction_hidden = torch.cat(
-                (prompt_last, hidden[0, start:end, :]), dim=0)
+            prediction_hidden = torch.cat((prompt_last, hidden[0, start:end, :]), dim=0)
             targets = example["response_ids"][0]
             result = _score_hidden_token_chunks(
                 prediction_hidden, targets, output_head,
@@ -3626,8 +3318,7 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
                 g = lp.gather(2, targets[:, s:e].unsqueeze(-1)).squeeze(-1)
                 parts.append(g)          # keep only (1, e-s); lp freed next iter
                 if return_entropy:
-                    entropies.append(_token_entropy(
-                        lp, detached=(return_entropy == "measure")))
+                    entropies.append(_token_entropy(lp, detached=(return_entropy == "measure")))
             gathered = torch.cat(parts, dim=1)  # (1, R)
             if return_entropy:
                 entropy = torch.cat(entropies, dim=1)
@@ -3635,8 +3326,7 @@ def compute_token_logprobs(model, prompt_ids, response_ids, with_grad: bool,
             log_probs = F.log_softmax(pred_logits.float(), dim=-1)
             gathered = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # (1, R)
             if return_entropy:
-                entropy = _token_entropy(
-                    log_probs, detached=(return_entropy == "measure"))
+                entropy = _token_entropy(log_probs, detached=(return_entropy == "measure"))
     if return_entropy:
         return gathered.squeeze(0), entropy.squeeze(0)
     return gathered.squeeze(0)
@@ -3679,25 +3369,18 @@ def compute_batched_token_logprobs(
     prompts = [example["prompt_ids"] for example in examples]
     responses = [example["response_ids"] for example in examples]
     for prompt_ids, response_ids in zip(prompts, responses):
-        if (prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1
-                or response_ids.ndim != 2 or response_ids.shape[0] != 1):
-            raise ValueError(
-                "training examples must contain (1, length) token tensors")
+        if (prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or response_ids.ndim != 2 or response_ids.shape[0] != 1):
+            raise ValueError("training examples must contain (1, length) token tensors")
         if prompt_ids.shape[1] < 1 or response_ids.shape[1] < 1:
             raise ValueError("training prompt/response tensors must be nonempty")
 
     device = prompts[0].device
     dtype = prompts[0].dtype
-    totals = [int(prompt.shape[1] + response.shape[1])
-              for prompt, response in zip(prompts, responses)]
+    totals = [int(prompt.shape[1] + response.shape[1]) for prompt, response in zip(prompts, responses)]
     max_total = max(totals)
-    input_ids = torch.full(
-        (len(examples), max_total), int(pad_token_id),
-        dtype=dtype, device=device)
-    attention_mask = torch.zeros(
-        (len(examples), max_total), dtype=torch.long, device=device)
-    for row, (prompt_ids, response_ids, total) in enumerate(
-            zip(prompts, responses, totals)):
+    input_ids = torch.full((len(examples), max_total), int(pad_token_id), dtype=dtype, device=device)
+    attention_mask = torch.zeros((len(examples), max_total), dtype=torch.long, device=device)
+    for row, (prompt_ids, response_ids, total) in enumerate(zip(prompts, responses, totals)):
         if prompt_ids.device != device or response_ids.device != device:
             raise ValueError("one training microbatch spans multiple devices")
         full_ids = torch.cat((prompt_ids, response_ids), dim=1)
@@ -3711,8 +3394,7 @@ def compute_batched_token_logprobs(
         for prompt_ids, response_ids in zip(prompts, responses):
             prompt_len = int(prompt_ids.shape[1])
             response_len = int(response_ids.shape[1])
-            response_ranges.append(
-                (prompt_len - 1, prompt_len - 1 + response_len))
+            response_ranges.append((prompt_len - 1, prompt_len - 1 + response_len))
             response_targets.append(response_ids[0])
         bounded = _decoder_token_logprobs(
             model, input_ids, attention_mask, response_ranges,
@@ -3725,26 +3407,20 @@ def compute_batched_token_logprobs(
         entropy_examples = []
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = out.logits
-        for row, (prompt_ids, response_ids) in enumerate(
-                zip(prompts, responses)):
+        for row, (prompt_ids, response_ids) in enumerate(zip(prompts, responses)):
             prompt_len = int(prompt_ids.shape[1])
             response_len = int(response_ids.shape[1])
-            pred_logits = logits[
-                row, prompt_len - 1:prompt_len - 1 + response_len, :]
+            pred_logits = logits[row, prompt_len - 1:prompt_len - 1 + response_len, :]
             targets = response_ids[0].to(device=pred_logits.device)
-            step = (int(chunk) if chunk and 0 < int(chunk) < response_len
-                    else response_len)
+            step = (int(chunk) if chunk and 0 < int(chunk) < response_len else response_len)
             parts = []
             entropies = []
             for start in range(0, response_len, step):
                 end = min(start + step, response_len)
-                log_probs = F.log_softmax(
-                    pred_logits[start:end, :].float(), dim=-1)
-                parts.append(log_probs.gather(
-                    1, targets[start:end].unsqueeze(-1)).squeeze(-1))
+                log_probs = F.log_softmax(pred_logits[start:end, :].float(), dim=-1)
+                parts.append(log_probs.gather(1, targets[start:end].unsqueeze(-1)).squeeze(-1))
                 if return_entropy:
-                    entropies.append(_token_entropy(
-                        log_probs, detached=(return_entropy == "measure")))
+                    entropies.append(_token_entropy(log_probs, detached=(return_entropy == "measure")))
             gathered_examples.append(torch.cat(parts, dim=0))
             if return_entropy:
                 entropy_examples.append(torch.cat(entropies, dim=0))
@@ -3769,10 +3445,7 @@ def _requires_fused_long_singleton(cfg, sequence_tokens):
 
 def _exceeds_fused_long_pack(cfg, packed_tokens):
     """Prevent a masked multi-example pack from becoming a long sequence."""
-    return bool(
-        getattr(cfg, "fused_long_attention", False)
-        and int(packed_tokens) >= _FUSED_LONG_SINGLETON_MIN_TOKENS
-    )
+    return bool(getattr(cfg, "fused_long_attention", False) and int(packed_tokens) >= _FUSED_LONG_SINGLETON_MIN_TOKENS)
 
 
 def _training_microbatches(examples, cfg):
@@ -3791,16 +3464,13 @@ def _training_microbatches(examples, cfg):
     batches = []
     ordered = sorted(
         examples,
-        key=lambda example: int(
-            example["prompt_ids"].shape[1]
-            + example["response_ids"].shape[1]),
+        key=lambda example: int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1]),
         reverse=True,
     )
     current = []
     current_max = 0
     for example in ordered:
-        length = int(example["prompt_ids"].shape[1]
-                     + example["response_ids"].shape[1])
+        length = int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1])
         if _requires_fused_long_singleton(cfg, length):
             if current:
                 batches.append(current)
@@ -3809,13 +3479,9 @@ def _training_microbatches(examples, cfg):
             batches.append([example])
             continue
         next_max = max(current_max, length)
-        exceeds_tokens = bool(
-            current and next_max * (len(current) + 1) > token_cap)
-        exceeds_fused_pack = bool(
-            current and _exceeds_fused_long_pack(
-                cfg, next_max * (len(current) + 1)))
-        if current and (len(current) >= example_cap or exceeds_tokens
-                        or exceeds_fused_pack):
+        exceeds_tokens = bool(current and next_max * (len(current) + 1) > token_cap)
+        exceeds_fused_pack = bool(current and _exceeds_fused_long_pack(cfg, next_max * (len(current) + 1)))
+        if current and (len(current) >= example_cap or exceeds_tokens or exceeds_fused_pack):
             batches.append(current)
             current = []
             current_max = 0
@@ -3833,9 +3499,7 @@ def _is_cuda_oom(error):
             return True
     except (ImportError, AttributeError):
         pass
-    return (isinstance(error, RuntimeError)
-            and "out of memory" in str(error).lower()
-            and "cuda" in str(error).lower())
+    return (isinstance(error, RuntimeError) and "out of memory" in str(error).lower() and "cuda" in str(error).lower())
 
 
 def _is_attention_kernel_unavailable(error):
@@ -3881,8 +3545,7 @@ def _split_training_batches_to_work_cap(batches, work_cap):
     def append(batch):
         nonlocal changed
         batch = list(batch)
-        if (len(batch) <= 1
-                or _gradient_checkpointing_work_units([batch]) <= work_cap):
+        if (len(batch) <= 1 or _gradient_checkpointing_work_units([batch]) <= work_cap):
             split.append(batch)
             return
         middle = (len(batch) + 1) // 2
@@ -3922,9 +3585,7 @@ def _gradient_checkpointing_work_units(batches):
         shared_prefix = bool(
             len(batch) > 1
             and prompt_job_id is not None
-            and all(bool(example.get(
-                "_shared_prefix_packing_allowed", True))
-                    for example in batch)
+            and all(bool(example.get("_shared_prefix_packing_allowed", True)) for example in batch)
             and all(
                 example.get("prompt_job_id") == prompt_job_id
                 and tuple(example["prompt_ids"].shape)
@@ -3939,8 +3600,7 @@ def _gradient_checkpointing_work_units(batches):
             )
         else:
             work = max(
-                int(example["prompt_ids"].shape[1]
-                    + example["response_ids"].shape[1])
+                int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1])
                 for example in batch
             ) * len(batch)
         largest = max(largest, work)
@@ -3973,11 +3633,11 @@ def _run_oom_resilient_backward(
     """
     import gc
     import torch
-    from host_memory import (ProcessRSSPeakSampler,
+    from runtime.host_memory import (ProcessRSSPeakSampler,
                              host_cache_reclaim_supported,
                              process_rss_bytes,
                              reclaim_unused_host_memory)
-    from model_backend import set_gradient_checkpointing
+    from models.model_backend import set_gradient_checkpointing
 
     # Saved-activation offload is safe in the replicated SPO-RS path only when
     # every process shares a bounded node-wide admission gate. Without that
@@ -3990,15 +3650,13 @@ def _run_oom_resilient_backward(
     def offload_gate_can_admit(work):
         if activation_offload_semaphore is None:
             return True
-        checker = getattr(
-            activation_offload_semaphore, "can_admit", None)
+        checker = getattr(activation_offload_semaphore, "can_admit", None)
         return bool(checker(work)) if callable(checker) else True
 
     def offload_admission(work):
         if activation_offload_semaphore is None:
             return nullcontext()
-        reservation = getattr(
-            activation_offload_semaphore, "reservation", None)
+        reservation = getattr(activation_offload_semaphore, "reservation", None)
         if callable(reservation):
             return reservation(work)
         return activation_offload_semaphore
@@ -4013,19 +3671,16 @@ def _run_oom_resilient_backward(
     cached_work_cap = profile.get("safe_work_cap")
     reused_split = False
     if cached_work_cap is not None:
-        active, reused_split = _split_training_batches_to_work_cap(
-            active, cached_work_cap)
+        active, reused_split = _split_training_batches_to_work_cap(active, cached_work_cap)
 
-    strict_exact_training = bool(
-        getattr(model, "_ttt_strict_exact_long_training", False))
+    strict_exact_training = bool(getattr(model, "_ttt_strict_exact_long_training", False))
     activation_offload = False
     memory_expanded = False
     expanded_fraction = None
     split_backoff = False
     offload_trigger_work = None
     headroom_trigger_work = None
-    checkpoint_threshold = getattr(
-        model, "_ttt_gradient_checkpointing_min_work", None)
+    checkpoint_threshold = getattr(model, "_ttt_gradient_checkpointing_min_work", None)
     checkpointing_available = set_gradient_checkpointing(model, False)
     checkpointing = False
 
@@ -4038,8 +3693,7 @@ def _run_oom_resilient_backward(
         if candidate is None:
             return None
         candidate = float(candidate)
-        if (expanded_fraction is not None
-                and candidate <= float(expanded_fraction) + 1e-9):
+        if (expanded_fraction is not None and candidate <= float(expanded_fraction) + 1e-9):
             return None
         expanded_fraction = candidate
         return candidate
@@ -4049,11 +3703,7 @@ def _run_oom_resilient_backward(
         work = _gradient_checkpointing_work_units(active)
         wanted = bool(
             checkpointing_available
-            and (
-                bool(start_checkpointed)
-                or (checkpoint_threshold is not None
-                    and work >= int(checkpoint_threshold))
-            )
+            and (bool(start_checkpointed) or (checkpoint_threshold is not None and work >= int(checkpoint_threshold)))
         )
         if wanted != checkpointing:
             if not set_gradient_checkpointing(model, wanted):
@@ -4063,31 +3713,23 @@ def _run_oom_resilient_backward(
         return work
 
     active_work = select_checkpointing()
-    configured_headroom_min_work = getattr(
-        model, "_ttt_reserved_headroom_min_work", None)
-    headroom_min_work = profile.get(
-        "headroom_min_work", configured_headroom_min_work)
-    if ((bool(start_with_headroom)
-         or (headroom_min_work is not None
-             and active_work >= int(headroom_min_work)))
+    configured_headroom_min_work = getattr(model, "_ttt_reserved_headroom_min_work", None)
+    headroom_min_work = profile.get("headroom_min_work", configured_headroom_min_work)
+    if ((bool(start_with_headroom) or (headroom_min_work is not None and active_work >= int(headroom_min_work)))
             and expand_memory is not None):
         memory_expanded = expand_to_next_memory_ceiling() is not None
-    configured_offload_min_work = getattr(
-        model, "_ttt_activation_offload_min_work", None)
-    offload_min_work = profile.get(
-        "activation_offload_min_work", configured_offload_min_work)
+    configured_offload_min_work = getattr(model, "_ttt_activation_offload_min_work", None)
+    offload_min_work = profile.get("activation_offload_min_work", configured_offload_min_work)
     if (allow_activation_offload
             and (bool(start_activation_offload)
-                 or (offload_min_work is not None
-                     and active_work >= int(offload_min_work)))
+                 or (offload_min_work is not None and active_work >= int(offload_min_work)))
             and offload_gate_can_admit(active_work)
             and hasattr(torch.autograd.graph, "save_on_cpu")):
         activation_offload = True
 
     reused_modes = []
     if reused_split:
-        reused_modes.append(
-            f"work cap {int(cached_work_cap)}")
+        reused_modes.append(f"work cap {int(cached_work_cap)}")
     if checkpointing:
         reused_modes.append("gradient checkpointing")
     if activation_offload:
@@ -4102,16 +3744,8 @@ def _run_oom_resilient_backward(
                 if start_checkpointed or start_with_headroom else
                 "reusing learned safe mode"
             )
-            log_prefix = (
-                "[train-memory]"
-                if start_checkpointed or start_with_headroom else
-                "[train-oom]"
-            )
-            print(
-                f"{log_prefix} {device_label}: {mode_source} "
-                f"({', '.join(reused_modes)})",
-                flush=True,
-            )
+            log_prefix = ("[train-memory]" if start_checkpointed or start_with_headroom else "[train-oom]")
+            print(f"{log_prefix} {device_label}: {mode_source} ({', '.join(reused_modes)})", flush=True)
             setattr(model, "_ttt_reported_oom_profile", signature)
 
     cuda_devices = sorted({
@@ -4126,22 +3760,16 @@ def _run_oom_resilient_backward(
             # faster, but PyTorch caches the released host blocks separately
             # from the CUDA device allocator.  Use pinned storage only when
             # this runtime exposes a way to return that cache to the OS.
-            admission = (
-                offload_admission(active_work)
-                if activation_offload else nullcontext())
+            admission = (offload_admission(active_work) if activation_offload else nullcontext())
             # Keep the admission token until inactive pinned blocks and libc
             # arenas have been returned. Otherwise the next trainer can begin
             # a large offload while this process still owns the prior batch's
             # host cache, recreating the node-wide RAM spike.
             with admission:
-                offload_rss_before = (
-                    process_rss_bytes() if activation_offload else None)
-                rss_sampler = (
-                    ProcessRSSPeakSampler()
-                    if activation_offload else nullcontext())
+                offload_rss_before = (process_rss_bytes() if activation_offload else None)
+                rss_sampler = (ProcessRSSPeakSampler() if activation_offload else nullcontext())
                 offload_context = (
-                    torch.autograd.graph.save_on_cpu(
-                        pin_memory=host_cache_reclaim_supported(torch))
+                    torch.autograd.graph.save_on_cpu(pin_memory=host_cache_reclaim_supported(torch))
                     if activation_offload
                     and hasattr(torch.autograd.graph, "save_on_cpu")
                     else nullcontext()
@@ -4161,41 +3789,27 @@ def _run_oom_resilient_backward(
                         for cuda_device in cuda_devices:
                             with torch.cuda.device(cuda_device):
                                 torch.cuda.empty_cache()
-                        reclaim_unused_host_memory(
-                            torch, cuda_devices=cuda_devices, force=True)
+                        reclaim_unused_host_memory(torch, cuda_devices=cuda_devices, force=True)
                     raise
                 else:
                     if activation_offload:
-                        cleanup = reclaim_unused_host_memory(
-                            torch, cuda_devices=cuda_devices, force=True)
+                        cleanup = reclaim_unused_host_memory(torch, cuda_devices=cuda_devices, force=True)
                         # Forced cleanup records the pinned allocator and RSS
                         # immediately before releasing the saved activations.
                         # Publish the larger measurement while this rank still
                         # owns its reservation; waiting ranks then recompute
                         # their token-weighted request before they can enter.
-                        observer = getattr(
-                            activation_offload_semaphore, "observe", None)
+                        observer = getattr(activation_offload_semaphore, "observe", None)
                         if callable(observer):
-                            footprint = int(
-                                cleanup.get("pinned_owned_before", 0) or 0)
+                            footprint = int(cleanup.get("pinned_owned_before", 0) or 0)
                             rss_at_cleanup = cleanup.get("rss_before")
-                            if (offload_rss_before is not None
-                                    and rss_at_cleanup is not None):
-                                footprint = max(
-                                    footprint,
-                                    max(0, int(rss_at_cleanup)
-                                        - int(offload_rss_before)),
-                                )
-                            footprint = max(
-                                footprint,
-                                int(getattr(
-                                    sampled_rss, "footprint_bytes", 0) or 0),
-                            )
+                            if (offload_rss_before is not None and rss_at_cleanup is not None):
+                                footprint = max(footprint, max(0, int(rss_at_cleanup) - int(offload_rss_before)))
+                            footprint = max(footprint, int(getattr(sampled_rss, "footprint_bytes", 0) or 0))
                             observer(active_work, footprint)
             if split_backoff and active:
                 successful_work = _gradient_checkpointing_work_units(active)
-                _remember_oom_profile_minimum(
-                    profile, "safe_work_cap", successful_work)
+                _remember_oom_profile_minimum(profile, "safe_work_cap", successful_work)
             if offload_trigger_work is not None:
                 _remember_oom_profile_minimum(
                     profile, "activation_offload_min_work",
@@ -4218,17 +3832,13 @@ def _run_oom_resilient_backward(
                 with torch.cuda.device(cuda_device):
                     torch.cuda.empty_cache()
             if cuda_oom and not checkpointing and checkpointing_available:
-                learned_checkpoint_floor = _oom_profile_work_floor(
-                    active_work)
+                learned_checkpoint_floor = _oom_profile_work_floor(active_work)
                 checkpoint_threshold = (
                     learned_checkpoint_floor
                     if checkpoint_threshold is None else
-                    min(int(checkpoint_threshold),
-                        learned_checkpoint_floor)
+                    min(int(checkpoint_threshold), learned_checkpoint_floor)
                 )
-                setattr(
-                    model, "_ttt_gradient_checkpointing_min_work",
-                    int(checkpoint_threshold))
+                setattr(model, "_ttt_gradient_checkpointing_min_work", int(checkpoint_threshold))
                 if set_gradient_checkpointing(model, True):
                     checkpointing = True
                     print(
@@ -4243,8 +3853,7 @@ def _run_oom_resilient_backward(
                 active = smaller
                 split_backoff = True
                 active_work = select_checkpointing()
-                reason = ("fused attention rejected the padded batch"
-                          if kernel_unavailable else "CUDA OOM")
+                reason = ("fused attention rejected the padded batch" if kernel_unavailable else "CUDA OOM")
                 print(f"[train-oom] {device_label}: {reason}; retrying with maximum "
                       f"microbatch {max(len(batch) for batch in active)}",
                       flush=True)
@@ -4255,11 +3864,7 @@ def _run_oom_resilient_backward(
                 if next_fraction is not None:
                     memory_expanded = True
                     headroom_trigger_work = active_work
-                    retry_label = (
-                        "singleton OOM"
-                        if previous_fraction is None else
-                        "singleton still OOM"
-                    )
+                    retry_label = ("singleton OOM" if previous_fraction is None else "singleton still OOM")
                     print(
                         f"[train-oom] {device_label}: {retry_label}; retrying "
                         "the exact update with "
@@ -4271,8 +3876,7 @@ def _run_oom_resilient_backward(
             if (cuda_oom and allow_activation_offload
                     and not activation_offload
                     and offload_gate_can_admit(active_work)
-                    and hasattr(
-                    torch.autograd.graph, "save_on_cpu")):
+                    and hasattr(torch.autograd.graph, "save_on_cpu")):
                 activation_offload = True
                 offload_trigger_work = active_work
                 setting_log_only(
@@ -4289,9 +3893,7 @@ def _run_oom_resilient_backward(
             )
             victim_batch = active.pop(victim_index)
             victim = victim_batch[0]
-            victim_tokens = int(
-                victim["prompt_ids"].shape[1]
-                + victim["response_ids"].shape[1])
+            victim_tokens = int(victim["prompt_ids"].shape[1] + victim["response_ids"].shape[1])
             if strict_exact_training:
                 if defer_exact_oom:
                     quarantined.append(victim)
@@ -4311,8 +3913,7 @@ def _run_oom_resilient_backward(
                 set_gradient_checkpointing(model, False)
                 model.zero_grad(set_to_none=True)
                 if kernel_unavailable:
-                    failure = (
-                        "no compatible exact linear-memory attention kernel")
+                    failure = ("no compatible exact linear-memory attention kernel")
                 elif allow_activation_offload:
                     failure = (
                         "insufficient memory after checkpointing, reserved "
@@ -4399,10 +4000,8 @@ def clipped_surrogate_loss(
     import torch
 
     symmetric_epsilon = float(clip_epsilon)
-    epsilon_low = (symmetric_epsilon if clip_epsilon_low is None
-                   else float(clip_epsilon_low))
-    epsilon_high = (symmetric_epsilon if clip_epsilon_high is None
-                    else float(clip_epsilon_high))
+    epsilon_low = (symmetric_epsilon if clip_epsilon_low is None else float(clip_epsilon_low))
+    epsilon_high = (symmetric_epsilon if clip_epsilon_high is None else float(clip_epsilon_high))
     if (not math.isfinite(epsilon_low) or not 0.0 < epsilon_low < 1.0
             or not math.isfinite(epsilon_high)
             or not 0.0 < epsilon_high < 1.0):
@@ -4424,36 +4023,26 @@ def clipped_surrogate_loss(
         policy_ratios = log_ratios.mean().exp()
     else:
         policy_ratios = log_ratios.exp()
-    clipped_policy_ratios = policy_ratios.clamp(
-        1.0 - epsilon_low, 1.0 + epsilon_high)
-    policy_loss = -torch.minimum(
-        policy_ratios * adv, clipped_policy_ratios * adv).mean()
+    clipped_policy_ratios = policy_ratios.clamp(1.0 - epsilon_low, 1.0 + epsilon_high)
+    policy_loss = -torch.minimum(policy_ratios * adv, clipped_policy_ratios * adv).mean()
     ratio = policy_ratios.mean()
-    clipped_fraction = (
-        policy_ratios.detach() != clipped_policy_ratios.detach()
-    ).double().mean()
+    clipped_fraction = (policy_ratios.detach() != clipped_policy_ratios.detach()).double().mean()
     policy_reference_delta = cur.new_zeros(())
     kl_policy_loss = cur.new_zeros(())
     if kl_coef:
         if reference_logprob is None:
             raise ValueError("reference logprobs are required for nonzero KL coefficient")
-        ref = torch.as_tensor(reference_logprob, dtype=cur.dtype,
-                              device=cur.device).detach()
+        ref = torch.as_tensor(reference_logprob, dtype=cur.dtype, device=cur.device).detach()
         if ref.shape != cur.shape or not torch.isfinite(ref).all():
-            raise ValueError(
-                "reference logprobs must be a finite vector matching current logprobs")
+            raise ValueError("reference logprobs must be a finite vector matching current logprobs")
         logp_difference = (cur - ref).detach()
         policy_reference_delta = logp_difference.mean()
-        kl_advantage = kl_coef * (
-            policy_reference_delta - (cur - ref)
-        )
+        kl_advantage = kl_coef * (policy_reference_delta - (cur - ref))
         # This is the KL component of entropic mode's policy-gradient loss.
         # Keep the current/reference centering unchanged. In sequence-ratio
         # mode, one detached trajectory weight replaces volatile per-token MoE
         # weights without changing how pi_theta and pi_ref are compared.
-        kl_policy_loss = -(
-            policy_ratios.detach() * kl_advantage.detach() * cur
-        ).mean()
+        kl_policy_loss = -(policy_ratios.detach() * kl_advantage.detach() * cur).mean()
 
     entropy_estimate = cur.new_zeros(())
     prefix_ratio_max = cur.new_ones(())
@@ -4474,9 +4063,7 @@ def clipped_surrogate_loss(
     }
     if return_tensor_metrics:
         return loss, tensor_metrics
-    return loss, {
-        key: float(value.item()) for key, value in tensor_metrics.items()
-    }
+    return loss, {key: float(value.item()) for key, value in tensor_metrics.items()}
 
 
 @contextmanager
@@ -4506,14 +4093,9 @@ def _policy_dropout_disabled(model):
 def _clipped_policy_options(cfg):
     """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
     if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
-        epsilon = float(getattr(
-            cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
-        epsilon_low = float(getattr(
-            cfg, "spo_rs_clip_epsilon_low",
-            SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
-        epsilon_high = float(getattr(
-            cfg, "spo_rs_clip_epsilon_high",
-            SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
+        epsilon = float(getattr(cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
+        epsilon_low = float(getattr(cfg, "spo_rs_clip_epsilon_low", SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
+        epsilon_high = float(getattr(cfg, "spo_rs_clip_epsilon_high", SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
         return epsilon, epsilon_low, epsilon_high, 0.0
     epsilon = SEQUENCE_CLIP_EPSILON_DEFAULT
     epsilon_low = float(getattr(cfg, "sequence_clip_epsilon_low", epsilon))
@@ -4537,9 +4119,7 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
         return_tensor_metrics=return_tensor_metrics)
 
 
-def _a3b_sequence_clipped_standard_loss(
-        cfg, current_logprobs, behavior_logprobs, reference_logprobs,
-        advantage):
+def _a3b_sequence_clipped_standard_loss(cfg, current_logprobs, behavior_logprobs, reference_logprobs, advantage):
     """Apply the A3B sequence surrogate inside entropic training.
 
     Entropic training retains its existing advantages, centered
@@ -4549,12 +4129,9 @@ def _a3b_sequence_clipped_standard_loss(
     to every other coder model.
     """
     if not _uses_sequence_level_policy_ratio(cfg):
-        raise ValueError(
-            "the sequence-clipped standard loss is Qwen3-30B-A3B only")
-    epsilon, epsilon_low, epsilon_high, kl_coef = (
-        _clipped_policy_options(cfg))
-    old = (current_logprobs.detach()
-           if behavior_logprobs is None else behavior_logprobs)
+        raise ValueError("the sequence-clipped standard loss is Qwen3-30B-A3B only")
+    epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
+    old = (current_logprobs.detach() if behavior_logprobs is None else behavior_logprobs)
     loss, metrics = clipped_policy_loss(
         cfg, current_logprobs, old, reference_logprobs, advantage,
         clip_epsilon=epsilon,
@@ -4583,14 +4160,9 @@ def _prepare_entropic_overlap_group(
             f"entropic overlap group {group_id} has {len(responses)} "
             f"responses but {len(reward_futures)} reward futures")
     if any(not future.done() for future in reward_futures):
-        raise RuntimeError(
-            f"entropic overlap group {group_id} was prepared before all of "
-            "its rewards completed")
+        raise RuntimeError(f'entropic overlap group {group_id} was prepared before all of its rewards completed')
 
-    rewards = np.asarray(
-        [float(future.result().reward) for future in reward_futures],
-        dtype=np.float64,
-    )
+    rewards = np.asarray([float(future.result().reward) for future in reward_futures], dtype=np.float64)
     if rewards.size == 0:
         return []
     advantages, _beta = compute_group_advantages(rewards)
@@ -4599,8 +4171,7 @@ def _prepare_entropic_overlap_group(
         return []
 
     prepared = []
-    for rollout_index, (record, advantage) in enumerate(
-            zip(responses, advantages)):
+    for rollout_index, (record, advantage) in enumerate(zip(responses, advantages)):
         token_ids = list(record.get("token_ids") or ())
         if not token_ids:
             continue
@@ -4622,8 +4193,7 @@ def _prepare_entropic_overlap_group(
             and len(reference_values) == len(token_ids) else None)
         example = {
             "prompt_ids": prompt_ids_by_job[job_idx],
-            "response_ids": torch.tensor(
-                [token_ids], dtype=torch.long, device="cpu"),
+            "response_ids": torch.tensor([token_ids], dtype=torch.long, device="cpu"),
             "_entropy_measurement": record.get("_entropy_measurement"),
             "advantage": float(advantage),
             "behavior_logprobs": behavior_logprobs,
@@ -4640,8 +4210,7 @@ def _prepare_entropic_overlap_group(
     return prepared
 
 
-def _prepare_spo_rs_overlap_inputs(
-        tokenizer, group_responses, reward_futures, prompt_jobs):
+def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, prompt_jobs):
     """Build every reward-independent SPO-RS training input on CPU.
 
     SPO-RS uses rollout-policy logprobs produced by vLLM and a frozen
@@ -4662,15 +4231,13 @@ def _prepare_spo_rs_overlap_inputs(
             raise RuntimeError(
                 f"SPO-RS overlap group {group_id} has {len(responses)} "
                 f"responses but {len(futures)} reward futures")
-        for rollout_index, (record, reward_future) in enumerate(
-                zip(responses, futures)):
+        for rollout_index, (record, reward_future) in enumerate(zip(responses, futures)):
             token_ids = list(record.get("token_ids") or ())
             behavior_values = record.get("behavior_logprobs")
             if not token_ids or behavior_values is None:
                 continue
             try:
-                behavior_array = np.asarray(
-                    behavior_values, dtype=np.float32)
+                behavior_array = np.asarray(behavior_values, dtype=np.float32)
             except (TypeError, ValueError):
                 continue
             if (behavior_array.ndim != 1
@@ -4685,12 +4252,10 @@ def _prepare_spo_rs_overlap_inputs(
                     return_tensors="pt").input_ids.cpu()
             example = {
                 "prompt_ids": prompt_ids_by_job[job_idx],
-                "response_ids": torch.tensor(
-                    [token_ids], dtype=torch.long, device="cpu"),
+                "response_ids": torch.tensor([token_ids], dtype=torch.long, device="cpu"),
                 "_entropy_measurement": record.get("_entropy_measurement"),
                 "advantage": None,
-                "behavior_logprobs": torch.as_tensor(
-                    behavior_array, dtype=torch.float32).cpu(),
+                "behavior_logprobs": torch.as_tensor(behavior_array, dtype=torch.float32).cpu(),
                 "reference_logprobs": None,
                 "reward_constant": False,
                 "group_id": int(group_id),
@@ -4716,16 +4281,14 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
         return []
     futures = [example.get("_overlap_reward_future") for example in examples]
     if any(future is None or not future.done() for future in futures):
-        raise RuntimeError(
-            "SPO-RS overlap received an example before its reward completed")
+        raise RuntimeError("SPO-RS overlap received an example before its reward completed")
     if spo_rs_tracker is None:
         raise RuntimeError("SPO-RS overlap requires its historical tracker")
     rewards = [float(future.result().reward) for future in futures]
     transformed = spo_rs_tracker.transformed_rewards(rewards)
     advantages = spo_rs_tracker.normalized_advantages(transformed)
     if advantages is None:
-        raise RuntimeError(
-            "SPO-RS overlap lost its frozen pre-step tracker baseline")
+        raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
     for example, advantage in zip(examples, advantages):
         example["advantage"] = float(advantage)
         # Futures cannot be sent through the process trainer's work queues.
@@ -4736,35 +4299,26 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
 def _validate_precomputed_exact_gradients(model, overflow_state, step_idx):
     """Validate and return a selective-overflow gradient mapping."""
     import torch
-    from fast_distributed import trainable_parameter_signature
+    from training.fast_distributed import trainable_parameter_signature
 
     if int(overflow_state.get("step", -1)) != int(step_idx):
-        raise RuntimeError(
-            "exact SPO-RS overflow gradients belong to a different step")
+        raise RuntimeError("exact SPO-RS overflow gradients belong to a different step")
 
     def canonical_signature(value):
-        return tuple(
-            (str(name), tuple(int(size) for size in shape), str(dtype))
-            for name, shape, dtype in value
-        )
+        return tuple((str(name), tuple(int(size) for size in shape), str(dtype)) for name, shape, dtype in value)
 
-    saved_signature = canonical_signature(
-        overflow_state.get("parameter_signature", ()))
-    current_signature = canonical_signature(
-        trainable_parameter_signature(model))
+    saved_signature = canonical_signature(overflow_state.get("parameter_signature", ()))
+    current_signature = canonical_signature(trainable_parameter_signature(model))
     if saved_signature != current_signature:
         raise RuntimeError(
             "exact SPO-RS overflow trainable-parameter layout changed; "
             "refusing to combine mismatched gradients")
     saved_gradients = overflow_state.get("gradients")
     if not isinstance(saved_gradients, dict):
-        raise RuntimeError(
-            "exact SPO-RS overflow checkpoint has no gradient mapping")
+        raise RuntimeError("exact SPO-RS overflow checkpoint has no gradient mapping")
     expected_names = {name for name, _shape, _dtype in current_signature}
     if set(saved_gradients) != expected_names:
-        raise RuntimeError(
-            "exact SPO-RS overflow gradient names do not match the loaded "
-            "adapter")
+        raise RuntimeError('exact SPO-RS overflow gradient names do not match the loaded adapter')
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
@@ -4772,8 +4326,7 @@ def _validate_precomputed_exact_gradients(model, overflow_state, step_idx):
         if (not torch.is_tensor(saved)
                 or tuple(saved.shape) != tuple(parameter.shape)
                 or not torch.isfinite(saved).all()):
-            raise RuntimeError(
-                f"invalid saved exact SPO-RS gradient for {name}")
+            raise RuntimeError(f"invalid saved exact SPO-RS gradient for {name}")
     return saved_gradients
 
 
@@ -4781,8 +4334,7 @@ def _apply_precomputed_exact_gradients(model, overflow_state, step_idx):
     """Add durable fast-path gradients to the model-sharded overflow pass."""
     import torch
 
-    saved_gradients = _validate_precomputed_exact_gradients(
-        model, overflow_state, step_idx)
+    saved_gradients = _validate_precomputed_exact_gradients(model, overflow_state, step_idx)
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
@@ -4790,8 +4342,7 @@ def _apply_precomputed_exact_gradients(model, overflow_state, step_idx):
             saved = saved_gradients[name]
             if parameter.grad is None:
                 parameter.grad = torch.zeros_like(parameter)
-            parameter.grad.add_(saved.to(
-                device=parameter.device, dtype=parameter.grad.dtype))
+            parameter.grad.add_(saved.to(device=parameter.device, dtype=parameter.grad.dtype))
 
 
 def _train_durable_exact_spo_rs_overflow(
@@ -4800,13 +4351,11 @@ def _train_durable_exact_spo_rs_overflow(
     """Finish selectively deferred SPO-RS trajectories one durable unit at a time."""
     import gc
     import torch
-    from fast_distributed import set_long_rollout_memory_ceiling
-    from host_memory import reclaim_unused_host_memory
+    from training.fast_distributed import set_long_rollout_memory_ceiling
+    from runtime.host_memory import reclaim_unused_host_memory
 
     checkpoint_path = Path(str(overflow_state.get("path", ""))).resolve()
-    expected_path = (
-        Path(run_dir).resolve()
-        / _EXACT_OVERFLOW_GRADIENT_FILE.format(step=int(step_idx)))
+    expected_path = (Path(run_dir).resolve() / _EXACT_OVERFLOW_GRADIENT_FILE.format(step=int(step_idx)))
     if checkpoint_path != expected_path:
         raise RuntimeError(
             "exact SPO-RS overflow checkpoint is outside the active run or "
@@ -4814,10 +4363,8 @@ def _train_durable_exact_spo_rs_overflow(
 
     epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
     if epochs != 1:
-        raise RuntimeError(
-            "selective exact SPO-RS overflow requires one optimizer update")
-    epsilon, epsilon_low, epsilon_high, kl_coef = (
-        _clipped_policy_options(cfg))
+        raise RuntimeError("selective exact SPO-RS overflow requires one optimizer update")
+    epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
     backend.set_training_mode()
     cuda_devices = sorted({
         parameter.device.index
@@ -4826,25 +4373,12 @@ def _train_durable_exact_spo_rs_overflow(
         and parameter.device.index is not None
     })
     if not cuda_devices:
-        raise RuntimeError(
-            "exact model-sharded overflow recovery found no CUDA shards")
+        raise RuntimeError("exact model-sharded overflow recovery found no CUDA shards")
 
-    original_keys = {
-        tuple(int(value) for value in key)
-        for key in overflow_state.get("deferred_keys", ())
-    }
-    remaining_keys = {
-        tuple(int(value) for value in key)
-        for key in overflow_state.get("remaining_keys", ())
-    }
-    completed_before = {
-        tuple(int(value) for value in key)
-        for key in overflow_state.get("completed_keys", ())
-    }
-    example_by_key = {
-        tuple(int(value) for value in example["_overlap_key"]): example
-        for example in examples
-    }
+    original_keys = {tuple(int(value) for value in key) for key in overflow_state.get("deferred_keys", ())}
+    remaining_keys = {tuple(int(value) for value in key) for key in overflow_state.get("remaining_keys", ())}
+    completed_before = {tuple(int(value) for value in key) for key in overflow_state.get("completed_keys", ())}
+    example_by_key = {tuple(int(value) for value in example["_overlap_key"]): example for example in examples}
     if set(example_by_key) != remaining_keys:
         raise RuntimeError(
             "exact SPO-RS overflow examples do not match the durable "
@@ -4866,8 +4400,7 @@ def _train_durable_exact_spo_rs_overflow(
             old_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=False, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
-            if any(not torch.isfinite(value).all()
-                   for value in old_logprobs):
+            if any(not torch.isfinite(value).all() for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
             for example, old_lp in zip(batch, old_logprobs):
                 example["old_policy_logprobs"] = old_lp.detach()
@@ -4882,16 +4415,12 @@ def _train_durable_exact_spo_rs_overflow(
         # the complete checkpoint.
         ordered_examples = sorted(
             examples,
-            key=lambda example: int(
-                example["prompt_ids"].shape[1]
-                + example["response_ids"].shape[1]),
+            key=lambda example: int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1]),
             reverse=True,
         )
         for ordinal, example in enumerate(ordered_examples, start=1):
             key = tuple(int(value) for value in example["_overlap_key"])
-            token_count = int(
-                example["prompt_ids"].shape[1]
-                + example["response_ids"].shape[1])
+            token_count = int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1])
             print(
                 f"[recovery] step {step_idx}: exact oversized trajectory "
                 f"{ordinal}/{len(ordered_examples)} key={key}, "
@@ -4907,8 +4436,7 @@ def _train_durable_exact_spo_rs_overflow(
                 if fraction is None:
                     return None
                 for cuda_device in cuda_devices:
-                    set_long_rollout_memory_ceiling(
-                        cuda_device, fraction)
+                    set_long_rollout_memory_ceiling(cuda_device, fraction)
                 return fraction
 
             def attempt(active_batches):
@@ -4926,8 +4454,7 @@ def _train_durable_exact_spo_rs_overflow(
                         measure_entropy=True)
                     current_logprobs = result
                     weighted_losses = []
-                    for item, current_lp in zip(
-                            batch, current_logprobs):
+                    for item, current_lp in zip(batch, current_logprobs):
                         loss, metrics = clipped_policy_loss(
                             cfg, current_lp, item["old_policy_logprobs"],
                             None, item["advantage"],
@@ -4944,14 +4471,11 @@ def _train_durable_exact_spo_rs_overflow(
                                 "policy_loss", "kl_estimate",
                                 "entropy_estimate", "ratio"):
                             totals[metric_name] += weight * metrics[metric_name]
-                        totals["clipped_fraction"] += (
-                            weight * float(metrics["clipped"]))
+                        totals["clipped_fraction"] += (weight * float(metrics["clipped"]))
                         max_ratio = max(max_ratio, metrics["ratio"])
-                        max_prefix_ratio = max(
-                            max_prefix_ratio, metrics["prefix_ratio_max"])
+                        max_prefix_ratio = max(max_prefix_ratio, metrics["prefix_ratio_max"])
                     if weighted_losses:
-                        sum(weighted_losses[1:],
-                            weighted_losses[0]).backward()
+                        sum(weighted_losses[1:], weighted_losses[0]).backward()
                 return {
                     "totals": totals,
                     "max_ratio": max_ratio,
@@ -4970,10 +4494,8 @@ def _train_durable_exact_spo_rs_overflow(
                 # is already spread over every GPU here, so use staged card
                 # headroom and exact checkpointed kernels instead.
                 allow_activation_offload=False)
-            if (result is None or quarantined
-                    or sum(len(batch) for batch in effective) != 1):
-                raise RuntimeError(
-                    f"exact overflow trajectory {key} did not complete")
+            if (result is None or quarantined or sum(len(batch) for batch in effective) != 1):
+                raise RuntimeError(f"exact overflow trajectory {key} did not complete")
             remaining_count = _commit_exact_spo_rs_overflow_progress(
                 model, overflow_state, step_idx, key, result,
                 training_seconds=time.time() - trajectory_started)
@@ -4983,8 +4505,7 @@ def _train_durable_exact_spo_rs_overflow(
             for cuda_device in cuda_devices:
                 with torch.cuda.device(cuda_device):
                     torch.cuda.empty_cache()
-            reclaim_unused_host_memory(
-                torch, cuda_devices=cuda_devices, force=True)
+            reclaim_unused_host_memory(torch, cuda_devices=cuda_devices, force=True)
             print(
                 f"[recovery] step {step_idx}: committed exact gradient for "
                 f"key={key}; {remaining_count} oversized trajectory/"
@@ -5013,8 +4534,7 @@ def _finalize_exact_spo_rs_overflow(
     optimizer.zero_grad(set_to_none=True)
     _apply_precomputed_exact_gradients(model, overflow_state, step_idx)
     grad_norm = _clip_sharded_grad_norm_(
-        [parameter for parameter in model.parameters()
-         if parameter.requires_grad],
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
         cfg.grad_clip, error_if_nonfinite=True)
     optimizer.step()
 
@@ -5026,20 +4546,12 @@ def _finalize_exact_spo_rs_overflow(
     overflow_stats = overflow_state.get("overflow_stats", {})
     normal_totals = normal_stats.get("totals", {})
     overflow_totals = overflow_stats.get("totals", {})
-    totals = {
-        key: (float(normal_totals.get(key, 0.0))
-              + float(overflow_totals.get(key, 0.0)))
-        for key in metric_keys
-    }
-    max_ratio = max(
-        float(normal_stats.get("max_ratio", 0.0)),
-        float(overflow_stats.get("max_ratio", 0.0)))
+    totals = {key: (float(normal_totals.get(key, 0.0)) + float(overflow_totals.get(key, 0.0))) for key in metric_keys}
+    max_ratio = max(float(normal_stats.get("max_ratio", 0.0)), float(overflow_stats.get("max_ratio", 0.0)))
     max_prefix_ratio = max(
         float(normal_stats.get("max_prefix_ratio", 0.0)),
         float(overflow_stats.get("max_prefix_ratio", 0.0)))
-    entropy_examples = (
-        int(normal_stats.get("entropy_examples", 0))
-        + int(overflow_stats.get("entropy_examples", 0)))
+    entropy_examples = (int(normal_stats.get("entropy_examples", 0)) + int(overflow_stats.get("entropy_examples", 0)))
     history = [{
         "epoch": 1,
         **totals,
@@ -5066,9 +4578,7 @@ def _finalize_exact_spo_rs_overflow(
             + float(overflow_stats.get("training_seconds", 0.0))
             + (time.time() - finalize_started)),
         "oom_quarantined_examples": 0,
-        "exact_overflow_reused_examples": (
-            int(normal_stats.get("trained_examples", 0))
-            + len(completed_before)),
+        "exact_overflow_reused_examples": (int(normal_stats.get("trained_examples", 0)) + len(completed_before)),
         "exact_overflow_sharded_examples": len(original_keys),
         "exact_overflow_resumed_examples": len(completed_before),
     }
@@ -5082,15 +4592,13 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
 
     if precomputed_gradient_state is not None:
         if exact_overflow_run_dir is None:
-            raise RuntimeError(
-                "selective exact SPO-RS overflow requires its run directory")
+            raise RuntimeError("selective exact SPO-RS overflow requires its run directory")
         return _train_durable_exact_spo_rs_overflow(
             backend, model, tokenizer, optimizer, examples, cfg, step_idx,
             precomputed_gradient_state, exact_overflow_run_dir)
 
     epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
-    epsilon, epsilon_low, epsilon_high, kl_coef = (
-        _clipped_policy_options(cfg))
+    epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
     backend.set_training_mode()
     started = time.time()
     update_batches = _training_microbatches(examples, cfg)
@@ -5116,8 +4624,7 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
             old_logprobs = compute_batched_token_logprobs(
                 model, batch, with_grad=False, chunk=cfg.logprob_chunk,
                 pad_token_id=tokenizer.pad_token_id)
-            if any(not torch.isfinite(value).all()
-                   for value in old_logprobs):
+            if any(not torch.isfinite(value).all() for value in old_logprobs):
                 raise FloatingPointError("nonfinite old-policy logprobs")
             for ex, old_lp in zip(batch, old_logprobs):
                 ex["old_policy_logprobs"] = old_lp.detach()
@@ -5140,8 +4647,7 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
                         measure_entropy=(epoch == 0))
                     current_logprobs = result
                     weighted_losses = []
-                    for ex, cur_lp in zip(
-                            batch, current_logprobs):
+                    for ex, cur_lp in zip(batch, current_logprobs):
                         loss, metrics = clipped_policy_loss(
                             cfg, cur_lp, ex["old_policy_logprobs"],
                             None, ex["advantage"],
@@ -5151,22 +4657,17 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
                             kl_coef=kl_coef)
                         weight = float(ex["sample_weight"])
                         if not torch.isfinite(loss).all():
-                            raise FloatingPointError(
-                                "nonfinite SPO-RS loss")
+                            raise FloatingPointError("nonfinite SPO-RS loss")
                         weighted_losses.append(weight * loss)
-                        totals["loss"] += (
-                            weight * float(loss.detach().item()))
+                        totals["loss"] += (weight * float(loss.detach().item()))
                         for key in ("policy_loss", "kl_estimate",
                                     "entropy_estimate", "ratio"):
                             totals[key] += weight * metrics[key]
-                        totals["clipped_fraction"] += (
-                            weight * float(metrics["clipped"]))
+                        totals["clipped_fraction"] += (weight * float(metrics["clipped"]))
                         max_ratio = max(max_ratio, metrics["ratio"])
-                        max_prefix_ratio = max(
-                            max_prefix_ratio, metrics["prefix_ratio_max"])
+                        max_prefix_ratio = max(max_prefix_ratio, metrics["prefix_ratio_max"])
                     if weighted_losses:
-                        sum(weighted_losses[1:],
-                            weighted_losses[0]).backward()
+                        sum(weighted_losses[1:], weighted_losses[0]).backward()
                 return (totals, max_ratio, max_prefix_ratio,
                         entropy_examples)
 
@@ -5184,20 +4685,14 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
                  entropy_examples) = result
 
             if precomputed_gradient_state is not None:
-                _apply_precomputed_exact_gradients(
-                    model, precomputed_gradient_state, step_idx)
-                normal_stats = precomputed_gradient_state.get(
-                    "normal_stats", {})
+                _apply_precomputed_exact_gradients(model, precomputed_gradient_state, step_idx)
+                normal_stats = precomputed_gradient_state.get("normal_stats", {})
                 normal_totals = normal_stats.get("totals", {})
                 for key in totals:
                     totals[key] += float(normal_totals.get(key, 0.0))
-                max_ratio = max(
-                    max_ratio, float(normal_stats.get("max_ratio", 0.0)))
-                max_prefix_ratio = max(
-                    max_prefix_ratio,
-                    float(normal_stats.get("max_prefix_ratio", 0.0)))
-                entropy_examples += int(
-                    normal_stats.get("entropy_examples", 0))
+                max_ratio = max(max_ratio, float(normal_stats.get("max_ratio", 0.0)))
+                max_prefix_ratio = max(max_prefix_ratio, float(normal_stats.get("max_prefix_ratio", 0.0)))
+                entropy_examples += int(normal_stats.get("entropy_examples", 0))
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
@@ -5220,19 +4715,14 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
     for ex in examples:
         for key in ("old_policy_logprobs",):
             ex.pop(key, None)
-    recovery_seconds = float(
-        (precomputed_gradient_state or {}).get(
-            "normal_stats", {}).get("training_seconds", 0.0))
+    recovery_seconds = float((precomputed_gradient_state or {}).get("normal_stats", {}).get("training_seconds", 0.0))
     return {
         "policy_updates": history,
         "training_seconds": recovery_seconds + (time.time() - started),
-        "oom_quarantined_examples": sum(
-            item["oom_quarantined_examples"] for item in history),
+        "oom_quarantined_examples": sum(item["oom_quarantined_examples"] for item in history),
         "exact_overflow_reused_examples": int(
-            (precomputed_gradient_state or {}).get(
-                "normal_stats", {}).get("trained_examples", 0)),
-        "exact_overflow_sharded_examples": (
-            len(examples) if precomputed_gradient_state is not None else 0),
+            (precomputed_gradient_state or {}).get("normal_stats", {}).get("trained_examples", 0)),
+        "exact_overflow_sharded_examples": (len(examples) if precomputed_gradient_state is not None else 0),
     }
 
 
@@ -5247,11 +4737,10 @@ class ReplicatedDataParallelTrainer:
     exactly without launching duplicate search/evaluation processes.
     """
 
-    def __init__(self, primary_backend, primary_model, primary_tokenizer,
-                 optimizer, cfg, dependency_log_path=None):
+    def __init__(self, primary_backend, primary_model, primary_tokenizer, optimizer, cfg, dependency_log_path=None):
         import torch
-        from model_backend import load_backend
-        from loading_logs import quiet_replica_load
+        from models.model_backend import load_backend
+        from diagnostics.loading_logs import quiet_replica_load
 
         self.cfg = cfg
         self.optimizer = optimizer
@@ -5272,14 +4761,11 @@ class ReplicatedDataParallelTrainer:
             # The explicit replica device controls placement. Keep the complete
             # budget vector so model_backend can select this device's budget.
             replica_cfg.num_training_gpus = 1
-            replica_log = (f"{dependency_log_path}.trainer-rank{logical_id}"
-                           if dependency_log_path else None)
+            replica_log = (f"{dependency_log_path}.trainer-rank{logical_id}" if dependency_log_path else None)
             with quiet_replica_load(replica_log):
                 replica_backend = load_backend(cfg.backend, replica_cfg)
                 replica_model, replica_tokenizer = replica_backend.load()
-            self.replicas.append(
-                (replica_backend, replica_model, replica_tokenizer, logical_id)
-            )
+            self.replicas.append((replica_backend, replica_model, replica_tokenizer, logical_id))
             print(f"[train-parallel] replica {logical_id}/{world_size - 1} "
                   f"ready on physical GPU {physical_ids[logical_id]}", flush=True)
 
@@ -5288,8 +4774,7 @@ class ReplicatedDataParallelTrainer:
         self._broadcast_trainable_parameters()
         for logical_id in range(world_size):
             torch.cuda.synchronize(logical_id)
-        print(f"[train-parallel] active on all {world_size} training GPUs "
-              f"{physical_ids}", flush=True)
+        print(f'[train-parallel] active on all {world_size} training GPUs {physical_ids}', flush=True)
 
     @property
     def world_size(self):
@@ -5301,35 +4786,26 @@ class ReplicatedDataParallelTrainer:
 
     def estimated_host_offload_bytes(self):
         """RAM required to move every live trainer replica off its GPU."""
-        from host_memory import (GIB, estimated_module_bytes,
-                                 estimated_optimizer_bytes)
+        from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
 
-        model_bytes = sum(
-            estimated_module_bytes(model)
-            for _, model, _, _ in self.replicas
-        )
+        model_bytes = sum(estimated_module_bytes(model) for _, model, _, _ in self.replicas)
         optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
         # The model estimate is storage-exact.  The small margin covers Python
         # tensor metadata, allocator alignment, and one GiB of workspace per
         # process without pretending that an additional model copy is needed.
-        return int(
-            1.05 * (model_bytes + optimizer_bytes)
-            + self.world_size * GIB
-        )
+        return int(1.05 * (model_bytes + optimizer_bytes) + self.world_size * GIB)
 
     def reclaim_host_memory(self):
         """Synchronize all replicas, then drop unused host allocations."""
         import torch
-        from host_memory import reclaim_unused_host_memory
+        from runtime.host_memory import reclaim_unused_host_memory
 
         devices = tuple(range(self.world_size))
-        return [reclaim_unused_host_memory(
-            torch, cuda_devices=devices, force=True)]
+        return [reclaim_unused_host_memory(torch, cuda_devices=devices, force=True)]
 
     @staticmethod
     def _trainable_parameters(model):
-        return [(name, parameter) for name, parameter in model.named_parameters()
-                if parameter.requires_grad]
+        return [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
 
     def _validate_parameter_layouts(self):
         expected = [
@@ -5337,23 +4813,15 @@ class ReplicatedDataParallelTrainer:
             for name, parameter in self._trainable_parameters(self.replicas[0][1])
         ]
         for _, model, _, logical_id in self.replicas[1:]:
-            actual = [
-                (name, tuple(parameter.shape))
-                for name, parameter in self._trainable_parameters(model)
-            ]
+            actual = [(name, tuple(parameter.shape)) for name, parameter in self._trainable_parameters(model)]
             if actual != expected:
-                raise RuntimeError(
-                    f"trainer replica {logical_id} has a different trainable "
-                    "parameter layout")
+                raise RuntimeError(f'trainer replica {logical_id} has a different trainable parameter layout')
 
     def _validate_replica_devices(self):
         import torch
         for _, model, _, logical_id in self.replicas:
             expected = torch.device(f"cuda:{logical_id}")
-            wrong_devices = {
-                str(parameter.device) for parameter in model.parameters()
-                if parameter.device != expected
-            }
+            wrong_devices = {str(parameter.device) for parameter in model.parameters() if parameter.device != expected}
             if wrong_devices:
                 raise RuntimeError(
                     f"trainer replica {logical_id} expected every parameter on "
@@ -5368,9 +4836,7 @@ class ReplicatedDataParallelTrainer:
             target = self._trainable_parameters(model)
             with torch.cuda.device(logical_id), torch.no_grad():
                 for (_, source_parameter), (_, target_parameter) in zip(source, target):
-                    target_parameter.copy_(
-                        source_parameter.detach().to(
-                            target_parameter.device, non_blocking=True))
+                    target_parameter.copy_(source_parameter.detach().to(target_parameter.device, non_blocking=True))
                 torch.cuda.synchronize(logical_id)
 
         self._run_replicas(copy_replica, self.replicas[1:])
@@ -5409,15 +4875,13 @@ class ReplicatedDataParallelTrainer:
         loads = [0 for _ in self.replicas]
         ordered = sorted(
             self._cpu_examples(examples),
-            key=lambda ex: int(ex["prompt_ids"].numel()
-                               + ex["response_ids"].numel()),
+            key=lambda ex: int(ex["prompt_ids"].numel() + ex["response_ids"].numel()),
             reverse=True,
         )
         for example in ordered:
             rank = min(range(self.world_size), key=lambda idx: loads[idx])
             shards[rank].append(example)
-            loads[rank] += int(example["prompt_ids"].numel()
-                               + example["response_ids"].numel())
+            loads[rank] += int(example["prompt_ids"].numel() + example["response_ids"].numel())
         return shards, loads
 
     @staticmethod
@@ -5432,8 +4896,7 @@ class ReplicatedDataParallelTrainer:
                 if torch.is_tensor(value):
                     cache_key = id(value)
                     if cache_key not in tensor_cache:
-                        tensor_cache[cache_key] = value.to(
-                            device, non_blocking=True)
+                        tensor_cache[cache_key] = value.to(device, non_blocking=True)
                     local[key] = tensor_cache[cache_key]
                 else:
                     local[key] = value
@@ -5450,11 +4913,9 @@ class ReplicatedDataParallelTrainer:
             with torch.cuda.device(logical_id):
                 return self._move_shard(shard, logical_id)
 
-        local_shards = self._run_replicas(
-            move, list(zip(self.replicas, shards)))
+        local_shards = self._run_replicas(move, list(zip(self.replicas, shards)))
         counts = [len(shard) for shard in local_shards]
-        print(f"[train-parallel] examples/GPU={counts}; "
-              f"tokens/GPU={token_loads}", flush=True)
+        print(f'[train-parallel] examples/GPU={counts}; tokens/GPU={token_loads}', flush=True)
         return local_shards
 
     def _zero_gradients(self):
@@ -5466,8 +4927,7 @@ class ReplicatedDataParallelTrainer:
         """Sum replica gradients without DDP's implicit world-size average."""
         import torch
         primary = self._trainable_parameters(self.replicas[0][1])
-        others = [self._trainable_parameters(replica[1])
-                  for replica in self.replicas[1:]]
+        others = [self._trainable_parameters(replica[1]) for replica in self.replicas[1:]]
         with torch.cuda.device(0), torch.no_grad():
             for parameter_index, (_, destination) in enumerate(primary):
                 gradient = destination.grad
@@ -5477,8 +4937,7 @@ class ReplicatedDataParallelTrainer:
                 for replica_parameters in others:
                     source_gradient = replica_parameters[parameter_index][1].grad
                     if source_gradient is not None:
-                        gradient.add_(source_gradient.to(
-                            destination.device, non_blocking=True))
+                        gradient.add_(source_gradient.to(destination.device, non_blocking=True))
             torch.cuda.synchronize(0)
 
 
@@ -5486,8 +4945,7 @@ class ReplicatedDataParallelTrainer:
         import torch
         self._sum_gradients_to_primary()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            [parameter for _, parameter in
-             self._trainable_parameters(self.replicas[0][1])],
+            [parameter for _, parameter in self._trainable_parameters(self.replicas[0][1])],
             max_norm=cfg.grad_clip, error_if_nonfinite=True)
         self.optimizer.step()
         self._broadcast_trainable_parameters()
@@ -5501,8 +4959,7 @@ class ReplicatedDataParallelTrainer:
         if not batch:
             return 0
         return max(
-            int(example["prompt_ids"].shape[1]
-                + example["response_ids"].shape[1])
+            int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1])
             for example in batch
         ) * len(batch)
 
@@ -5520,21 +4977,16 @@ class ReplicatedDataParallelTrainer:
 
         started = time.time()
         if self._offloaded:
-            print(f"[train-fast] restoring {self.world_size} trainer "
-                  "replicas for the update", flush=True)
+            print(f'[train-fast] restoring {self.world_size} trainer replicas for the update', flush=True)
             self.restore_after_generation()
 
-        epochs = int(getattr(cfg, "spo_rs_update_epochs",
-                             SPO_RS_UPDATE_EPOCHS_DEFAULT))
+        epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
         if epochs != 1:
             raise ValueError("--fast requires one clipped-policy update epoch")
-        epsilon, epsilon_low, epsilon_high, kl_coef = (
-            _clipped_policy_options(cfg))
+        epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
 
         cpu_examples = self._cpu_examples(examples)
-        supplied_old = sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in cpu_examples)
+        supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in cpu_examples)
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(cpu_examples)}, reference="
@@ -5544,9 +4996,7 @@ class ReplicatedDataParallelTrainer:
 
         pending = sorted(
             cpu_examples,
-            key=lambda example: int(
-                example["prompt_ids"].shape[1]
-                + example["response_ids"].shape[1]))
+            key=lambda example: int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1]))
 
         queue_lock = threading.Lock()
         # A token budget is the real memory controller. This loose count guard
@@ -5558,14 +5008,10 @@ class ReplicatedDataParallelTrainer:
                 if not pending:
                     return []
                 batch = [pending.pop()]
-                maximum = int(
-                    batch[0]["prompt_ids"].shape[1]
-                    + batch[0]["response_ids"].shape[1])
+                maximum = int(batch[0]["prompt_ids"].shape[1] + batch[0]["response_ids"].shape[1])
                 while pending and len(batch) < max_examples_per_batch:
                     candidate = pending[-1]
-                    candidate_length = int(
-                        candidate["prompt_ids"].shape[1]
-                        + candidate["response_ids"].shape[1])
+                    candidate_length = int(candidate["prompt_ids"].shape[1] + candidate["response_ids"].shape[1])
                     next_maximum = max(maximum, candidate_length)
                     if next_maximum * (len(batch) + 1) > token_budget:
                         break
@@ -5580,8 +5026,7 @@ class ReplicatedDataParallelTrainer:
             self._fast_token_budgets = budgets
         else:
             for replica_index in range(self.world_size):
-                budgets[replica_index] = max(
-                    1, int(budgets[replica_index] or initial_budget))
+                budgets[replica_index] = max(1, int(budgets[replica_index] or initial_budget))
 
         print(f"[train-fast] shared adaptive queue on {self.world_size} GPUs; "
               "memory target=80%; initial padded-token budgets/GPU="
@@ -5596,8 +5041,7 @@ class ReplicatedDataParallelTrainer:
         def work(replica_index):
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             backend.set_training_mode()
-            parameters = [parameter for _, parameter in
-                          self._trainable_parameters(model)]
+            parameters = [parameter for _, parameter in self._trainable_parameters(model)]
             # Keep already-computed LoRA gradients outside model.grad so the
             # existing OOM retry helper can safely clear a partial next batch.
             gradient_accumulators = [None for _ in parameters]
@@ -5623,8 +5067,7 @@ class ReplicatedDataParallelTrainer:
                     base_allocated = int(torch.cuda.memory_allocated())
                     base_reserved = int(torch.cuda.memory_reserved())
                     free_bytes, total_bytes = torch.cuda.mem_get_info()
-                    external_bytes = max(
-                        0, int(total_bytes) - int(free_bytes) - base_reserved)
+                    external_bytes = max(0, int(total_bytes) - int(free_bytes) - base_reserved)
                     torch.cuda.reset_peak_memory_stats()
                     local_batch = self._move_shard(cpu_batch, logical_id)
 
@@ -5636,25 +5079,18 @@ class ReplicatedDataParallelTrainer:
 
                         with _policy_dropout_disabled(model):
                             for batch in active_batches:
-                                missing_old = (
-                                    _initialize_behavior_logprobs(batch))
-                                for fallback_batch in (
-                                        [example] for example in missing_old):
+                                missing_old = (_initialize_behavior_logprobs(batch))
+                                for fallback_batch in ([example] for example in missing_old):
                                     old_logprobs = (
                                         compute_batched_token_logprobs(
                                             model, fallback_batch,
                                             with_grad=False,
                                             chunk=cfg.logprob_chunk,
-                                            pad_token_id=(
-                                                tokenizer.pad_token_id)))
-                                    if any(not torch.isfinite(value).all()
-                                           for value in old_logprobs):
-                                        raise FloatingPointError(
-                                            "nonfinite old-policy logprobs")
-                                    for example, old_lp in zip(
-                                            fallback_batch, old_logprobs):
-                                        example["old_policy_logprobs"] = (
-                                            old_lp.detach())
+                                            pad_token_id=(tokenizer.pad_token_id)))
+                                    if any(not torch.isfinite(value).all() for value in old_logprobs):
+                                        raise FloatingPointError("nonfinite old-policy logprobs")
+                                    for example, old_lp in zip(fallback_batch, old_logprobs):
+                                        example["old_policy_logprobs"] = (old_lp.detach())
 
 
                                 result = compute_batched_token_logprobs(
@@ -5664,8 +5100,7 @@ class ReplicatedDataParallelTrainer:
                                 current_logprobs = result
 
                                 weighted_losses = []
-                                for example, current_lp in zip(
-                                        batch, current_logprobs):
+                                for example, current_lp in zip(batch, current_logprobs):
                                     loss, metrics = clipped_policy_loss(
                                         cfg, current_lp,
                                         example["old_policy_logprobs"],
@@ -5678,50 +5113,35 @@ class ReplicatedDataParallelTrainer:
                                         return_tensor_metrics=True)
                                     weight = float(example["sample_weight"])
                                     if not torch.isfinite(loss).all():
-                                        raise FloatingPointError(
-                                            "nonfinite SPO-RS loss")
+                                        raise FloatingPointError("nonfinite SPO-RS loss")
                                     weighted_losses.append(weight * loss)
-                                    attempt_values["loss"].append(
-                                        weight * loss.detach())
+                                    attempt_values["loss"].append(weight * loss.detach())
                                     for key in (
                                             "policy_loss", "kl_estimate",
                                             "entropy_estimate", "ratio"):
-                                        attempt_values[key].append(
-                                            weight * metrics[key])
-                                    attempt_values[
-                                        "clipped_fraction"].append(
-                                            weight * metrics["clipped"])
-                                    attempt_ratio_values.append(
-                                        metrics["ratio"])
-                                    attempt_prefix_ratio_values.append(
-                                        metrics["prefix_ratio_max"])
+                                        attempt_values[key].append(weight * metrics[key])
+                                    attempt_values["clipped_fraction"].append(weight * metrics["clipped"])
+                                    attempt_ratio_values.append(metrics["ratio"])
+                                    attempt_prefix_ratio_values.append(metrics["prefix_ratio_max"])
                                 if weighted_losses:
-                                    sum(weighted_losses[1:],
-                                        weighted_losses[0]).backward()
+                                    sum(weighted_losses[1:], weighted_losses[0]).backward()
 
-                        zero = torch.zeros(
-                            (), dtype=torch.float64,
-                            device=torch.device(f"cuda:{logical_id}"))
+                        zero = torch.zeros((), dtype=torch.float64, device=torch.device(f"cuda:{logical_id}"))
                         reduced = [
-                            (torch.stack(attempt_values[key]).sum()
-                             if attempt_values[key] else zero)
+                            (torch.stack(attempt_values[key]).sum() if attempt_values[key] else zero)
                             for key in metric_keys
                         ]
                         reduced.extend((
-                            (torch.stack(attempt_ratio_values).max()
-                             if attempt_ratio_values else zero),
-                            (torch.stack(attempt_prefix_ratio_values).max()
-                             if attempt_prefix_ratio_values else zero),
+                            (torch.stack(attempt_ratio_values).max() if attempt_ratio_values else zero),
+                            (torch.stack(attempt_prefix_ratio_values).max() if attempt_prefix_ratio_values else zero),
                         ))
                         packed = torch.stack([
                             value.to(dtype=torch.float64)
                             for value in reduced
                         ]).detach().cpu().tolist()
-                        attempt_totals = dict(zip(
-                            metric_keys, packed[:len(metric_keys)]))
+                        attempt_totals = dict(zip(metric_keys, packed[:len(metric_keys)]))
                         attempt_max_ratio = packed[len(metric_keys)]
-                        attempt_max_prefix_ratio = packed[
-                            len(metric_keys) + 1]
+                        attempt_max_prefix_ratio = packed[len(metric_keys) + 1]
                         return (
                             attempt_totals, attempt_max_ratio,
                             attempt_max_prefix_ratio,
@@ -5729,92 +5149,64 @@ class ReplicatedDataParallelTrainer:
                         )
 
                     result, effective_batches, quarantined = (
-                        _run_oom_resilient_backward(
-                            model, [local_batch], attempt,
-                            device_label=f"cuda:{logical_id}"))
+                        _run_oom_resilient_backward(model, [local_batch], attempt, device_label=f"cuda:{logical_id}"))
 
-                    peak_allocated = int(
-                        torch.cuda.max_memory_allocated())
+                    peak_allocated = int(torch.cuda.max_memory_allocated())
                     peak_reserved = int(torch.cuda.max_memory_reserved())
-                    used_at_peak = min(
-                        int(total_bytes), external_bytes + peak_reserved)
-                    peak_memory_fraction = max(
-                        peak_memory_fraction,
-                        used_at_peak / max(1, int(total_bytes)))
+                    used_at_peak = min(int(total_bytes), external_bytes + peak_reserved)
+                    peak_memory_fraction = max(peak_memory_fraction, used_at_peak / max(1, int(total_bytes)))
 
                     if result is not None:
                         with torch.no_grad():
-                            for parameter_index, parameter in enumerate(
-                                    parameters):
+                            for parameter_index, parameter in enumerate(parameters):
                                 gradient = parameter.grad
                                 if gradient is None:
                                     continue
-                                accumulator = gradient_accumulators[
-                                    parameter_index]
+                                accumulator = gradient_accumulators[parameter_index]
                                 if accumulator is None:
-                                    gradient_accumulators[
-                                        parameter_index] = gradient.detach()
+                                    gradient_accumulators[parameter_index] = gradient.detach()
                                 else:
                                     accumulator.add_(gradient)
                                 parameter.grad = None
                         for key in metric_keys:
                             totals[key] += result[0][key]
                         max_ratio = max(max_ratio, result[1])
-                        max_prefix_ratio = max(
-                            max_prefix_ratio, result[2])
+                        max_prefix_ratio = max(max_prefix_ratio, result[2])
                         entropy_examples += result[3]
 
                     model.zero_grad(set_to_none=True)
                     quarantined_examples += len(quarantined)
                     backward_batches += len(effective_batches)
-                    trained_examples += sum(
-                        len(batch) for batch in effective_batches)
+                    trained_examples += sum(len(batch) for batch in effective_batches)
 
                     successful_padded_tokens = max(
-                        (self._padded_token_count(batch)
-                         for batch in effective_batches),
+                        (self._padded_token_count(batch) for batch in effective_batches),
                         default=0)
                     longest_successful = max(
-                        (int(example["prompt_ids"].shape[1]
-                             + example["response_ids"].shape[1])
+                        (int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1])
                          for batch in effective_batches
                          for example in batch),
                         default=1)
-                    backed_off = bool(
-                        len(effective_batches) > 1 or quarantined)
+                    backed_off = bool(len(effective_batches) > 1 or quarantined)
                     if not effective_batches:
                         budget = max(1, budget // 2)
                     elif backed_off:
-                        budget = max(
-                            longest_successful,
-                            min(budget, successful_padded_tokens))
+                        budget = max(longest_successful, min(budget, successful_padded_tokens))
                     else:
-                        active_bytes = max(
-                            1, peak_allocated - base_allocated)
-                        target_process_bytes = max(
-                            base_allocated + 1,
-                            int(0.80 * int(total_bytes)) - external_bytes)
-                        available_for_batch = max(
-                            1, target_process_bytes - base_allocated)
-                        desired_budget = int(
-                            requested_padded_tokens
-                            * available_for_batch / active_bytes * 0.96)
-                        lower = max(
-                            longest_successful, int(budget * 0.70))
+                        active_bytes = max(1, peak_allocated - base_allocated)
+                        target_process_bytes = max(base_allocated + 1, int(0.80 * int(total_bytes)) - external_bytes)
+                        available_for_batch = max(1, target_process_bytes - base_allocated)
+                        desired_budget = int(requested_padded_tokens * available_for_batch / active_bytes * 0.96)
+                        lower = max(longest_successful, int(budget * 0.70))
                         upper = max(lower, int(budget * 1.35))
-                        desired_budget = min(
-                            upper, max(lower, desired_budget))
-                        budget = max(
-                            longest_successful,
-                            int(round(0.5 * budget
-                                      + 0.5 * desired_budget)))
+                        desired_budget = min(upper, max(lower, desired_budget))
+                        budget = max(longest_successful, int(round(0.5 * budget + 0.5 * desired_budget)))
                     budgets[replica_index] = budget
 
                 del local_batch, effective_batches, quarantined
 
             with torch.cuda.device(logical_id), torch.no_grad():
-                for parameter, accumulator in zip(
-                        parameters, gradient_accumulators):
+                for parameter, accumulator in zip(parameters, gradient_accumulators):
                     parameter.grad = accumulator
                 torch.cuda.synchronize(logical_id)
 
@@ -5831,17 +5223,11 @@ class ReplicatedDataParallelTrainer:
             }
 
         results = self._run_replicas(work, range(self.world_size))
-        totals = {
-            key: sum(result["totals"][key] for result in results)
-            for key in metric_keys
-        }
+        totals = {key: sum(result["totals"][key] for result in results) for key in metric_keys}
         max_ratio = max(result["max_ratio"] for result in results)
-        max_prefix_ratio = max(
-            result["max_prefix_ratio"] for result in results)
-        entropy_examples = sum(
-            result["entropy_examples"] for result in results)
-        quarantined_examples = sum(
-            result["quarantined_examples"] for result in results)
+        max_prefix_ratio = max(result["max_prefix_ratio"] for result in results)
+        entropy_examples = sum(result["entropy_examples"] for result in results)
+        quarantined_examples = sum(result["quarantined_examples"] for result in results)
         grad_norm = self._clip_step_and_sync(cfg)
         history = [{
             "epoch": 1, **totals, "ratio_max": max_ratio,
@@ -5850,13 +5236,9 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
             "grad_norm": grad_norm,
         }]
-        trained_per_gpu = [
-            result["trained_examples"] for result in results]
-        batches_per_gpu = [
-            result["backward_batches"] for result in results]
-        peak_percentages = [
-            round(100.0 * result["peak_memory_fraction"], 1)
-            for result in results]
+        trained_per_gpu = [result["trained_examples"] for result in results]
+        batches_per_gpu = [result["backward_batches"] for result in results]
+        peak_percentages = [round(100.0 * result["peak_memory_fraction"], 1) for result in results]
         print(f"[train-fast] trained examples/GPU={trained_per_gpu}; "
               f"backward batches/GPU={batches_per_gpu}; final padded-token "
               f"budgets/GPU={list(budgets)}; peak memory/GPU="
@@ -5876,43 +5258,31 @@ class ReplicatedDataParallelTrainer:
             "fast_trained_examples_per_gpu": trained_per_gpu,
             "fast_backward_batches_per_gpu": batches_per_gpu,
             "fast_padded_token_budgets": list(budgets),
-            "fast_peak_memory_fraction": [
-                result["peak_memory_fraction"] for result in results],
+            "fast_peak_memory_fraction": [result["peak_memory_fraction"] for result in results],
             "oom_quarantined_examples": quarantined_examples,
         }
 
     def train_spo_rs(self, examples, cfg, step_idx):
         if bool(getattr(cfg, "fast", False)):
-            return self._train_spo_rs_fast(
-                examples, cfg, step_idx)
+            return self._train_spo_rs_fast(examples, cfg, step_idx)
 
         import torch
 
         started = time.time()
         if self._offloaded:
-            print(f"[train-parallel] restoring {self.world_size} trainer "
-                  "replicas for the update", flush=True)
+            print(f'[train-parallel] restoring {self.world_size} trainer replicas for the update', flush=True)
             self.restore_after_generation()
-        epochs = int(getattr(cfg, "spo_rs_update_epochs",
-                             SPO_RS_UPDATE_EPOCHS_DEFAULT))
-        epsilon, epsilon_low, epsilon_high, kl_coef = (
-            _clipped_policy_options(cfg))
+        epochs = int(getattr(cfg, "spo_rs_update_epochs", SPO_RS_UPDATE_EPOCHS_DEFAULT))
+        epsilon, epsilon_low, epsilon_high, kl_coef = (_clipped_policy_options(cfg))
         local_shards = self._prepare_shards(examples)
-        update_batches = [
-            _training_microbatches(shard, cfg)
-            for shard in local_shards
-        ]
-        largest_batch = max(
-            (len(batch) for batches in update_batches for batch in batches),
-            default=0)
+        update_batches = [_training_microbatches(shard, cfg) for shard in local_shards]
+        largest_batch = max((len(batch) for batches in update_batches for batch in batches), default=0)
         print(f"[train-parallel] LoRA microbatches/GPU="
               f"{[len(batches) for batches in update_batches]}; "
               f"configured max={int(cfg.train_examples_per_microbatch)}, "
               f"effective max={largest_batch}, "
               f"padded-token cap={int(cfg.max_seq_length)}", flush=True)
-        supplied_old = sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in examples)
+        supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in examples)
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
@@ -5925,8 +5295,7 @@ class ReplicatedDataParallelTrainer:
             backend, model, tokenizer, logical_id = self.replicas[replica_index]
             backend.set_training_mode()
             with torch.cuda.device(logical_id), _policy_dropout_disabled(model):
-                missing_old = (
-                    _initialize_behavior_logprobs(shard))
+                missing_old = (_initialize_behavior_logprobs(shard))
                 # vLLM normally fills these caches. Singleton fallback keeps a
                 # rare incomplete payload from destabilizing all eight replicas.
                 for batch in ([example] for example in missing_old):
@@ -5934,16 +5303,13 @@ class ReplicatedDataParallelTrainer:
                         model, batch, with_grad=False,
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id)
-                    if any(not torch.isfinite(value).all()
-                           for value in old_logprobs):
-                        raise FloatingPointError(
-                            "nonfinite old-policy logprobs")
+                    if any(not torch.isfinite(value).all() for value in old_logprobs):
+                        raise FloatingPointError("nonfinite old-policy logprobs")
                     for example, old_lp in zip(batch, old_logprobs):
                         example["old_policy_logprobs"] = old_lp.detach()
                 torch.cuda.synchronize(logical_id)
 
-        self._run_replicas(
-            cache, list(enumerate(local_shards)))
+        self._run_replicas(cache, list(enumerate(local_shards)))
         history = []
         for epoch in range(epochs):
             self._zero_gradients()
@@ -5967,8 +5333,7 @@ class ReplicatedDataParallelTrainer:
                                 measure_entropy=(epoch == 0))
                             current_logprobs = result
                             weighted_losses = []
-                            for example, current_lp in zip(
-                                    batch, current_logprobs):
+                            for example, current_lp in zip(batch, current_logprobs):
                                 loss, metrics = clipped_policy_loss(
                                     cfg, current_lp,
                                     example["old_policy_logprobs"],
@@ -5980,33 +5345,24 @@ class ReplicatedDataParallelTrainer:
                                     kl_coef=kl_coef)
                                 weight = float(example["sample_weight"])
                                 if not torch.isfinite(loss).all():
-                                    raise FloatingPointError(
-                                        "nonfinite SPO-RS loss")
+                                    raise FloatingPointError("nonfinite SPO-RS loss")
                                 weighted_losses.append(weight * loss)
-                                totals["loss"] += (
-                                    weight * float(loss.detach().item()))
+                                totals["loss"] += (weight * float(loss.detach().item()))
                                 for key in ("policy_loss", "kl_estimate",
                                             "entropy_estimate", "ratio"):
                                     totals[key] += weight * metrics[key]
-                                totals["clipped_fraction"] += (
-                                    weight * float(metrics["clipped"]))
-                                max_ratio = max(
-                                    max_ratio, metrics["ratio"])
-                                max_prefix_ratio = max(
-                                    max_prefix_ratio,
-                                    metrics["prefix_ratio_max"])
+                                totals["clipped_fraction"] += (weight * float(metrics["clipped"]))
+                                max_ratio = max(max_ratio, metrics["ratio"])
+                                max_prefix_ratio = max(max_prefix_ratio, metrics["prefix_ratio_max"])
                             if weighted_losses:
-                                sum(weighted_losses[1:],
-                                    weighted_losses[0]).backward()
+                                sum(weighted_losses[1:], weighted_losses[0]).backward()
                     torch.cuda.synchronize(logical_id)
                     return (totals, max_ratio, max_prefix_ratio,
                             entropy_examples)
 
                 with torch.cuda.device(logical_id):
                     result, _effective, quarantined = (
-                        _run_oom_resilient_backward(
-                            model, batches, attempt,
-                            device_label=f"cuda:{logical_id}"))
+                        _run_oom_resilient_backward(model, batches, attempt, device_label=f"cuda:{logical_id}"))
                 if result is None:
                     result = (
                         {key: 0.0 for key in (
@@ -6017,10 +5373,8 @@ class ReplicatedDataParallelTrainer:
                     )
                 return (*result, len(quarantined))
 
-            results = self._run_replicas(
-                accumulate, list(enumerate(update_batches)))
-            totals = {key: sum(result[0][key] for result in results)
-                      for key in results[0][0]}
+            results = self._run_replicas(accumulate, list(enumerate(update_batches)))
+            totals = {key: sum(result[0][key] for result in results) for key in results[0][0]}
             max_ratio = max(result[1] for result in results)
             max_prefix_ratio = max(result[2] for result in results)
             entropy_examples = sum(result[3] for result in results)
@@ -6046,8 +5400,7 @@ class ReplicatedDataParallelTrainer:
             "policy_updates": history,
             "training_seconds": time.time() - started,
             "training_parallel_gpus": self.world_size,
-            "oom_quarantined_examples": sum(
-                item["oom_quarantined_examples"] for item in history),
+            "oom_quarantined_examples": sum(item["oom_quarantined_examples"] for item in history),
         }
 
     def train_policy(self, examples, cfg, step_idx):
@@ -6055,17 +5408,12 @@ class ReplicatedDataParallelTrainer:
 
         started = time.time()
         if self._offloaded:
-            print(f"[train-parallel] restoring {self.world_size} trainer "
-                  "replicas for the update", flush=True)
+            print(f'[train-parallel] restoring {self.world_size} trainer replicas for the update', flush=True)
             self.restore_after_generation()
         local_shards = self._prepare_shards(examples)
         n_examples = len(examples)
-        microbatches = [
-            _training_microbatches(shard, cfg) for shard in local_shards
-        ]
-        largest_batch = max(
-            (len(batch) for batches in microbatches for batch in batches),
-            default=0)
+        microbatches = [_training_microbatches(shard, cfg) for shard in local_shards]
+        largest_batch = max((len(batch) for batches in microbatches for batch in batches), default=0)
         print(f"[train-parallel] LoRA microbatches/GPU="
               f"{[len(batches) for batches in microbatches]}; "
               f"configured max={int(cfg.train_examples_per_microbatch)}, "
@@ -6086,13 +5434,9 @@ class ReplicatedDataParallelTrainer:
                 ratio_count = 0
                 kl_error = None
                 for batch in active_batches:
-                    base_logprobs = [
-                        example.get("reference_logprobs")
-                        for example in batch
-                    ]
+                    base_logprobs = [example.get("reference_logprobs") for example in batch]
                     supplied_reference = all(
-                        _valid_example_token_logprobs(
-                            example, "reference_logprobs")
+                        _valid_example_token_logprobs(example, "reference_logprobs")
                         for example in batch)
                     if not supplied_reference:
                         try:
@@ -6111,18 +5455,15 @@ class ReplicatedDataParallelTrainer:
                         chunk=cfg.logprob_chunk,
                         pad_token_id=tokenizer.pad_token_id)
                     batch_losses = []
-                    for example, current_lp, base_lp in zip(
-                            batch, current_logprobs, base_logprobs):
+                    for example, current_lp, base_lp in zip(batch, current_logprobs, base_logprobs):
                         base_lp = base_lp.to(current_lp.device)
                         advantage = example["advantage"]
                         logp_difference = (current_lp - base_lp).detach()
                         average_difference = logp_difference.mean()
-                        kl_advantage = cfg.kl_penalty_coef * (
-                            average_difference - (current_lp - base_lp))
+                        kl_advantage = cfg.kl_penalty_coef * (average_difference - (current_lp - base_lp))
                         effective_advantage = advantage + kl_advantage
                         behavior_lp = example.get("behavior_logprobs")
-                        has_behavior = _valid_example_token_logprobs(
-                            example, "behavior_logprobs")
+                        has_behavior = _valid_example_token_logprobs(example, "behavior_logprobs")
                         if sequence_policy:
                             loss, policy_metrics = (
                                 _a3b_sequence_clipped_standard_loss(
@@ -6131,29 +5472,18 @@ class ReplicatedDataParallelTrainer:
                                     base_lp, advantage))
                             importance_ratio = policy_metrics["ratio"]
                         elif has_behavior:
-                            importance_ratio = (
-                                _detached_behavior_importance_ratio(
-                                    cfg, current_lp, behavior_lp))
-                            loss = -(
-                                importance_ratio
-                                * effective_advantage.detach()
-                                * current_lp).mean()
+                            importance_ratio = (_detached_behavior_importance_ratio(cfg, current_lp, behavior_lp))
+                            loss = -(importance_ratio * effective_advantage.detach() * current_lp).mean()
                         else:
                             importance_ratio = 1.0
-                            loss = -(
-                                effective_advantage.detach()
-                                * current_lp).mean()
+                            loss = -(effective_advantage.detach() * current_lp).mean()
                         if has_behavior:
-                            ratio_sum += float(
-                                importance_ratio.mean().item())
-                            ratio_max = max(
-                                ratio_max,
-                                float(importance_ratio.max().item()))
+                            ratio_sum += float(importance_ratio.mean().item())
+                            ratio_max = max(ratio_max, float(importance_ratio.max().item()))
                             ratio_count += 1
                         batch_losses.append(loss / n_examples)
                         total_loss += float(loss.detach().item())
-                        total_logp_delta += float(
-                            logp_difference.mean().item())
+                        total_logp_delta += float(logp_difference.mean().item())
                     if batch_losses:
                         sum(batch_losses[1:], batch_losses[0]).backward()
                 torch.cuda.synchronize(logical_id)
@@ -6162,15 +5492,12 @@ class ReplicatedDataParallelTrainer:
 
             with torch.cuda.device(logical_id):
                 result, _effective, quarantined = (
-                    _run_oom_resilient_backward(
-                        model, batches, attempt,
-                        device_label=f"cuda:{logical_id}"))
+                    _run_oom_resilient_backward(model, batches, attempt, device_label=f"cuda:{logical_id}"))
             if result is None:
                 result = (0.0, 0.0, 0.0, 0.0, 0, None)
             return (*result, len(quarantined))
 
-        results = self._run_replicas(
-            accumulate, list(enumerate(microbatches)))
+        results = self._run_replicas(accumulate, list(enumerate(microbatches)))
         grad_norm = self._clip_step_and_sync(cfg)
         total_loss = sum(result[0] for result in results)
         total_logp_delta = sum(result[1] for result in results)
@@ -6185,8 +5512,7 @@ class ReplicatedDataParallelTrainer:
         elapsed = time.time() - started
         ratio_message = ""
         if ratio_count:
-            ratio_message = (f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
-                             f"max={ratio_max:.3f}")
+            ratio_message = (f'  IS ratio mean={ratio_sum / ratio_count:.9f} max={ratio_max:.3f}')
         print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
               f"avg loss: {total_loss / n_examples:.9f}  "
               f"avg logpi_theta - logpi_base: "
@@ -6230,7 +5556,7 @@ class ReplicatedDataParallelTrainer:
             return
         import gc
         import torch
-        from host_memory import reclaim_unused_host_memory
+        from runtime.host_memory import reclaim_unused_host_memory
         gc.collect()
 
         def restore(replica):
@@ -6244,8 +5570,7 @@ class ReplicatedDataParallelTrainer:
         self._run_replicas(restore, self.replicas)
         self._validate_replica_devices()
         _restore_optimizer_state_to_parameters(self.optimizer)
-        reclaim_unused_host_memory(
-            torch, cuda_devices=tuple(range(self.world_size)), force=True)
+        reclaim_unused_host_memory(torch, cuda_devices=tuple(range(self.world_size)), force=True)
         self._offloaded = False
 
 
@@ -6260,7 +5585,7 @@ class ProcessDistributedTrainer:
         import torch
         import torch.distributed as dist
         import torch.multiprocessing as mp
-        from fast_distributed import (
+        from training.fast_distributed import (
             broadcast_trainable_parameters, set_total_memory_ceiling,
             trainable_parameter_signature, validate_model_device, worker_main,
         )
@@ -6275,8 +5600,7 @@ class ProcessDistributedTrainer:
         self.optimizer = optimizer
         self.cfg = cfg
         self._exp_dir = Path(exp_dir).resolve()
-        self._process_label = (
-            "train-fast" if bool(cfg.fast) else "train-process")
+        self._process_label = ("train-fast" if bool(cfg.fast) else "train-process")
         self._offloaded = False
         self._offloaded_ranks = set()
         self._closed = False
@@ -6292,42 +5616,32 @@ class ProcessDistributedTrainer:
         self._processes = {}
         self._physical_ids = _parse_gpu_ids(cfg.training_gpu_ids)
         self._world_size = int(cfg.num_training_gpus)
-        self._memory_fraction = float(
-            getattr(cfg, "training_memory_fraction", 0.80))
-        self._memory_percentage = round(
-            100.0 * self._memory_fraction, 1)
-        self._token_budgets = [
-            max(1, int(cfg.max_seq_length))
-            for _ in range(self._world_size)
-        ]
+        self._memory_fraction = float(getattr(cfg, "training_memory_fraction", 0.80))
+        self._memory_percentage = round(100.0 * self._memory_fraction, 1)
+        self._token_budgets = [max(1, int(cfg.max_seq_length)) for _ in range(self._world_size)]
         if self._world_size != len(self._physical_ids):
-            raise ValueError(
-                "num_training_gpus does not match training_gpu_ids")
+            raise ValueError("num_training_gpus does not match training_gpu_ids")
         if self._world_size < 2:
             raise ValueError("process-distributed training requires two GPUs")
 
-        from host_memory import (
+        from runtime.host_memory import (
             GIB, TokenWeightedActivationOffloadGate,
             automatic_activation_offload_budget_bytes,
         )
-        self._activation_offload_budget_bytes = (
-            automatic_activation_offload_budget_bytes())
+        self._activation_offload_budget_bytes = (automatic_activation_offload_budget_bytes())
         self._activation_offload_semaphore = (
             TokenWeightedActivationOffloadGate(
                 self._context,
                 self._activation_offload_budget_bytes,
                 max(1, int(cfg.max_seq_length)),
             ))
-        self._activation_offload_slots = (
-            self._activation_offload_semaphore.full_context_concurrency)
-        self._activation_offload_budget_gib = (
-            self._activation_offload_budget_bytes / GIB)
+        self._activation_offload_slots = (self._activation_offload_semaphore.full_context_concurrency)
+        self._activation_offload_budget_gib = (self._activation_offload_budget_bytes / GIB)
 
         # Eight independent Python processes must not each create a full-sized
         # host thread pool. GPU 0 was loaded before this class is constructed;
         # the allocator limit still constrains every subsequent allocation.
-        torch.set_num_threads(max(
-            1, int(os.cpu_count() or self._world_size) // self._world_size))
+        torch.set_num_threads(max(1, int(os.cpu_count() or self._world_size) // self._world_size))
         torch.cuda.set_device(0)
         set_total_memory_ceiling(0, self._memory_fraction)
         validate_model_device(self.model, 0)
@@ -6336,14 +5650,11 @@ class ProcessDistributedTrainer:
 
         sync_dir = Path(exp_dir).resolve() / ".fast_trainer"
         sync_dir.mkdir(parents=True, exist_ok=True)
-        rendezvous_path = sync_dir / (
-            f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
+        rendezvous_path = sync_dir / (f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
         self._init_method = rendezvous_path.as_uri()
         cfg_dict = dict(vars(cfg))
-        cfg_dict["_terminal_log_path"] = str(
-            Path(exp_dir).resolve() / "temirnal.log")
-        cfg_dict["_setting_log_path"] = str(
-            Path(exp_dir).resolve() / "setting.log")
+        cfg_dict["_terminal_log_path"] = str(Path(exp_dir).resolve() / "temirnal.log")
+        cfg_dict["_setting_log_path"] = str(Path(exp_dir).resolve() / "setting.log")
         cfg_dict["_log_time_offset_seconds"] = _LOG_TIME_OFFSET_SECONDS
 
         setting_log_only(
@@ -6371,9 +5682,7 @@ class ProcessDistributedTrainer:
                 self._processes[rank] = process
                 message = self._collect_event("loaded", [rank])[rank]
                 if message.get("parameter_signature") != expected_signature:
-                    raise RuntimeError(
-                        f"fast trainer rank {rank} has a different trainable "
-                        "parameter layout")
+                    raise RuntimeError(f'fast trainer rank {rank} has a different trainable parameter layout')
                 print(f"[{self._process_label}] trainer replica {rank + 1}/"
                       f"{self._world_size} loaded on logical GPU {rank}",
                       flush=True)
@@ -6422,18 +5731,14 @@ class ProcessDistributedTrainer:
 
     def estimated_host_offload_bytes(self):
         """RAM required to move every live trainer replica off its GPU."""
-        from host_memory import (GIB, estimated_module_bytes,
-                                 estimated_optimizer_bytes)
+        from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
 
         model_bytes = estimated_module_bytes(self.model)
         optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
         # All worker models have the same storage layout as rank zero.  The
         # optimizer exists only on rank zero; workers retain gradients/model
         # state but do not construct duplicate Adam state.
-        return int(
-            1.05 * (model_bytes * self._world_size + optimizer_bytes)
-            + self._world_size * GIB
-        )
+        return int(1.05 * (model_bytes * self._world_size + optimizer_bytes) + self._world_size * GIB)
 
     @property
     def host_memory_admission(self):
@@ -6442,30 +5747,20 @@ class ProcessDistributedTrainer:
     def reclaim_host_memory(self):
         """Synchronize every trainer process and free unused host caches."""
         import torch
-        from host_memory import reclaim_unused_host_memory
+        from runtime.host_memory import reclaim_unused_host_memory
 
         if not self._workers_idle:
-            raise RuntimeError(
-                "cannot reclaim trainer host caches while an update is active")
+            raise RuntimeError("cannot reclaim trainer host caches while an update is active")
         for command_queue in self._command_queues.values():
             command_queue.put({"kind": "purge_host_memory"})
         with torch.cuda.device(0):
             torch.cuda.synchronize(0)
-        local_cleanup = reclaim_unused_host_memory(
-            torch, cuda_devices=(0,), force=True)
-        child_messages = self._collect_event(
-            "host_memory_purged", range(1, self._world_size))
-        return [local_cleanup] + [
-            child_messages[rank]["cleanup"]
-            for rank in range(1, self._world_size)
-        ]
+        local_cleanup = reclaim_unused_host_memory(torch, cuda_devices=(0,), force=True)
+        child_messages = self._collect_event("host_memory_purged", range(1, self._world_size))
+        return [local_cleanup] + [child_messages[rank]["cleanup"] for rank in range(1, self._world_size)]
 
     def _dead_workers(self, pending):
-        return [
-            rank for rank in pending
-            if rank in self._processes
-            and not self._processes[rank].is_alive()
-        ]
+        return [rank for rank in pending if rank in self._processes and not self._processes[rank].is_alive()]
 
     def _collect_event(self, event, ranks):
         pending = set(int(rank) for rank in ranks)
@@ -6476,12 +5771,8 @@ class ProcessDistributedTrainer:
             except self._queue_module.Empty:
                 dead = self._dead_workers(pending)
                 if dead:
-                    codes = {
-                        rank: self._processes[rank].exitcode for rank in dead
-                    }
-                    raise RuntimeError(
-                        f"fast trainer worker(s) exited while waiting for "
-                        f"{event}: {codes}")
+                    codes = {rank: self._processes[rank].exitcode for rank in dead}
+                    raise RuntimeError(f'fast trainer worker(s) exited while waiting for {event}: {codes}')
                 continue
             message_event = message.get("event")
             rank = int(message.get("rank", -1))
@@ -6492,13 +5783,9 @@ class ProcessDistributedTrainer:
                         f"fast trainer rank {rank} exhausted exact "
                         "single-GPU long-context fallbacks:\n"
                         f"{traceback_text}")
-                raise RuntimeError(
-                    f"fast trainer rank {rank} failed:\n"
-                    f"{traceback_text}")
+                raise RuntimeError(f'fast trainer rank {rank} failed:\n{traceback_text}')
             if message_event != event or rank not in pending:
-                raise RuntimeError(
-                    f"unexpected fast trainer message while waiting for "
-                    f"{event}: {message}")
+                raise RuntimeError(f'unexpected fast trainer message while waiting for {event}: {message}')
             pending.remove(rank)
             results[rank] = message
         return results
@@ -6522,9 +5809,7 @@ class ProcessDistributedTrainer:
             copied_examples.append(copied)
         return copied_examples
 
-    def _queue_examples(
-            self, examples, *, seal=True, announce=True,
-            weighted_offload=False):
+    def _queue_examples(self, examples, *, seal=True, announce=True, weighted_offload=False):
         """Queue expensive examples first; idle ranks steal the next work."""
         import torch
 
@@ -6541,8 +5826,7 @@ class ProcessDistributedTrainer:
         if overflow_floor is not None:
             for example in copied:
                 example["_cooperative_overflow"] = bool(
-                    int(example["prompt_ids"].shape[1]
-                        + example["response_ids"].shape[1]) >= overflow_floor)
+                    int(example["prompt_ids"].shape[1] + example["response_ids"].shape[1]) >= overflow_floor)
         # Packing response branches behind one shared prompt is exact for
         # ordinary transformer attention because the registered branch mask
         # isolates every response.  It is not valid for GPT-OSS (learned
@@ -6550,36 +5834,28 @@ class ProcessDistributedTrainer:
         # Qwen3.8's recurrent Gated-DeltaNet layers, whose state cannot be
         # reset by an attention mask.  Keep those profiles as independent
         # batch rows throughout scheduling and scoring.
-        shared_prefix_packing = str(getattr(
-            self.cfg, "coder_model_profile", "")) not in {
+        shared_prefix_packing = str(getattr(self.cfg, "coder_model_profile", "")) not in {
                 "gpt-oss-120b", "qwen3.8-27b",
             }
         for example in copied:
             example["_shared_prefix_packing_allowed"] = shared_prefix_packing
 
-        if (bool(getattr(self.cfg, "strategies", False))
-                and shared_prefix_packing):
-            from fast_distributed import SHARED_PREFIX_WORK_KEY
+        if (bool(getattr(self.cfg, "strategies", False)) and shared_prefix_packing):
+            from training.fast_distributed import SHARED_PREFIX_WORK_KEY
 
             grouped = {}
             for example in copied:
                 prompt_job_id = example.get("prompt_job_id")
                 if prompt_job_id is None:
-                    raise RuntimeError(
-                        "strategy training example has no prompt_job_id")
+                    raise RuntimeError("strategy training example has no prompt_job_id")
                 grouped.setdefault(int(prompt_job_id), []).append(example)
 
             def group_cost(group):
                 prompt = int(group[0]["prompt_ids"].shape[1])
-                responses = [
-                    int(example["response_ids"].shape[1])
-                    for example in group
-                ]
+                responses = [int(example["response_ids"].shape[1]) for example in group]
                 # The prompt is evaluated once. Each isolated response branch
                 # attends to that prompt and its own causal prefix.
-                return prompt * prompt + sum(
-                    response * (prompt + response)
-                    for response in responses)
+                return prompt * prompt + sum(response * (prompt + response) for response in responses)
 
             groups = []
             for prompt_job_id, group in grouped.items():
@@ -6588,15 +5864,10 @@ class ProcessDistributedTrainer:
                         example["prompt_ids"].shape != prompt.shape
                         or not torch.equal(example["prompt_ids"], prompt)
                         for example in group[1:]):
-                    raise RuntimeError(
-                        "one strategy prompt_job_id contains different prompts: "
-                        f"{prompt_job_id}")
+                    raise RuntimeError(f'one strategy prompt_job_id contains different prompts: {prompt_job_id}')
                 # Longest branches first makes any budget-driven split stable
                 # and avoids leaving one pathological response until last.
-                group.sort(
-                    key=lambda example: int(
-                        example["response_ids"].shape[1]),
-                    reverse=True)
+                group.sort(key=lambda example: int(example["response_ids"].shape[1]), reverse=True)
                 groups.append(group)
             groups.sort(key=group_cost, reverse=True)
             for group in groups:
@@ -6622,8 +5893,7 @@ class ProcessDistributedTrainer:
                 gate = self._activation_offload_semaphore
                 waves = []
                 for example in ordered:
-                    work = int(example["prompt_ids"].shape[1]) + int(
-                        example["response_ids"].shape[1])
+                    work = int(example["prompt_ids"].shape[1]) + int(example["response_ids"].shape[1])
                     units = gate.request_units(work)
                     if units is None:
                         waves.append({
@@ -6645,12 +5915,8 @@ class ProcessDistributedTrainer:
                             "units": int(units),
                             "items": [example],
                         })
-                ordered = [
-                    example for wave in waves for example in wave["items"]
-                ]
-                offload_waves = [
-                    len(wave["items"]) for wave in waves
-                ]
+                ordered = [example for wave in waves for example in wave["items"]]
+                offload_waves = [len(wave["items"]) for wave in waves]
             for example in ordered:
                 self._work_queue.put(example)
             if announce:
@@ -6659,8 +5925,7 @@ class ProcessDistributedTrainer:
                           "examples longest-first; each free GPU claims the "
                           "next adaptive batch", flush=True)
                 else:
-                    preview = ",".join(
-                        str(value) for value in offload_waves[:8])
+                    preview = ",".join(str(value) for value in offload_waves[:8])
                     suffix = "..." if len(offload_waves) > 8 else ""
                     print(
                         f"[{self._process_label}] queued {len(ordered)} "
@@ -6678,22 +5943,19 @@ class ProcessDistributedTrainer:
 
     def train_spo_rs(self, examples, cfg, step_idx):
         import torch
-        from fast_distributed import (broadcast_trainable_parameters,
+        from training.fast_distributed import (broadcast_trainable_parameters,
                                       local_spo_rs_update,
                                       reduce_trainable_gradients)
 
         if self._offloaded:
-            print(f"[train-fast] restoring {self._world_size} process "
-                  "trainers for the update", flush=True)
+            print(f'[train-fast] restoring {self._world_size} process trainers for the update', flush=True)
             self.restore_after_generation()
         if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("--fast requires one clipped-policy update epoch")
 
         started = time.time()
         queued_examples = self._queue_examples(examples)
-        supplied_old = sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in queued_examples)
+        supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
         print(f"[step {step_idx}] {cfg.advantage_mode} logprobs: "
               "vLLM supplied old="
               f"{supplied_old}/{len(examples)}, reference="
@@ -6705,8 +5967,7 @@ class ProcessDistributedTrainer:
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
-        defer_exact_oom = (
-            str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs")
+        defer_exact_oom = (str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs")
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
@@ -6722,15 +5983,10 @@ class ProcessDistributedTrainer:
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
-            activation_offload_semaphore=(
-                self._activation_offload_semaphore),
+            activation_offload_semaphore=(self._activation_offload_semaphore),
             defer_exact_oom=defer_exact_oom)
-        child_messages = self._collect_event(
-            "computed", range(1, self._world_size))
-        rank_stats = [local_stats] + [
-            child_messages[rank]["stats"]
-            for rank in range(1, self._world_size)
-        ]
+        child_messages = self._collect_event("computed", range(1, self._world_size))
+        rank_stats = [local_stats] + [child_messages[rank]["stats"] for rank in range(1, self._world_size)]
         accounted_examples = sum(
             int(stats["trained_examples"])
             + int(stats["quarantined_examples"])
@@ -6750,17 +6006,14 @@ class ProcessDistributedTrainer:
         overflow_error = None
         grad_norm = None
         try:
-            deferred_examples = sum(
-                int(stats.get("deferred_examples", 0))
-                for stats in rank_stats)
+            deferred_examples = sum(int(stats.get("deferred_examples", 0)) for stats in rank_stats)
             if deferred_examples:
                 gradient_path, marker, deferred_keys, _normal_stats = (
                     _save_exact_spo_rs_overflow(
                         self._exp_dir, step_idx, self.model, rank_stats,
                         normal_train_seconds=time.time() - started))
                 longest = max(
-                    (int(length) for stats in rank_stats
-                     for length in stats.get("deferred_token_lengths", ())),
+                    (int(length) for stats in rank_stats for length in stats.get("deferred_token_lengths", ())),
                     default=0)
                 print(
                     f"[train-overflow] step {step_idx}: retained exact "
@@ -6779,8 +6032,7 @@ class ProcessDistributedTrainer:
                     "overflow lane")
             else:
                 grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                    [parameter for parameter in self.model.parameters()
-                     if parameter.requires_grad],
+                    [parameter for parameter in self.model.parameters() if parameter.requires_grad],
                     max_norm=cfg.grad_clip, error_if_nonfinite=True)
                 self.optimizer.step()
                 grad_norm = float(grad_norm_tensor.item())
@@ -6794,7 +6046,7 @@ class ProcessDistributedTrainer:
         if update_error is not None:
             raise update_error
         if overflow_error is not None:
-            from exact_overflow import supports_warm_overflow, complete_warm_overflow
+            from training.exact_overflow import supports_warm_overflow, complete_warm_overflow
             if supports_warm_overflow(cfg):
                 return complete_warm_overflow(
                     self, queued_examples, cfg, step_idx,
@@ -6802,35 +6054,22 @@ class ProcessDistributedTrainer:
             raise overflow_error
 
         for rank, stats in enumerate(rank_stats):
-            self._token_budgets[rank] = max(
-                1, int(stats["token_budget"]))
+            self._token_budgets[rank] = max(1, int(stats["token_budget"]))
         metric_keys = (
             "loss", "policy_loss", "kl_estimate", "entropy_estimate",
             "ratio", "clipped_fraction",
         )
-        totals = {
-            key: sum(stats["totals"][key] for stats in rank_stats)
-            for key in metric_keys
-        }
+        totals = {key: sum(stats["totals"][key] for stats in rank_stats) for key in metric_keys}
         max_ratio = max(stats["max_ratio"] for stats in rank_stats)
-        max_prefix_ratio = max(
-            stats["max_prefix_ratio"] for stats in rank_stats)
-        entropy_examples = sum(
-            stats["entropy_examples"] for stats in rank_stats)
-        quarantined_examples = sum(
-            stats["quarantined_examples"] for stats in rank_stats)
-        trained_per_gpu = [
-            stats["trained_examples"] for stats in rank_stats]
-        batches_per_gpu = [
-            stats["backward_batches"] for stats in rank_stats]
-        peak_fractions = [
-            stats["peak_memory_fraction"] for stats in rank_stats]
-        allocator_fractions = [
-            stats["allocator_memory_fraction"] for stats in rank_stats]
-        peak_percentages = [
-            round(100.0 * fraction, 1) for fraction in peak_fractions]
-        allocator_percentages = [
-            round(100.0 * fraction, 1) for fraction in allocator_fractions]
+        max_prefix_ratio = max(stats["max_prefix_ratio"] for stats in rank_stats)
+        entropy_examples = sum(stats["entropy_examples"] for stats in rank_stats)
+        quarantined_examples = sum(stats["quarantined_examples"] for stats in rank_stats)
+        trained_per_gpu = [stats["trained_examples"] for stats in rank_stats]
+        batches_per_gpu = [stats["backward_batches"] for stats in rank_stats]
+        peak_fractions = [stats["peak_memory_fraction"] for stats in rank_stats]
+        allocator_fractions = [stats["allocator_memory_fraction"] for stats in rank_stats]
+        peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         history = [{
             "epoch": 1, **totals, "ratio_max": max_ratio,
             "prefix_ratio_max": max_prefix_ratio,
@@ -6864,8 +6103,7 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def recover_spo_rs_overflow(
-            self, examples, cfg, step_idx, overflow_state):
+    def recover_spo_rs_overflow(self, examples, cfg, step_idx, overflow_state):
         """Finish saved SPO-RS overflow without replaying completed gradients.
 
         Older Qwen checkpoints first try grouped checkpointing on every GPU
@@ -6878,21 +6116,19 @@ class ProcessDistributedTrainer:
         merged into the durable checkpoint. Only a trajectory that also fails
         that bounded fallback is left for the final model-sharded lane.
         """
-        from exact_overflow import supports_warm_overflow, complete_warm_overflow
+        from training.exact_overflow import supports_warm_overflow, complete_warm_overflow
         grouped_recovery = bool(
             overflow_state is not None
             and overflow_state.get("remaining_keys")
             and not overflow_state.get("replica_checkpoint_groups_attempted", False)
-            and any(hasattr(module, "_ttt_group_checkpoint_min_tokens")
-                    for module in self.model.modules()))
-        from context_parallel import availability as context_parallel_availability
+            and any(hasattr(module, "_ttt_group_checkpoint_min_tokens") for module in self.model.modules()))
+        from training.context_parallel import availability as context_parallel_availability
         context_supported, _ = context_parallel_availability(self.model, cfg, self._world_size)
         if supports_warm_overflow(cfg) and (context_supported or not grouped_recovery):
-            return complete_warm_overflow(
-                self, examples, cfg, step_idx, overflow_state)
+            return complete_warm_overflow(self, examples, cfg, step_idx, overflow_state)
 
         import torch
-        from fast_distributed import (
+        from training.fast_distributed import (
             broadcast_trainable_parameters, local_spo_rs_update,
             reduce_trainable_gradients,
         )
@@ -6902,8 +6138,7 @@ class ProcessDistributedTrainer:
         if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("exact overflow recovery requires one update epoch")
         if self._closed or not self._workers_idle:
-            raise RuntimeError(
-                "process trainer is not idle for exact overflow recovery")
+            raise RuntimeError("process trainer is not idle for exact overflow recovery")
         if self._offloaded:
             print(
                 f"[{self._process_label}] restoring {self._world_size} "
@@ -6912,16 +6147,9 @@ class ProcessDistributedTrainer:
             )
             self.restore_after_generation()
 
-        _validate_precomputed_exact_gradients(
-            self.model, overflow_state, step_idx)
-        requested_keys = {
-            tuple(int(value) for value in example["_overlap_key"])
-            for example in examples
-        }
-        remaining_keys = {
-            tuple(int(value) for value in key)
-            for key in overflow_state.get("remaining_keys", ())
-        }
+        _validate_precomputed_exact_gradients(self.model, overflow_state, step_idx)
+        requested_keys = {tuple(int(value) for value in example["_overlap_key"]) for example in examples}
+        remaining_keys = {tuple(int(value) for value in key) for key in overflow_state.get("remaining_keys", ())}
         if not requested_keys or requested_keys != remaining_keys:
             raise RuntimeError(
                 "replicated exact-overflow inputs do not match the durable "
@@ -6938,8 +6166,7 @@ class ProcessDistributedTrainer:
             self.__dict__.pop("_warm_overflow_min_tokens", None)
             examples = [{key: value for key, value in item.items()
                          if key != "_cooperative_overflow"} for item in examples]
-        queued_examples = self._queue_examples(
-            examples, weighted_offload=not grouped_recovery)
+        queued_examples = self._queue_examples(examples, weighted_offload=not grouped_recovery)
         if grouped_recovery:
             print(f"[recovery] step {step_idx}: dispatching {len(queued_examples)} "
                   f"saved trajectories across all {self._world_size} GPU replicas "
@@ -6973,16 +6200,11 @@ class ProcessDistributedTrainer:
                 self._token_budgets[0],
                 memory_fraction=self._memory_fraction,
                 work_queue=self._work_queue,
-                activation_offload_semaphore=(
-                    self._activation_offload_semaphore),
+                activation_offload_semaphore=(self._activation_offload_semaphore),
                 defer_exact_oom=True,
             )
-            child_messages = self._collect_event(
-                "computed", range(1, self._world_size))
-            rank_stats = [local_stats] + [
-                child_messages[rank]["stats"]
-                for rank in range(1, self._world_size)
-            ]
+            child_messages = self._collect_event("computed", range(1, self._world_size))
+            rank_stats = [local_stats] + [child_messages[rank]["stats"] for rank in range(1, self._world_size)]
             accounted_examples = sum(
                 int(stats["trained_examples"])
                 + int(stats["quarantined_examples"])
@@ -7000,14 +6222,9 @@ class ProcessDistributedTrainer:
                 for stats in rank_stats
                 for key in stats.get("deferred_keys", ())
             }
-            deferred_count = sum(
-                int(stats.get("deferred_examples", 0))
-                for stats in rank_stats)
-            quarantined_count = sum(
-                int(stats["quarantined_examples"])
-                for stats in rank_stats)
-            trained_count = sum(
-                int(stats["trained_examples"]) for stats in rank_stats)
+            deferred_count = sum(int(stats.get("deferred_examples", 0)) for stats in rank_stats)
+            quarantined_count = sum(int(stats["quarantined_examples"]) for stats in rank_stats)
+            trained_count = sum(int(stats["trained_examples"]) for stats in rank_stats)
             if (deferred_count != len(deferred_keys)
                     or not deferred_keys.issubset(requested_keys)
                     or quarantined_count):
@@ -7028,20 +6245,11 @@ class ProcessDistributedTrainer:
                 "ratio", "clipped_fraction",
             )
             wave_stats = {
-                "totals": {
-                    key: sum(float(stats["totals"][key])
-                             for stats in rank_stats)
-                    for key in metric_keys
-                },
-                "max_ratio": max(
-                    float(stats["max_ratio"]) for stats in rank_stats),
-                "max_prefix_ratio": max(
-                    float(stats["max_prefix_ratio"])
-                    for stats in rank_stats),
-                "entropy_examples": sum(
-                    int(stats["entropy_examples"]) for stats in rank_stats),
-                "backward_batches": sum(
-                    int(stats["backward_batches"]) for stats in rank_stats),
+                "totals": {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in metric_keys},
+                "max_ratio": max(float(stats["max_ratio"]) for stats in rank_stats),
+                "max_prefix_ratio": max(float(stats["max_prefix_ratio"]) for stats in rank_stats),
+                "entropy_examples": sum(int(stats["entropy_examples"]) for stats in rank_stats),
+                "backward_batches": sum(int(stats["backward_batches"]) for stats in rank_stats),
             }
 
             # Workers reduce their local sums into rank 0, then wait at the
@@ -7070,16 +6278,12 @@ class ProcessDistributedTrainer:
                         overflow_state["replica_checkpoint_groups_attempted"] = True
                     overflow_state["replica_offload_exhausted"] = True
                     _write_exact_spo_rs_overflow_state(overflow_state)
-                    marker = _read_exact_sharded_recovery(
-                        self._exp_dir) or {}
+                    marker = _read_exact_sharded_recovery(self._exp_dir) or {}
                     _write_exact_sharded_recovery(
                         self._exp_dir, step_idx,
-                        marker.get(
-                            "reason",
-                            "bounded replicated overflow recovery exhausted"),
+                        marker.get("reason", "bounded replicated overflow recovery exhausted"),
                         replica_offload_exhausted=True,
-                        remaining_deferred_keys=[
-                            list(key) for key in sorted(deferred_keys)],
+                        remaining_deferred_keys=[list(key) for key in sorted(deferred_keys)],
                     )
                     overflow_error = ExactLongContextTrainingOOM(
                         f"step {step_idx} retained "
@@ -7087,11 +6291,9 @@ class ProcessDistributedTrainer:
                         f"but {len(deferred_keys)} trajectory/trajectories "
                         "still exceed bounded replica activation offload")
                 else:
-                    _apply_precomputed_exact_gradients(
-                        self.model, overflow_state, step_idx)
+                    _apply_precomputed_exact_gradients(self.model, overflow_state, step_idx)
                     grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                        [parameter for parameter in self.model.parameters()
-                         if parameter.requires_grad],
+                        [parameter for parameter in self.model.parameters() if parameter.requires_grad],
                         max_norm=cfg.grad_clip,
                         error_if_nonfinite=True,
                     )
@@ -7108,8 +6310,7 @@ class ProcessDistributedTrainer:
                 raise update_error
             if overflow_error is not None:
                 if grouped_recovery and supports_warm_overflow(cfg):
-                    return complete_warm_overflow(
-                        self, examples, cfg, step_idx, overflow_state)
+                    return complete_warm_overflow(self, examples, cfg, step_idx, overflow_state)
                 raise overflow_error
         except BaseException:
             if not self._workers_idle:
@@ -7117,21 +6318,16 @@ class ProcessDistributedTrainer:
             raise
 
         for rank, stats in enumerate(rank_stats):
-            self._token_budgets[rank] = max(
-                1, int(stats["token_budget"]))
+            self._token_budgets[rank] = max(1, int(stats["token_budget"]))
         normal_stats = overflow_state.get("normal_stats", {})
         overflow_stats = overflow_state.get("overflow_stats", {})
         normal_totals = normal_stats.get("totals", {})
         overflow_totals = overflow_stats.get("totals", {})
         totals = {
-            key: (float(normal_totals.get(key, 0.0))
-                  + float(overflow_totals.get(key, 0.0)))
+            key: (float(normal_totals.get(key, 0.0)) + float(overflow_totals.get(key, 0.0)))
             for key in metric_keys
         }
-        max_ratio = max(
-            float(normal_stats.get("max_ratio", 0.0)),
-            float(overflow_stats.get("max_ratio", 0.0)),
-        )
+        max_ratio = max(float(normal_stats.get("max_ratio", 0.0)), float(overflow_stats.get("max_ratio", 0.0)))
         max_prefix_ratio = max(
             float(normal_stats.get("max_prefix_ratio", 0.0)),
             float(overflow_stats.get("max_prefix_ratio", 0.0)),
@@ -7140,12 +6336,8 @@ class ProcessDistributedTrainer:
             int(normal_stats.get("entropy_examples", 0))
             + int(overflow_stats.get("entropy_examples", 0))
         )
-        trained_per_gpu = [
-            int(stats["trained_examples"]) for stats in rank_stats
-        ]
-        batches_per_gpu = [
-            int(stats["backward_batches"]) for stats in rank_stats
-        ]
+        trained_per_gpu = [int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
         history = [{
             "epoch": 1,
             **totals,
@@ -7184,31 +6376,27 @@ class ProcessDistributedTrainer:
             "fast_backward_batches_per_gpu": batches_per_gpu,
             "fast_padded_token_budgets": list(self._token_budgets),
             "oom_quarantined_examples": 0,
-            "exact_overflow_reused_examples": int(
-                normal_stats.get("trained_examples", 0))
+            "exact_overflow_reused_examples": int(normal_stats.get("trained_examples", 0))
                 + len(overflow_state.get("completed_keys", ()))
                 - len(successful_keys),
             "exact_overflow_replica_examples": len(successful_keys),
             "exact_overflow_sharded_examples": 0,
         }
 
-    def begin_entropic_overlap(self, cfg, step_idx,
-                               normalization_examples):
+    def begin_entropic_overlap(self, cfg, step_idx, normalization_examples):
         """Start a streaming entropic backward before CPU evaluation ends."""
         from concurrent.futures import ThreadPoolExecutor
-        from fast_distributed import local_policy_update
+        from training.fast_distributed import local_policy_update
 
         if str(getattr(cfg, "advantage_mode", "")).lower() != "entropic":
             raise ValueError("streaming policy overlap is entropic-only")
         if self._closed or not self._workers_idle:
-            raise RuntimeError(
-                "process trainer is not idle for an entropic overlap update")
+            raise RuntimeError("process trainer is not idle for an entropic overlap update")
         if self._entropic_overlap is not None:
             raise RuntimeError("an entropic overlap update is already active")
         normalization_examples = int(normalization_examples)
         if normalization_examples < 1:
-            raise ValueError(
-                "entropic overlap needs a positive normalization count")
+            raise ValueError("entropic overlap needs a positive normalization count")
         if self._offloaded:
             print(f"[{self._process_label}] restoring {self._world_size} "
                   "process trainers while CPU evaluation continues",
@@ -7232,9 +6420,7 @@ class ProcessDistributedTrainer:
                 "adaptive_batches": adaptive_batches,
             })
 
-        executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="entropic-rank0-overlap")
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="entropic-rank0-overlap")
         state = {
             "step_idx": int(step_idx),
             "started_at": time.time(),
@@ -7255,8 +6441,7 @@ class ProcessDistributedTrainer:
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
             adaptive_batches=adaptive_batches,
-            activation_offload_semaphore=(
-                self._activation_offload_semaphore))
+            activation_offload_semaphore=(self._activation_offload_semaphore))
         state["future"] = future
 
         def _record_completion(_future):
@@ -7271,17 +6456,13 @@ class ProcessDistributedTrainer:
         state = self._entropic_overlap
         if state is None or state["sealed"]:
             raise RuntimeError("entropic overlap queue is not open")
-        queued = self._queue_examples(
-            examples, seal=False, announce=False)
+        queued = self._queue_examples(examples, seal=False, announce=False)
         state["queued_examples"] += len(queued)
-        state["supplied_old"] += sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in queued)
+        state["supplied_old"] += sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued)
         state["supplied_reference"] += sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued)
-        state["scheduled_keys"].update(
-            example["_overlap_key"] for example in queued)
+        state["scheduled_keys"].update(example["_overlap_key"] for example in queued)
         return len(queued)
 
     def seal_entropic_overlap(self):
@@ -7294,12 +6475,10 @@ class ProcessDistributedTrainer:
                 self._work_queue.put(None)
             state["sealed"] = True
 
-    def finish_entropic_overlap(self, cfg, step_idx, expected_examples, *,
-                                apply_update=True):
+    def finish_entropic_overlap(self, cfg, step_idx, expected_examples, *, apply_update=True):
         """Finish, globally normalize, and optionally apply streamed gradients."""
         import torch
-        from fast_distributed import (broadcast_trainable_parameters,
-                                      reduce_trainable_gradients)
+        from training.fast_distributed import (broadcast_trainable_parameters, reduce_trainable_gradients)
 
         state = self._entropic_overlap
         if state is None:
@@ -7314,12 +6493,8 @@ class ProcessDistributedTrainer:
 
         try:
             local_stats = state["future"].result()
-            child_messages = self._collect_event(
-                "computed", range(1, self._world_size))
-            rank_stats = [local_stats] + [
-                child_messages[rank]["stats"]
-                for rank in range(1, self._world_size)
-            ]
+            child_messages = self._collect_event("computed", range(1, self._world_size))
+            rank_stats = [local_stats] + [child_messages[rank]["stats"] for rank in range(1, self._world_size)]
             accounted_examples = sum(
                 int(stats["trained_examples"])
                 + int(stats["quarantined_examples"])
@@ -7347,12 +6522,10 @@ class ProcessDistributedTrainer:
                     for parameter in self.model.parameters():
                         if parameter.requires_grad and parameter.grad is not None:
                             parameter.grad.mul_(gradient_scale)
-                reduce_trainable_gradients(
-                    self.model, destination_rank=0)
+                reduce_trainable_gradients(self.model, destination_rank=0)
                 try:
                     grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                        [parameter for parameter in self.model.parameters()
-                         if parameter.requires_grad],
+                        [parameter for parameter in self.model.parameters() if parameter.requires_grad],
                         max_norm=cfg.grad_clip, error_if_nonfinite=True)
                     self.optimizer.step()
                     grad_norm = float(grad_norm_tensor.item())
@@ -7360,8 +6533,7 @@ class ProcessDistributedTrainer:
                     update_error = error
                 finally:
                     self.model.zero_grad(set_to_none=True)
-                    broadcast_trainable_parameters(
-                        self.model, source_rank=0)
+                    broadcast_trainable_parameters(self.model, source_rank=0)
             else:
                 self.model.zero_grad(set_to_none=True)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -7379,43 +6551,27 @@ class ProcessDistributedTrainer:
             self._entropic_overlap = None
 
         for rank, stats in enumerate(rank_stats):
-            self._token_budgets[rank] = max(
-                1, int(stats["token_budget"]))
+            self._token_budgets[rank] = max(1, int(stats["token_budget"]))
         if not apply_update:
             return {}
 
-        total_loss = sum(
-            float(stats["total_loss"]) for stats in rank_stats)
-        total_logp_delta = sum(
-            float(stats["total_logp_delta"]) for stats in rank_stats)
-        ratio_sum = sum(
-            float(stats["ratio_sum"]) for stats in rank_stats)
-        ratio_max = max(
-            float(stats["ratio_max"]) for stats in rank_stats)
-        ratio_count = sum(
-            int(stats["ratio_count"]) for stats in rank_stats)
-        quarantined_examples = sum(
-            int(stats["quarantined_examples"]) for stats in rank_stats)
-        trained_per_gpu = [
-            int(stats["trained_examples"]) for stats in rank_stats]
-        batches_per_gpu = [
-            int(stats["backward_batches"]) for stats in rank_stats]
-        peak_fractions = [
-            float(stats["peak_memory_fraction"]) for stats in rank_stats]
-        allocator_fractions = [
-            float(stats["allocator_memory_fraction"])
-            for stats in rank_stats]
-        kl_errors = [
-            error for stats in rank_stats for error in stats["kl_errors"]]
+        total_loss = sum(float(stats["total_loss"]) for stats in rank_stats)
+        total_logp_delta = sum(float(stats["total_logp_delta"]) for stats in rank_stats)
+        ratio_sum = sum(float(stats["ratio_sum"]) for stats in rank_stats)
+        ratio_max = max(float(stats["ratio_max"]) for stats in rank_stats)
+        ratio_count = sum(int(stats["ratio_count"]) for stats in rank_stats)
+        quarantined_examples = sum(int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [float(stats["allocator_memory_fraction"]) for stats in rank_stats]
+        kl_errors = [error for stats in rank_stats for error in stats["kl_errors"]]
         if kl_errors:
             print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
                   "training without KL penalty on affected examples",
                   flush=True)
-        peak_percentages = [
-            round(100.0 * fraction, 1) for fraction in peak_fractions]
-        allocator_percentages = [
-            round(100.0 * fraction, 1)
-            for fraction in allocator_fractions]
+        peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         print(f"[{self._process_label}] trained examples/GPU="
               f"{trained_per_gpu}; backward batches/GPU={batches_per_gpu}; "
               f"final padded-token budgets/GPU={self._token_budgets}; "
@@ -7425,9 +6581,7 @@ class ProcessDistributedTrainer:
         elapsed = max(0.0, completed_at - state["started_at"])
         ratio_message = ""
         if ratio_count:
-            ratio_message = (
-                f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
-                f"max={ratio_max:.3f}")
+            ratio_message = (f'  IS ratio mean={ratio_sum / ratio_count:.9f} max={ratio_max:.3f}')
         print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
               f"avg loss: {total_loss / expected_examples:.9f}  "
               "avg logpi_theta - logpi_base: "
@@ -7452,15 +6606,14 @@ class ProcessDistributedTrainer:
     def begin_spo_rs_overlap(self, cfg, step_idx):
         """Start exact clipped SPO-RS backward while CPU evaluation runs."""
         from concurrent.futures import ThreadPoolExecutor
-        from fast_distributed import local_spo_rs_update
+        from training.fast_distributed import local_spo_rs_update
 
         if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
             raise ValueError("streaming clipped overlap is SPO-RS-only")
         if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("streaming SPO-RS requires one update epoch")
         if self._closed or not self._workers_idle:
-            raise RuntimeError(
-                "process trainer is not idle for an SPO-RS overlap update")
+            raise RuntimeError("process trainer is not idle for an SPO-RS overlap update")
         if self._spo_rs_overlap is not None:
             raise RuntimeError("an SPO-RS overlap update is already active")
         if self._entropic_overlap is not None:
@@ -7483,9 +6636,7 @@ class ProcessDistributedTrainer:
                 "defer_exact_oom": True,
             })
 
-        executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="spo-rs-rank0-overlap")
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spo-rs-rank0-overlap")
         state = {
             "overflow_examples": {},
             "step_idx": int(step_idx),
@@ -7504,8 +6655,7 @@ class ProcessDistributedTrainer:
             self._token_budgets[0],
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
-            activation_offload_semaphore=(
-                self._activation_offload_semaphore),
+            activation_offload_semaphore=(self._activation_offload_semaphore),
             defer_exact_oom=True)
         state["future"] = future
 
@@ -7522,18 +6672,12 @@ class ProcessDistributedTrainer:
         if state is None or state["sealed"]:
             raise RuntimeError("SPO-RS overlap queue is not open")
         if any(example.get("advantage") is None for example in examples):
-            raise RuntimeError(
-                "SPO-RS overlap cannot queue an unresolved advantage")
-        queued = self._queue_examples(
-            examples, seal=False, announce=False)
+            raise RuntimeError("SPO-RS overlap cannot queue an unresolved advantage")
+        queued = self._queue_examples(examples, seal=False, announce=False)
         state["queued_examples"] += len(queued)
-        state["supplied_old"] += sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in queued)
-        state["scheduled_keys"].update(
-            example["_overlap_key"] for example in queued)
-        state["overflow_examples"].update(
-            (tuple(example["_overlap_key"]), example) for example in queued)
+        state["supplied_old"] += sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued)
+        state["scheduled_keys"].update(example["_overlap_key"] for example in queued)
+        state["overflow_examples"].update((tuple(example["_overlap_key"]), example) for example in queued)
         return len(queued)
 
     def seal_spo_rs_overlap(self):
@@ -7546,12 +6690,10 @@ class ProcessDistributedTrainer:
                 self._work_queue.put(None)
             state["sealed"] = True
 
-    def finish_spo_rs_overlap(self, cfg, step_idx, expected_examples, *,
-                              apply_update=True):
+    def finish_spo_rs_overlap(self, cfg, step_idx, expected_examples, *, apply_update=True):
         """Reduce and apply the exact streamed SPO-RS gradients once."""
         import torch
-        from fast_distributed import (broadcast_trainable_parameters,
-                                      reduce_trainable_gradients)
+        from training.fast_distributed import (broadcast_trainable_parameters, reduce_trainable_gradients)
 
         state = self._spo_rs_overlap
         if state is None:
@@ -7566,15 +6708,11 @@ class ProcessDistributedTrainer:
 
         try:
             local_stats = state["future"].result()
-            child_messages = self._collect_event(
-                "computed", range(1, self._world_size))
+            child_messages = self._collect_event("computed", range(1, self._world_size))
             # Rank 0 can finish before a longer worker. Record completion only
             # after every GPU has drained the shared queue.
             state["computed_at"] = time.time()
-            rank_stats = [local_stats] + [
-                child_messages[rank]["stats"]
-                for rank in range(1, self._world_size)
-            ]
+            rank_stats = [local_stats] + [child_messages[rank]["stats"] for rank in range(1, self._world_size)]
             accounted_examples = sum(
                 int(stats["trained_examples"])
                 + int(stats["quarantined_examples"])
@@ -7586,9 +6724,7 @@ class ProcessDistributedTrainer:
                     f"accounted for {accounted_examples}/{queued_examples} "
                     "examples")
 
-            deferred_examples = sum(
-                int(stats.get("deferred_examples", 0))
-                for stats in rank_stats)
+            deferred_examples = sum(int(stats.get("deferred_examples", 0)) for stats in rank_stats)
             for command_queue in self._command_queues.values():
                 command_queue.put({
                     "kind": "finish_update",
@@ -7599,21 +6735,16 @@ class ProcessDistributedTrainer:
             update_error = None
             overflow_error = None
             if apply_update:
-                reduce_trainable_gradients(
-                    self.model, destination_rank=0)
+                reduce_trainable_gradients(self.model, destination_rank=0)
                 try:
                     if deferred_examples:
                         gradient_path, marker, deferred_keys, _normal_stats = (
                             _save_exact_spo_rs_overflow(
                                 self._exp_dir, step_idx, self.model,
                                 rank_stats,
-                                normal_train_seconds=max(
-                                    0.0, state["computed_at"]
-                                    - state["started_at"])))
+                                normal_train_seconds=max(0.0, state["computed_at"] - state["started_at"])))
                         longest = max(
-                            (int(length) for stats in rank_stats
-                             for length in stats.get(
-                                 "deferred_token_lengths", ())),
+                            (int(length) for stats in rank_stats for length in stats.get("deferred_token_lengths", ())),
                             default=0)
                         print(
                             f"[train-overflow] step {step_idx}: retained "
@@ -7634,8 +6765,7 @@ class ProcessDistributedTrainer:
                             "overflow lane")
                     else:
                         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                            [parameter for parameter in self.model.parameters()
-                             if parameter.requires_grad],
+                            [parameter for parameter in self.model.parameters() if parameter.requires_grad],
                             max_norm=cfg.grad_clip,
                             error_if_nonfinite=True)
                         self.optimizer.step()
@@ -7644,8 +6774,7 @@ class ProcessDistributedTrainer:
                     update_error = error
                 finally:
                     self.model.zero_grad(set_to_none=True)
-                    broadcast_trainable_parameters(
-                        self.model, source_rank=0)
+                    broadcast_trainable_parameters(self.model, source_rank=0)
             else:
                 self.model.zero_grad(set_to_none=True)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -7663,7 +6792,7 @@ class ProcessDistributedTrainer:
             self._spo_rs_overlap = None
 
         if overflow_error is not None:
-            from exact_overflow import supports_warm_overflow, complete_warm_overflow
+            from training.exact_overflow import supports_warm_overflow, complete_warm_overflow
             if supports_warm_overflow(cfg):
                 return complete_warm_overflow(
                     self, list(state["overflow_examples"].values()), cfg,
@@ -7671,8 +6800,7 @@ class ProcessDistributedTrainer:
             raise overflow_error
 
         for rank, stats in enumerate(rank_stats):
-            self._token_budgets[rank] = max(
-                1, int(stats["token_budget"]))
+            self._token_budgets[rank] = max(1, int(stats["token_budget"]))
         if not apply_update:
             return {}
 
@@ -7680,31 +6808,17 @@ class ProcessDistributedTrainer:
             "loss", "policy_loss", "kl_estimate", "entropy_estimate",
             "ratio", "clipped_fraction",
         )
-        totals = {
-            key: sum(float(stats["totals"][key]) for stats in rank_stats)
-            for key in metric_keys
-        }
+        totals = {key: sum(float(stats["totals"][key]) for stats in rank_stats) for key in metric_keys}
         max_ratio = max(float(stats["max_ratio"]) for stats in rank_stats)
-        max_prefix_ratio = max(
-            float(stats["max_prefix_ratio"]) for stats in rank_stats)
-        entropy_examples = sum(
-            int(stats["entropy_examples"]) for stats in rank_stats)
-        quarantined_examples = sum(
-            int(stats["quarantined_examples"]) for stats in rank_stats)
-        trained_per_gpu = [
-            int(stats["trained_examples"]) for stats in rank_stats]
-        batches_per_gpu = [
-            int(stats["backward_batches"]) for stats in rank_stats]
-        peak_fractions = [
-            float(stats["peak_memory_fraction"]) for stats in rank_stats]
-        allocator_fractions = [
-            float(stats["allocator_memory_fraction"])
-            for stats in rank_stats]
-        peak_percentages = [
-            round(100.0 * fraction, 1) for fraction in peak_fractions]
-        allocator_percentages = [
-            round(100.0 * fraction, 1)
-            for fraction in allocator_fractions]
+        max_prefix_ratio = max(float(stats["max_prefix_ratio"]) for stats in rank_stats)
+        entropy_examples = sum(int(stats["entropy_examples"]) for stats in rank_stats)
+        quarantined_examples = sum(int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [float(stats["allocator_memory_fraction"]) for stats in rank_stats]
+        peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         completed_at = state["computed_at"] or time.time()
         elapsed = max(0.0, completed_at - state["started_at"])
         history = [{
@@ -7745,15 +6859,14 @@ class ProcessDistributedTrainer:
     def train_policy(self, examples, cfg, step_idx):
         """Run the exact standard policy loss on the process-per-GPU path."""
         import torch
-        from fast_distributed import (broadcast_trainable_parameters,
+        from training.fast_distributed import (broadcast_trainable_parameters,
                                       local_policy_update,
                                       reduce_trainable_gradients)
 
         process_label = self._process_label
         adaptive_batches = bool(cfg.fast)
         if self._offloaded:
-            print(f"[{process_label}] restoring {self._world_size} process "
-                  "trainers for the update", flush=True)
+            print(f'[{process_label}] restoring {self._world_size} process trainers for the update', flush=True)
             self.restore_after_generation()
 
         started = time.time()
@@ -7767,9 +6880,7 @@ class ProcessDistributedTrainer:
             }
         queued_examples = self._queue_examples(examples)
         total_examples = len(queued_examples)
-        supplied_old = sum(
-            _valid_example_token_logprobs(example, "behavior_logprobs")
-            for example in queued_examples)
+        supplied_old = sum(_valid_example_token_logprobs(example, "behavior_logprobs") for example in queued_examples)
         supplied_reference = sum(
             _valid_example_token_logprobs(example, "reference_logprobs")
             for example in queued_examples)
@@ -7804,14 +6915,9 @@ class ProcessDistributedTrainer:
             memory_fraction=self._memory_fraction,
             work_queue=self._work_queue,
             adaptive_batches=adaptive_batches,
-            activation_offload_semaphore=(
-                self._activation_offload_semaphore))
-        child_messages = self._collect_event(
-            "computed", range(1, self._world_size))
-        rank_stats = [local_stats] + [
-            child_messages[rank]["stats"]
-            for rank in range(1, self._world_size)
-        ]
+            activation_offload_semaphore=(self._activation_offload_semaphore))
+        child_messages = self._collect_event("computed", range(1, self._world_size))
+        rank_stats = [local_stats] + [child_messages[rank]["stats"] for rank in range(1, self._world_size)]
         accounted_examples = sum(
             int(stats["trained_examples"])
             + int(stats["quarantined_examples"])
@@ -7830,8 +6936,7 @@ class ProcessDistributedTrainer:
         grad_norm = None
         try:
             grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in self.model.parameters()
-                 if parameter.requires_grad],
+                [parameter for parameter in self.model.parameters() if parameter.requires_grad],
                 max_norm=cfg.grad_clip, error_if_nonfinite=True)
             self.optimizer.step()
             grad_norm = float(grad_norm_tensor.item())
@@ -7846,41 +6951,24 @@ class ProcessDistributedTrainer:
             raise update_error
 
         for rank, stats in enumerate(rank_stats):
-            self._token_budgets[rank] = max(
-                1, int(stats["token_budget"]))
-        total_loss = sum(
-            float(stats["total_loss"]) for stats in rank_stats)
-        total_logp_delta = sum(
-            float(stats["total_logp_delta"]) for stats in rank_stats)
-        ratio_sum = sum(
-            float(stats["ratio_sum"]) for stats in rank_stats)
-        ratio_max = max(
-            float(stats["ratio_max"]) for stats in rank_stats)
-        ratio_count = sum(
-            int(stats["ratio_count"]) for stats in rank_stats)
-        quarantined_examples = sum(
-            int(stats["quarantined_examples"]) for stats in rank_stats)
-        trained_per_gpu = [
-            int(stats["trained_examples"]) for stats in rank_stats]
-        batches_per_gpu = [
-            int(stats["backward_batches"]) for stats in rank_stats]
-        peak_fractions = [
-            float(stats["peak_memory_fraction"]) for stats in rank_stats]
-        allocator_fractions = [
-            float(stats["allocator_memory_fraction"])
-            for stats in rank_stats]
-        kl_errors = [
-            error for stats in rank_stats for error in stats["kl_errors"]
-        ]
+            self._token_budgets[rank] = max(1, int(stats["token_budget"]))
+        total_loss = sum(float(stats["total_loss"]) for stats in rank_stats)
+        total_logp_delta = sum(float(stats["total_logp_delta"]) for stats in rank_stats)
+        ratio_sum = sum(float(stats["ratio_sum"]) for stats in rank_stats)
+        ratio_max = max(float(stats["ratio_max"]) for stats in rank_stats)
+        ratio_count = sum(int(stats["ratio_count"]) for stats in rank_stats)
+        quarantined_examples = sum(int(stats["quarantined_examples"]) for stats in rank_stats)
+        trained_per_gpu = [int(stats["trained_examples"]) for stats in rank_stats]
+        batches_per_gpu = [int(stats["backward_batches"]) for stats in rank_stats]
+        peak_fractions = [float(stats["peak_memory_fraction"]) for stats in rank_stats]
+        allocator_fractions = [float(stats["allocator_memory_fraction"]) for stats in rank_stats]
+        kl_errors = [error for stats in rank_stats for error in stats["kl_errors"]]
         if kl_errors:
             print(f"[warn] disable_adapter failed ({kl_errors[0]}); "
                   "training without KL penalty on affected examples",
                   flush=True)
-        peak_percentages = [
-            round(100.0 * fraction, 1) for fraction in peak_fractions]
-        allocator_percentages = [
-            round(100.0 * fraction, 1)
-            for fraction in allocator_fractions]
+        peak_percentages = [round(100.0 * fraction, 1) for fraction in peak_fractions]
+        allocator_percentages = [round(100.0 * fraction, 1) for fraction in allocator_fractions]
         print(f"[{process_label}] trained examples/GPU={trained_per_gpu}; "
               f"backward batches/GPU={batches_per_gpu}; final padded-token "
               f"budgets/GPU={self._token_budgets}; peak memory/GPU="
@@ -7889,9 +6977,7 @@ class ProcessDistributedTrainer:
         elapsed = time.time() - started
         ratio_message = ""
         if ratio_count:
-            ratio_message = (
-                f"  IS ratio mean={ratio_sum / ratio_count:.9f} "
-                f"max={ratio_max:.3f}")
+            ratio_message = (f'  IS ratio mean={ratio_sum / ratio_count:.9f} max={ratio_max:.3f}')
         print(f"[step {step_idx}] train time: {elapsed:.1f}s  "
               f"avg loss: {total_loss / total_examples:.9f}  "
               "avg logpi_theta - logpi_base: "
@@ -7956,19 +7042,15 @@ class ProcessDistributedTrainer:
         if not self._offloaded:
             return
         physical_gpu_ids = set(int(gpu) for gpu in physical_gpu_ids)
-        ranks = {rank for rank in self._offloaded_ranks
-                 if self._physical_ids[rank] in physical_gpu_ids}
+        ranks = {rank for rank in self._offloaded_ranks if self._physical_ids[rank] in physical_gpu_ids}
         if not ranks:
             return
         if not self._dist_initialized:
-            raise RuntimeError(
-                "process-distributed trainer is unavailable after a worker "
-                "failure")
+            raise RuntimeError('process-distributed trainer is unavailable after a worker failure')
         import gc
         import torch
-        from fast_distributed import (set_total_memory_ceiling,
-                                      validate_model_device)
-        from host_memory import reclaim_unused_host_memory
+        from training.fast_distributed import (set_total_memory_ceiling, validate_model_device)
+        from runtime.host_memory import reclaim_unused_host_memory
 
         try:
             print(f"[{self._process_label}] restoring trainer GPUs "
@@ -7987,8 +7069,7 @@ class ProcessDistributedTrainer:
                     torch.cuda.synchronize(0)
                 validate_model_device(self.model, 0)
                 _restore_optimizer_state_to_parameters(self.optimizer)
-                reclaim_unused_host_memory(
-                    torch, cuda_devices=(0,), force=True)
+                reclaim_unused_host_memory(torch, cuda_devices=(0,), force=True)
             self._collect_event("restored", ranks - {0})
             self._offloaded_ranks.difference_update(ranks)
             self._offloaded = bool(self._offloaded_ranks)
@@ -8083,8 +7164,7 @@ class ProcessDistributedTrainer:
             except Exception:
                 pass
             finally:
-                state["executor"].shutdown(
-                    wait=True, cancel_futures=False)
+                state["executor"].shutdown(wait=True, cancel_futures=False)
                 self._entropic_overlap = None
 
         if self._spo_rs_overlap is not None:
@@ -8095,12 +7175,10 @@ class ProcessDistributedTrainer:
             except Exception:
                 pass
             finally:
-                state["executor"].shutdown(
-                    wait=True, cancel_futures=False)
+                state["executor"].shutdown(wait=True, cancel_futures=False)
                 self._spo_rs_overlap = None
 
-        if (not self._workers_idle or not self._dist_initialized
-                or self._dead_workers(range(1, self._world_size))):
+        if (not self._workers_idle or not self._dist_initialized or self._dead_workers(range(1, self._world_size))):
             self._abort_workers()
             return
         try:
@@ -8154,8 +7232,7 @@ def _adapter_exists(exp_dir):
     return any(p.glob("adapter_step*"))
 
 
-def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
-                  directory_name=None):
+def _save_adapter(model, exp_dir, step_idx, generation_model_name=None, directory_name=None):
     """
     Save the current LoRA adapter to disk so generation workers can load it.
     The caller writes a new step directory before advancing the checkpoint,
@@ -8174,8 +7251,7 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None,
         adapter_config = json.loads(config_path.read_text(encoding="utf-8"))
         if adapter_config.get("base_model_name_or_path") != generation_model_name:
             adapter_config["base_model_name_or_path"] = generation_model_name
-            config_path.write_text(
-                json.dumps(adapter_config, indent=2) + "\n", encoding="utf-8")
+            config_path.write_text(json.dumps(adapter_config, indent=2) + "\n", encoding="utf-8")
     return out_dir
 
 
@@ -8187,13 +7263,10 @@ def _prune_adapter_snapshots(exp_dir, keep_paths):
     consecutive-policy KL at the next step requires both policies.
     """
     root = Path(exp_dir)
-    keep_names = {
-        Path(path).name for path in keep_paths if path is not None
-    }
+    keep_names = {Path(path).name for path in keep_paths if path is not None}
     removed = []
     for path in root.iterdir():
-        is_step_adapter = bool(
-            re.fullmatch(r"adapter_step\d+", path.name))
+        is_step_adapter = bool(re.fullmatch(r"adapter_step\d+", path.name))
         if (not is_step_adapter and path.name != "adapter_initial"):
             continue
         if path.name in keep_names:
@@ -8206,8 +7279,7 @@ def _prune_adapter_snapshots(exp_dir, keep_paths):
             else:
                 continue
         except OSError as error:
-            print(f"[warn] could not remove superseded adapter {path}: "
-                  f"{error}", flush=True)
+            print(f'[warn] could not remove superseded adapter {path}: {error}', flush=True)
             continue
         removed.append(path.name)
     return removed
@@ -8242,22 +7314,16 @@ def _load_adapter(model, adapter_dir, *, announce=True):
 
     try:
         from peft.utils.save_and_load import load_peft_weights
-        weights = load_peft_weights(
-            str(adapter_dir), device=str(next(model.parameters()).device)
-        )
+        weights = load_peft_weights(str(adapter_dir), device=str(next(model.parameters()).device))
     except (ImportError, TypeError):
         safe_path = adapter_dir / "adapter_model.safetensors"
         bin_path = adapter_dir / "adapter_model.bin"
         if safe_path.is_file():
             from safetensors.torch import load_file
-            weights = load_file(
-                str(safe_path), device=str(next(model.parameters()).device)
-            )
+            weights = load_file(str(safe_path), device=str(next(model.parameters()).device))
         elif bin_path.is_file():
             try:
-                weights = torch.load(
-                    str(bin_path), map_location="cpu", weights_only=True
-                )
+                weights = torch.load(str(bin_path), map_location="cpu", weights_only=True)
             except TypeError:
                 weights = torch.load(str(bin_path), map_location="cpu")
         else:
@@ -8268,8 +7334,7 @@ def _load_adapter(model, adapter_dir, *, announce=True):
         print(f"[resume] loaded LoRA adapter from {adapter_dir}")
 
 
-def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
-                              optimizer, spo_rs_tracker=None):
+def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimizer, spo_rs_tracker=None):
     """Atomically save the state required for an exact next-step resume."""
     import torch
 
@@ -8281,8 +7346,7 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler,
         "adapter_dir": Path(adapter_path).name,
         "sampler": sampler.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "spo_rs_tracker": (spo_rs_tracker.state_dict()
-                           if spo_rs_tracker is not None else None),
+        "spo_rs_tracker": (spo_rs_tracker.state_dict() if spo_rs_tracker is not None else None),
     }
     torch.save(payload, tmp)
     tmp.replace(target)
@@ -8296,8 +7360,7 @@ def _load_training_checkpoint(exp_dir, *, mmap=False):
     if not path.is_file():
         return None
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False,
-                             **({"mmap": True} if mmap else {}))
+        payload = torch.load(path, map_location="cpu", weights_only=False, **({"mmap": True} if mmap else {}))
     except TypeError:
         payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
@@ -8317,7 +7380,7 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
     """Switch only before fresh selection, preserving the complete training state."""
     if sampler.selection_mode == cfg.parent_selection:
         return sampler
-    from sampler import can_migrate_parent_selection
+    from search.sampler import can_migrate_parent_selection
     if not can_migrate_parent_selection(sampler.selection_mode, cfg.parent_selection):
         raise ValueError("unsupported resume parent-selection change")
     if recovery_pending:
@@ -8326,7 +7389,7 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
               f"{cfg.parent_selection.upper()} starts at the next fresh step",
               flush=True)
         return sampler
-    from llm_sampler import LLMSampler
+    from search.llm_sampler import LLMSampler
     migrated = LLMSampler(
         num_seeds=0, exp_dir=exp_dir, problem=problem,
         puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
@@ -8341,8 +7404,7 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(saved, indent=2) + "\n")
     tmp.replace(path)
-    _save_training_checkpoint(exp_dir, next_step, adapter_path, migrated,
-                              optimizer, spo_rs_tracker)
+    _save_training_checkpoint(exp_dir, next_step, adapter_path, migrated, optimizer, spo_rs_tracker)
     print(f"[resume] {sampler.selection_mode.upper()} -> "
           f"{cfg.parent_selection.upper()} at step {next_step}; {detail}; "
           "archive, adapter, optimizer and SPO tracker preserved", flush=True)
@@ -8353,18 +7415,14 @@ def _prefetch_resume_parents(sampler, cfg, exp_dir, next_step, adapter_path,
                              optimizer, spo_rs_tracker, *, problem,
                              interrupted_artifacts=None):
     """Start fresh-step selection before resumed trainer/generation startup."""
-    if (cfg.parent_selection != "llm" or next_step >= cfg.num_steps
-            or interrupted_artifacts is not None):
+    if (cfg.parent_selection != "llm" or next_step >= cfg.num_steps or interrupted_artifacts is not None):
         return sampler, None
-    if (cfg.advantage_mode == "spo-rs"
-            and _recoverable_pending_spo_rs_artifacts(exp_dir, next_step, cfg)
-            is not None):
+    if (cfg.advantage_mode == "spo-rs" and _recoverable_pending_spo_rs_artifacts(exp_dir, next_step, cfg) is not None):
         return sampler, None
     sampler = _migrate_parent_selection(
         sampler, cfg, exp_dir, next_step, adapter_path,
         optimizer, spo_rs_tracker, recovery_pending=False, problem=problem)
-    future = sampler.prefetch_states(
-        int(cfg.groups_per_step), selection_step=next_step)
+    future = sampler.prefetch_states(int(cfg.groups_per_step), selection_step=next_step)
     print(f"[resume] LLM parent request for step {next_step} overlaps "
           "trainer initialization and generation warm-up", flush=True)
     return sampler, future
@@ -8389,8 +7447,8 @@ def _legacy_resume_info(exp_dir):
 
 def _restore_legacy_archive(sampler, exp_dir, before_step):
     """Recover valid candidates from rollout files that predate checkpoints."""
-    from reward import extract_python_code
-    from sampler import State
+    from evaluation.reward import extract_python_code
+    from search.sampler import State
 
     states = []
     total_rollouts = 0
@@ -8406,9 +7464,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
         total_rollouts += 1
         if not meta.get("valid"):
             continue
-        text_path = meta_path.with_name(
-            meta_path.name.removesuffix(".meta.json") + ".txt"
-        )
+        text_path = meta_path.with_name(meta_path.name.removesuffix(".meta.json") + ".txt")
         try:
             code = extract_python_code(text_path.read_text(errors="replace"))
         except OSError:
@@ -8422,10 +7478,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             construction = meta.get("construction")
         except (TypeError, ValueError):
             continue
-        states.append(State.make(
-            timestep=step, value=reward, code=code, raw_score=raw,
-            construction=construction,
-        ))
+        states.append(State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
 
@@ -8434,8 +7487,7 @@ def _logged_step_rewards(exp_dir, step_idx):
     """Read one completed step's finite rewards for tracker migration."""
     step_dir = Path(exp_dir) / f"step{int(step_idx):02d}"
     rewards = []
-    for meta_path in sorted(
-            step_dir.glob(f"step{int(step_idx):02d}_group*_rollout*.meta.json")):
+    for meta_path in sorted(step_dir.glob(f"step{int(step_idx):02d}_group*_rollout*.meta.json")):
         try:
             meta = json.loads(meta_path.read_text())
             reward = float(meta["reward"])
@@ -8460,8 +7512,7 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
     summary_path = step_dir / f"step{step_idx:02d}.summary.json"
     if summary_path.is_file() or not step_dir.is_dir():
         return None
-    paths = sorted(step_dir.glob(
-        f"step{step_idx:02d}_group*_rollout*.meta.json"))
+    paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     expected_primary = int(cfg.groups_per_step) * int(cfg.group_size)
     if len(paths) < expected_primary:
         return None
@@ -8478,8 +7529,7 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         )
         if any(name not in meta for name in required):
             return None
-        if (int(meta["step"]) != step_idx
-                or str(meta["advantage_mode"]).lower() != "spo-rs"):
+        if (int(meta["step"]) != step_idx or str(meta["advantage_mode"]).lower() != "spo-rs"):
             return None
         try:
             reward = float(meta["reward"])
@@ -8487,15 +7537,13 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
             response_tokens = int(meta["n_response_tokens"])
         except (TypeError, ValueError):
             return None
-        if (not math.isfinite(reward) or not math.isfinite(advantage)
-                or response_tokens < 0):
+        if (not math.isfinite(reward) or not math.isfinite(advantage) or response_tokens < 0):
             return None
         base = meta_path.name.removesuffix(".meta.json")
         response_path = meta_path.with_name(base + ".txt")
         prompt_path = meta_path.with_name(base + ".prompt.txt")
         token_path = meta_path.with_name(base + ".tokens.zlib")
-        behavior_path = meta_path.with_name(
-            base + ".behavior_logprobs.zlib")
+        behavior_path = meta_path.with_name(base + ".behavior_logprobs.zlib")
         if not response_path.is_file() or not prompt_path.is_file():
             return None
         artifacts.append({
@@ -8503,8 +7551,7 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
             "response_path": response_path,
             "prompt_path": prompt_path,
             "token_path": token_path if token_path.is_file() else None,
-            "behavior_logprobs_path": (
-                behavior_path if behavior_path.is_file() else None),
+            "behavior_logprobs_path": (behavior_path if behavior_path.is_file() else None),
             "meta": meta,
         })
 
@@ -8520,9 +7567,7 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         group = int(item["meta"]["group"])
         per_group[group] = per_group.get(group, 0) + 1
     expected_groups = set(range(int(cfg.groups_per_step)))
-    if (set(per_group) != expected_groups
-            or any(count != int(cfg.group_size)
-                   for count in per_group.values())):
+    if (set(per_group) != expected_groups or any(count != int(cfg.group_size) for count in per_group.values())):
         return None
     artifacts.sort(key=lambda item: (
         int(item["meta"]["group"]), int(item["meta"]["rollout"])))
@@ -8544,8 +7589,7 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
     summary_path = step_dir / f"step{step_idx:02d}.summary.json"
     if summary_path.is_file() or not step_dir.is_dir():
         return None
-    paths = sorted(step_dir.glob(
-        f"step{step_idx:02d}_group*_rollout*.meta.json"))
+    paths = sorted(step_dir.glob(f"step{step_idx:02d}_group*_rollout*.meta.json"))
     expected_primary = int(cfg.groups_per_step) * int(cfg.group_size)
     if len(paths) < expected_primary:
         return None
@@ -8556,8 +7600,7 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
-        if (int(meta.get("step", -1)) != step_idx
-                or meta.get("status") != "evaluation_pending"):
+        if (int(meta.get("step", -1)) != step_idx or meta.get("status") != "evaluation_pending"):
             return None
         required = (
             "group", "parent_group", "rollout", "n_response_tokens",
@@ -8569,8 +7612,7 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
         response_path = meta_path.with_name(base + ".txt")
         prompt_path = meta_path.with_name(base + ".prompt.txt")
         token_path = meta_path.with_name(base + ".tokens.zlib")
-        behavior_path = meta_path.with_name(
-            base + ".behavior_logprobs.zlib")
+        behavior_path = meta_path.with_name(base + ".behavior_logprobs.zlib")
         if not all(path.is_file() for path in (
                 response_path, prompt_path, token_path, behavior_path)):
             return None
@@ -8595,8 +7637,7 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
         group = int(item["meta"]["group"])
         per_group[group] = per_group.get(group, 0) + 1
     if (set(per_group) != set(range(int(cfg.groups_per_step)))
-            or any(count != int(cfg.group_size)
-                   for count in per_group.values())):
+            or any(count != int(cfg.group_size) for count in per_group.values())):
         return None
     artifacts.sort(key=lambda item: (
         int(item["meta"]["group"]), int(item["meta"]["rollout"])))
@@ -8649,8 +7690,7 @@ def _metadata_is_code_failure(meta):
     return "timeout" not in str(meta.get("msg", "") or "").lower()
 
 
-def _reconstruct_saved_response_tokens(
-        model, tokenizer, response_text, expected_count):
+def _reconstruct_saved_response_tokens(model, tokenizer, response_text, expected_count):
     """Build a safe training sequence from a legacy text-only artifact.
 
     Old runs saved vLLM's decoded text but not ``candidate.token_ids``.  Such
@@ -8665,8 +7705,7 @@ def _reconstruct_saved_response_tokens(
 
     New runs carry an exact ``.tokens.zlib`` sidecar and never use this path.
     """
-    token_ids = list(tokenizer(
-        response_text, add_special_tokens=False).input_ids)
+    token_ids = list(tokenizer(response_text, add_special_tokens=False).input_ids)
     expected_count = int(expected_count)
     canonical_count = len(token_ids)
     restored_terminal = False
@@ -8693,13 +7732,10 @@ def _reconstruct_saved_response_tokens(
         tokenizer_eos = int(tokenizer_eos)
     except (TypeError, ValueError):
         tokenizer_eos = None
-    chosen = (tokenizer_eos if tokenizer_eos in configured
-              else configured[0] if len(configured) == 1 else None)
+    chosen = (tokenizer_eos if tokenizer_eos in configured else configured[0] if len(configured) == 1 else None)
     if canonical_count < expected_count and chosen is not None:
         try:
-            visible = tokenizer.decode(
-                [chosen], skip_special_tokens=True,
-                clean_up_tokenization_spaces=False)
+            visible = tokenizer.decode([chosen], skip_special_tokens=True, clean_up_tokenization_spaces=False)
         except TypeError:
             visible = tokenizer.decode([chosen], skip_special_tokens=True)
         if not str(visible or ""):
@@ -8714,18 +7750,15 @@ def _reconstruct_saved_response_tokens(
         "canonical_count": canonical_count,
         "recovered_count": recovered_count,
         "restored_terminal": restored_terminal,
-        "unavailable_original_tokens": max(
-            0, expected_count - recovered_count),
-        "canonical_extra_tokens": max(
-            0, recovered_count - expected_count),
+        "unavailable_original_tokens": max(0, expected_count - recovered_count),
+        "canonical_extra_tokens": max(0, recovered_count - expected_count),
     }
     return token_ids, recovery
 
 
 def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
     """Validate/cache artifact token IDs before distributed replicas load."""
-    from experiment_io import (load_rollout_logprobs,
-                               load_rollout_token_ids)
+    from experiment_io import (load_rollout_logprobs, load_rollout_token_ids)
     from zlib import error as ZlibError
 
     summary = {
@@ -8764,12 +7797,10 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
             }
             summary["exact_sidecars"] += 1
         else:
-            response_text = item["response_path"].read_text(
-                encoding="utf-8", errors="replace")
+            response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
             try:
                 token_ids, recovery = (
-                    _reconstruct_saved_response_tokens(
-                        model, tokenizer, response_text, expected_count))
+                    _reconstruct_saved_response_tokens(model, tokenizer, response_text, expected_count))
             except ValueError as error:
                 raise RuntimeError(
                     "evaluated-step recovery cannot tokenize the saved "
@@ -8803,12 +7834,9 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
         restored_terminal = bool(recovery["restored_terminal"])
         item["restored_terminal_token"] = restored_terminal
         summary["restored_terminal_tokens"] += int(restored_terminal)
-        summary["unavailable_original_tokens"] += int(
-            recovery["unavailable_original_tokens"])
-        summary["canonical_extra_tokens"] += int(
-            recovery["canonical_extra_tokens"])
-        summary["count_changed_responses"] += int(
-            len(token_ids) != expected_count)
+        summary["unavailable_original_tokens"] += int(recovery["unavailable_original_tokens"])
+        summary["canonical_extra_tokens"] += int(recovery["canonical_extra_tokens"])
+        summary["count_changed_responses"] += int(len(token_ids) != expected_count)
     return summary
 
 
@@ -8828,68 +7856,49 @@ def _finalize_pending_spo_rs_artifacts(
     from queue import Queue
 
     from experiment_io import save_rollout
-    from gen_workers import make_progress_bar
-    from _retire.problems.base import ParentContext, RewardResult
-    from sampler import State
+    from generation.gen_workers import make_progress_bar
+    from problems.base import ParentContext, RewardResult
+    from search.sampler import State
 
     if cfg.generation_backend != "vllm":
-        raise RuntimeError(
-            "generated-step SPO-RS recovery requires exact vLLM rollout "
-            "artifacts")
+        raise RuntimeError('generated-step SPO-RS recovery requires exact vLLM rollout artifacts')
     if gen_pool is None:
         raise RuntimeError(
             "generated-step SPO-RS recovery requires the "
             "configured vLLM pool for exact consecutive-policy scoring")
     if (spo_rs_tracker is None or not spo_rs_tracker.initialized):
-        raise RuntimeError(
-            "generated-step SPO-RS recovery requires the restored pre-step "
-            "tracker")
+        raise RuntimeError('generated-step SPO-RS recovery requires the restored pre-step tracker')
     spo_rs_tracker.prepare_step()
-    if sampling_adapter_path is None or not Path(
-            sampling_adapter_path).is_dir():
+    if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
         raise FileNotFoundError(
             "generated-step SPO-RS recovery cannot find its sampling adapter: "
             f"{sampling_adapter_path}")
 
-    token_summary = _prepare_recoverable_response_tokens(
-        None, tokenizer, artifacts)
+    token_summary = _prepare_recoverable_response_tokens(None, tokenizer, artifacts)
     if token_summary["exact_sidecars"] != len(artifacts):
-        raise RuntimeError(
-            "generated-step recovery refuses non-exact response token IDs")
+        raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
     if token_summary["behavior_logprob_sidecars"] != len(artifacts):
-        raise RuntimeError(
-            "generated-step recovery requires every rollout-policy logprob "
-            "sidecar")
+        raise RuntimeError('generated-step recovery requires every rollout-policy logprob sidecar')
 
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if len(parents) != int(cfg.groups_per_step):
-        raise RuntimeError(
-            "generated-step recovery could not reconstruct every parent")
-    parents_path = (
-        Path(exp_dir) / f"step{int(step_idx):02d}"
-        / f"step{int(step_idx):02d}.parents.json")
+        raise RuntimeError("generated-step recovery could not reconstruct every parent")
+    parents_path = (Path(exp_dir) / f"step{int(step_idx):02d}" / f"step{int(step_idx):02d}.parents.json")
     try:
-        saved_parent_rows = json.loads(
-            parents_path.read_text(encoding="utf-8"))["parents"]
+        saved_parent_rows = json.loads(parents_path.read_text(encoding="utf-8"))["parents"]
     except (OSError, KeyError, TypeError, ValueError,
             json.JSONDecodeError) as error:
-        raise RuntimeError(
-            "generated-step recovery cannot read its saved parent selection") \
+        raise RuntimeError("generated-step recovery cannot read its saved parent selection") \
             from error
-    saved_parents = {
-        int(row["group"]): row for row in saved_parent_rows
-    }
+    saved_parents = {int(row["group"]): row for row in saved_parent_rows}
     for group, parent in enumerate(parents):
         row = saved_parents.get(group)
         if row is None:
-            raise RuntimeError(
-                f"generated-step recovery is missing parent group {group}")
+            raise RuntimeError(f"generated-step recovery is missing parent group {group}")
         if (str(row.get("parent_id")) != str(parent.id)
                 or int(row.get("parent_timestep", -1))
                 != int(parent.timestep)
-                or not math.isclose(
-                    float(row.get("parent_reward")), float(parent.value),
-                    rel_tol=0.0, abs_tol=1e-12)):
+                or not math.isclose(float(row.get("parent_reward")), float(parent.value), rel_tol=0.0, abs_tol=1e-12)):
             raise RuntimeError(
                 f"generated-step recovery parent {group} does not match the "
                 "restored sampler checkpoint")
@@ -8914,14 +7923,12 @@ def _finalize_pending_spo_rs_artifacts(
         for _layer in range(processes_per_cpu):
             for cpu_id in cpu_ids:
                 isolated_slots.put(cpu_id)
-        workers = max(1, min(
-            len(artifacts), len(cpu_ids) * processes_per_cpu))
+        workers = max(1, min(len(artifacts), len(cpu_ids) * processes_per_cpu))
         isolated_memory_limit = _automatic_sandbox_memory_limit_bytes(workers)
     else:
-        workers = max(1, min(
-            len(artifacts), _resolve_reward_workers(cfg, problem)))
+        workers = max(1, min(len(artifacts), _resolve_reward_workers(cfg, problem)))
 
-    from host_memory import HostMemoryAdmission
+    from runtime.host_memory import HostMemoryAdmission
     import multiprocessing
     host_admission = (getattr(gen_pool, "host_memory_admission", None)
                       or HostMemoryAdmission(multiprocessing.get_context("spawn")))
@@ -8930,15 +7937,11 @@ def _finalize_pending_spo_rs_artifacts(
         meta = item["meta"]
         issue = meta.get("output_format_issue")
         if issue:
-            return RewardResult(
-                reward=float(problem.fail_score), msg=str(issue),
-                failure_kind="code")
-        response_text = item["response_path"].read_text(
-            encoding="utf-8", errors="replace")
+            return RewardResult(reward=float(problem.fail_score), msg=str(issue), failure_kind="code")
+        response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
         parent_context = parent_contexts[int(meta["parent_group"])]
         if not isolated_eval:
-            return problem.compute_reward(
-                response_text, parent_context, cfg.sandbox_timeout_s)
+            return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s)
         with host_admission.reservation(isolated_memory_limit):
             cpu_id = isolated_slots.get()
             try:
@@ -8950,10 +7953,7 @@ def _finalize_pending_spo_rs_artifacts(
                 isolated_slots.put(cpu_id)
 
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
-    evaluation_futures = {
-        evaluation_pool.submit(evaluate, item): index
-        for index, item in enumerate(artifacts)
-    }
+    evaluation_futures = {evaluation_pool.submit(evaluate, item): index for index, item in enumerate(artifacts)}
     results = [None] * len(artifacts)
     try:
         prompt_cache = {}
@@ -8961,11 +7961,9 @@ def _finalize_pending_spo_rs_artifacts(
         current_scores = []
         context_ids = []
         for item in artifacts:
-            prompt_text = item["prompt_path"].read_text(
-                encoding="utf-8", errors="replace")
+            prompt_text = item["prompt_path"].read_text(encoding="utf-8", errors="replace")
             if prompt_text not in prompt_cache:
-                prompt_cache[prompt_text] = tokenizer(
-                    prompt_text).input_ids
+                prompt_cache[prompt_text] = tokenizer(prompt_text).input_ids
             score_pairs.append((
                 prompt_cache[prompt_text], item["response_token_ids"]))
             current_scores.append(item["behavior_logprobs"])
@@ -8973,15 +7971,13 @@ def _finalize_pending_spo_rs_artifacts(
 
         previous_name = spo_rs_tracker.last_policy_adapter
         if previous_name is None:
-            raise RuntimeError(
-                "generated-step recovery has no preceding SPO-RS adapter")
+            raise RuntimeError("generated-step recovery has no preceding SPO-RS adapter")
         previous_adapter_path = Path(exp_dir) / previous_name
         if not previous_adapter_path.is_dir():
             raise FileNotFoundError(
                 "generated-step recovery cannot find the preceding policy "
                 f"adapter: {previous_adapter_path}")
-        if (previous_adapter_path.resolve()
-                == Path(sampling_adapter_path).resolve()):
+        if (previous_adapter_path.resolve() == Path(sampling_adapter_path).resolve()):
             previous_scores = current_scores
         else:
             try:
@@ -8998,12 +7994,9 @@ def _finalize_pending_spo_rs_artifacts(
                 current_scores, previous_scores, context_ids,
                 required_context_ids=range(int(cfg.groups_per_step))))
         if missing_scores or not math.isfinite(divergence):
-            raise RuntimeError(
-                "generated-step recovery did not obtain every exact "
-                "consecutive-policy score")
+            raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
 
-        eval_bar = make_progress_bar(
-            len(evaluation_futures), desc="recovering evaluations")
+        eval_bar = make_progress_bar(len(evaluation_futures), desc="recovering evaluations")
         try:
             for future in as_completed(evaluation_futures):
                 results[evaluation_futures[future]] = future.result()
@@ -9016,23 +8009,20 @@ def _finalize_pending_spo_rs_artifacts(
     rewards = [float(result.reward) for result in results]
     prompt_indices = {}
     for item in artifacts:
-        prompt_text = item["prompt_path"].read_text(
-            encoding="utf-8", errors="replace")
+        prompt_text = item["prompt_path"].read_text(encoding="utf-8", errors="replace")
         if prompt_text not in prompt_indices:
             prompt_indices[prompt_text] = len(prompt_indices)
     transformed = spo_rs_tracker.transformed_rewards(rewards)
     advantages = spo_rs_tracker.normalized_advantages(transformed)
     if advantages is None:
-        raise RuntimeError(
-            "generated-step recovery lost the pre-step SPO-RS baseline")
+        raise RuntimeError("generated-step recovery lost the pre-step SPO-RS baseline")
     preview_tracker = deepcopy(spo_rs_tracker)
     update = preview_tracker.update(
         transformed, divergence=divergence,
         policy_adapter=sampling_adapter_path, step=step_idx,
         raw_rewards=rewards)
     update.update({
-        "groups": sorted({int(item["meta"]["group"])
-                          for item in artifacts}),
+        "groups": sorted({int(item["meta"]["group"]) for item in artifacts}),
         "prompt_jobs": list(range(len(prompt_indices))),
         "contexts": sorted(set(context_ids)),
         "context_divergences": context_divergences,
@@ -9043,12 +8033,10 @@ def _finalize_pending_spo_rs_artifacts(
         "transformed_reward": float(transformed[index]),
         "used_for_policy_update": True,
     } for index in range(len(artifacts))]
-    beta_by_index = np.full(
-        len(artifacts), float(cfg.spo_rs_beta), dtype=np.float64)
+    beta_by_index = np.full(len(artifacts), float(cfg.spo_rs_beta), dtype=np.float64)
 
     save_ctor = bool(getattr(problem, "saves_construction", False))
-    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
-                    else type(sampler).__name__)
+    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False) else type(sampler).__name__)
     step_dir = Path(exp_dir) / f"step{int(step_idx):02d}"
     for index, (item, result) in enumerate(zip(artifacts, results)):
         pending = item["meta"]
@@ -9070,25 +8058,20 @@ def _finalize_pending_spo_rs_artifacts(
         strategy_path = step_dir / f"{base}.strategy.txt"
         strategy = None
         if strategy_path.is_file():
-            raw_strategy = strategy_path.read_text(
-                encoding="utf-8", errors="replace")
+            raw_strategy = strategy_path.read_text(encoding="utf-8", errors="replace")
             strategy, _issue = _extract_final_strategy(
                 raw_strategy,
                 strict=bool(getattr(cfg, "strict_strategy_validation", False)),
             )
         info = rollout_infos[index]
-        meta = {
-            key: value for key, value in pending.items()
-            if key != "status"
-        }
+        meta = {key: value for key, value in pending.items() if key != "status"}
         meta.update({
             "node_id": child.id,
             "parent_id": parent.id,
             "parent_timestep": int(parent.timestep),
             "sampler_type": sampler_type,
             "reward": float(result.reward),
-            "raw_score": (float(result.raw_score)
-                          if result.raw_score is not None else None),
+            "raw_score": (float(result.raw_score) if result.raw_score is not None else None),
             "valid": bool(result.valid),
             "parsed": bool(result.parsed),
             "ran": bool(result.ran),
@@ -9099,42 +8082,29 @@ def _finalize_pending_spo_rs_artifacts(
             "advantage_mode": "spo-rs",
             "advantage_scale": float(beta_by_index[index]),
             "sandbox_stdout": (result.stdout or "")[:2000],
-            "parent_value": (float(parent.value)
-                             if parent.value is not None else None),
-            "parent_raw_score": (float(parent.raw_score)
-                                 if parent.raw_score is not None else None),
+            "parent_value": (float(parent.value) if parent.value is not None else None),
+            "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
             "parent_is_seed": parent.id in sampler._seed_ids,
             "parent_visit_count": int(parent_row.get("visit_count", 0)),
             "parent_q_value": parent_row.get("q_value"),
             "parent_prior": parent_row.get("prior"),
-            "parent_exploration_bonus": parent_row.get(
-                "exploration_bonus"),
+            "parent_exploration_bonus": parent_row.get("exploration_bonus"),
             "parent_selection_score": parent_row.get("selection_score"),
             "archive_eligible": archive_eligible,
             "two_stage_rollout": bool(cfg.strategies),
             "strategy": strategy,
             "strategy_index": strategy_index,
-            "strategy_model_name": (
-                cfg.strategy_model_name if bool(cfg.strategies) else None),
-            "programs_per_strategy": (
-                int(cfg.programs_per_strategy)
-                if bool(cfg.strategies) else None),
-            "construction": (
-                _as_float_list(result.construction,
-                               cfg.max_saved_construction)
-                if save_ctor else None),
+            "strategy_model_name": (cfg.strategy_model_name if bool(cfg.strategies) else None),
+            "programs_per_strategy": (int(cfg.programs_per_strategy) if bool(cfg.strategies) else None),
+            "construction": (_as_float_list(result.construction, cfg.max_saved_construction) if save_ctor else None),
             "parent_construction": (
-                _as_float_list(parent.construction,
-                               cfg.max_saved_construction)
+                _as_float_list(parent.construction, cfg.max_saved_construction)
                 if save_ctor else None),
             "seed": int(cfg.seed),
             "spo_rs": info,
         })
-        response_text = item["response_path"].read_text(
-            encoding="utf-8", errors="replace")
-        save_rollout(
-            exp_dir, step_idx, group, rollout, response_text, meta,
-            artifacts_already_saved=True)
+        response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
+        save_rollout(exp_dir, step_idx, group, rollout, response_text, meta, artifacts_already_saved=True)
 
     print(
         f"[resume] step {step_idx}: reused {len(artifacts)} exact generated "
@@ -9144,8 +8114,7 @@ def _finalize_pending_spo_rs_artifacts(
     )
     completed = _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg)
     if completed is None:
-        raise RuntimeError(
-            "generated-step recovery failed to seal complete rollout metadata")
+        raise RuntimeError("generated-step recovery failed to seal complete rollout metadata")
     _prepare_recoverable_response_tokens(None, tokenizer, completed)
     return completed
 
@@ -9157,24 +8126,20 @@ def _resume_spo_rs_step_from_artifacts(
     """Finish one interrupted SPO-RS step from its durable evaluations."""
     import torch
     from experiment_io import save_rollout
-    from reward import extract_python_code
-    from sampler import State
+    from evaluation.reward import extract_python_code
+    from search.sampler import State
 
     adaptive_spo_beta = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
 
-    if (parallel_trainer is None
-            and str(getattr(cfg, "training_layout", "")) != "sharded"):
+    if (parallel_trainer is None and str(getattr(cfg, "training_layout", "")) != "sharded"):
         raise RuntimeError(
             "evaluated-step recovery requires either the configured fast "
             "distributed trainer or the automatic exact sharded trainer")
     if (spo_rs_tracker is None or not spo_rs_tracker.initialized):
-        raise RuntimeError(
-            "evaluated-step recovery requires the pre-step SPO-RS tracker")
+        raise RuntimeError("evaluated-step recovery requires the pre-step SPO-RS tracker")
     spo_rs_tracker.prepare_step()
     if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
-        raise FileNotFoundError(
-            "evaluated-step recovery cannot find the sampling adapter: "
-            f"{sampling_adapter_path}")
+        raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
 
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if len(parents) != int(cfg.groups_per_step):
@@ -9187,24 +8152,18 @@ def _resume_spo_rs_step_from_artifacts(
     for group, parent in enumerate(parents):
         records = by_group.get(group, ())
         if not records:
-            raise RuntimeError(
-                f"evaluated-step recovery has no rollout group {group}")
+            raise RuntimeError(f"evaluated-step recovery has no rollout group {group}")
         first = records[0]["meta"]
         try:
             saved_value = float(first["parent_value"])
             saved_timestep = int(first["parent_timestep"])
             saved_parent_id = str(first["parent_id"])
         except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError(
-                f"evaluated-step recovery lacks parent identity for group "
-                f"{group}") from error
+            raise RuntimeError(f'evaluated-step recovery lacks parent identity for group {group}') from error
         current_value = float(parent.value)
         if (saved_timestep != int(parent.timestep)
-                or not math.isclose(saved_value, current_value,
-                                    rel_tol=0.0, abs_tol=1e-12)):
-            raise RuntimeError(
-                f"evaluated-step recovery parent {group} does not match the "
-                "restored sampler state")
+                or not math.isclose(saved_value, current_value, rel_tol=0.0, abs_tol=1e-12)):
+            raise RuntimeError(f'evaluated-step recovery parent {group} does not match the restored sampler state')
         if parent.id != saved_parent_id:
             if step_idx == 0 and parent.id in sampler._seed_ids:
                 # Fresh seed State UUIDs are intentionally random. Reuse the
@@ -9218,15 +8177,9 @@ def _resume_spo_rs_step_from_artifacts(
         sampler.record_expansion(parent, count=int(cfg.group_size))
 
     rewards = [float(item["meta"]["reward"]) for item in artifacts]
-    saved_advantages = np.asarray(
-        [float(item["meta"]["advantage"]) for item in artifacts],
-        dtype=np.float64)
-    spo_infos = [
-        _literal_metadata_mapping(item["meta"].get("spo_rs"))
-        for item in artifacts
-    ]
-    if any(not info or not bool(info.get("used_for_policy_update", False))
-           for info in spo_infos):
+    saved_advantages = np.asarray([float(item["meta"]["advantage"]) for item in artifacts], dtype=np.float64)
+    spo_infos = [_literal_metadata_mapping(item["meta"].get("spo_rs")) for item in artifacts]
+    if any(not info or not bool(info.get("used_for_policy_update", False)) for info in spo_infos):
         raise RuntimeError(
             "evaluated-step recovery found a rollout that was not part of "
             "the saved SPO-RS policy update")
@@ -9239,25 +8192,15 @@ def _resume_spo_rs_step_from_artifacts(
             or not math.isclose(float(saved_value_before),
                                 float(spo_rs_tracker.baseline()),
                                 rel_tol=0.0, abs_tol=1e-10)):
-        raise RuntimeError(
-            "evaluated-step recovery does not match the saved pre-step "
-            "SPO-RS value")
+        raise RuntimeError('evaluated-step recovery does not match the saved pre-step SPO-RS value')
     if int(spo_info.get("group_size", -1)) != len(artifacts):
-        raise RuntimeError(
-            "evaluated-step recovery rollout count differs from the saved "
-            "SPO-RS update")
-    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(
-            sampling_adapter_path).name:
-        raise RuntimeError(
-            "evaluated-step recovery sampling adapter differs from the "
-            "saved SPO-RS update")
-    for index, (info, transformed_reward) in enumerate(
-            zip(spo_infos, transformed)):
+        raise RuntimeError('evaluated-step recovery rollout count differs from the saved SPO-RS update')
+    if Path(str(spo_info.get("policy_adapter", ""))).name != Path(sampling_adapter_path).name:
+        raise RuntimeError('evaluated-step recovery sampling adapter differs from the saved SPO-RS update')
+    for index, (info, transformed_reward) in enumerate(zip(spo_infos, transformed)):
         saved_transformed = info.get("transformed_reward")
         if (saved_transformed is None
-                or not math.isclose(float(saved_transformed),
-                                    float(transformed_reward),
-                                    rel_tol=0.0, abs_tol=1e-10)):
+                or not math.isclose(float(saved_transformed), float(transformed_reward), rel_tol=0.0, abs_tol=1e-10)):
             raise RuntimeError(
                 "evaluated-step recovery transformed reward differs from "
                 f"the saved SPO-RS record at rollout {index}")
@@ -9266,12 +8209,10 @@ def _resume_spo_rs_step_from_artifacts(
         if bool(spo_info.get("divergence_missing", False)):
             divergence = math.inf
         else:
-            raise RuntimeError(
-                "evaluated-step recovery has no saved SPO-RS divergence")
+            raise RuntimeError("evaluated-step recovery has no saved SPO-RS divergence")
     divergence = float(divergence)
     if math.isnan(divergence) or divergence < 0.0:
-        raise RuntimeError(
-            "evaluated-step recovery found an invalid SPO-RS divergence")
+        raise RuntimeError("evaluated-step recovery found an invalid SPO-RS divergence")
     tracker_update = spo_rs_tracker.update(
         transformed, divergence=divergence,
         policy_adapter=sampling_adapter_path, step=step_idx,
@@ -9279,17 +8220,14 @@ def _resume_spo_rs_step_from_artifacts(
     recovery_updates = [tracker_update]
     saved_after = spo_info.get("value_after")
     if (saved_after is not None
-            and not math.isclose(float(saved_after),
-                                 float(tracker_update["value_after"]),
-                                 rel_tol=0.0, abs_tol=1e-10)):
+            and not math.isclose(float(saved_after), float(tracker_update["value_after"]), rel_tol=0.0, abs_tol=1e-10)):
         raise RuntimeError(
             "evaluated-step recovery produced a different SPO-RS tracker "
             "value; refusing an inexact update")
 
     if (recovered_advantages is None
             or recovered_advantages.shape != saved_advantages.shape
-            or not np.allclose(recovered_advantages, saved_advantages,
-                               rtol=0.0, atol=1e-10)):
+            or not np.allclose(recovered_advantages, saved_advantages, rtol=0.0, atol=1e-10)):
         raise RuntimeError(
             "evaluated-step recovery advantages differ from the saved SPO "
             "objective; refusing an inexact update")
@@ -9302,8 +8240,7 @@ def _resume_spo_rs_step_from_artifacts(
     entropy_directory = None
     entropy_observations = []
     if bool(getattr(cfg, "measure_entropy", False)):
-        from entropy_tools import (begin_step, observation_descriptor,
-                                   rollout_observation)
+        from analysis.entropy_tools import (begin_step, observation_descriptor, rollout_observation)
         entropy_directory = begin_step(exp_dir, step_idx)
     group_sizes = {group: len(records) for group, records in by_group.items()}
     restored_terminal_tokens = 0
@@ -9312,17 +8249,14 @@ def _resume_spo_rs_step_from_artifacts(
     canonical_extra_tokens = 0
     for item in artifacts:
         meta = item["meta"]
-        response_text = item["response_path"].read_text(
-            encoding="utf-8", errors="replace")
-        prompt_text = item["prompt_path"].read_text(
-            encoding="utf-8", errors="replace")
+        response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
+        prompt_text = item["prompt_path"].read_text(encoding="utf-8", errors="replace")
         expected_tokens = int(meta["n_response_tokens"])
         response_tokens = item.get("response_token_ids")
         if response_tokens is None:
             try:
                 response_tokens, recovery = (
-                    _reconstruct_saved_response_tokens(
-                        model, tokenizer, response_text, expected_tokens))
+                    _reconstruct_saved_response_tokens(model, tokenizer, response_text, expected_tokens))
             except ValueError as error:
                 raise RuntimeError(
                     "evaluated-step recovery cannot tokenize the saved "
@@ -9336,31 +8270,26 @@ def _resume_spo_rs_step_from_artifacts(
                 "recorded_count": expected_tokens,
                 "canonical_count": None,
                 "recovered_count": len(response_tokens),
-                "restored_terminal": bool(
-                    item.get("restored_terminal_token")),
+                "restored_terminal": bool(item.get("restored_terminal_token")),
                 "unavailable_original_tokens": 0,
                 "canonical_extra_tokens": 0,
             }
-            if (bool(recovery.get("exact", False))
-                    and len(response_tokens) != expected_tokens):
+            if (bool(recovery.get("exact", False)) and len(response_tokens) != expected_tokens):
                 raise RuntimeError(
                     "evaluated-step recovery exact token cache changed for "
                     f"{item['response_path'].name}")
         restored_terminal = bool(recovery.get("restored_terminal", False))
         restored_terminal_tokens += int(restored_terminal)
-        canonical_recovery_responses += int(
-            recovery.get("source") == "canonical-text")
+        canonical_recovery_responses += int(recovery.get("source") == "canonical-text")
         unavailable_original_tokens += int(recovery.get('unavailable_original_tokens', 0) or 0)
         canonical_extra_tokens += int(recovery.get('canonical_extra_tokens', 0) or 0)
         if prompt_text not in prompt_cache:
-            prompt_cache[prompt_text] = tokenizer(
-                prompt_text, return_tensors="pt").input_ids
+            prompt_cache[prompt_text] = tokenizer(prompt_text, return_tensors="pt").input_ids
             prompt_job_ids[prompt_text] = len(prompt_job_ids)
         group = int(meta["group"])
         entropy_descriptor = None
         if entropy_directory is not None:
-            entropy_descriptor = observation_descriptor(
-                entropy_directory, group, int(meta["rollout"]))
+            entropy_descriptor = observation_descriptor(entropy_directory, group, int(meta["rollout"]))
         if response_tokens:
             behavior_values = item.get("behavior_logprobs")
             behavior_logprobs = (
@@ -9370,8 +8299,7 @@ def _resume_spo_rs_step_from_artifacts(
                 else None)
             all_examples.append({
                 "prompt_ids": prompt_cache[prompt_text],
-                "response_ids": torch.tensor(
-                    [response_tokens], dtype=torch.long),
+                "response_ids": torch.tensor([response_tokens], dtype=torch.long),
                 "_entropy_measurement": entropy_descriptor,
                 "advantage": float(meta["advantage"]),
                 "behavior_logprobs": behavior_logprobs,
@@ -9388,8 +8316,7 @@ def _resume_spo_rs_step_from_artifacts(
         if entropy_descriptor is not None:
             entropy_meta = dict(meta)
             entropy_meta["n_response_tokens"] = len(response_tokens)
-            entropy_observations.append(rollout_observation(
-                entropy_descriptor, entropy_meta, code))
+            entropy_observations.append(rollout_observation(entropy_descriptor, entropy_meta, code))
 
         if bool(meta.get("archive_eligible", False)):
             if not code:
@@ -9398,21 +8325,17 @@ def _resume_spo_rs_step_from_artifacts(
                     f"rollout: {item['response_path'].name}")
             child = State.make(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
-                raw_score=(float(meta["raw_score"])
-                           if meta.get("raw_score") is not None else None),
+                raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
                 construction=_literal_float_list(meta.get("construction")),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
-            strategy_keys.append(
-                int(meta["strategy_index"])
-                if meta.get("strategy_index") is not None else None)
+            strategy_keys.append(int(meta["strategy_index"]) if meta.get("strategy_index") is not None else None)
 
     if not all_examples:
-        raise RuntimeError(
-            "evaluated-step recovery found no nonempty responses to train")
+        raise RuntimeError("evaluated-step recovery found no nonempty responses to train")
     trajectory_weight = 1.0 / len(all_examples)
     for example in all_examples:
         example["sample_weight"] = trajectory_weight
@@ -9421,26 +8344,18 @@ def _resume_spo_rs_step_from_artifacts(
     recovery_examples = all_examples
     if overflow_state is not None:
         try:
-            _validate_precomputed_exact_gradients(
-                model, overflow_state, step_idx)
-            deferred_keys = {
-                (int(key[0]), int(key[1]))
-                for key in overflow_state.get("deferred_keys", ())
-            }
+            _validate_precomputed_exact_gradients(model, overflow_state, step_idx)
+            deferred_keys = {(int(key[0]), int(key[1])) for key in overflow_state.get("deferred_keys", ())}
             remaining_keys = {
                 (int(key[0]), int(key[1]))
-                for key in overflow_state.get(
-                    "remaining_keys", overflow_state.get("deferred_keys", ()))
+                for key in overflow_state.get("remaining_keys", overflow_state.get("deferred_keys", ()))
             }
             marker_keys = {
                 (int(key[0]), int(key[1]))
-                for key in (_read_exact_sharded_recovery(exp_dir) or {}).get(
-                    "deferred_keys", ())
+                for key in (_read_exact_sharded_recovery(exp_dir) or {}).get("deferred_keys", ())
             }
             if not deferred_keys or deferred_keys != marker_keys:
-                raise RuntimeError(
-                    "trajectory keys disagree between the marker and "
-                    "gradient checkpoint")
+                raise RuntimeError('trajectory keys disagree between the marker and gradient checkpoint')
             if not remaining_keys.issubset(deferred_keys):
                 raise RuntimeError(
                     "remaining overflow trajectories are not a subset of "
@@ -9449,24 +8364,18 @@ def _resume_spo_rs_step_from_artifacts(
             for example in all_examples:
                 key = tuple(example["_overlap_key"])
                 if key in example_by_key:
-                    raise RuntimeError(
-                        f"durable trajectory key {key} is duplicated")
+                    raise RuntimeError(f"durable trajectory key {key} is duplicated")
                 example_by_key[key] = example
             missing_keys = deferred_keys - set(example_by_key)
             if missing_keys:
-                raise RuntimeError(
-                    "deferred trajectories are absent from durable "
-                    f"rollouts: {sorted(missing_keys)}")
-            normal_count = int(
-                overflow_state.get("normal_stats", {}).get(
-                    "trained_examples", -1))
+                raise RuntimeError(f'deferred trajectories are absent from durable rollouts: {sorted(missing_keys)}')
+            normal_count = int(overflow_state.get("normal_stats", {}).get("trained_examples", -1))
             if normal_count + len(deferred_keys) != len(all_examples):
                 raise RuntimeError(
                     "trajectory accounting changed: retained="
                     f"{normal_count}, deferred={len(deferred_keys)}, "
                     f"recovered={len(all_examples)}")
-            recovery_examples = [
-                example_by_key[key] for key in sorted(remaining_keys)]
+            recovery_examples = [example_by_key[key] for key in sorted(remaining_keys)]
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             print(
                 f"[warn] selective exact SPO-RS overflow state is not "
@@ -9480,8 +8389,7 @@ def _resume_spo_rs_step_from_artifacts(
     archive_stats = sampler.update(
         all_children,
         strategy_keys=(strategy_keys if bool(cfg.strategies) else None),
-        strategy_top_r=(int(cfg.strategy_archive_top_r)
-                        if bool(cfg.strategies) else 0),
+        strategy_top_r=(int(cfg.strategy_archive_top_r) if bool(cfg.strategies) else 0),
     )
     print(
         f"[resume] step {step_idx}: reusing {len(artifacts)} saved rollout "
@@ -9510,12 +8418,11 @@ def _resume_spo_rs_step_from_artifacts(
         flush=True,
     )
     if overflow_state is not None:
-        from exact_overflow import supports_warm_overflow
+        from training.exact_overflow import supports_warm_overflow
         recovery_lane = (
             ("grouped-checkpoint GPU replicas, then cooperative groups if needed"
              if (not overflow_state.get("replica_checkpoint_groups_attempted", False)
-                 and any(hasattr(module, "_ttt_group_checkpoint_min_tokens")
-                         for module in model.modules())) else
+                 and any(hasattr(module, "_ttt_group_checkpoint_min_tokens") for module in model.modules())) else
              "warm cooperative GPU groups (no process restart)"
              if supports_warm_overflow(cfg) else
              f"the {parallel_trainer.world_size}-GPU RAM-bounded replica lane")
@@ -9541,43 +8448,28 @@ def _resume_spo_rs_step_from_artifacts(
          if problem.maximize else
          min(raw_states, key=lambda state: float(state.raw_score)))
         if raw_states else None)
-    best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize))
-                 or sampler.best_state())
+    best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
     stats = {
-        "planned_rollouts": sum(
-            bool(item["meta"].get("counts_toward_allocation", True))
-            for item in artifacts),
-        "coder_format_retries": sum(
-            int(item['meta'].get('retry_attempt', 0) or 0) > 0
-            for item in artifacts),
+        "planned_rollouts": sum(bool(item["meta"].get("counts_toward_allocation", True)) for item in artifacts),
+        "coder_format_retries": sum(int(item['meta'].get('retry_attempt', 0) or 0) > 0 for item in artifacts),
         "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
         "result_metric_name": str(problem.metric_name),
         "result_maximize": bool(problem.maximize),
-        "step_best_raw_score": (
-            float(step_best.raw_score) if step_best is not None else None),
-        "step_best_reward": (
-            float(step_best.value) if step_best is not None else None),
+        "step_best_raw_score": (float(step_best.raw_score) if step_best is not None else None),
+        "step_best_reward": (float(step_best.value) if step_best is not None else None),
         "best_seen_raw_score": (
             float(best_seen.raw_score)
             if best_seen is not None and best_seen.raw_score is not None
             else None),
-        "best_seen_reward": (
-            float(best_seen.value)
-            if best_seen is not None and best_seen.value is not None else None),
-        "best_seen_step": (
-            int(best_seen.timestep) if best_seen is not None else None),
-        "valid_fraction": (
-            sum(bool(item["meta"]["valid"]) for item in artifacts)
-            / len(artifacts)),
+        "best_seen_reward": (float(best_seen.value) if best_seen is not None and best_seen.value is not None else None),
+        "best_seen_step": (int(best_seen.timestep) if best_seen is not None else None),
+        "valid_fraction": (sum(bool(item["meta"]["valid"]) for item in artifacts) / len(artifacts)),
         "code_valid_fraction": (
-            1.0 - sum(_metadata_is_code_failure(item["meta"])
-                      for item in artifacts) / len(artifacts)),
+            1.0 - sum(_metadata_is_code_failure(item["meta"]) for item in artifacts) / len(artifacts)),
         "spo_rs_updates": recovery_updates,
         "spo_rs_adaptive_beta": adaptive_spo_beta,
-        "spo_rs_tracker_size": (
-            0 if spo_rs_tracker is None else len(spo_rs_tracker)),
-        "spo_rs_divergence": (
-            None if not math.isfinite(divergence) else divergence),
+        "spo_rs_tracker_size": (0 if spo_rs_tracker is None else len(spo_rs_tracker)),
+        "spo_rs_divergence": (None if not math.isfinite(divergence) else divergence),
         "spo_rs_context_divergences": spo_info.get("context_divergences", {}),
         "spo_rs_missing_policy_scores": int(spo_info.get('missing_policy_scores', 0) or 0),
         "spo_rs_sampling_adapter": Path(sampling_adapter_path).name,
@@ -9589,15 +8481,12 @@ def _resume_spo_rs_step_from_artifacts(
     if (overflow_state is not None
             and parallel_trainer is not None
             and hasattr(parallel_trainer, "recover_spo_rs_overflow")):
-        stats.update(parallel_trainer.recover_spo_rs_overflow(
-            recovery_examples, cfg, step_idx, overflow_state))
+        stats.update(parallel_trainer.recover_spo_rs_overflow(recovery_examples, cfg, step_idx, overflow_state))
     elif parallel_trainer is not None:
-        stats.update(parallel_trainer.train_spo_rs(
-            all_examples, cfg, step_idx))
+        stats.update(parallel_trainer.train_spo_rs(all_examples, cfg, step_idx))
     else:
         try:
-            input_device = next(
-                model.get_input_embeddings().parameters()).device
+            input_device = next(model.get_input_embeddings().parameters()).device
         except (AttributeError, StopIteration):
             input_device = model.device
         for example in recovery_examples:
@@ -9631,10 +8520,8 @@ def _resume_spo_rs_step_from_artifacts(
 # ======================================================================
 def _isolated_evaluation_cpu_ids():
     """Return the exact Linux cpuset available to this training process."""
-    if not (hasattr(os, "sched_getaffinity")
-            and hasattr(os, "sched_setaffinity")):
-        raise RuntimeError(
-            "--isolate-eval requires Linux CPU affinity support")
+    if not (hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")):
+        raise RuntimeError("--isolate-eval requires Linux CPU affinity support")
     cpu_ids = sorted(int(cpu_id) for cpu_id in os.sched_getaffinity(0))
     if not cpu_ids:
         raise RuntimeError("--isolate-eval found no CPUs in the allowed cpuset")
@@ -9685,38 +8572,32 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
     from queue import Queue
 
-    from sampler import State
+    from search.sampler import State
     from experiment_io import (save_parent_selections, save_rollout,
                                save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
-    from _retire.problems.base import ParentContext, RewardResult, is_code_failure
-    from gen_workers import make_progress_bar
+    from problems.base import ParentContext, RewardResult, is_code_failure
+    from generation.gen_workers import make_progress_bar
 
 
     step_t0 = time.time()
     entropy_directory = None
     entropy_observations = []
     if getattr(cfg, "measure_entropy", False):
-        from entropy_tools import (begin_step, observation_descriptor,
-                                   rollout_observation)
+        from analysis.entropy_tools import (begin_step, observation_descriptor, rollout_observation)
         entropy_directory = begin_step(exp_dir, step_idx)
-    active_advantage_mode = str(
-        getattr(cfg, "advantage_mode", "entropic")).lower()
+    active_advantage_mode = str(getattr(cfg, "advantage_mode", "entropic")).lower()
     spo_rs_mode = active_advantage_mode == "spo-rs"
-    adaptive_spo_beta = bool(
-        spo_rs_mode and getattr(cfg, "spo_rs_adaptive_beta", False))
+    adaptive_spo_beta = bool(spo_rs_mode and getattr(cfg, "spo_rs_adaptive_beta", False))
     if spo_rs_mode and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
     if (spo_rs_mode and (not spo_rs_tracker.initialized)):
-        raise ValueError(
-            "SPO-RS tracker must be initialized from pre-step history before "
-            "rollouts are sampled")
+        raise ValueError('SPO-RS tracker must be initialized from pre-step history before rollouts are sampled')
     if spo_rs_mode:
         spo_rs_tracker.prepare_step()
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
-    requested_parent_contexts = (
-        int(cfg.groups_per_step))
+    requested_parent_contexts = (int(cfg.groups_per_step))
     parents = sampler.sample_states(requested_parent_contexts, selection_step=step_idx)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
@@ -9727,8 +8608,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   f"Luna rank={detail['rank']} ({detail['role']}): "
                   f"{detail['reason']}")
             continue
-        prior_label = ("" if info.get("selection_mode") == "uct"
-                       else f"  P={info['P']:.9f}")
+        prior_label = ("" if info.get("selection_mode") == "uct" else f"  P={info['P']:.9f}")
         print(f"  parent {i} [{tag}]  value={info['value']:.9f}  n={info['n']}  "
               f"Q={info['Q']:.9f}{prior_label}  "
               f"bonus={info['bonus']:.9f}  score={info['score']:.9f}")
@@ -9736,11 +8616,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # Save the selection event immediately. Unlike the sampler checkpoint,
     # this survives later archive pruning and also exists if generation or
     # adapter training is interrupted.
-    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False)
-                    else type(sampler).__name__)
-    save_parent_selections(
-        exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info,
-        rollout_config=cfg)
+    sampler_type = ("UCTSampler" if getattr(sampler, "use_uct", False) else type(sampler).__name__)
+    save_parent_selections(exp_dir, step_idx, sampler_type, parents, sampler.last_picks_info, rollout_config=cfg)
     setting_log_only(
         f"[step {step_idx}] saved {len(parents)} selected parent(s) before "
         f"generation/training", flush=True)
@@ -9764,9 +8641,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     base_messages = []
 
     for g, parent in enumerate(parents):
-        sampler.record_expansion(
-            parent,
-            count=int(cfg.group_size))
+        sampler.record_expansion(parent, count=int(cfg.group_size))
         pc = ParentContext(
             code=parent.code,
             value=parent.value if parent.value is not None else 0.0,
@@ -9783,25 +8658,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     adapter_path = None
     if spo_rs_mode:
         if sampling_adapter_path is None:
-            adapter_path = _save_adapter(
-                model, exp_dir, step_idx, cfg.model_name,
-                directory_name="adapter_initial")
+            adapter_path = _save_adapter(model, exp_dir, step_idx, cfg.model_name, directory_name="adapter_initial")
         else:
             adapter_path = str(Path(sampling_adapter_path))
             if not Path(adapter_path).is_dir():
-                raise FileNotFoundError(
-                    f"SPO-RS sampling adapter not found: {adapter_path}")
+                raise FileNotFoundError(f"SPO-RS sampling adapter not found: {adapter_path}")
     elif gen_pool is not None:
-        adapter_path = _save_adapter(
-            model, exp_dir, step_idx, cfg.model_name)
+        adapter_path = _save_adapter(model, exp_dir, step_idx, cfg.model_name)
 
     def _render(messages, *, rollout_phase=None, reasoning_effort=None):
-        template_kind = str(
-            getattr(cfg, "coder_template_kind", "generic"))
+        template_kind = str(getattr(cfg, "coder_template_kind", "generic"))
         template_options = {}
         if template_kind == "gpt-oss":
-            template_options["reasoning_effort"] = str(
-                cfg.coder_reasoning_effort)
+            template_options["reasoning_effort"] = str(cfg.coder_reasoning_effort)
         elif template_kind == "qwen3.8":
             template_options.update({
                 "enable_thinking": True,
@@ -9841,8 +8710,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"the required {template_kind} reasoning controls "
                     f"{template_options}; update transformers and refresh "
                     "the model tokenizer files")
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     strategy_tokenizer = strategy_tokenizer or tokenizer
 
@@ -9857,25 +8725,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             return render_strategy_prompt(
                 strategy_tokenizer, messages, cfg.strategy_model_name,
                 thinking=cfg.strategy_thinking,
-                effort=(cfg.strategy_reasoning_effort
-                        if reasoning_effort is None else reasoning_effort))
+                effort=(cfg.strategy_reasoning_effort if reasoning_effort is None else reasoning_effort))
         template_options = {}
         if "gpt-oss" in strategy_name:
             template_options["reasoning_effort"] = str(
                 cfg.strategy_reasoning_effort
                 if reasoning_effort is None else reasoning_effort)
         else:
-            template_options["enable_thinking"] = bool(
-                cfg.strategy_thinking)
+            template_options["enable_thinking"] = bool(cfg.strategy_thinking)
         try:
             return strategy_tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
                 **template_options,
             )
         except TypeError:
-            return strategy_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
+            return strategy_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     prompt_jobs = []
     phase_prompt_job_cache = {}
@@ -9890,44 +8754,27 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "count": count,
         })
 
-    two_stage_rollouts = bool(
-        getattr(problem, "two_stage_rollouts", False))
-    strategies_per_parent = (
-        int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
-    programs_per_strategy = (
-        int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
-    pilot_programs_per_strategy = (
-        int(getattr(cfg, "pilot_programs_per_strategy", -1))
-        if two_stage_rollouts else -1)
-    phase2_allocation_method = str(getattr(
-        cfg, "phase2_allocation_method", "rule_based"
-    )).strip().lower()
+    two_stage_rollouts = bool(getattr(problem, "two_stage_rollouts", False))
+    strategies_per_parent = (int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
+    programs_per_strategy = (int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
+    pilot_programs_per_strategy = (int(getattr(cfg, "pilot_programs_per_strategy", -1)) if two_stage_rollouts else -1)
+    phase2_allocation_method = str(getattr(cfg, "phase2_allocation_method", "rule_based")).strip().lower()
     if phase2_allocation_method not in {"rule_based", "bandit", "hurdle"}:
-        raise RuntimeError(
-            "phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
-    adaptive_strategy_pilots = bool(
-        two_stage_rollouts and pilot_programs_per_strategy > 0)
-    if (two_stage_rollouts
-            and int(cfg.group_size)
-            != strategies_per_parent * programs_per_strategy):
+        raise RuntimeError("phase2_allocation_method must be 'rule_based', 'bandit', or 'hurdle'")
+    adaptive_strategy_pilots = bool(two_stage_rollouts and pilot_programs_per_strategy > 0)
+    if (two_stage_rollouts and int(cfg.group_size) != strategies_per_parent * programs_per_strategy):
         raise RuntimeError(
             "hierarchical rollout group size must equal "
             "strategies_per_parent * programs_per_strategy")
 
     def _source_schedule(parent_group):
-        indices = [
-            index for index, job in enumerate(prompt_jobs)
-            if int(job["parent_group"]) == int(parent_group)
-        ]
+        indices = [index for index, job in enumerate(prompt_jobs) if int(job["parent_group"]) == int(parent_group)]
         if not indices:
-            raise RuntimeError(
-                f"parent {parent_group} has no rendered prompt job")
-        weights = [max(0, int(prompt_jobs[index]["count"]))
-                   for index in indices]
+            raise RuntimeError(f"parent {parent_group} has no rendered prompt job")
+        weights = [max(0, int(prompt_jobs[index]["count"])) for index in indices]
         total = sum(weights)
         if total < 1:
-            return [indices[slot % len(indices)]
-                    for slot in range(strategies_per_parent)]
+            return [indices[slot % len(indices)] for slot in range(strategies_per_parent)]
         cumulative = []
         running = 0
         for index, weight in zip(indices, weights):
@@ -9948,8 +8795,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     strategy_prompt_cache = {}
     strategy_attempt_prompts = {}
     strategy_format_max_retries = int(getattr(cfg, "strategy_format_max_retries", 3))
-    strict_strategy_validation = bool(
-        getattr(cfg, "strict_strategy_validation", False))
+    strict_strategy_validation = bool(getattr(cfg, "strict_strategy_validation", False))
     if two_stage_rollouts:
         for parent_group in range(len(parents)):
             schedule = _source_schedule(parent_group)
@@ -9966,23 +8812,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 f"strategy chain {chain['chain_id']} received strategy "
                 f"{strategy_index} after {len(chain['strategies'])} records")
         raw_response = str(response_text or '')
-        normalize_response = getattr(
-            problem, "normalize_strategy_response", None)
-        accepted_response = (
-            str(normalize_response(raw_response))
-            if callable(normalize_response) else raw_response)
-        save_strategy_response(
-            exp_dir,
-            step_idx,
-            int(chain["parent_group"]),
-            int(strategy_index),
-            accepted_response,
-        )
-        strategy, extraction_issue = _extract_final_strategy(
-            accepted_response, strict=strict_strategy_validation)
+        normalize_response = getattr(problem, "normalize_strategy_response", None)
+        accepted_response = (str(normalize_response(raw_response)) if callable(normalize_response) else raw_response)
+        save_strategy_response(exp_dir, step_idx, int(chain["parent_group"]), int(strategy_index), accepted_response)
+        strategy, extraction_issue = _extract_final_strategy(accepted_response, strict=strict_strategy_validation)
         if extraction_issue is None and strict_strategy_validation:
-            validate_strategy = getattr(
-                problem, "strategy_output_issue", None)
+            validate_strategy = getattr(problem, "strategy_output_issue", None)
             if callable(validate_strategy):
                 extraction_issue = validate_strategy(strategy)
                 if extraction_issue is not None:
@@ -10002,12 +8837,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             source_idx = chain["source_indices"][strategy_index]
             strategy_prompt_cache[key] = deepcopy(problem.build_strategy_messages(
                 source_jobs[source_idx]["messages"],
-                previous_strategies=[record["strategy"]
-                                     for record in chain["strategies"]]))
+                previous_strategies=[record["strategy"] for record in chain["strategies"]]))
         messages = deepcopy(strategy_prompt_cache[key])
         if retry:
             if getattr(cfg, "api_strategy", ""):
-                from strategy_prompts_openai import openai_strategy_retry_messages
+                from generation.strategy_prompts_openai import openai_strategy_retry_messages
                 messages = openai_strategy_retry_messages(messages)
             else:
                 messages = output_retry_messages(messages, "strategy")
@@ -10018,24 +8852,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     def _handle_strategy_attempt(chain_index, strategy_index, response, attempt):
         chain = strategy_chains[int(chain_index)]
         raw_response = str(response or '')
-        normalize_response = getattr(
-            problem, "normalize_strategy_response", None)
-        checked_response = (
-            str(normalize_response(raw_response))
-            if callable(normalize_response) else raw_response)
-        strategy, issue = _extract_final_strategy(
-            checked_response, strict=strict_strategy_validation)
+        normalize_response = getattr(problem, "normalize_strategy_response", None)
+        checked_response = (str(normalize_response(raw_response)) if callable(normalize_response) else raw_response)
+        strategy, issue = _extract_final_strategy(checked_response, strict=strict_strategy_validation)
         if issue is None and strict_strategy_validation:
-            validate_strategy = getattr(
-                problem, "strategy_output_issue", None)
+            validate_strategy = getattr(problem, "strategy_output_issue", None)
             if callable(validate_strategy):
                 issue = validate_strategy(strategy)
         save_strategy_response(
             exp_dir, step_idx, int(chain["parent_group"]),
             int(strategy_index), raw_response,
             attempt=int(attempt), extraction_issue=issue,
-            prompt_text=strategy_attempt_prompts.pop(
-                (int(chain["chain_id"]), int(strategy_index), int(attempt))))
+            prompt_text=strategy_attempt_prompts.pop((int(chain["chain_id"]), int(strategy_index), int(attempt))))
         needs_retry = strategy_retry_needed(
             issue, attempt, strategy_format_max_retries,
             label=f"strategy {strategy_index + 1}, chain {chain_index + 1}")
@@ -10049,17 +8877,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # canonical strategy for this slot an explicit direct-solve
             # instruction.  This keeps dependent stages and coder rollout
             # counts intact without admitting malformed planner text.
-            fallback_response = (
-                f"<strategy>{_STRATEGY_FALLBACK}</strategy>")
-            _record_strategy_response(
-                chain, strategy_index, fallback_response)
+            fallback_response = (f"<strategy>{_STRATEGY_FALLBACK}</strategy>")
+            _record_strategy_response(chain, strategy_index, fallback_response)
             chain["strategies"][-1].update({
                 "used_fallback": True,
                 "fallback_issue": issue,
                 "failed_attempts": int(attempt) + 1,
             })
-            strategy_prompt_cache.pop(
-                (int(chain["chain_id"]), int(strategy_index)), None)
+            strategy_prompt_cache.pop((int(chain["chain_id"]), int(strategy_index)), None)
             print(
                 f"[warn] strategy {strategy_index + 1}, chain "
                 f"{chain_index + 1}: {issue} after "
@@ -10085,13 +8910,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"strategy chain {chain['chain_id']} expected "
                     f"{strategies_per_parent} strategies, received "
                     f"{len(chain['strategies'])}")
-            for strategy_index, strategy_record in enumerate(
-                    chain["strategies"]):
+            for strategy_index, strategy_record in enumerate(chain["strategies"]):
                 source_idx = chain["source_indices"][strategy_index]
                 source_job = source_jobs[source_idx]
                 strategy = strategy_record["strategy"]
-                messages = problem.build_code_messages(
-                    source_job["messages"], strategy)
+                messages = problem.build_code_messages(source_job["messages"], strategy)
                 code_jobs.append({
                     **source_job,
                     "messages": messages,
@@ -10128,7 +8951,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # parallel across cores. THREAD-SAFETY REQUIREMENT: each compute_reward call
     # must use a unique temp file/dir and must not os.chdir or mutate shared
     # state; otherwise concurrent runs corrupt each other's rewards.
-    from host_memory import HostMemoryAdmission
+    from runtime.host_memory import HostMemoryAdmission
     host_admission = getattr(parallel_trainer, "host_memory_admission", None)
     if host_admission is None:
         host_admission = getattr(gen_pool, "host_memory_admission", None)
@@ -10152,8 +8975,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 isolated_cpu_slots.put(cpu_id)
         isolated_capacity = isolated_cpu_count * isolated_processes_per_cpu
         n_reward_workers = max(1, min(total_rollouts, isolated_capacity))
-        isolated_memory_limit_bytes = (
-            _automatic_sandbox_memory_limit_bytes(n_reward_workers))
+        isolated_memory_limit_bytes = (_automatic_sandbox_memory_limit_bytes(n_reward_workers))
         setting_log_only(
             f"[step {step_idx}] isolated evaluation pool: "
             f"{n_reward_workers} sandbox process(es) across "
@@ -10173,8 +8995,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # on a dedicated thread so disk I/O never blocks the generation scheduler.
     # The complete reward/advantage metadata replaces the provisional metadata
     # below after evaluation; the large text artifacts are written only once.
-    rollout_io_pool = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix=f"rollout-save-step{step_idx}")
+    rollout_io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"rollout-save-step{step_idx}")
     rollout_io_futures = []
 
     # This bar must exist before generation begins.  Reward futures are added
@@ -10214,8 +9035,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # not change inside a step, so this is scheduling-only: prompts, policy,
     # sampling, token limits, rewards, and training membership stay identical.
     deferred_coder_retry_batches = []
-    defer_gpu_evaluation = bool(
-        getattr(cfg, "evaluation_shares_generation", False))
+    defer_gpu_evaluation = bool(getattr(cfg, "evaluation_shares_generation", False))
     if adaptive_strategy_pilots and defer_gpu_evaluation:
         raise ValueError(
             "adaptive strategy pilots require CPU evaluation concurrent with "
@@ -10246,9 +9066,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 reward=float(problem.fail_score), msg=record["output_format_issue"],
                 failure_kind="code"))
         elif isolated_eval:
-            fut = reward_pool.submit(
-                _run_isolated_reward, record["text"],
-                parent_ctxs[parent_group])
+            fut = reward_pool.submit(_run_isolated_reward, record["text"], parent_ctxs[parent_group])
         else:
             fut = reward_pool.submit(
                 problem.compute_reward, record["text"],
@@ -10272,8 +9090,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             behavior_logprobs = (
                 behavior_values
                 if len(behavior_values) == len(token_ids)
-                and all(math.isfinite(float(value))
-                        for value in behavior_values)
+                and all(math.isfinite(float(value)) for value in behavior_values)
                 else None)
         job = prompt_jobs[int(job_idx)]
         parent_group = int(job["parent_group"])
@@ -10298,8 +9115,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
             "output_format_issue": coder_output_issue(
-                text, require_final_marker=bool(
-                    getattr(problem, "require_final_code_marker", False))),
+                text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False))),
             "retry_attempt": 0 if retry_of is None else 1,
             "retry_of_group": None if retry_of is None else int(retry_of["group_id"]),
             "retry_of_rollout": None if retry_of is None else int(retry_of["rollout_index"]),
@@ -10307,19 +9123,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         }
         (primary_rollout_records if retry_of is None else coder_retry_records).append(record)
         if entropy_directory is not None:
-            record["_entropy_measurement"] = observation_descriptor(
-                entropy_directory, int(group_id), rollout_index)
+            record["_entropy_measurement"] = observation_descriptor(entropy_directory, int(group_id), rollout_index)
         if rollout_phase is not None:
             record["strategy_rollout_phase"] = str(rollout_phase)
         if strategy_source_job_idx is not None:
-            record["strategy_source_job_idx"] = int(
-                strategy_source_job_idx)
+            record["strategy_source_job_idx"] = int(strategy_source_job_idx)
         save_future = rollout_io_pool.submit(
             save_rollout_artifacts,
             exp_dir, step_idx, int(group_id), rollout_index, text,
             prompt_text=job["prompt_text"],
-            strategy_text=(job.get("strategy_response")
-                           if two_stage_rollouts else None),
+            strategy_text=(job.get("strategy_response") if two_stage_rollouts else None),
             response_token_ids=token_ids,
             behavior_logprobs=behavior_logprobs,
             pending_meta={
@@ -10331,8 +9144,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "rollout": rollout_index,
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
-                "strategy_rollout_phase": (
-                    str(rollout_phase) if rollout_phase is not None else None),
+                "strategy_rollout_phase": (str(rollout_phase) if rollout_phase is not None else None),
                 "strategy_source_job_idx": (
                     int(strategy_source_job_idx)
                     if strategy_source_job_idx is not None else None),
@@ -10340,8 +9152,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         )
         record["_artifact_save_future"] = save_future
         rollout_io_futures.append(save_future)
-        if (training_enabled and cfg.generation_backend == "vllm"
-                and token_ids):
+        if (training_enabled and cfg.generation_backend == "vllm" and token_ids):
             vllm_logprob_records.append(record)
         if defer_gpu_evaluation:
             deferred_rollouts.append(record)
@@ -10353,8 +9164,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         """Recover a low-validity batch; never return retries to the allocator."""
         if not bool(getattr(cfg, "coder_retry", False)):
             return
-        triggered, total, valid, missing, retry_budget = coder_retry_gate(
-            records)
+        triggered, total, valid, missing, retry_budget = coder_retry_gate(records)
         if not triggered:
             if missing:
                 print(
@@ -10372,17 +9182,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Spread a limited recovery budget across the streamed failure order
         # instead of always favoring the first strategy/worker group.
         if retry_budget < len(failed):
-            failed = [
-                failed[(index * len(failed)) // retry_budget]
-                for index in range(retry_budget)
-            ]
+            failed = [failed[(index * len(failed)) // retry_budget] for index in range(retry_budget)]
         prompt_indices = [coder_retry_prompt_job(
             prompt_jobs, record, _render, coder_retry_prompt_cache,
             reasoning_effort=prompt_jobs[int(record["job_idx"])].get(
-                "coder_reasoning_effort", _coder_effort_for_rollout_phase(
-                    cfg, record.get("strategy_rollout_phase"))),
-            continue_from_failure=bool(getattr(
-                problem, "coder_retry_uses_failed_response", False)))
+                "coder_reasoning_effort", _coder_effort_for_rollout_phase(cfg, record.get("strategy_rollout_phase"))),
+            continue_from_failure=bool(getattr(problem, "coder_retry_uses_failed_response", False)))
             for record in failed]
         prompts = [prompt_jobs[index]["prompt_text"] for index in prompt_indices]
         with eval_progress_condition:
@@ -10408,9 +9213,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             stream = gen_pool.iter_group_jobs(**options)
         else:
             _seed_local_generation(retry_step)
-            stream = generate_prompt_jobs(
-                model, tokenizer, prompts, [1] * len(prompts), cfg,
-                cap_state=cap_state)
+            stream = generate_prompt_jobs(model, tokenizer, prompts, [1] * len(prompts), cfg, cap_state=cap_state)
         seen = set()
         still_missing = 0
         for index, results in stream:
@@ -10442,8 +9245,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # Retain every planned record, including fully valid batches, because
         # the 50% trigger is defined over the complete pilot + phase-2 set.
         if records:
-            deferred_coder_retry_batches.append(
-                (list(records), int(seed_offset)))
+            deferred_coder_retry_batches.append((list(records), int(seed_offset)))
 
     def _drain_deferred_coder_format_retries():
         if not bool(getattr(cfg, "coder_retry", False)):
@@ -10451,36 +9253,24 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             return
         batches = list(deferred_coder_retry_batches)
         deferred_coder_retry_batches.clear()
-        all_records = [record for records, _seed_offset in batches
-                       for record in records]
+        all_records = [record for records, _seed_offset in batches for record in records]
         _run_coder_format_retries(all_records, seed_offset=0)
 
     def _strategy_plan_metadata(source_job_idx):
         source_job = prompt_jobs[int(source_job_idx)]
         return {
-            "strategy_pilot_reward_mean": source_job.get(
-                "strategy_pilot_reward_mean"),
-            "strategy_pilot_reward_variance": source_job.get(
-                "strategy_pilot_reward_variance"),
-            "strategy_pilot_mean_threshold": source_job.get(
-                "strategy_pilot_mean_threshold"),
-            "strategy_pilot_variance_threshold": source_job.get(
-                "strategy_pilot_variance_threshold"),
-            "strategy_pilot_scenario": source_job.get(
-                "strategy_pilot_scenario"),
-            "strategy_phase2_allocation_method": source_job.get(
-                "strategy_phase2_allocation_method"),
-            "strategy_pilot_valid_count": source_job.get(
-                "strategy_pilot_valid_count"),
-            "strategy_posterior_valid_probability": source_job.get(
-                "strategy_posterior_valid_probability"),
-            "strategy_initial_expected_improvement": source_job.get(
-                "strategy_initial_expected_improvement"),
+            "strategy_pilot_reward_mean": source_job.get("strategy_pilot_reward_mean"),
+            "strategy_pilot_reward_variance": source_job.get("strategy_pilot_reward_variance"),
+            "strategy_pilot_mean_threshold": source_job.get("strategy_pilot_mean_threshold"),
+            "strategy_pilot_variance_threshold": source_job.get("strategy_pilot_variance_threshold"),
+            "strategy_pilot_scenario": source_job.get("strategy_pilot_scenario"),
+            "strategy_phase2_allocation_method": source_job.get("strategy_phase2_allocation_method"),
+            "strategy_pilot_valid_count": source_job.get("strategy_pilot_valid_count"),
+            "strategy_posterior_valid_probability": source_job.get("strategy_posterior_valid_probability"),
+            "strategy_initial_expected_improvement": source_job.get("strategy_initial_expected_improvement"),
             "strategy_hurdle": source_job.get("strategy_hurdle"),
-            "strategy_pilot_followup_count": source_job.get(
-                "strategy_pilot_followup_count"),
-            "strategy_allocated_programs": source_job.get(
-                "strategy_allocated_programs"),
+            "strategy_pilot_followup_count": source_job.get("strategy_pilot_followup_count"),
+            "strategy_allocated_programs": source_job.get("strategy_allocated_programs"),
         }
 
     def _attach_strategy_plan(record, source_job_idx, rollout_phase):
@@ -10517,37 +9307,24 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             raise RuntimeError("adaptive rollout allocation lost budget")
         return allocations
 
-    def _finish_strategy_pilots(
-            pilot_records, source_job_indices, *, rewards_already_ready=False):
+    def _finish_strategy_pilots(pilot_records, source_job_indices, *, rewards_already_ready=False):
         """Finish one or more ready parent pilot sets exactly."""
-        expected_pilots = (
-            len(source_job_indices) * pilot_programs_per_strategy)
+        expected_pilots = (len(source_job_indices) * pilot_programs_per_strategy)
         if len(pilot_records) != expected_pilots:
-            raise RuntimeError(
-                "pilot generation returned "
-                f"{len(pilot_records)}/{expected_pilots} rollouts")
-        pilot_futures = [record.get("_reward_future")
-                         for record in pilot_records]
+            raise RuntimeError(f'pilot generation returned {len(pilot_records)}/{expected_pilots} rollouts')
+        pilot_futures = [record.get("_reward_future") for record in pilot_records]
         if any(future is None for future in pilot_futures):
-            raise RuntimeError(
-                "adaptive pilot allocation requires CPU rewards to run "
-                "concurrently with generation")
+            raise RuntimeError('adaptive pilot allocation requires CPU rewards to run concurrently with generation')
         if rewards_already_ready:
             if not all(future.done() for future in pilot_futures):
-                raise RuntimeError(
-                    "pilot allocation was requested before its rewards were "
-                    "ready")
+                raise RuntimeError('pilot allocation was requested before its rewards were ready')
         else:
             wait(pilot_futures)
 
-        rewards_by_source = {
-            int(source_idx): [] for source_idx in source_job_indices}
-        raw_scores_by_source = {
-            int(source_idx): [] for source_idx in source_job_indices}
-        valid_flags_by_source = {
-            int(source_idx): [] for source_idx in source_job_indices}
-        records_by_source = {
-            int(source_idx): [] for source_idx in source_job_indices}
+        rewards_by_source = {int(source_idx): [] for source_idx in source_job_indices}
+        raw_scores_by_source = {int(source_idx): [] for source_idx in source_job_indices}
+        valid_flags_by_source = {int(source_idx): [] for source_idx in source_job_indices}
+        records_by_source = {int(source_idx): [] for source_idx in source_job_indices}
         for record in pilot_records:
             source_idx = int(record["strategy_source_job_idx"])
             result = record["_reward_future"].result()
@@ -10556,16 +9333,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # so completed futures cannot retain hundreds of MiB of diagnostic
             # output while phase 2 is generated.
             if len(result.stdout or '') > 4096:
-                result.stdout = (
-                    (result.stdout or '')[:4096]
-                    + "\n[... sandbox output truncated ...]")
+                result.stdout = ((result.stdout or '')[:4096] + "\n[... sandbox output truncated ...]")
             reward = float(result.reward)
             if not math.isfinite(reward):
-                raise RuntimeError(
-                    f"pilot reward for strategy job {source_idx} is not finite")
+                raise RuntimeError(f"pilot reward for strategy job {source_idx} is not finite")
             rewards_by_source[source_idx].append(reward)
-            valid_flags_by_source[source_idx].append(bool(
-                getattr(result, "valid", False)))
+            valid_flags_by_source[source_idx].append(bool(getattr(result, "valid", False)))
             raw_score = getattr(result, "raw_score", None)
             if bool(getattr(result, "valid", False)) and raw_score is not None:
                 try:
@@ -10582,12 +9355,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             key = int(job["parent_group"])
             chains.setdefault(key, []).append(int(source_idx))
 
-        followup_counts = {int(source_idx): 0
-                           for source_idx in source_job_indices}
-        for parent_group, chain_indices in sorted(
-                chains.items()):
-            chain_indices.sort(
-                key=lambda index: int(prompt_jobs[index]["strategy_index"]))
+        followup_counts = {int(source_idx): 0 for source_idx in source_job_indices}
+        for parent_group, chain_indices in sorted(chains.items()):
+            chain_indices.sort(key=lambda index: int(prompt_jobs[index]["strategy_index"]))
             if len(chain_indices) != strategies_per_parent:
                 raise RuntimeError(
                     f"parent {parent_group} has "
@@ -10606,27 +9376,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 means.append(float(values.mean()))
                 variances.append(float(values.var(ddof=0)))
 
-            remaining = (
-                strategies_per_parent
-                * (programs_per_strategy - pilot_programs_per_strategy))
+            remaining = (strategies_per_parent * (programs_per_strategy - pilot_programs_per_strategy))
             bandit_diagnostics = [None] * len(chain_indices)
             bandit_summary = None
 
             if phase2_allocation_method in {"bandit", "hurdle"}:
-                from rollout_allocation import (
-                    allocate_hurdle_expected_best,
-                    allocate_posterior_expected_best,
-                )
+                from search.rollout_allocation import (allocate_hurdle_expected_best, allocate_posterior_expected_best)
                 allocation_seed = (
                     int(cfg.seed) * 1_000_003
                     + (int(step_idx) + 1) * 1009
                     + (int(parent_group) + 1) * 9176
                     + 131
                 ) % (2 ** 32)
-                reward_groups = [rewards_by_source[index]
-                                 for index in chain_indices]
-                valid_groups = [valid_flags_by_source[index]
-                                for index in chain_indices]
+                reward_groups = [rewards_by_source[index] for index in chain_indices]
+                valid_groups = [valid_flags_by_source[index] for index in chain_indices]
                 if phase2_allocation_method == "hurdle":
                     saved_parent_reward = parents[parent_group].value
                     if saved_parent_reward is None:
@@ -10638,8 +9401,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         )
                     )
                     allocation_label = "hurdle expected-best"
-                    baseline_label = (
-                        f"parent reward={float(saved_parent_reward):.9f}, ")
+                    baseline_label = (f"parent reward={float(saved_parent_reward):.9f}, ")
                     fallback_label = " equally (no pilot improved the saved parent)"
                 else:
                     followups, bandit_diagnostics, bandit_summary = (
@@ -10670,18 +9432,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"projected phase-2 gain="
                     f"{gain_text}; "
                     f"allocating {remaining} phase-2 rollouts"
-                    + (fallback_label
-                       if bandit_summary.get("fallback_equal") else ""),
+                    + (fallback_label if bandit_summary.get("fallback_equal") else ""),
                     flush=True,
                 )
             else:
                 # Original rule-based allocator. Keep this path byte-for-byte
                 # equivalent in behavior so selecting the new bandit cannot
                 # change or retire existing experiments.
-                mean_threshold = float(np.median(
-                    np.asarray(means, dtype=np.float64)))
-                variance_threshold = float(np.median(
-                    np.asarray(variances, dtype=np.float64)))
+                mean_threshold = float(np.median(np.asarray(means, dtype=np.float64)))
+                variance_threshold = float(np.median(np.asarray(variances, dtype=np.float64)))
                 scenarios = []
                 weights = []
                 for mean, variance in zip(means, variances):
@@ -10704,8 +9463,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 tie_values = [
                     (mean, variance,
                      int(prompt_jobs[source_idx]["strategy_index"]))
-                    for source_idx, mean, variance in zip(
-                        chain_indices, means, variances)
+                    for source_idx, mean, variance in zip(chain_indices, means, variances)
                 ]
 
                 # The original rule-based zero-signal exploration floor.
@@ -10713,35 +9471,27 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     abs(mean) <= 1e-12 and abs(variance) <= 1e-12
                     for mean, variance in zip(means, variances)
                 ]
-                requested_floor = max(
-                    0, int(pilot_programs_per_strategy) // 3)
+                requested_floor = max(0, int(pilot_programs_per_strategy) // 3)
                 floor_allocations = [0] * len(chain_indices)
                 floor_demand = requested_floor * sum(zero_signal)
                 if floor_demand > 0:
                     floor_budget = min(remaining, floor_demand)
                     if floor_budget == floor_demand:
-                        floor_allocations = [
-                            requested_floor if is_zero else 0
-                            for is_zero in zero_signal
-                        ]
+                        floor_allocations = [requested_floor if is_zero else 0 for is_zero in zero_signal]
                     else:
                         floor_allocations = _allocate_largest_remainder(
                             floor_budget,
-                            [1.0 if is_zero else 0.0
-                             for is_zero in zero_signal],
+                            [1.0 if is_zero else 0.0 for is_zero in zero_signal],
                             tie_values,
                         )
                 weighted_budget = remaining - sum(floor_allocations)
-                weighted_allocations = _allocate_largest_remainder(
-                    weighted_budget, weights, tie_values)
+                weighted_allocations = _allocate_largest_remainder(weighted_budget, weights, tie_values)
                 followups = [
                     int(floor_count) + int(weighted_count)
-                    for floor_count, weighted_count in zip(
-                        floor_allocations, weighted_allocations)
+                    for floor_count, weighted_count in zip(floor_allocations, weighted_allocations)
                 ]
                 if sum(followups) != remaining:
-                    raise RuntimeError(
-                        "adaptive rollout exploration floor lost budget")
+                    raise RuntimeError("adaptive rollout exploration floor lost budget")
                 fallback_equal = not any(weight > 0.0 for weight in weights)
                 floor_total = sum(floor_allocations)
                 if requested_floor > 0 and any(zero_signal):
@@ -10764,60 +9514,39 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"{mean_threshold:.9f}, variance threshold="
                     f"{variance_threshold:.9f}; allocating {remaining} "
                     "phase-2 rollouts"
-                    + (" equally (all pilot statistics tied)"
-                       if fallback_equal else "")
+                    + (" equally (all pilot statistics tied)" if fallback_equal else "")
                     + floor_label,
                     flush=True,
                 )
 
             for (source_idx, mean, variance, scenario, followup,
-                 bandit_arm) in zip(
-                    chain_indices, means, variances, scenarios, followups,
-                    bandit_diagnostics):
+                 bandit_arm) in zip(chain_indices, means, variances, scenarios, followups, bandit_diagnostics):
                 job = prompt_jobs[source_idx]
                 allocated = pilot_programs_per_strategy + int(followup)
                 raw_scores = raw_scores_by_source[source_idx]
-                best_raw_score = (
-                    (max(raw_scores) if problem.maximize else min(raw_scores))
-                    if raw_scores else None
-                )
+                best_raw_score = ((max(raw_scores) if problem.maximize else min(raw_scores)) if raw_scores else None)
                 diagnostic = {
                     "parent_group": int(parent_group),
                     "strategy_index": int(job["strategy_index"]),
                     "pilot_count": int(pilot_programs_per_strategy),
                     "pilot_reward_mean": float(mean),
                     "pilot_reward_variance": float(variance),
-                    "mean_threshold": (
-                        float(mean_threshold)
-                        if mean_threshold is not None else None),
-                    "variance_threshold": (
-                        float(variance_threshold)
-                        if variance_threshold is not None else None),
+                    "mean_threshold": (float(mean_threshold) if mean_threshold is not None else None),
+                    "variance_threshold": (float(variance_threshold) if variance_threshold is not None else None),
                     "scenario": str(scenario),
                     "allocation_method": phase2_allocation_method,
                     "followup_count": int(followup),
                     "allocated_programs": int(allocated),
                     "source_job_idx": int(source_idx),
-                    "pilot_best_raw_score": (
-                        float(best_raw_score)
-                        if best_raw_score is not None else None),
+                    "pilot_best_raw_score": (float(best_raw_score) if best_raw_score is not None else None),
                 }
                 if bandit_arm is not None:
                     diagnostic.update({
-                        "pilot_valid_count": int(
-                            bandit_arm["valid_count"]),
-                        "posterior_valid_probability": float(
-                            bandit_arm[
-                                "posterior_valid_probability"]),
-                        "initial_expected_improvement": float(
-                            bandit_arm[
-                                "initial_expected_improvement"]),
-                        "final_marginal_expected_improvement": float(
-                            bandit_arm[
-                                "final_marginal_expected_improvement"]),
-                        "projected_expected_gain": float(
-                            bandit_summary[
-                                "projected_expected_gain"]),
+                        "pilot_valid_count": int(bandit_arm["valid_count"]),
+                        "posterior_valid_probability": float(bandit_arm["posterior_valid_probability"]),
+                        "initial_expected_improvement": float(bandit_arm["initial_expected_improvement"]),
+                        "final_marginal_expected_improvement": float(bandit_arm["final_marginal_expected_improvement"]),
+                        "projected_expected_gain": float(bandit_summary["projected_expected_gain"]),
                     })
                     if phase2_allocation_method == "hurdle":
                         diagnostic["hurdle"] = {
@@ -10838,21 +9567,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 job.update({
                     "strategy_pilot_reward_mean": float(mean),
                     "strategy_pilot_reward_variance": float(variance),
-                    "strategy_pilot_mean_threshold": (
-                        float(mean_threshold)
-                        if mean_threshold is not None else None),
+                    "strategy_pilot_mean_threshold": (float(mean_threshold) if mean_threshold is not None else None),
                     "strategy_pilot_variance_threshold": (
                         float(variance_threshold)
                         if variance_threshold is not None else None),
                     "strategy_pilot_scenario": str(scenario),
-                    "strategy_phase2_allocation_method": (
-                        phase2_allocation_method),
-                    "strategy_pilot_valid_count": diagnostic.get(
-                        "pilot_valid_count"),
-                    "strategy_posterior_valid_probability": diagnostic.get(
-                        "posterior_valid_probability"),
-                    "strategy_initial_expected_improvement": diagnostic.get(
-                        "initial_expected_improvement"),
+                    "strategy_phase2_allocation_method": (phase2_allocation_method),
+                    "strategy_pilot_valid_count": diagnostic.get("pilot_valid_count"),
+                    "strategy_posterior_valid_probability": diagnostic.get("posterior_valid_probability"),
+                    "strategy_initial_expected_improvement": diagnostic.get("initial_expected_improvement"),
                     "strategy_hurdle": diagnostic.get("hurdle"),
                     "strategy_pilot_followup_count": int(followup),
                     "strategy_allocated_programs": int(allocated),
@@ -10860,10 +9583,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 followup_counts[source_idx] = int(followup)
                 for record in records_by_source[source_idx]:
                     _attach_strategy_plan(record, source_idx, "pilot")
-                best_raw_text = (
-                    f"{best_raw_score:.9f}"
-                    if best_raw_score is not None else "unavailable"
-                )
+                best_raw_text = (f"{best_raw_score:.9f}" if best_raw_score is not None else "unavailable")
                 if phase2_allocation_method == "hurdle":
                     allocation_text = (
                         f"valid={int(bandit_arm['valid_count'])}/"
@@ -10893,13 +9613,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     flush=True,
                 )
 
-            if (sum(pilot_programs_per_strategy + count
-                    for count in followups) != int(cfg.group_size)):
-                raise RuntimeError(
-                    "adaptive strategy allocation changed the fixed group "
-                    "rollout budget")
-        return [followup_counts[int(source_idx)]
-                for source_idx in source_job_indices]
+            if (sum(pilot_programs_per_strategy + count for count in followups) != int(cfg.group_size)):
+                raise RuntimeError('adaptive strategy allocation changed the fixed group rollout budget')
+        return [followup_counts[int(source_idx)] for source_idx in source_job_indices]
 
     def _print_adaptive_phase2_results():
         """Repeat pilot diagnostics with each strategy's final best result."""
@@ -10914,21 +9630,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 source_idx = record.get("strategy_source_job_idx")
                 if source_idx is None:
                     continue
-                records_by_source.setdefault(int(source_idx), []).append(
-                    record)
+                records_by_source.setdefault(int(source_idx), []).append(record)
 
         diagnostics_by_chain = {}
         for diagnostic in strategy_pilot_diagnostics:
             key = int(diagnostic["parent_group"])
             diagnostics_by_chain.setdefault(key, []).append(diagnostic)
 
-        for parent_group, diagnostics in sorted(
-                diagnostics_by_chain.items()):
+        for parent_group, diagnostics in sorted(diagnostics_by_chain.items()):
             diagnostics.sort(key=lambda item: int(item["strategy_index"]))
-            allocation_method = str(diagnostics[0].get(
-                "allocation_method") or "rule_based")
-            phase2_total = sum(
-                int(item["followup_count"]) for item in diagnostics)
+            allocation_method = str(diagnostics[0].get("allocation_method") or "rule_based")
+            phase2_total = sum(int(item["followup_count"]) for item in diagnostics)
             if allocation_method in {"bandit", "hurdle"}:
                 allocation_label = (
                     "hurdle expected-best" if allocation_method == "hurdle"
@@ -10942,8 +9654,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 )
             else:
                 mean_threshold = float(diagnostics[0]["mean_threshold"])
-                variance_threshold = float(
-                    diagnostics[0]["variance_threshold"])
+                variance_threshold = float(diagnostics[0]["variance_threshold"])
                 print(
                     f"[step {step_idx}] rollout phase 2 complete parent "
                     f"{parent_group}: mean threshold="
@@ -10957,10 +9668,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 source_idx = int(diagnostic["source_job_idx"])
                 followup_count = int(diagnostic["followup_count"])
                 pilot_best = diagnostic.get("pilot_best_raw_score")
-                pilot_best_text = (
-                    f"{float(pilot_best):.9f}"
-                    if pilot_best is not None else "unavailable"
-                )
+                pilot_best_text = (f"{float(pilot_best):.9f}" if pilot_best is not None else "unavailable")
                 if allocation_method == "hurdle":
                     hurdle = diagnostic["hurdle"]
                     allocation_text = (
@@ -10998,13 +9706,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     for record in records_by_source.get(source_idx, []):
                         future = record.get("_reward_future")
                         if future is None or not future.done():
-                            raise RuntimeError(
-                                "phase-2 report requested before all strategy "
-                                "rewards were ready")
+                            raise RuntimeError('phase-2 report requested before all strategy rewards were ready')
                         result = future.result()
                         raw_score = getattr(result, "raw_score", None)
-                        if (not bool(getattr(result, "valid", False))
-                                or raw_score is None):
+                        if (not bool(getattr(result, "valid", False)) or raw_score is None):
                             continue
                         try:
                             raw_score = float(raw_score)
@@ -11012,17 +9717,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             continue
                         if math.isfinite(raw_score):
                             raw_scores.append(raw_score)
-                    final_best = (
-                        (max(raw_scores) if problem.maximize
-                         else min(raw_scores))
-                        if raw_scores else None
-                    )
-                    diagnostic["final_best_raw_score"] = (
-                        float(final_best) if final_best is not None else None)
-                    final_best_text = (
-                        f"{final_best:.9f}"
-                        if final_best is not None else "unavailable"
-                    )
+                    final_best = ((max(raw_scores) if problem.maximize else min(raw_scores)) if raw_scores else None)
+                    diagnostic["final_best_raw_score"] = (float(final_best) if final_best is not None else None)
+                    final_best_text = (f"{final_best:.9f}" if final_best is not None else "unavailable")
                     line += (
                         f" {_ANSI_YELLOW}--> best raw after new rollouts "
                         f"{problem.metric_name}={final_best_text}"
@@ -11030,8 +9727,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     )
                 print(line, flush=True)
 
-    def _run_adaptive_followups_as_ready(
-            pilot_records, source_job_indices, run_phase):
+    def _run_adaptive_followups_as_ready(pilot_records, source_job_indices, run_phase):
         """Allocate and generate each parent as soon as its pilots finish.
 
         The selected allocator sees all strategies and every pilot for that
@@ -11040,17 +9736,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         belonging to other parents continue in parallel.
         """
         source_job_indices = [int(index) for index in source_job_indices]
-        source_position = {
-            source_idx: position
-            for position, source_idx in enumerate(source_job_indices)
-        }
-        records_by_source = {source_idx: []
-                             for source_idx in source_job_indices}
+        source_position = {source_idx: position for position, source_idx in enumerate(source_job_indices)}
+        records_by_source = {source_idx: [] for source_idx in source_job_indices}
         for record in pilot_records:
             source_idx = int(record["strategy_source_job_idx"])
             if source_idx not in records_by_source:
-                raise RuntimeError(
-                    f"pilot record references unknown strategy {source_idx}")
+                raise RuntimeError(f"pilot record references unknown strategy {source_idx}")
             records_by_source[source_idx].append(record)
         for source_idx, records in records_by_source.items():
             if len(records) != pilot_programs_per_strategy:
@@ -11064,18 +9755,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             key = int(job["parent_group"])
             pending_chains.setdefault(key, []).append(source_idx)
         for key, chain_indices in pending_chains.items():
-            chain_indices.sort(
-                key=lambda index: int(
-                    prompt_jobs[index]["strategy_index"]))
+            chain_indices.sort(key=lambda index: int(prompt_jobs[index]["strategy_index"]))
             if len(chain_indices) != strategies_per_parent:
                 raise RuntimeError(
                     f"parent {key} has "
                     f"{len(chain_indices)} strategy jobs; expected "
                     f"{strategies_per_parent}")
 
-        remaining_per_chain = (
-            strategies_per_parent
-            * (programs_per_strategy - pilot_programs_per_strategy))
+        remaining_per_chain = (strategies_per_parent * (programs_per_strategy - pilot_programs_per_strategy))
         expected_followups = len(pending_chains) * remaining_per_chain
         print(
             f"[step {step_idx}] adaptive phase 2: "
@@ -11111,36 +9798,22 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if not record["_reward_future"].done()
                 }
                 if not incomplete:
-                    raise RuntimeError(
-                        "adaptive pilot scheduler has no ready chain or "
-                        "pending reward")
+                    raise RuntimeError('adaptive pilot scheduler has no ready chain or pending reward')
                 wait(incomplete, return_when=FIRST_COMPLETED)
                 continue
 
             ready_keys.sort()
-            ready_sources = [
-                source_idx
-                for key in ready_keys
-                for source_idx in pending_chains[key]
-            ]
-            ready_records = [
-                record
-                for source_idx in ready_sources
-                for record in records_by_source[source_idx]
-            ]
-            ready_followups = _finish_strategy_pilots(
-                ready_records, ready_sources, rewards_already_ready=True)
+            ready_sources = [source_idx for key in ready_keys for source_idx in pending_chains[key]]
+            ready_records = [record for source_idx in ready_sources for record in records_by_source[source_idx]]
+            ready_followups = _finish_strategy_pilots(ready_records, ready_sources, rewards_already_ready=True)
             batch_counts = [0] * len(source_job_indices)
-            for source_idx, count in zip(
-                    ready_sources, ready_followups):
+            for source_idx, count in zip(ready_sources, ready_followups):
                 position = source_position[source_idx]
                 batch_counts[position] = int(count)
                 all_followup_counts[position] = int(count)
             batch_total = sum(batch_counts)
             if batch_total:
-                run_phase(
-                    batch_counts, dispatch_index, batch_total,
-                    dispatched + batch_total, expected_followups)
+                run_phase(batch_counts, dispatch_index, batch_total, dispatched + batch_total, expected_followups)
                 dispatched += batch_total
                 dispatch_index += 1
             for key in ready_keys:
@@ -11158,10 +9831,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     coder_phase_complete = False
     try:
         try:
-            api_planned = bool(two_stage_rollouts and
-                               getattr(cfg, "strategy_backend", "local") == "api")
+            api_planned = bool(two_stage_rollouts and getattr(cfg, "strategy_backend", "local") == "api")
             if api_planned:
-                from strategy_api import run_strategy_rounds
+                from generation.strategy_api import run_strategy_rounds
                 if strategy_pool is None:
                     raise RuntimeError("API strategy mode requires its remote generation pool")
                 source_prompt_jobs = prompt_jobs
@@ -11201,9 +9873,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                           f"(max {cfg.strategy_max_new_tokens} tokens each)",
                           flush=True)
                     try:
-                        def _generate_strategy_batch(
-                                prompts, chain_indices, strategy_index,
-                                *, retry=0):
+                        def _generate_strategy_batch(prompts, chain_indices, strategy_index, *, retry=0):
                             responses = {}
                             completed = set()
                             suffix = " retry" if retry else ""
@@ -11213,19 +9883,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         group_size=1,
                                         counts_by_group=[1] * len(prompts),
                                         adapter_path=None,
-                                        max_new_tokens=int(
-                                            cfg.strategy_max_new_tokens),
-                                        temperature=float(
-                                            cfg.strategy_temperature),
+                                        max_new_tokens=int(cfg.strategy_max_new_tokens),
+                                        temperature=float(cfg.strategy_temperature),
                                         top_p=float(cfg.strategy_top_p),
-                                        top_k=getattr(
-                                            cfg,
-                                            "strategy_sampling_top_k",
-                                            None),
-                                        min_p=getattr(
-                                            cfg,
-                                            "strategy_sampling_min_p",
-                                            None),
+                                        top_k=getattr(cfg, "strategy_sampling_top_k", None),
+                                        min_p=getattr(cfg, "strategy_sampling_min_p", None),
                                         step_idx=(
                                             int(step_idx) + 2_000_000
                                             + strategy_index * 10_000
@@ -11240,14 +9902,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         "strategy generation must return "
                                         "exactly one response per chain")
                                 prompt_index = int(prompt_index)
-                                if (prompt_index < 0
-                                        or prompt_index
-                                        >= len(chain_indices)):
-                                    raise RuntimeError(
-                                        "strategy generation returned an "
-                                        "out-of-range prompt index")
-                                chain_index = int(
-                                    chain_indices[prompt_index])
+                                if (prompt_index < 0 or prompt_index >= len(chain_indices)):
+                                    raise RuntimeError('strategy generation returned an out-of-range prompt index')
+                                chain_index = int(chain_indices[prompt_index])
                                 if chain_index in completed:
                                     raise RuntimeError(
                                         "strategy generation returned chain "
@@ -11256,14 +9913,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     chain_index, strategy_index, job_results[0][0], retry)
                                 completed.add(chain_index)
                             if completed != set(chain_indices):
-                                raise RuntimeError(
-                                    "strategy generation did not return every "
-                                    "parent chain")
+                                raise RuntimeError('strategy generation did not return every parent chain')
                             return responses
 
                         if hasattr(planning_pool, "run_sequential_chains"):
-                            def _build_ready_strategy_prompt(
-                                    chain_index, strategy_index, retry):
+                            def _build_ready_strategy_prompt(chain_index, strategy_index, retry):
                                 return _strategy_prompt(
                                     source_prompt_jobs,
                                     strategy_chains[int(chain_index)],
@@ -11278,15 +9932,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 result_handler=_handle_strategy_attempt,
                                 max_retries=strategy_format_max_retries,
                                 adapter_path=None,
-                                max_new_tokens=int(
-                                    cfg.strategy_max_new_tokens),
-                                temperature=float(
-                                    cfg.strategy_temperature),
+                                max_new_tokens=int(cfg.strategy_max_new_tokens),
+                                temperature=float(cfg.strategy_temperature),
                                 top_p=float(cfg.strategy_top_p),
-                                top_k=getattr(
-                                    cfg, "strategy_sampling_top_k", None),
-                                min_p=getattr(
-                                    cfg, "strategy_sampling_min_p", None),
+                                top_k=getattr(cfg, "strategy_sampling_top_k", None),
+                                min_p=getattr(cfg, "strategy_sampling_min_p", None),
                                 step_idx=int(step_idx) + 2_000_000,
                                 progress_desc="strategies pipelined",
                             )
@@ -11294,10 +9944,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             # Legacy local pools retain the compatible
                             # depth-batched path. Local vLLM pools use the
                             # dependency-pipelined scheduler above.
-                            for strategy_index in range(
-                                    strategies_per_parent):
-                                chain_indices = list(range(
-                                    len(strategy_chains)))
+                            for strategy_index in range(strategies_per_parent):
+                                chain_indices = list(range(len(strategy_chains)))
                                 for attempt in range(strategy_format_max_retries + 1):
                                     strategy_prompts = [
                                         _strategy_prompt(
@@ -11308,19 +9956,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     needs_retry = _generate_strategy_batch(
                                         strategy_prompts, chain_indices,
                                         strategy_index, retry=attempt)
-                                    chain_indices = [index for index in chain_indices
-                                                     if needs_retry[index]]
+                                    chain_indices = [index for index in chain_indices if needs_retry[index]]
                                     if not chain_indices:
                                         break
                     finally:
                         if (planning_pool is not gen_pool
-                                and not getattr(
-                                    cfg,
-                                    "dual_resident_qwen3_8b_strategy_coder_pools",
-                                    False)):
+                                and not getattr(cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False)):
                             planning_pool.release()
-                    prompt_jobs = _code_prompt_jobs(
-                        source_prompt_jobs, strategy_chains)
+                    prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
                     setting_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
@@ -11329,12 +9972,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 if adaptive_strategy_pilots:
                     source_job_indices = list(range(len(prompt_jobs)))
 
-                    def _run_vllm_code_phase(
-                            counts, *, phase, seed_offset, progress_desc,
-                            defer_format_retries=False):
-                        active = _coder_effort_entries(
-                            prompt_jobs, source_job_indices, counts, cfg,
-                            step_idx, phase)
+                    def _run_vllm_code_phase(counts, *, phase, seed_offset, progress_desc, defer_format_retries=False):
+                        active = _coder_effort_entries(prompt_jobs, source_job_indices, counts, cfg, step_idx, phase)
                         if not active:
                             return []
                         active_indices = [item[0] for item in active]
@@ -11345,42 +9984,34 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 phase_prompt_job_cache, effort=effort)
                             for index, _count, effort in active]
                         options = {
-                            "prompts_by_group": [
-                                prompt_jobs[index]["prompt_text"]
-                                for index in active_prompt_indices],
+                            "prompts_by_group": [prompt_jobs[index]["prompt_text"] for index in active_prompt_indices],
                             "group_size": max(active_counts),
                             "counts_by_group": active_counts,
                             "adapter_path": adapter_path,
                             "max_new_tokens": cfg.max_new_tokens,
                             "temperature": cfg.temperature,
                             "top_p": cfg.top_p,
-                            "top_k": getattr(
-                                cfg, "sampling_top_k", None),
-                            "min_p": getattr(
-                                cfg, "sampling_min_p", None),
+                            "top_k": getattr(cfg, "sampling_top_k", None),
+                            "min_p": getattr(cfg, "sampling_min_p", None),
                             "step_idx": int(step_idx) + int(seed_offset),
                             "progress_desc": progress_desc,
-                            "full_policy_sampling": (
-                                _uses_sequence_level_policy_ratio(cfg)),
+                            "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                         }
                         if cfg.generation_backend == "vllm":
                             options["return_logprobs"] = training_enabled
                         phase_records = []
-                        for local_idx, job_results in (
-                                gen_pool.iter_group_jobs(**options)):
+                        for local_idx, job_results in (gen_pool.iter_group_jobs(**options)):
                             source_idx = active_indices[int(local_idx)]
                             for result in job_results:
                                 text, token_ids = result[:2]
-                                behavior_logprobs = (
-                                    result[2] if len(result) > 2 else None)
+                                behavior_logprobs = (result[2] if len(result) > 2 else None)
                                 record = _queue_rollout(
                                     active_prompt_indices[int(local_idx)],
                                     text, token_ids,
                                     behavior_logprobs,
                                     rollout_phase=phase,
                                     strategy_source_job_idx=source_idx)
-                                _attach_strategy_plan(
-                                    record, source_idx, phase)
+                                _attach_strategy_plan(record, source_idx, phase)
                                 phase_records.append(record)
                         expected = sum(active_counts)
                         if len(phase_records) != expected:
@@ -11388,11 +10019,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
                         if defer_format_retries:
-                            _defer_coder_format_retries(
-                                phase_records, seed_offset=seed_offset)
+                            _defer_coder_format_retries(phase_records, seed_offset=seed_offset)
                         else:
-                            _run_coder_format_retries(
-                                phase_records, seed_offset=seed_offset)
+                            _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     setting_log_only(
@@ -11414,26 +10043,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             dispatched_after, expected_total):
                         _run_vllm_code_phase(
                             counts, phase="adaptive",
-                            seed_offset=(
-                                4_000_000 + dispatch_index * 100_000),
-                            progress_desc=(
-                                "adaptive rollouts "
-                                f"{dispatched_after}/{expected_total}"),
+                            seed_offset=(4_000_000 + dispatch_index * 100_000),
+                            progress_desc=(f'adaptive rollouts {dispatched_after}/{expected_total}'),
                             defer_format_retries=True)
 
-                    _run_adaptive_followups_as_ready(
-                        pilot_records, source_job_indices,
-                        _run_ready_vllm_followups)
+                    _run_adaptive_followups_as_ready(pilot_records, source_job_indices, _run_ready_vllm_followups)
                     _drain_deferred_coder_format_retries()
                 else:
                     # Keep the disabled path structurally identical to the
                     # original one-pass rollout scheduler.
                     generation_options = {
-                        "prompts_by_group": [
-                            job["prompt_text"] for job in prompt_jobs],
+                        "prompts_by_group": [job["prompt_text"] for job in prompt_jobs],
                         "group_size": cfg.group_size,
-                        "counts_by_group": [
-                            job["count"] for job in prompt_jobs],
+                        "counts_by_group": [job["count"] for job in prompt_jobs],
                         "adapter_path": adapter_path,
                         "max_new_tokens": cfg.max_new_tokens,
                         "temperature": cfg.temperature,
@@ -11441,19 +10063,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "top_k": getattr(cfg, "sampling_top_k", None),
                         "min_p": getattr(cfg, "sampling_min_p", None),
                         "step_idx": step_idx,
-                        "full_policy_sampling": (
-                            _uses_sequence_level_policy_ratio(cfg)),
+                        "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                     }
                     if cfg.generation_backend == "vllm":
                         generation_options["return_logprobs"] = training_enabled
-                    for job_idx, job_results in gen_pool.iter_group_jobs(
-                            **generation_options):
+                    for job_idx, job_results in gen_pool.iter_group_jobs(**generation_options):
                         for result in job_results:
                             text, token_ids = result[:2]
-                            behavior_logprobs = (
-                                result[2] if len(result) > 2 else None)
-                            _queue_rollout(
-                                job_idx, text, token_ids, behavior_logprobs)
+                            behavior_logprobs = (result[2] if len(result) > 2 else None)
+                            _queue_rollout(job_idx, text, token_ids, behavior_logprobs)
                     _run_coder_format_retries(primary_rollout_records, seed_offset=0)
             else:
                 # In-process generation uses cross-prompt micro-batches rather
@@ -11464,9 +10082,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
                 def _seed_local_generation(seed_step):
                     if cfg.deterministic:
-                        torch.manual_seed((int(cfg.seed) * 1_000_003
-                                           + int(seed_step) * 1009 + 13)
-                                          % (2**31 - 1))
+                        torch.manual_seed((int(cfg.seed) * 1_000_003 + int(seed_step) * 1009 + 13) % (2**31 - 1))
 
                 if two_stage_rollouts and not api_planned:
                     source_prompt_jobs = prompt_jobs
@@ -11479,13 +10095,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     strategy_cfg = SimpleNamespace(**vars(cfg))
                     strategy_cfg.advantage_mode = "entropic"
                     strategy_cfg.max_seq_length = int(cfg.strategy_max_seq_length)
-                    strategy_cfg.temperature = float(
-                        cfg.strategy_temperature)
+                    strategy_cfg.temperature = float(cfg.strategy_temperature)
                     strategy_cfg.top_p = float(cfg.strategy_top_p)
-                    strategy_cfg.sampling_top_k = getattr(
-                        cfg, "strategy_sampling_top_k", None)
-                    strategy_cfg.sampling_min_p = getattr(
-                        cfg, "strategy_sampling_min_p", None)
+                    strategy_cfg.sampling_top_k = getattr(cfg, "strategy_sampling_top_k", None)
+                    strategy_cfg.sampling_min_p = getattr(cfg, "strategy_sampling_min_p", None)
                     with backend.disable_adapter():
                         for strategy_index in range(strategies_per_parent):
                             pending_chains = list(range(len(strategy_chains)))
@@ -11529,8 +10142,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 pending_chains = sorted(retry_chains)
                                 if not pending_chains:
                                     break
-                    prompt_jobs = _code_prompt_jobs(
-                        source_prompt_jobs, strategy_chains)
+                    prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
                     setting_log_only(f"[step {step_idx}] two-stage coding: generating "
                           f"{sum(job['count'] for job in prompt_jobs)} "
                           f"LoRA-policy programs from {len(prompt_jobs)} "
@@ -11539,12 +10151,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 if adaptive_strategy_pilots:
                     source_job_indices = list(range(len(prompt_jobs)))
 
-                    def _run_local_code_phase(
-                            counts, *, phase, seed_offset, progress_desc,
-                            defer_format_retries=False):
-                        active = _coder_effort_entries(
-                            prompt_jobs, source_job_indices, counts, cfg,
-                            step_idx, phase)
+                    def _run_local_code_phase(counts, *, phase, seed_offset, progress_desc, defer_format_retries=False):
+                        active = _coder_effort_entries(prompt_jobs, source_job_indices, counts, cfg, step_idx, phase)
                         if not active:
                             return []
                         active_indices = [item[0] for item in active]
@@ -11554,16 +10162,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 prompt_jobs, index, phase, cfg, _render,
                                 phase_prompt_job_cache, effort=effort)
                             for index, _count, effort in active]
-                        _seed_local_generation(
-                            int(step_idx) + int(seed_offset))
+                        _seed_local_generation(int(step_idx) + int(seed_offset))
                         phase_records = []
-                        gen_bar = make_progress_bar(
-                            sum(active_counts), desc=progress_desc)
+                        gen_bar = make_progress_bar(sum(active_counts), desc=progress_desc)
                         try:
                             for local_idx, responses in generate_prompt_jobs(
                                     model, tokenizer,
-                                    [prompt_jobs[index]["prompt_text"]
-                                     for index in active_prompt_indices],
+                                    [prompt_jobs[index]["prompt_text"] for index in active_prompt_indices],
                                     active_counts, cfg,
                                     cap_state=cap_state):
                                 source_idx = active_indices[int(local_idx)]
@@ -11573,8 +10178,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         text, token_ids,
                                         rollout_phase=phase,
                                         strategy_source_job_idx=source_idx)
-                                    _attach_strategy_plan(
-                                        record, source_idx, phase)
+                                    _attach_strategy_plan(record, source_idx, phase)
                                     phase_records.append(record)
                                 gen_bar.update(len(responses))
                         finally:
@@ -11585,11 +10189,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 f"{phase} generation returned "
                                 f"{len(phase_records)}/{expected} rollouts")
                         if defer_format_retries:
-                            _defer_coder_format_retries(
-                                phase_records, seed_offset=seed_offset)
+                            _defer_coder_format_retries(phase_records, seed_offset=seed_offset)
                         else:
-                            _run_coder_format_retries(
-                                phase_records, seed_offset=seed_offset)
+                            _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
                     setting_log_only(
@@ -11611,24 +10213,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             dispatched_after, expected_total):
                         _run_local_code_phase(
                             counts, phase="adaptive",
-                            seed_offset=(
-                                4_000_000 + dispatch_index * 100_000),
-                            progress_desc=(
-                                "adaptive rollouts "
-                                f"{dispatched_after}/{expected_total}"),
+                            seed_offset=(4_000_000 + dispatch_index * 100_000),
+                            progress_desc=(f'adaptive rollouts {dispatched_after}/{expected_total}'),
                             defer_format_retries=True)
 
-                    _run_adaptive_followups_as_ready(
-                        pilot_records, source_job_indices,
-                        _run_ready_local_followups)
+                    _run_adaptive_followups_as_ready(pilot_records, source_job_indices, _run_ready_local_followups)
                     _drain_deferred_coder_format_retries()
                     cfg._local_generation_cap = int(cap_state["value"])
                 else:
                     # Keep the disabled path structurally identical to the
                     # original one-pass rollout scheduler.
                     _seed_local_generation(step_idx)
-                    gen_bar = make_progress_bar(
-                        total_rollouts, desc="rollouts")
+                    gen_bar = make_progress_bar(total_rollouts, desc="rollouts")
                     try:
                         for job_idx, responses in generate_prompt_jobs(
                                 model, tokenizer,
@@ -11662,16 +10258,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # to score fixed base/reference token logprobs without the adapter.
             if cfg.generation_backend == "vllm" and vllm_logprob_records:
                 scoring_started = time.time()
-                eval_done_before = sum(
-                    future.done() for futures in reward_futures.values()
-                    for future in futures)
+                eval_done_before = sum(future.done() for futures in reward_futures.values() for future in futures)
                 prompt_token_ids = {}
                 score_pairs = []
                 for record in vllm_logprob_records:
                     job_idx = record["job_idx"]
                     if job_idx not in prompt_token_ids:
-                        prompt_token_ids[job_idx] = tokenizer(
-                            prompt_jobs[job_idx]["prompt_text"]).input_ids
+                        prompt_token_ids[job_idx] = tokenizer(prompt_jobs[job_idx]["prompt_text"]).input_ids
                     score_pairs.append((
                         prompt_token_ids[job_idx], record["token_ids"]))
                 if spo_rs_mode:
@@ -11691,13 +10284,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             require_complete=True)
                         current_policy_scores = [
                             existing if existing is not None else retry
-                            for existing, retry in zip(
-                                current_policy_scores, rescored_current)
+                            for existing, retry in zip(current_policy_scores, rescored_current)
                         ]
-                    for record, values in zip(
-                            vllm_logprob_records, current_policy_scores):
-                        if values is None or len(values) != len(
-                                record["token_ids"]):
+                    for record, values in zip(vllm_logprob_records, current_policy_scores):
+                        if values is None or len(values) != len(record["token_ids"]):
                             raise RuntimeError(
                                 "SPO-RS could not obtain complete rollout-"
                                 "policy logprobs before training")
@@ -11724,13 +10314,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         == spo_rs_previous_adapter_path.resolve())
                     if same_policy:
                         spo_rs_divergence = 0.0
-                        spo_rs_context_divergences = {
-                            int(record["context_id"]): 0.0
-                            for record in vllm_logprob_records
-                        }
+                        spo_rs_context_divergences = {int(record["context_id"]): 0.0 for record in vllm_logprob_records}
                     elif (spo_rs_tracker.initialized):
-                        if (spo_rs_previous_adapter_path is None
-                                or not spo_rs_previous_adapter_path.is_dir()):
+                        if (spo_rs_previous_adapter_path is None or not spo_rs_previous_adapter_path.is_dir()):
                             raise FileNotFoundError(
                                 "SPO-RS cannot compute the consecutive-policy "
                                 "KL because its previous sampling adapter is "
@@ -11739,8 +10325,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             previous_policy_scores = (
                                 gen_pool.score_token_logprobs(
                                     score_pairs, show_progress=True,
-                                    adapter_path=str(
-                                        spo_rs_previous_adapter_path),
+                                    adapter_path=str(spo_rs_previous_adapter_path),
                                     require_complete=True))
                             (spo_rs_divergence,
                              spo_rs_missing_policy_scores,
@@ -11748,13 +10333,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 spo_rs_tracker.consecutive_policy_divergence(
                                     current_policy_scores,
                                     previous_policy_scores,
-                                    [record["context_id"] for record
-                                     in vllm_logprob_records],
-                                    required_context_ids=[
-                                        spec["context_id"]
-                                        for spec in group_specs]))
-                            if (spo_rs_missing_policy_scores
-                                    or not math.isfinite(spo_rs_divergence)):
+                                    [record["context_id"] for record in vllm_logprob_records],
+                                    required_context_ids=[spec["context_id"] for spec in group_specs]))
+                            if (spo_rs_missing_policy_scores or not math.isfinite(spo_rs_divergence)):
                                 raise RuntimeError(
                                     "SPO-RS exact consecutive-policy scoring "
                                     "completed without a usable score for "
@@ -11762,27 +10343,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 else:
                     current_policy_scores = [None] * len(score_pairs)
                     try:
-                        reference_scores = gen_pool.score_token_logprobs(
-                            score_pairs, show_progress=True)
+                        reference_scores = gen_pool.score_token_logprobs(score_pairs, show_progress=True)
                     except Exception as error:
                         reference_scores = [None] * len(score_pairs)
                         print(f"[warn] vLLM reference scoring failed ({error!r}); "
                               "missing values will be recomputed exactly by "
                               "the HF trainer", flush=True)
-                for record, values in zip(
-                        vllm_logprob_records, reference_scores):
+                for record, values in zip(vllm_logprob_records, reference_scores):
                     record["reference_logprobs"] = values
-                behavior_count = sum(
-                    record["behavior_logprobs"] is not None
-                    for record in vllm_logprob_records)
-                reference_count = sum(
-                    record["reference_logprobs"] is not None
-                    for record in vllm_logprob_records)
-                reference_hf_fallbacks = (
-                    0 if spo_rs_mode else len(vllm_logprob_records) - reference_count)
-                eval_done_after = sum(
-                    future.done() for futures in reward_futures.values()
-                    for future in futures)
+                behavior_count = sum(record["behavior_logprobs"] is not None for record in vllm_logprob_records)
+                reference_count = sum(record["reference_logprobs"] is not None for record in vllm_logprob_records)
+                reference_hf_fallbacks = (0 if spo_rs_mode else len(vllm_logprob_records) - reference_count)
+                eval_done_after = sum(future.done() for futures in reward_futures.values() for future in futures)
                 reference_label = (
                     'off for SPO-RS' if spo_rs_mode else f'{reference_count}/{len(vllm_logprob_records)}')
                 if spo_rs_mode and not spo_rs_tracker.initialized:
@@ -11816,16 +10388,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     and not defer_gpu_evaluation
                     and hasattr(parallel_trainer, "restore_on_gpus")
                     and hasattr(gen_pool, "release_for_training")
-                    and not getattr(cfg,
-                        "dual_resident_qwen3_8b_strategy_coder_pools", False))
+                    and not getattr(cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False))
                 if immediate_restore:
                     gen_pool.release_for_training(parallel_trainer)
                 else:
                     gen_pool.release()
-            if (getattr(
-                    cfg,
-                    "dual_resident_qwen3_8b_strategy_coder_pools",
-                    False)
+            if (getattr(cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False)
                     and strategy_pool is not None
                     and strategy_pool is not gen_pool
                     and getattr(strategy_pool, "sequential", False)):
@@ -11876,24 +10444,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 staged_spo_rs_examples = []
                 try:
                     staged_spo_rs_examples = (
-                        _prepare_spo_rs_overlap_inputs(
-                            tokenizer, group_responses, reward_futures,
-                            prompt_jobs))
+                        _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, prompt_jobs))
                     if staged_spo_rs_examples:
-                        pending_before = sum(
-                            not future.done() for future in all_futs)
+                        pending_before = sum(not future.done() for future in all_futs)
                         pending_by_future = {
                             example["_overlap_reward_future"]: example
                             for example in staged_spo_rs_examples
                         }
-                        if (len(pending_by_future)
-                                != len(staged_spo_rs_examples)):
+                        if (len(pending_by_future) != len(staged_spo_rs_examples)):
                             raise RuntimeError(
                                 "SPO-RS overlap found a reward future shared "
                                 "by multiple rollout records")
-                        spo_rs_overlap_state = (
-                            parallel_trainer.begin_spo_rs_overlap(
-                                cfg, step_idx))
+                        spo_rs_overlap_state = (parallel_trainer.begin_spo_rs_overlap(cfg, step_idx))
                         print(
                             f"[step {step_idx}] SPO-RS "
                             "evaluation/training overlap started; "
@@ -11904,22 +10466,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             flush=True,
                         )
                         while pending_by_future:
-                            ready_futures = [
-                                future for future in pending_by_future
-                                if future.done()
-                            ]
+                            ready_futures = [future for future in pending_by_future if future.done()]
                             if not ready_futures:
-                                wait(tuple(pending_by_future),
-                                     return_when=FIRST_COMPLETED)
+                                wait(tuple(pending_by_future), return_when=FIRST_COMPLETED)
                                 continue
-                            ready_examples = [
-                                pending_by_future.pop(future)
-                                for future in ready_futures
-                            ]
-                            _complete_spo_rs_overlap_examples(
-                                ready_examples, spo_rs_tracker)
-                            parallel_trainer.queue_spo_rs_overlap(
-                                ready_examples)
+                            ready_examples = [pending_by_future.pop(future) for future in ready_futures]
+                            _complete_spo_rs_overlap_examples(ready_examples, spo_rs_tracker)
+                            parallel_trainer.queue_spo_rs_overlap(ready_examples)
 
                         if spo_rs_overlap_state is not None:
                             parallel_trainer.seal_spo_rs_overlap()
@@ -11971,10 +10524,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and not evaluation_trainer_offloaded
             )
             if entropic_overlap_eligible:
-                pending_groups = {
-                    int(group_id) for group_id in range(num_groups)
-                    if reward_futures[group_id]
-                }
+                pending_groups = {int(group_id) for group_id in range(num_groups) if reward_futures[group_id]}
                 overlap_normalization_examples = sum(
                     bool(record.get("token_ids"))
                     for responses in group_responses.values()
@@ -11984,8 +10534,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     while pending_groups:
                         ready_groups = [
                             group_id for group_id in sorted(pending_groups)
-                            if all(future.done() for future in
-                                   reward_futures[group_id])
+                            if all(future.done() for future in reward_futures[group_id])
                         ]
                         if not ready_groups:
                             unfinished = [
@@ -12006,14 +10555,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 overlap_prompt_ids, num_groups)
                             if prepared:
                                 if entropic_overlap_state is None:
-                                    pending_before = sum(
-                                        not future.done()
-                                        for future in all_futs)
+                                    pending_before = sum(not future.done() for future in all_futs)
                                     entropic_overlap_state = (
                                         parallel_trainer.
-                                        begin_entropic_overlap(
-                                            cfg, step_idx,
-                                            overlap_normalization_examples))
+                                        begin_entropic_overlap(cfg, step_idx, overlap_normalization_examples))
                                     print(
                                         f"[step {step_idx}] entropic "
                                         "evaluation/training overlap started; "
@@ -12021,11 +10566,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                         "evaluations still pending",
                                         flush=True,
                                     )
-                                queued = (
-                                    parallel_trainer.queue_entropic_overlap(
-                                        prepared))
-                                remaining = sum(
-                                    not future.done() for future in all_futs)
+                                queued = (parallel_trainer.queue_entropic_overlap(prepared))
+                                remaining = sum(not future.done() for future in all_futs)
                                 print(
                                     f"[step {step_idx}] entropic overlap: "
                                     f"group {group_id} reward-complete; queued "
@@ -12081,8 +10623,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             # below remains the single place that reports reward failures.
             wait(all_futs)
             with eval_progress_condition:
-                eval_progress_condition.wait_for(
-                    lambda: eval_progress_completed >= len(all_futs))
+                eval_progress_condition.wait_for(lambda: eval_progress_completed >= len(all_futs))
         finally:
             eval_bar.close()
             eval_bar_closed = True
@@ -12092,8 +10633,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if not eval_bar_closed:
             eval_bar.close()
         if evaluation_trainer_offloaded:
-            print(f"[step {step_idx}] restoring trainer after shared-GPU "
-                  "benchmark evaluation")
+            print(f'[step {step_idx}] restoring trainer after shared-GPU benchmark evaluation')
             import gc
             gc.collect()
             torch.cuda.empty_cache()
@@ -12116,12 +10656,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # With policy optimization disabled, consecutive policies are exactly
         # identical even though the selected parents may be new.
         spo_rs_divergence = 0.0
-        spo_rs_context_divergences = {
-            int(spec["context_id"]): 0.0 for spec in group_specs
-        }
+        spo_rs_context_divergences = {int(spec["context_id"]): 0.0 for spec in group_specs}
 
-    if (spo_rs_mode and training_enabled
-            and cfg.generation_backend != "vllm"):
+    if (spo_rs_mode and training_enabled and cfg.generation_backend != "vllm"):
         drift_t0 = time.time()
         current_records = [
             record for responses in group_responses.values()
@@ -12137,8 +10674,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     return_tensors="pt").input_ids.to(model.device)
             score_examples.append({
                 "prompt_ids": prompt_cache[job_idx],
-                "response_ids": torch.tensor(
-                    [record["token_ids"]], device=model.device),
+                "response_ids": torch.tensor([record["token_ids"]], device=model.device),
                 "_spo_rs_record": record,
             })
 
@@ -12149,15 +10685,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     chunk=cfg.logprob_chunk,
                     pad_token_id=tokenizer.pad_token_id)
                 for example, score in zip(batch, scores):
-                    example["_spo_rs_record"][field_name] = (
-                        score.detach().cpu())
+                    example["_spo_rs_record"][field_name] = (score.detach().cpu())
 
         with _policy_dropout_disabled(model):
             try:
                 _score_local_policy("_spo_rs_current_score")
                 for record in current_records:
-                    record["behavior_logprobs"] = record.get(
-                        "_spo_rs_current_score")
+                    record["behavior_logprobs"] = record.get("_spo_rs_current_score")
 
                 same_policy = bool(
                     spo_rs_tracker.initialized
@@ -12166,20 +10700,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     == spo_rs_previous_adapter_path.resolve())
                 if same_policy:
                     spo_rs_divergence = 0.0
-                    spo_rs_context_divergences = {
-                        int(record["context_id"]): 0.0
-                        for record in current_records
-                    }
+                    spo_rs_context_divergences = {int(record["context_id"]): 0.0 for record in current_records}
                 elif spo_rs_tracker.initialized:
-                    if (spo_rs_previous_adapter_path is None
-                            or not spo_rs_previous_adapter_path.is_dir()):
+                    if (spo_rs_previous_adapter_path is None or not spo_rs_previous_adapter_path.is_dir()):
                         spo_rs_divergence = math.inf
                         spo_rs_missing_policy_scores = len(current_records)
                     else:
                         try:
-                            _load_adapter(
-                                model, spo_rs_previous_adapter_path,
-                                announce=False)
+                            _load_adapter(model, spo_rs_previous_adapter_path, announce=False)
                             _score_local_policy("_spo_rs_previous_score")
                         finally:
                             _load_adapter(model, adapter_path, announce=False)
@@ -12187,15 +10715,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                          spo_rs_missing_policy_scores,
                          spo_rs_context_divergences) = (
                             spo_rs_tracker.consecutive_policy_divergence(
-                                [record.get("_spo_rs_current_score")
-                                 for record in current_records],
-                                [record.get("_spo_rs_previous_score")
-                                 for record in current_records],
-                                [record["context_id"]
-                                 for record in current_records],
-                                required_context_ids=[
-                                    spec["context_id"]
-                                    for spec in group_specs]))
+                                [record.get("_spo_rs_current_score") for record in current_records],
+                                [record.get("_spo_rs_previous_score") for record in current_records],
+                                [record["context_id"] for record in current_records],
+                                required_context_ids=[spec["context_id"] for spec in group_specs]))
             except Exception as error:
                 spo_rs_divergence = math.inf
                 spo_rs_missing_policy_scores = len(current_records)
@@ -12246,12 +10769,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     "reward": float(futures[rollout_index].result().reward),
                 })
         if samples:
-            transformed = spo_rs_tracker.transformed_rewards(
-                [sample["reward"] for sample in samples])
+            transformed = spo_rs_tracker.transformed_rewards([sample["reward"] for sample in samples])
             normalized = spo_rs_tracker.normalized_advantages(transformed)
             if normalized is None:
-                raise RuntimeError(
-                    "SPO-RS lost its pre-step historical baseline")
+                raise RuntimeError("SPO-RS lost its pre-step historical baseline")
             update = spo_rs_tracker.update(
                 transformed,
                 divergence=spo_rs_divergence,
@@ -12262,12 +10783,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             update.update({
                 "groups": sorted({sample["group"] for sample in samples}),
                 "prompt_jobs": sorted({sample["job"] for sample in samples}),
-                "contexts": sorted({
-                    int(sample["record"]["context_id"])
-                    for sample in samples}),
+                "contexts": sorted({int(sample["record"]["context_id"]) for sample in samples}),
                 "context_divergences": spo_rs_context_divergences,
-                "missing_policy_scores": int(
-                    spo_rs_missing_policy_scores),
+                "missing_policy_scores": int(spo_rs_missing_policy_scores),
             })
             spo_rs_updates.append(update)
 
@@ -12283,9 +10801,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     },
                 }
 
-            divergence_label = (
-                "missing" if update["divergence"] is None
-                else f"{update['divergence']:.6f}")
+            divergence_label = ("missing" if update["divergence"] is None else f"{update['divergence']:.6f}")
             print(f"[step {step_idx}] SPO-RS global tracker: "
                   f"v={update['value_before']:.9f}->"
                   f"{update['value_after']:.9f} "
@@ -12320,11 +10836,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         spo_rs_rollout_info = [None] * len(responses)
         spo_rs_trainable = [True] * len(responses)
         if spo_rs_mode:
-            prepared = [spo_rs_prepared[(g, r_idx)]
-                        for r_idx in range(len(responses))]
-            advantages = np.asarray(
-                [item["advantage"] for item in prepared],
-                dtype=np.float64)
+            prepared = [spo_rs_prepared[(g, r_idx)] for r_idx in range(len(responses))]
+            advantages = np.asarray([item["advantage"] for item in prepared], dtype=np.float64)
             spo_rs_trainable = [item["trainable"] for item in prepared]
             spo_rs_rollout_info = [item["info"] for item in prepared]
             adv_scale = float(cfg.spo_rs_beta)
@@ -12332,8 +10845,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         else:
             advantages, adv_scale = compute_group_advantages(rewards_np)
             adv_scale_label = "beta"
-        constant = (
-            float(rewards_np.max() - rewards_np.min()) < 1e-12)
+        constant = (float(rewards_np.max() - rewards_np.min()) < 1e-12)
 
         step_valid_count += sum(valids)
         step_rollout_count += len(valids)
@@ -12351,8 +10863,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             job_idx = record["job_idx"]
             res = outs[r_idx]
             job = prompt_jobs[job_idx]
-            artifact_rollout_index = int(record.get(
-                "rollout_index", r_idx))
+            artifact_rollout_index = int(record.get("rollout_index", r_idx))
             if artifact_rollout_index != r_idx:
                 raise RuntimeError(
                     f"rollout persistence order changed for group {g}: "
@@ -12371,11 +10882,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
                 all_children.append((child, parent))
-                all_child_strategy_keys.append(
-                    int(job["strategy_index"])
-                    if two_stage_rollouts else None)
-            pick_info = (sampler.last_picks_info[parent_group]
-                         if parent_group < len(sampler.last_picks_info) else {})
+                all_child_strategy_keys.append(int(job["strategy_index"]) if two_stage_rollouts else None)
+            pick_info = (sampler.last_picks_info[parent_group] if parent_group < len(sampler.last_picks_info) else {})
             meta = {
                 **retry_metadata(record),
                 "step": step_idx,
@@ -12394,37 +10902,26 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "msg": res.msg,
                 "failure_kind": res.failure_kind,
                 "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
-                "beta": (float(adv_scale)
-                         if adv_mode in ("entropic", "spo-rs") else 0.0),
+                "beta": (float(adv_scale) if adv_mode in ("entropic", "spo-rs") else 0.0),
                 "advantage_mode": adv_mode,
-                "advantage_scale": (float(adv_scale)
-                                    if math.isfinite(adv_scale) else None),
+                "advantage_scale": (float(adv_scale) if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": (res.stdout or '')[:2000],
                 "parent_value": float(parent.value) if parent.value is not None else None,
-                "parent_raw_score": (float(parent.raw_score)
-                                     if parent.raw_score is not None else None),
+                "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
                 "parent_visit_count": int(pick_info.get("n", 0)),
-                "parent_q_value": (float(pick_info["Q"])
-                                   if pick_info.get("Q") is not None else None),
-                "parent_prior": (float(pick_info["P"])
-                                 if pick_info.get("P") is not None else None),
-                "parent_exploration_bonus": (float(pick_info["bonus"])
-                                             if pick_info.get("bonus") is not None else None),
-                "parent_selection_score": (float(pick_info["score"])
-                                           if pick_info.get("score") is not None else None),
+                "parent_q_value": (float(pick_info["Q"]) if pick_info.get("Q") is not None else None),
+                "parent_prior": (float(pick_info["P"]) if pick_info.get("P") is not None else None),
+                "parent_exploration_bonus": (float(pick_info["bonus"]) if pick_info.get("bonus") is not None else None),
+                "parent_selection_score": (float(pick_info["score"]) if pick_info.get("score") is not None else None),
                 "archive_eligible": archive_eligible,
                 "two_stage_rollout": bool(two_stage_rollouts),
-                "strategy": (job.get("strategy")
-                             if two_stage_rollouts else None),
-                "strategy_index": (job.get("strategy_index")
-                                   if two_stage_rollouts else None),
-                "strategy_model_name": (cfg.strategy_model_name
-                                        if two_stage_rollouts else None),
-                "programs_per_strategy": (
-                    programs_per_strategy if two_stage_rollouts else None),
+                "strategy": (job.get("strategy") if two_stage_rollouts else None),
+                "strategy_index": (job.get("strategy_index") if two_stage_rollouts else None),
+                "strategy_model_name": (cfg.strategy_model_name if two_stage_rollouts else None),
+                "programs_per_strategy": (programs_per_strategy if two_stage_rollouts else None),
                 # The solution itself, and the one it started from. Neither is
                 # recoverable afterwards: `construction` lives only in the
                 # in-memory sampler State, and a mid-run rollout's parent array
@@ -12432,8 +10929,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # means reproducing a figure needs no re-execution at all, which
                 # also sidesteps programs that are stochastic or wall-clock
                 # bounded and therefore cannot replay identically.
-                "construction": (_as_float_list(getattr(res, "construction", None),
-                                                cfg.max_saved_construction)
+                "construction": (_as_float_list(getattr(res, "construction", None), cfg.max_saved_construction)
                                  if save_ctor else None),
                 "parent_construction": (_as_float_list(
                     getattr(parent, "construction", None),
@@ -12442,46 +10938,30 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             }
             if adaptive_strategy_pilots:
                 meta.update({
-                    "pilot_programs_per_strategy": (
-                        pilot_programs_per_strategy),
-                    "strategy_rollout_phase": record.get(
-                        "strategy_rollout_phase"),
-                    "strategy_source_job_idx": record.get(
-                        "strategy_source_job_idx"),
-                    "strategy_pilot_reward_mean": record.get(
-                        "strategy_pilot_reward_mean"),
-                    "strategy_pilot_reward_variance": record.get(
-                        "strategy_pilot_reward_variance"),
-                    "strategy_pilot_mean_threshold": record.get(
-                        "strategy_pilot_mean_threshold"),
-                    "strategy_pilot_variance_threshold": record.get(
-                        "strategy_pilot_variance_threshold"),
-                    "strategy_pilot_scenario": record.get(
-                        "strategy_pilot_scenario"),
-                    "strategy_phase2_allocation_method": record.get(
-                        "strategy_phase2_allocation_method"),
-                    "strategy_pilot_valid_count": record.get(
-                        "strategy_pilot_valid_count"),
-                    "strategy_posterior_valid_probability": record.get(
-                        "strategy_posterior_valid_probability"),
-                    "strategy_initial_expected_improvement": record.get(
-                        "strategy_initial_expected_improvement"),
+                    "pilot_programs_per_strategy": (pilot_programs_per_strategy),
+                    "strategy_rollout_phase": record.get("strategy_rollout_phase"),
+                    "strategy_source_job_idx": record.get("strategy_source_job_idx"),
+                    "strategy_pilot_reward_mean": record.get("strategy_pilot_reward_mean"),
+                    "strategy_pilot_reward_variance": record.get("strategy_pilot_reward_variance"),
+                    "strategy_pilot_mean_threshold": record.get("strategy_pilot_mean_threshold"),
+                    "strategy_pilot_variance_threshold": record.get("strategy_pilot_variance_threshold"),
+                    "strategy_pilot_scenario": record.get("strategy_pilot_scenario"),
+                    "strategy_phase2_allocation_method": record.get("strategy_phase2_allocation_method"),
+                    "strategy_pilot_valid_count": record.get("strategy_pilot_valid_count"),
+                    "strategy_posterior_valid_probability": record.get("strategy_posterior_valid_probability"),
+                    "strategy_initial_expected_improvement": record.get("strategy_initial_expected_improvement"),
                     "strategy_hurdle": record.get("strategy_hurdle"),
-                    "strategy_pilot_followup_count": record.get(
-                        "strategy_pilot_followup_count"),
-                    "strategy_allocated_programs": record.get(
-                        "strategy_allocated_programs"),
+                    "strategy_pilot_followup_count": record.get("strategy_pilot_followup_count"),
+                    "strategy_allocated_programs": record.get("strategy_allocated_programs"),
                 })
             if spo_rs_mode:
                 meta["spo_rs"] = spo_rs_rollout_info[r_idx]
             if entropy_directory is not None:
-                entropy_observations.append(rollout_observation(
-                    record.get("_entropy_measurement"), meta, res.code))
+                entropy_observations.append(rollout_observation(record.get("_entropy_measurement"), meta, res.code))
             save_rollout(exp_dir, step_idx, g, artifact_rollout_index,
                          text, meta,
                          prompt_text=job["prompt_text"],
-                         strategy_text=(job.get("strategy_response")
-                                        if two_stage_rollouts else None),
+                         strategy_text=(job.get("strategy_response") if two_stage_rollouts else None),
                          artifacts_already_saved=True)
             saved_rollouts += 1
 
@@ -12490,8 +10970,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         if constant and not clipped_policy_mode:
             continue
 
-        for r_idx, (record, adv) in enumerate(
-                zip(responses, advantages)):
+        for r_idx, (record, adv) in enumerate(zip(responses, advantages)):
             token_ids = record["token_ids"]
             job_idx = record["job_idx"]
             if not training_enabled:
@@ -12500,14 +10979,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 continue
             if len(token_ids) == 0:
                 continue
-            prepared = (
-                record.get("_entropic_overlap_example")
-                or record.get("_spo_rs_overlap_example"))
+            prepared = (record.get("_entropic_overlap_example") or record.get("_spo_rs_overlap_example"))
             res = outs[r_idx]
             if prepared is not None:
                 prepared_advantage = prepared.get("advantage")
-                if (prepared_advantage is not None
-                        and float(prepared_advantage) != float(adv)):
+                if (prepared_advantage is not None and float(prepared_advantage) != float(adv)):
                     prepared["_overlap_label_mismatch"] = True
                 prepared.update({
                     "advantage": float(adv),
@@ -12524,13 +11000,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             behavior_values = record["behavior_logprobs"]
             reference_values = record["reference_logprobs"]
             behavior_logprobs = (
-                torch.tensor(behavior_values, dtype=torch.float32,
-                             device=model.device)
+                torch.tensor(behavior_values, dtype=torch.float32, device=model.device)
                 if behavior_values is not None
                 and len(behavior_values) == len(token_ids) else None)
             reference_logprobs = (
-                torch.tensor(reference_values, dtype=torch.float32,
-                             device=model.device)
+                torch.tensor(reference_values, dtype=torch.float32, device=model.device)
                 if reference_values is not None
                 and len(reference_values) == len(token_ids) else None)
             all_examples.append({
@@ -12554,15 +11028,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # this barrier.
     # stepXX.summary.json remains the completion marker and is written only
     # after the adapter/checkpoint.
-    save_suffix = ("with training disabled"
-                   if not training_enabled else "before adapter update")
-    print(f"[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json "
-          f"pairs {save_suffix}", flush=True)
+    save_suffix = ("with training disabled" if not training_enabled else "before adapter update")
+    print(f'[step {step_idx}] saved {saved_rollouts} rollout .txt/.meta.json pairs {save_suffix}', flush=True)
 
-    valid_fraction = (step_valid_count / step_rollout_count
-                      if step_rollout_count else 0.0)
-    code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count
-                           if step_rollout_count else 1.0)
+    valid_fraction = (step_valid_count / step_rollout_count if step_rollout_count else 0.0)
+    code_valid_fraction = (1.0 - step_code_failure_count / step_rollout_count if step_rollout_count else 1.0)
 
     # Preserve the standard objectives' constant-reward-group filtering.
     if not clipped_policy_mode:
@@ -12576,8 +11046,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         before = len(all_examples)
         all_examples = [
             example for example in all_examples
-            if _valid_example_token_logprobs(
-                example, "behavior_logprobs")
+            if _valid_example_token_logprobs(example, "behavior_logprobs")
         ]
         unusable = before - len(all_examples)
         if unusable:
@@ -12596,15 +11065,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             example.get("_overlap_key") for example in all_examples
             if example.get("_overlap_key") is not None
         }
-        advantages_complete = all(
-            math.isfinite(float(example["advantage"]))
-            for example in all_examples)
-        advantages_match = not any(
-            example.get("_overlap_label_mismatch", False)
-            for example in all_examples)
+        advantages_complete = all(math.isfinite(float(example["advantage"])) for example in all_examples)
+        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
         expected_keys = entropic_overlap_state["scheduled_keys"]
-        if (actual_keys != expected_keys
-                or not advantages_complete or not advantages_match):
+        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
             parallel_trainer.finish_entropic_overlap(
                 cfg, step_idx,
                 entropic_overlap_state["queued_examples"],
@@ -12627,12 +11091,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             example.get("advantage") is not None
             and math.isfinite(float(example["advantage"]))
             for example in all_examples)
-        advantages_match = not any(
-            example.get("_overlap_label_mismatch", False)
-            for example in all_examples)
+        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
         expected_keys = spo_rs_overlap_state["scheduled_keys"]
-        if (actual_keys != expected_keys
-                or not advantages_complete or not advantages_match):
+        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
             parallel_trainer.finish_spo_rs_overlap(
                 cfg, step_idx,
                 spo_rs_overlap_state["queued_examples"],
@@ -12647,12 +11108,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             spo_rs_overlap_state = None
 
     rollout_time = time.time() - rollout_t0
-    training_label = (str(len(all_examples))
-                      if training_enabled else "disabled")
+    training_label = (str(len(all_examples)) if training_enabled else "disabled")
     rollout_phase_label = (
         "rollout+eval+overlapped-backward wall time"
-        if (entropic_overlap_state is not None
-            or spo_rs_overlap_state is not None)
+        if (entropic_overlap_state is not None or spo_rs_overlap_state is not None)
         else "rollout+eval time")
     print(f"[step {step_idx}] {rollout_phase_label}: {rollout_time:.1f}s  "
           f"training examples: {training_label}  "
@@ -12660,19 +11119,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
     # Keep the previous raw optimum so the status line can distinguish a new
     # run best from a step that merely repeats the best-ever value.
-    previous_best_raw = sampler.best_raw_state(
-        maximize=bool(problem.maximize))
-    previous_best_value = (
-        float(previous_best_raw.raw_score)
-        if previous_best_raw is not None else None)
+    previous_best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
+    previous_best_value = (float(previous_best_raw.raw_score) if previous_best_raw is not None else None)
 
     # Update archive
     archive_stats = sampler.update(
         all_children,
-        strategy_keys=(all_child_strategy_keys
-                       if two_stage_rollouts else None),
-        strategy_top_r=(int(cfg.strategy_archive_top_r)
-                        if two_stage_rollouts else 0),
+        strategy_keys=(all_child_strategy_keys if two_stage_rollouts else None),
+        strategy_top_r=(int(cfg.strategy_archive_top_r) if two_stage_rollouts else 0),
     )
     if two_stage_rollouts:
         print(
@@ -12711,8 +11165,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         # higher-is-better reward and no native raw metric.
         step_best_result = max(
             step_states,
-            key=lambda state: (float(state.value)
-                               if state.value is not None else -math.inf),
+            key=lambda state: (float(state.value) if state.value is not None else -math.inf),
         )
         step_best_raw_score = None
     else:
@@ -12729,8 +11182,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         best_value = float(best_raw.raw_score)
         improved = (
             previous_best_value is None
-            or (best_value > previous_best_value if problem.maximize
-                else best_value < previous_best_value)
+            or (best_value > previous_best_value if problem.maximize else best_value < previous_best_value)
         )
         # ``target`` is part of the problem context shown to the model.
         # ``target_print`` is deliberately display-only, so changing the SOTA
@@ -12742,8 +11194,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             target = None
         beats_sota = bool(
             improved and target is not None and math.isfinite(target)
-            and (best_value > target if problem.maximize
-                 else best_value < target)
+            and (best_value > target if problem.maximize else best_value < target)
         )
         message = (
             f"[step {step_idx}] best-ever raw {problem.metric_name}: "
@@ -12751,11 +11202,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             f"reward={float(best_raw.value):.9f}, found step={best_raw.timestep})"
         )
         if beats_sota:
-            margin = (best_value - target if problem.maximize
-                      else target - best_value)
-            message += (
-                f"  🏆 CONGRATULATIONS — NEW SOTA! "
-                f"target={target:.12f}, beaten by {margin:.12f} 🏆")
+            margin = (best_value - target if problem.maximize else target - best_value)
+            message += (f'  🏆 CONGRATULATIONS — NEW SOTA! target={target:.12f}, beaten by {margin:.12f} 🏆')
             color = "\033[32m"       # dark green
         elif improved:
             message += "  ★ NEW RUN BEST"
@@ -12765,8 +11213,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             color = "\033[93m"       # yellow
         print(f"{color}{message}\033[0m", flush=True)
     else:
-        message = (f"[step {step_idx}] best-ever raw "
-                   f"{problem.metric_name}: unavailable")
+        message = (f'[step {step_idx}] best-ever raw {problem.metric_name}: unavailable')
         print(f"\033[93m{message}\033[0m", flush=True)
 
     step_stats = {
@@ -12780,21 +11227,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         "step_best_raw_score": step_best_raw_score,
         "step_best_reward": (
             float(step_best_result.value)
-            if (step_best_result is not None
-                and step_best_result.value is not None) else None),
+            if (step_best_result is not None and step_best_result.value is not None) else None),
         "best_seen_raw_score": (
             float(best_seen_result.raw_score)
-            if (best_seen_result is not None
-                and best_seen_result.raw_score is not None)
+            if (best_seen_result is not None and best_seen_result.raw_score is not None)
             else None),
         "best_seen_reward": (
             float(best_seen_result.value)
-            if (best_seen_result is not None
-                and best_seen_result.value is not None)
+            if (best_seen_result is not None and best_seen_result.value is not None)
             else None),
-        "best_seen_step": (
-            int(best_seen_result.timestep)
-            if best_seen_result is not None else None),
+        "best_seen_step": (int(best_seen_result.timestep) if best_seen_result is not None else None),
         "valid_fraction": float(valid_fraction),
         "code_valid_fraction": float(code_valid_fraction),
         "evaluation_isolated": isolated_eval,
@@ -12805,28 +11247,21 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     if entropy_directory is not None:
         step_stats["_entropy_observations"] = entropy_observations
     if adaptive_strategy_pilots:
-        step_stats["strategy_pilot_allocation"] = (
-            strategy_pilot_diagnostics)
+        step_stats["strategy_pilot_allocation"] = (strategy_pilot_diagnostics)
     if spo_rs_mode:
         step_stats["spo_rs_updates"] = spo_rs_updates
         step_stats["spo_rs_adaptive_beta"] = adaptive_spo_beta
-        step_stats["spo_rs_tracker_size"] = (
-            0 if spo_rs_tracker is None else len(spo_rs_tracker))
-        step_stats["spo_rs_divergence"] = (
-            None if not math.isfinite(spo_rs_divergence)
-            else float(spo_rs_divergence))
-        step_stats["spo_rs_context_divergences"] = (
-            spo_rs_context_divergences)
-        step_stats["spo_rs_missing_policy_scores"] = int(
-            spo_rs_missing_policy_scores)
+        step_stats["spo_rs_tracker_size"] = (0 if spo_rs_tracker is None else len(spo_rs_tracker))
+        step_stats["spo_rs_divergence"] = (None if not math.isfinite(spo_rs_divergence) else float(spo_rs_divergence))
+        step_stats["spo_rs_context_divergences"] = (spo_rs_context_divergences)
+        step_stats["spo_rs_missing_policy_scores"] = int(spo_rs_missing_policy_scores)
         step_stats["spo_rs_sampling_adapter"] = Path(adapter_path).name
         step_stats["spo_rs_policy_updated"] = False
 
     if not training_enabled:
         step_stats["training_disabled"] = True
         step_stats["training_seconds"] = 0.0
-        disabled_reason = str(getattr(
-            cfg, "_training_disabled_reason", "--no-train"))
+        disabled_reason = str(getattr(cfg, "_training_disabled_reason", "--no-train"))
         print(f"[step {step_idx}] training disabled ({disabled_reason}); "
               "skipping training-only logprobs, backward, and optimizer update",
               flush=True)
@@ -12836,10 +11271,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         print(f"[step {step_idx}] no usable training examples")
         return step_stats
 
-    if (sampler.selection_mode == "llm"
-            and step_idx + 1 < int(cfg.num_steps)):
-        sampler.prefetch_states(
-            int(cfg.groups_per_step), selection_step=step_idx + 1)
+    if (sampler.selection_mode == "llm" and step_idx + 1 < int(cfg.num_steps)):
+        sampler.prefetch_states(int(cfg.groups_per_step), selection_step=step_idx + 1)
 
     # A model-parallel trainer can remain on CPU throughout every vLLM phase
     # and all reward processing. Restore its shards only when this step has a
@@ -12854,29 +11287,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 cfg, step_idx, len(all_examples), apply_update=True))
             spo_rs_overlap_state = None
         elif parallel_trainer is not None:
-            step_stats.update(parallel_trainer.train_spo_rs(
-                all_examples, cfg, step_idx))
+            step_stats.update(parallel_trainer.train_spo_rs(all_examples, cfg, step_idx))
         else:
-            step_stats.update(_train_spo_rs_examples(
-                backend, model, tokenizer, optimizer, all_examples, cfg,
-                step_idx))
+            step_stats.update(_train_spo_rs_examples(backend, model, tokenizer, optimizer, all_examples, cfg, step_idx))
         if spo_rs_mode:
             step_stats["spo_rs_policy_updated"] = True
         return step_stats
 
     # ----- TRAIN STEP -----
-    print(f"[step {step_idx}] starting adapter training; rollout artifacts "
-          f"are already on disk", flush=True)
+    print(f'[step {step_idx}] starting adapter training; rollout artifacts are already on disk', flush=True)
     if parallel_trainer is not None:
         if entropic_overlap_state is not None:
             step_stats.update(parallel_trainer.finish_entropic_overlap(
                 cfg, step_idx, len(all_examples), apply_update=True))
             entropic_overlap_state = None
         else:
-            step_stats.update(parallel_trainer.train_policy(
-                all_examples, cfg, step_idx))
-        best = (sampler.best_raw_state(maximize=bool(problem.maximize))
-                or sampler.best_state())
+            step_stats.update(parallel_trainer.train_policy(all_examples, cfg, step_idx))
+        best = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
         if best is not None:
             raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
             print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
@@ -12904,12 +11331,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         is_ratio_max = 0.0
         is_ratio_count = 0
         for batch in active_batches:
-            base_logprobs = [
-                example.get("reference_logprobs") for example in batch]
-            supplied_reference = all(
-                _valid_example_token_logprobs(
-                    example, "reference_logprobs")
-                for example in batch)
+            base_logprobs = [example.get("reference_logprobs") for example in batch]
+            supplied_reference = all(_valid_example_token_logprobs(example, "reference_logprobs") for example in batch)
             if not supplied_reference:
                 try:
                     with backend.disable_adapter(), torch.no_grad():
@@ -12927,20 +11350,17 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 pad_token_id=tokenizer.pad_token_id)
 
             batch_losses = []
-            for ex, cur_lp, base_lp in zip(
-                    batch, current_logprobs, base_logprobs):
+            for ex, cur_lp, base_lp in zip(batch, current_logprobs, base_logprobs):
                 base_lp = base_lp.to(cur_lp.device)
                 adv = ex["advantage"]
                 logp_diff = (cur_lp - base_lp).detach()
                 avg_logp_diff = logp_diff.mean()
-                kl_adv = cfg.kl_penalty_coef * (
-                    avg_logp_diff - (cur_lp - base_lp))
+                kl_adv = cfg.kl_penalty_coef * (avg_logp_diff - (cur_lp - base_lp))
                 eff_adv = adv + kl_adv
 
 
                 behavior_lp = ex.get("behavior_logprobs")
-                has_behavior = _valid_example_token_logprobs(
-                    ex, "behavior_logprobs")
+                has_behavior = _valid_example_token_logprobs(ex, "behavior_logprobs")
                 if sequence_policy:
                     loss, policy_metrics = (
                         _a3b_sequence_clipped_standard_loss(
@@ -12949,22 +11369,18 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             base_lp, adv))
                     is_ratio = policy_metrics["ratio"]
                 elif has_behavior:
-                    is_ratio = _detached_behavior_importance_ratio(
-                        cfg, cur_lp, behavior_lp)
+                    is_ratio = _detached_behavior_importance_ratio(cfg, cur_lp, behavior_lp)
                     loss = -(is_ratio * eff_adv.detach() * cur_lp).mean()
                 else:
-                    if (behavior_lp is not None
-                            and not hasattr(train_step, "_is_len_warned")):
-                        print("[warn] invalid behavior logprobs; skipping IS "
-                              "for affected examples")
+                    if (behavior_lp is not None and not hasattr(train_step, "_is_len_warned")):
+                        print('[warn] invalid behavior logprobs; skipping IS for affected examples')
                         train_step._is_len_warned = True
                     is_ratio = 1.0
                     loss = -(eff_adv.detach() * cur_lp).mean()
 
                 if has_behavior:
                     is_ratio_sum += float(is_ratio.mean().item())
-                    is_ratio_max = max(
-                        is_ratio_max, float(is_ratio.max().item()))
+                    is_ratio_max = max(is_ratio_max, float(is_ratio.max().item()))
                     is_ratio_count += 1
                 batch_losses.append(loss / n_examples)
                 total_loss += float(loss.detach().item())
@@ -12982,10 +11398,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
      is_ratio_count) = result
 
     import torch as _torch
-    _torch.nn.utils.clip_grad_norm_(
-        [p for p in model.parameters() if p.requires_grad],
-        max_norm=cfg.grad_clip,
-    )
+    _torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=cfg.grad_clip)
     optimizer.step()
 
     train_time = time.time() - train_t0
@@ -12994,8 +11407,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     step_stats["oom_quarantined_examples"] = len(quarantined)
     is_msg = ""
     if is_ratio_count > 0:
-        is_msg = (f"  IS ratio mean={is_ratio_sum / is_ratio_count:.9f} "
-                  f"max={is_ratio_max:.3f}")
+        is_msg = (f'  IS ratio mean={is_ratio_sum / is_ratio_count:.9f} max={is_ratio_max:.3f}')
     print(f"[step {step_idx}] train time: {train_time:.1f}s  "
           f"avg loss: {total_loss / n_examples:.9f}  "
           f"avg logpi_theta - logpi_base: "
@@ -13006,8 +11418,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # The independent raw record includes seeds and candidates removed by
     # exact-code deduplication/archive pruning; ``best_state()`` alone can
     # therefore save an older or worse stochastic realization.
-    best = (sampler.best_raw_state(maximize=bool(problem.maximize))
-            or sampler.best_state())
+    best = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
     if best is not None:
         raw = f" raw={best.raw_score:.9f}" if best.raw_score is not None else ""
         print(f"[step {step_idx}] best so far: value={best.value:.9f}{raw}  "
@@ -13023,13 +11434,12 @@ def main():
     _install_console_timestamps()
     terminal_log = _install_terminal_log()
     from builtins import print as console_print
-    from startup_logs import StartupLog, print_dashboard
+    from diagnostics.startup_logs import StartupLog, print_dashboard
     startup_log = StartupLog(time_offset=_LOG_TIME_OFFSET_SECONDS)
     with startup_log.capture():
         cfg, merged = load_config()
         if cfg.strategies and cfg.strategy_backend == "local":
-            validate_strategist_runtime(
-                cfg.strategy_model_name, prepare_encoder=True)
+            validate_strategist_runtime(cfg.strategy_model_name, prepare_encoder=True)
         # This must precede every import path that can initialize CUDA. Worker
         # and evaluation children set their own physical groups before import.
         _pin_training_process(cfg.training_gpu_ids)
@@ -13058,29 +11468,22 @@ def main():
                 # Re-resolve layout without the old step's overflow marker.
                 cfg, merged = load_config()
                 merged.pop("_resume_dir", None)
-        exp_dir = make_experiment_dir(
-            cfg, resume_dir=resume_dir, config_dict=merged
-        )
+        exp_dir = make_experiment_dir(cfg, resume_dir=resume_dir, config_dict=merged)
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
-        startup_log.title = (
-            "Strategist Bandit" if cfg.strategies
-            else "Single-Model Discovery")
+        startup_log.title = ("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
-        bind_setting_log(
-            setting_log_path, time_offset=_LOG_TIME_OFFSET_SECONDS)
+        bind_setting_log(setting_log_path, time_offset=_LOG_TIME_OFFSET_SECONDS)
     # Keep the full resolved settings in the file; show their grouped dashboard
     # once below. Restore normal print before loading/training begins.
     print = startup_log.print
     terminal_log_path = str(Path(exp_dir).resolve() / "temirnal.log")
     terminal_log.bind(terminal_log_path)
     if cfg.generation_backend == "vllm":
-        from host_memory import validate_memory_handoff_runtime
+        from runtime.host_memory import validate_memory_handoff_runtime
         runtime = validate_memory_handoff_runtime(__file__)
         with (Path(exp_dir) / "runtime.json").open("w", encoding="utf-8") as handle:
             json.dump(runtime, handle, indent=2)
-        runtime_message = (
-            f"[runtime] checkout={runtime['checkout']}; "
-            f"memory handoff: {runtime['memory_handoff']}")
+        runtime_message = (f"[runtime] checkout={runtime['checkout']}; memory handoff: {runtime['memory_handoff']}")
         console_print(runtime_message, flush=True)
         setting_log_only(runtime_message, flush=True)
     print(f"[logs] terminal output: {terminal_log_path}", flush=True)
@@ -13093,31 +11496,22 @@ def main():
     if cfg.generation_backend == "vllm":
         vllm_log_path = str((Path(exp_dir).resolve() / "vllm.log"))
         with open(vllm_log_path, "a", encoding="utf-8") as log_handle:
-            log_handle.write(
-                f"\n=== TTT vLLM log parent_pid={os.getpid()} "
-                f"run_dir={Path(exp_dir).resolve()} ===\n")
+            log_handle.write(f'\n=== TTT vLLM log parent_pid={os.getpid()} run_dir={Path(exp_dir).resolve()} ===\n')
         print(f"[logs] vLLM output: {vllm_log_path}", flush=True)
         if (cfg.strategies
                 and getattr(cfg, "strategy_backend", "local") == "local"
                 and (getattr(cfg, "strategy_model_name", cfg.model_name)
                      != cfg.model_name
-                     or getattr(
-                         cfg,
-                         "dual_resident_qwen3_8b_strategy_coder_pools",
-                         False))):
-            strategy_vllm_log_path = str(
-                Path(exp_dir).resolve() / "strategy_vllm.log")
-            with open(strategy_vllm_log_path, "a",
-                      encoding="utf-8") as log_handle:
+                     or getattr(cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False))):
+            strategy_vllm_log_path = str(Path(exp_dir).resolve() / "strategy_vllm.log")
+            with open(strategy_vllm_log_path, "a", encoding="utf-8") as log_handle:
                 log_handle.write(
                     f"\n=== TTT strategy vLLM log parent_pid={os.getpid()} "
                     f"run_dir={Path(exp_dir).resolve()} ===\n")
-            print(f"[logs] strategy vLLM output: "
-                  f"{strategy_vllm_log_path}", flush=True)
+            print(f'[logs] strategy vLLM output: {strategy_vllm_log_path}', flush=True)
         dependency_log_path = vllm_log_path
     else:
-        dependency_log_path = str(
-            Path(exp_dir).resolve() / "dependency_warnings.log")
+        dependency_log_path = str(Path(exp_dir).resolve() / "dependency_warnings.log")
         with open(dependency_log_path, "a", encoding="utf-8") as log_handle:
             log_handle.write(
                 f"\n=== TTT dependency warnings parent_pid={os.getpid()} "
@@ -13127,8 +11521,7 @@ def main():
     # One effective seed for every generation stream. None => not seeded, which
     # is the original behaviour. Set once here and threaded through unchanged.
     run_seed = cfg.seed if cfg.deterministic else None
-    print(f"[init] deterministic = {cfg.deterministic}"
-          + (f" (seed {cfg.seed})" if cfg.deterministic else ""))
+    print(f"[init] deterministic = {cfg.deterministic}" + (f" (seed {cfg.seed})" if cfg.deterministic else ""))
 
     # Replicate the complete trainer whenever the profiled trainable copy fits
     # on one card, rather than layer-sharding one update across every card. The
@@ -13137,8 +11530,7 @@ def main():
     # of the cards during training and requires them to offload for generation.
     replicated_backend_supported = bool(
         cfg.backend == "hf"
-        or (cfg.backend == "unsloth"
-            and getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
+        or (cfg.backend == "unsloth" and getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
     )
     use_replicated_training = bool(
         not cfg.no_train
@@ -13153,19 +11545,17 @@ def main():
     # optional scheduling choice: it enables adaptive batches; without it the
     # configured microbatch ceiling is honored.  Clipped-policy modes retain
     # their existing default trainer unless --fast is explicitly requested.
-    standard_policy_objective = not bool(
-        _uses_clipped_policy_loss(cfg.advantage_mode))
+    standard_policy_objective = not bool(_uses_clipped_policy_loss(cfg.advantage_mode))
     use_process_distributed_training = bool(
         use_replicated_training
-        and (cfg.fast or standard_policy_objective
-             or getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
+        and (cfg.fast or standard_policy_objective or getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b")
     )
     if use_replicated_training:
         cfg.training_replica_device = 0
 
     # Build the problem from the merged config (the registry reads problem-only
     # knobs like num_circles / problem_type / budget_s / score_scale from here).
-    from _retire.problems.registry import get_problem
+    from problems.registry import get_problem
     problem_config = merged
     if cfg.isolate_eval:
         # Prompts must describe the sandbox's real allocation. Keep the saved
@@ -13181,22 +11571,17 @@ def main():
 
     startup_log.begin_summary()
     print("=" * 70)
-    print("Strategist Bandit" if cfg.strategies
-          else "Single-Model Discovery")
+    print("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
     print("=" * 70)
     problem_type = getattr(cfg, "problem_type", "")
-    print(f"Problem:            {cfg.problem}"
-          + (f" ({problem_type})" if problem_type else ""))
+    print(f"Problem:            {cfg.problem}" + (f" ({problem_type})" if problem_type else ""))
     print(f"Entrypoint:         {getattr(problem, 'entrypoint', '?')}")
     print(f"Metric:             {getattr(problem, 'metric_name', '?')} "
           f"({'maximize' if getattr(problem, 'maximize', True) else 'minimize'})")
     print(f"Model:              {cfg.model_name}")
     if getattr(problem, "two_stage_rollouts", False):
-        strategy_location = (
-            "remote API; no local weights"
-            if cfg.strategy_backend == "api" else "local; no LoRA")
-        print(f"Strategy model:     {_strategy_model_name(cfg)} "
-              f"({strategy_location})")
+        strategy_location = ("remote API; no local weights" if cfg.strategy_backend == "api" else "local; no LoRA")
+        print(f'Strategy model:     {_strategy_model_name(cfg)} ({strategy_location})')
     if cfg.training_model_name != cfg.model_name:
         print(f"Training model:     {cfg.training_model_name}")
     print(f"Training backend:   {cfg.backend}")
@@ -13206,8 +11591,7 @@ def main():
         "disabled (--no-train)" if cfg.no_train
         else ("process-distributed LoRA"
               if use_process_distributed_training
-              else ("replicated data parallel" if use_replicated_training
-                    else "model parallel/single GPU"))
+              else ("replicated data parallel" if use_replicated_training else "model parallel/single GPU"))
     )
     training_scheduler = (
         "disabled (--no-train)" if cfg.no_train
@@ -13221,8 +11605,7 @@ def main():
     print(f"Training layout:    {training_layout}")
     print(f"Training scheduler: {training_scheduler}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
-    print(f"Evaluation GPU:     "
-          f"{cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none'}")
+    print(f"Evaluation GPU:     {(cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none')}")
     evaluation_mode = (
         f"isolated, {cfg.reward_workers} processes/CPU (--isolate-eval)"
         if cfg.isolate_eval else "default")
@@ -13246,15 +11629,13 @@ def main():
         print("Reference KL:        off (SPO-RS PPO objective)")
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
-    print(f"Advantage mode:     "
-          f"{getattr(cfg, 'advantage_mode', 'entropic')}")
+    print(f"Advantage mode:     {getattr(cfg, 'advantage_mode', 'entropic')}")
     if _uses_sequence_level_policy_ratio(cfg):
         print("MoE policy ratio:    sequence-level geometric mean "
               "(Qwen3-30B-A3B only; existing asymmetric low/high bounds)")
     if configured_advantage_mode == "spo-rs":
         if bool(getattr(cfg, "spo_rs_adaptive_beta", False)):
-            print(f"SPO-RS shaping:     historical arctan, width=1.25; "
-                  f"beta={cfg.spo_rs_beta}; all rollouts train")
+            print(f'SPO-RS shaping:     historical arctan, width=1.25; beta={cfg.spo_rs_beta}; all rollouts train')
         else:
             print(f"SPO-RS beta:        fixed {cfg.spo_rs_beta}")
         print(f"SPO-RS D_half:      {cfg.spo_rs_d_half}")
@@ -13273,20 +11654,14 @@ def main():
     print(f"Max new tokens:     {cfg.max_new_tokens}")
     if getattr(problem, "two_stage_rollouts", False):
         base_effort = _coder_effort_for_rollout_phase(cfg)
-        pilot_count = int(getattr(
-            cfg, "pilot_programs_per_strategy", -1))
-        if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"
-                and pilot_count > 0):
-            pilot_efforts = _coder_effort_entries(
-                [], [0], [pilot_count], cfg, 0, "pilot")
-            pilot_description = " + ".join(
-                f"{count} {effort}" for _, count, effort in pilot_efforts)
+        pilot_count = int(getattr(cfg, "pilot_programs_per_strategy", -1))
+        if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8" and pilot_count > 0):
+            pilot_efforts = _coder_effort_entries([], [0], [pilot_count], cfg, 0, "pilot")
+            pilot_description = " + ".join(f"{count} {effort}" for _, count, effort in pilot_efforts)
             phase2_description = ", ".join(
                 f"{effort}={('remaining' if count == -1 else count)}"
                 for effort in ("low", "medium", "xhigh")
-                for count in [getattr(
-                    cfg, f"phase2_{effort}_programs_per_strategy",
-                    -1 if effort == "medium" else 0)])
+                for count in [getattr(cfg, f"phase2_{effort}_programs_per_strategy", -1 if effort == "medium" else 0)])
             print(
                 "Coder reasoning:    pilot/strategy="
                 f"{pilot_description}; "
@@ -13311,8 +11686,7 @@ def main():
         if int(getattr(cfg, "pilot_programs_per_strategy", -1)) == -1:
             print("Rollout pilot:      off (-1; unchanged one-pass generation)")
         else:
-            allocation_method = str(getattr(
-                cfg, "phase2_allocation_method", "rule_based"))
+            allocation_method = str(getattr(cfg, "phase2_allocation_method", "rule_based"))
             allocation_label = (
                 "hurdle expected-best allocation"
                 if allocation_method == "hurdle" else
@@ -13352,23 +11726,16 @@ def main():
                   "fields ignored; output budget includes reasoning")
     print(f"Max seq length:     {cfg.max_seq_length}")
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
-        fused_attention_label = (
-            "GPT-OSS sink-aware Unsloth path "
-            "(generic Flash-SDPA prohibited)")
+        fused_attention_label = ('GPT-OSS sink-aware Unsloth path (generic Flash-SDPA prohibited)')
     elif getattr(cfg, "coder_model_profile", "") == "qwen3.8-27b":
-        fused_attention_label = (
-            "on for full-attention layers; exact FLA for Gated DeltaNet")
-    elif (getattr(cfg, "coder_model_profile", "")
-          == "qwen3-30b-a3b-thinking-2507"):
+        fused_attention_label = ("on for full-attention layers; exact FLA for Gated DeltaNet")
+    elif (getattr(cfg, "coder_model_profile", "") == "qwen3-30b-a3b-thinking-2507"):
         fused_attention_label = "on (exact Qwen full-attention path)"
     else:
-        fused_attention_label = (
-            "on" if cfg.fused_long_attention else "off")
+        fused_attention_label = ("on" if cfg.fused_long_attention else "off")
     print(f"Fused long attention: {fused_attention_label}")
-    print(f"Train microbatch:   up to "
-          f"{cfg.train_examples_per_microbatch} examples/GPU")
-    print(f"LoRA:               rank={cfg.lora_rank}, alpha={cfg.lora_alpha}, "
-          f"dropout={cfg.lora_dropout}")
+    print(f'Train microbatch:   up to {cfg.train_examples_per_microbatch} examples/GPU')
+    print(f'LoRA:               rank={cfg.lora_rank}, alpha={cfg.lora_alpha}, dropout={cfg.lora_dropout}')
     print(f"Deterministic:      {cfg.deterministic}")
     if use_process_distributed_training:
         print(f"Training memory cap: {100.0 * float(cfg.training_memory_fraction):g}% "
@@ -13392,7 +11759,7 @@ def main():
     # ---- backend + model ----
     # Load backend FIRST so Unsloth can patch transformers if used.
     with startup_log.capture(loading=True), _route_dependency_notices(dependency_log_path):
-        from model_backend import load_backend
+        from models.model_backend import load_backend
         backend = load_backend(cfg.backend, cfg)
         model, tokenizer = backend.load()
     strategy_tokenizer = tokenizer
@@ -13401,27 +11768,19 @@ def main():
             and cfg.strategy_model_name != cfg.model_name):
         from transformers import AutoTokenizer
         with _route_dependency_notices(dependency_log_path):
-            strategy_tokenizer = AutoTokenizer.from_pretrained(
-                cfg.strategy_model_name, trust_remote_code=True)
+            strategy_tokenizer = AutoTokenizer.from_pretrained(cfg.strategy_model_name, trust_remote_code=True)
         if strategy_tokenizer.pad_token_id is None:
             strategy_tokenizer.pad_token = strategy_tokenizer.eos_token
-    effective_4bit = bool(getattr(cfg, "effective_load_in_4bit",
-                                  cfg.load_in_4bit))
+    effective_4bit = bool(getattr(cfg, "effective_load_in_4bit", cfg.load_in_4bit))
     if getattr(cfg, "coder_model_profile", "") == "gpt-oss-120b":
         training_precision = "original packed MXFP4 (no NF4 re-quantization)"
     else:
-        training_precision = (
-            "BitsAndBytes 4-bit" if effective_4bit
-            else "checkpoint/default precision")
+        training_precision = ("BitsAndBytes 4-bit" if effective_4bit else "checkpoint/default precision")
     print(f"[precision] training copy: {training_precision}")
 
     if cfg.generation_backend == "vllm":
-        from gpu_runtime import validate_attention_heads
-        validate_attention_heads(
-            _attention_head_count(model),
-            int(cfg.vllm_tensor_parallel_size),
-            cfg.model_name,
-        )
+        from runtime.gpu_runtime import validate_attention_heads
+        validate_attention_heads(_attention_head_count(model), int(cfg.vllm_tensor_parallel_size), cfg.model_name)
 
     import torch  # safe to import now
     import random
@@ -13447,17 +11806,12 @@ def main():
             current_policy_adapter_path = adapter_path
             print(f"[resume] training checkpoint found; next step is {start_step}")
             if resume_payload["version"] == 1:
-                print("[resume] legacy batch-growth state ignored; "
-                      "using fixed configured batch sizes")
+                print('[resume] legacy batch-growth state ignored; using fixed configured batch sizes')
             if configured_advantage_mode == "spo-rs":
-                interrupted_spo_rs_artifacts = (
-                    _recoverable_spo_rs_artifacts(
-                        exp_dir, start_step, cfg))
+                interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, start_step, cfg))
                 if interrupted_spo_rs_artifacts is not None:
                     token_recovery = (
-                        _prepare_recoverable_response_tokens(
-                            model, tokenizer,
-                            interrupted_spo_rs_artifacts))
+                        _prepare_recoverable_response_tokens(model, tokenizer, interrupted_spo_rs_artifacts))
                     print(
                         "[resume] preflight prepared the interrupted "
                         f"step-{start_step} responses: "
@@ -13473,16 +11827,13 @@ def main():
                     )
         else:
             if configured_advantage_mode == "spo-rs":
-                interrupted_spo_rs_artifacts = (
-                    _recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
+                interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
-            if (interrupted_spo_rs_artifacts is not None
-                    and initial_adapter.is_dir()):
+            if (interrupted_spo_rs_artifacts is not None and initial_adapter.is_dir()):
                 start_step = 0
                 adapter_path = initial_adapter
                 _load_adapter(model, adapter_path)
-                token_recovery = _prepare_recoverable_response_tokens(
-                    model, tokenizer, interrupted_spo_rs_artifacts)
+                token_recovery = _prepare_recoverable_response_tokens(model, tokenizer, interrupted_spo_rs_artifacts)
                 current_policy_adapter_path = adapter_path
                 print(
                     "[resume] found a fully evaluated interrupted SPO-RS "
@@ -13526,11 +11877,10 @@ def main():
         print("[resume] restored optimizer state")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"[init] trainable params: {trainable:,} / total {total:,} "
-          f"({100 * trainable / total:.2f}%)")
+    print(f'[init] trainable params: {trainable:,} / total {total:,} ({100 * trainable / total:.2f}%)')
 
     # ---- sampler ----
-    from sampler import can_migrate_parent_selection, make_sampler
+    from search.sampler import can_migrate_parent_selection, make_sampler
     restored_selection = (resume_payload["sampler"].get("selection_mode", cfg.parent_selection)
                           if resume_payload is not None else cfg.parent_selection)
     if (restored_selection != cfg.parent_selection
@@ -13549,20 +11899,15 @@ def main():
     )
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
-        print(f"[resume] restored exact {sampler.selection_mode.upper()} "
-              "archive and search statistics")
+        print(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
     elif legacy_resume is not None:
-        n_states, n_rollouts = _restore_legacy_archive(
-            sampler, exp_dir, before_step=start_step
-        )
-        print(f"[resume] reconstructed {n_states} valid archived candidates "
-              f"from {n_rollouts} earlier rollouts")
-    setting_log_only(
-        f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
+        n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
+        print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')
+    setting_log_only(f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
     if (configured_advantage_mode == 'spo-rs'):
-        from spo_rs import BoundedSPORSTracker, SPORSTracker
+        from training.spo_rs import BoundedSPORSTracker, SPORSTracker
         bounded_shaping = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
         tracker_class = BoundedSPORSTracker if bounded_shaping else SPORSTracker
         spo_rs_tracker = tracker_class(
@@ -13572,10 +11917,8 @@ def main():
             rho_max=cfg.spo_rs_rho_max,
             **({"fail_score": cfg.fail_score} if bounded_shaping else {}),
         )
-        tracker_state = (resume_payload.get("spo_rs_tracker")
-                         if resume_payload is not None else None)
-        if tracker_state is not None and (
-                bounded_shaping or tracker_state.get("version") == 2):
+        tracker_state = (resume_payload.get("spo_rs_tracker") if resume_payload is not None else None)
+        if tracker_state is not None and (bounded_shaping or tracker_state.get("version") == 2):
             spo_rs_tracker.load_state_dict(tracker_state)
             print("[resume] restored the run-wide SPO-RS tracker")
         elif start_step:
@@ -13605,8 +11948,7 @@ def main():
                 transformed, divergence=0.0,
                 policy_adapter=prior_sampling_adapter,
                 step=last_step, raw_rewards=rewards)
-            source = ("legacy prompt trackers" if tracker_state is not None
-                      else "logged rollout history")
+            source = ("legacy prompt trackers" if tracker_state is not None else "logged rollout history")
             print(f"[resume] replaced {source} with one run-wide SPO-RS "
                   f"tracker initialized from {len(rewards)} rewards in step "
                   f"{last_step}")
@@ -13628,9 +11970,7 @@ def main():
                 raise ValueError(
                     "a fresh SPO-RS run requires at least one finite verified "
                     "seed reward to initialize its pre-step baseline")
-            initial_adapter = Path(_save_adapter(
-                model, exp_dir, -1, cfg.model_name,
-                directory_name="adapter_initial"))
+            initial_adapter = Path(_save_adapter(model, exp_dir, -1, cfg.model_name, directory_name="adapter_initial"))
             transformed = spo_rs_tracker.transformed_rewards(seed_rewards)
             initialization = spo_rs_tracker.update(
                 transformed, divergence=0.0,
@@ -13645,8 +11985,7 @@ def main():
 
     removed_adapters = _prune_adapter_snapshots(
         exp_dir,
-        _live_adapter_snapshots(
-            exp_dir, current_policy_adapter_path, spo_rs_tracker),
+        _live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker),
     )
     if removed_adapters:
         print(f"[checkpoint] removed {len(removed_adapters)} superseded "
@@ -13680,9 +12019,8 @@ def main():
     # Generation callbacks consult it so all later steps follow the genuine
     # no-training residency path instead of waiting for a nonexistent update.
     runtime_training_active = {"value": not bool(cfg.no_train)}
-    if (getattr(problem, "two_stage_rollouts", False)
-            and cfg.strategy_backend == "api"):
-        from strategy_api import StrategyAPIGenerationPool
+    if (getattr(problem, "two_stage_rollouts", False) and cfg.strategy_backend == "api"):
+        from generation.strategy_api import StrategyAPIGenerationPool
         strategy_pool = StrategyAPIGenerationPool(
             model_name=_strategy_model_name(cfg),
             base_url=cfg.strategy_api_base_url,
@@ -13704,11 +12042,10 @@ def main():
         cfg.generation_backend == "vllm"
         or (cfg.num_gpus > 1 and cfg.num_training_gpus == 1))
     if use_gen_pool:
-        from gen_workers import (GenerationPool, HybridHFGenerationPool,
+        from generation.gen_workers import (GenerationPool, HybridHFGenerationPool,
                                  PhasedVLLMGenerationPool, worker_seed)
         gpu_ids = _parse_gpu_ids(cfg.gpu_ids)
-        dual_resident_qwen3_8b_pools = bool(getattr(
-            cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False))
+        dual_resident_qwen3_8b_pools = bool(getattr(cfg, "dual_resident_qwen3_8b_strategy_coder_pools", False))
         separate_strategy_pool = bool(
             cfg.generation_backend == "vllm"
             and getattr(problem, "two_stage_rollouts", False)
@@ -13730,8 +12067,7 @@ def main():
             num_workers=cfg.num_gpus,
             gpu_ids=gpu_ids,
             max_seq_length=cfg.max_seq_length,
-            load_in_4bit=(effective_4bit
-                          and cfg.training_model_name == cfg.model_name),
+            load_in_4bit=(effective_4bit and cfg.training_model_name == cfg.model_name),
             seed=run_seed,
             gen_micro_batch=cfg.gen_micro_batch,
             backend=cfg.generation_backend,
@@ -13758,13 +12094,12 @@ def main():
             # generation. Give that vocabulary projection explicit memory
             # headroom; this changes scheduling only, never the scores.
             vllm_token_scoring=not bool(cfg.no_train),
-            vllm_runtime_reserve_gib=float(
-                cfg.vllm_runtime_reserve_gib),
+            vllm_runtime_reserve_gib=float(cfg.vllm_runtime_reserve_gib),
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
         )
         if cfg.generation_backend == "vllm":
-            from host_memory import HostMemoryAdmission
+            from runtime.host_memory import HostMemoryAdmission
             import multiprocessing
             pool_options["host_memory_admission"] = (
                 getattr(parallel_trainer, "host_memory_admission", None)
@@ -13773,12 +12108,11 @@ def main():
 
             def _offload_trainer_for_generation(phase="coder"):
                 nonlocal trainer_offloaded
-                if (parallel_trainer is not None
-                        and parallel_trainer.is_offloaded):
+                if (parallel_trainer is not None and parallel_trainer.is_offloaded):
                     return
                 if parallel_trainer is None and trainer_offloaded:
                     return
-                from host_memory import (
+                from runtime.host_memory import (
                     GIB, estimated_module_bytes, estimated_optimizer_bytes,
                     host_memory_info, reclaim_unused_host_memory,
                 )
@@ -13789,8 +12123,7 @@ def main():
                 # gradients untouched and runs only once per rollout step.
                 if parallel_trainer is not None:
                     cleanups = parallel_trainer.reclaim_host_memory()
-                    required_bytes = (
-                        parallel_trainer.estimated_host_offload_bytes())
+                    required_bytes = (parallel_trainer.estimated_host_offload_bytes())
                 else:
                     torch.cuda.synchronize()
                     cleanups = [reclaim_unused_host_memory(
@@ -13799,9 +12132,7 @@ def main():
                         force=True,
                     )]
                     required_bytes = int(
-                        1.05 * (
-                            estimated_module_bytes(model)
-                            + estimated_optimizer_bytes(optimizer))
+                        1.05 * (estimated_module_bytes(model) + estimated_optimizer_bytes(optimizer))
                         + GIB
                     )
 
@@ -13812,9 +12143,7 @@ def main():
                 ) for cleanup in cleanups)
                 memory = host_memory_info()
                 if reclaimed_bytes >= GIB:
-                    available = (
-                        "unknown" if memory is None else
-                        f"{memory['available'] / GIB:.1f} GiB")
+                    available = ("unknown" if memory is None else f"{memory['available'] / GIB:.1f} GiB")
                     setting_log_only(
                         f"[host-memory] released "
                         f"{reclaimed_bytes / GIB:.1f} GiB of inactive pinned "
@@ -13843,8 +12172,7 @@ def main():
                     for pool_label, pool in pressure_candidates:
                         if memory["available"] >= target_available:
                             break
-                        discard = getattr(
-                            pool, "discard_sleeping_host_residency", None)
+                        discard = getattr(pool, "discard_sleeping_host_residency", None)
                         if pool is None or not callable(discard) or not discard():
                             continue
                         memory = host_memory_info() or memory
@@ -13872,8 +12200,7 @@ def main():
                     "shared-GPU vLLM generation", flush=True)
                 try:
                     if parallel_trainer is not None:
-                        parallel_trainer.offload_for_generation(
-                            purge_host_cache=False)
+                        parallel_trainer.offload_for_generation(purge_host_cache=False)
                     else:
                         _move_optimizer_state(optimizer, "cpu")
                         backend.offload_for_generation()
@@ -13898,13 +12225,11 @@ def main():
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
-                if (parallel_trainer is not None
-                        and not parallel_trainer.is_offloaded):
+                if (parallel_trainer is not None and not parallel_trainer.is_offloaded):
                     trainer_offloaded = False
                     return
                 if not runtime_training_active["value"]:
-                    print("[gpu] keeping inactive training model offloaded "
-                          "(no-training phase)", flush=True)
+                    print('[gpu] keeping inactive training model offloaded (no-training phase)', flush=True)
                     return
                 if dual_resident_qwen3_8b_pools and any(
                         pool is not None and getattr(pool, "active", False)
@@ -13913,63 +12238,47 @@ def main():
                           "Qwen3-8B generation pool remains active",
                           flush=True)
                     return
-                if (parallel_trainer is not None
-                        or cfg.training_layout == "sharded"):
+                if (parallel_trainer is not None or cfg.training_layout == "sharded"):
                     # Keep the trainer on CPU through generation and restore it
                     # once, lazily, when the actual gradient update begins.
-                    trainer_label = ("trainer replicas"
-                                     if parallel_trainer is not None
-                                     else "sharded trainer")
-                    print(f"[gpu] keeping {trainer_label} offloaded until the "
-                          "adapter update", flush=True)
+                    trainer_label = ("trainer replicas" if parallel_trainer is not None else "sharded trainer")
+                    print(f'[gpu] keeping {trainer_label} offloaded until the adapter update', flush=True)
                     return
                 if not trainer_offloaded:
                     return
-                print("[gpu] restoring trainer after shared-GPU vLLM "
-                      "generation", flush=True)
+                print('[gpu] restoring trainer after shared-GPU vLLM generation', flush=True)
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
                 backend.restore_after_generation()
                 _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
-                from host_memory import reclaim_unused_host_memory
-                reclaim_unused_host_memory(
-                    torch,
-                    cuda_devices=tuple(range(torch.cuda.device_count())),
-                    force=True,
-                )
+                from runtime.host_memory import reclaim_unused_host_memory
+                reclaim_unused_host_memory(torch, cuda_devices=tuple(range(torch.cuda.device_count())), force=True)
                 trainer_offloaded = False
 
             def _ensure_sharded_trainer_ready():
                 nonlocal trainer_offloaded
                 if not runtime_training_active["value"]:
-                    raise RuntimeError(
-                        "trainer restore requested during a no-training phase")
+                    raise RuntimeError("trainer restore requested during a no-training phase")
                 if not trainer_offloaded:
                     return
-                print("[gpu] restoring sharded trainer for adapter update",
-                      flush=True)
+                print("[gpu] restoring sharded trainer for adapter update", flush=True)
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
                 backend.restore_after_generation()
                 _restore_optimizer_state_to_parameters(optimizer)
                 backend.set_training_mode()
-                from host_memory import reclaim_unused_host_memory
-                reclaim_unused_host_memory(
-                    torch,
-                    cuda_devices=tuple(range(torch.cuda.device_count())),
-                    force=True,
-                )
+                from runtime.host_memory import reclaim_unused_host_memory
+                reclaim_unused_host_memory(torch, cuda_devices=tuple(range(torch.cuda.device_count())), force=True)
                 trainer_offloaded = False
 
             if cfg.training_layout == "sharded":
                 ensure_trainer_ready = _ensure_sharded_trainer_ready
 
             gen_pool = PhasedVLLMGenerationPool(
-                before_start=lambda: _offload_trainer_for_generation(
-                    "coder"),
+                before_start=lambda: _offload_trainer_for_generation("coder"),
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
@@ -13985,11 +12294,8 @@ def main():
                 # the expensive coder resident and make the much smaller
                 # strategist pool transient so its processes are completely
                 # gone before the coder wakes.
-                strategy_persistent_workers = getattr(
-                    cfg, "strategy_vllm_persistent_workers", None)
-                if str(getattr(
-                        cfg, "coder_model_profile", "")).lower() == (
-                            "gpt-oss-120b"):
+                strategy_persistent_workers = getattr(cfg, "strategy_vllm_persistent_workers", None)
+                if str(getattr(cfg, "coder_model_profile", "")).lower() == ("gpt-oss-120b"):
                     strategy_persistent_workers = 0
                     setting_log_only(
                         "[memory] GPT-OSS-120B coder: local strategist "
@@ -13999,35 +12305,25 @@ def main():
                     )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
-                    "vllm_engine_options": strategist_engine_options(
-                        cfg.strategy_model_name),
+                    "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name),
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
-                    "gen_micro_batch": getattr(
-                        cfg, "strategy_gen_micro_batch",
-                        cfg.gen_micro_batch),
-                    "vllm_quantization": (
-                        cfg.strategy_vllm_quantization),
-                    "vllm_tensor_parallel_size": (
-                        cfg.strategy_vllm_tensor_parallel_size),
-                    "vllm_pipeline_parallel_size": (
-                        cfg.strategy_vllm_pipeline_parallel_size),
+                    "gen_micro_batch": getattr(cfg, "strategy_gen_micro_batch", cfg.gen_micro_batch),
+                    "vllm_quantization": (cfg.strategy_vllm_quantization),
+                    "vllm_tensor_parallel_size": (cfg.strategy_vllm_tensor_parallel_size),
+                    "vllm_pipeline_parallel_size": (cfg.strategy_vllm_pipeline_parallel_size),
                     "vllm_max_num_batched_tokens": getattr(
                         cfg, "strategy_vllm_max_num_batched_tokens",
                         cfg.vllm_max_num_batched_tokens),
                     "vllm_sleep_level": cfg.strategy_vllm_sleep_level,
                     "vllm_token_scoring": False,
-                    "vllm_runtime_reserve_gib": float(getattr(
-                        cfg, "strategy_vllm_runtime_reserve_gib",
-                        16.0)),
+                    "vllm_runtime_reserve_gib": float(getattr(cfg, "strategy_vllm_runtime_reserve_gib", 16.0)),
                     "vllm_persistent_workers": strategy_persistent_workers,
-                    "vllm_staged_loading": (
-                        cfg.strategy_vllm_staged_loading),
+                    "vllm_staged_loading": (cfg.strategy_vllm_staged_loading),
                     "vllm_log_path": strategy_vllm_log_path,
                 })
                 strategy_pool = PhasedVLLMGenerationPool(
-                    before_start=lambda: _offload_trainer_for_generation(
-                        "strategy"),
+                    before_start=lambda: _offload_trainer_for_generation("strategy"),
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )
@@ -14054,10 +12350,7 @@ def main():
                     torch.manual_seed(local_seed)
                     torch.cuda.manual_seed_all(local_seed)
                 try:
-                    adapter_context = (
-                        backend.disable_adapter()
-                        if adapter_path is None else nullcontext()
-                    )
+                    adapter_context = (backend.disable_adapter() if adapter_path is None else nullcontext())
                     with adapter_context:
                         yield from generate_prompt_jobs(
                             model, tokenizer, prompts_by_group,
@@ -14069,13 +12362,11 @@ def main():
                 finally:
                     backend.set_training_mode()
 
-            gen_pool = HybridHFGenerationPool(
-                remote_pool=remote_pool, local_iter=_local_hf_rollouts)
+            gen_pool = HybridHFGenerationPool(remote_pool=remote_pool, local_iter=_local_hf_rollouts)
             print(f"[init] hybrid HF rollout pool: live trainer on "
                   f"physical GPU {gpu_ids[0]} plus persistent workers "
                   f"{gpu_ids[1:]}")
-        if (getattr(problem, "two_stage_rollouts", False)
-                and strategy_pool is None):
+        if (getattr(problem, "two_stage_rollouts", False) and strategy_pool is None):
             strategy_pool = gen_pool
         elif dual_resident_qwen3_8b_pools:
             print(f"[init] dual-resident Qwen3-8B pools: strategist and coder "
@@ -14083,10 +12374,8 @@ def main():
                   "strategist is always base/no-LoRA, coder receives the "
                   "current LoRA", flush=True)
         if cfg.gen_micro_batch and cfg.gen_micro_batch > 0:
-            limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm"
-                          else "micro-batch")
-            limit_scope = ("/engine" if cfg.generation_backend == "vllm"
-                           else "/GPU")
+            limit_name = ("max_num_seqs" if cfg.generation_backend == "vllm" else "micro-batch")
+            limit_scope = ("/engine" if cfg.generation_backend == "vllm" else "/GPU")
             setting_log_only(
                 f"[init] generation pool ready "
                 f"({limit_name} {cfg.gen_micro_batch}{limit_scope})",
@@ -14106,30 +12395,24 @@ def main():
     step_plotter = StepPlotter(exp_dir, cfg.problem)
     cumulative_training_seconds = 0.0
     for completed_step in range(start_step):
-        summary_path = (Path(exp_dir) / f"step{completed_step:02d}"
-                        / f"step{completed_step:02d}.summary.json")
+        summary_path = (Path(exp_dir) / f"step{completed_step:02d}" / f"step{completed_step:02d}.summary.json")
         try:
             completed_summary = json.loads(summary_path.read_text())
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
         if "result_metric_name" in completed_summary:
-            append_step_result(
-                exp_dir, completed_step, completed_summary)
-        cumulative_training_seconds += float(
-            completed_summary.get("training_seconds", 0.0) or 0.0)
+            append_step_result(exp_dir, completed_step, completed_summary)
+        cumulative_training_seconds += float(completed_summary.get("training_seconds", 0.0) or 0.0)
     if cumulative_training_seconds:
-        print(f"[resume] prior cumulative training time: "
-              f"{cumulative_training_seconds:.1f}s")
+        print(f'[resume] prior cumulative training time: {cumulative_training_seconds:.1f}s')
     restart_for_exact_recovery = False
     restart_after_exact_recovery = False
     active_step = None
     try:
-        if (resume_parent_prefetch is not None
-                and cfg.generation_backend == "vllm"):
+        if (resume_parent_prefetch is not None and cfg.generation_backend == "vllm"):
             warmup_pool = (
                 strategy_pool
-                if (getattr(problem, "two_stage_rollouts", False)
-                    and cfg.strategy_backend == "local")
+                if (getattr(problem, "two_stage_rollouts", False) and cfg.strategy_backend == "local")
                 else gen_pool)
             if warmup_pool is not None:
                 warmup_pool.prepare()
@@ -14153,17 +12436,12 @@ def main():
                     f"({cfg.groups_per_step * cfg.group_size} rollouts)",
                     flush=True)
 
-            if (resume_dir
-                    and step == start_step
-                    and configured_advantage_mode == "spo-rs"):
+            if (resume_dir and step == start_step and configured_advantage_mode == "spo-rs"):
                 pending_spo_rs_artifacts = None
                 if interrupted_spo_rs_artifacts is None:
-                    interrupted_spo_rs_artifacts = (
-                        _recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
+                    interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
                 if interrupted_spo_rs_artifacts is None:
-                    pending_spo_rs_artifacts = (
-                        _recoverable_pending_spo_rs_artifacts(
-                            exp_dir, step, step_cfg))
+                    pending_spo_rs_artifacts = (_recoverable_pending_spo_rs_artifacts(exp_dir, step, step_cfg))
             else:
                 interrupted_spo_rs_artifacts = None
                 pending_spo_rs_artifacts = None
@@ -14171,8 +12449,7 @@ def main():
             sampler = _migrate_parent_selection(
                 sampler, cfg, exp_dir, step, current_policy_adapter_path,
                 optimizer, spo_rs_tracker,
-                recovery_pending=(interrupted_spo_rs_artifacts is not None
-                                  or pending_spo_rs_artifacts is not None),
+                recovery_pending=(interrupted_spo_rs_artifacts is not None or pending_spo_rs_artifacts is not None),
                 problem=problem)
 
             if interrupted_spo_rs_artifacts is not None:
@@ -14213,8 +12490,7 @@ def main():
 
             stats = stats or {}
             entropy_observations = stats.pop("_entropy_observations", [])
-            step_training_seconds = float(
-                stats.get("training_seconds", 0.0) or 0.0)
+            step_training_seconds = float(stats.get("training_seconds", 0.0) or 0.0)
             cumulative_training_seconds += step_training_seconds
             stats["training_seconds"] = step_training_seconds
             stats["cumulative_training_seconds"] = cumulative_training_seconds
@@ -14228,14 +12504,11 @@ def main():
             # valid.
             if configured_advantage_mode == "spo-rs":
                 if stats.get("spo_rs_policy_updated", False):
-                    adapter_path = _save_adapter(
-                        model, exp_dir, step, cfg.model_name)
+                    adapter_path = _save_adapter(model, exp_dir, step, cfg.model_name)
                 else:
-                    adapter_path = (Path(exp_dir)
-                                    / stats["spo_rs_sampling_adapter"])
+                    adapter_path = (Path(exp_dir) / stats["spo_rs_sampling_adapter"])
             else:
-                adapter_path = _save_adapter(
-                    model, exp_dir, step, cfg.model_name)
+                adapter_path = _save_adapter(model, exp_dir, step, cfg.model_name)
             checkpoint_path = _save_training_checkpoint(
                 exp_dir, step + 1, adapter_path, sampler, optimizer,
                 spo_rs_tracker=spo_rs_tracker,
@@ -14254,20 +12527,14 @@ def main():
             # Snapshot the sampler's independent native-metric optimum before
             # asynchronous plotting starts.  This includes unbeaten seeds and
             # evaluated children that no longer survive archive pruning.
-            best_seen_state = (
-                sampler.best_raw_state(maximize=bool(problem.maximize))
-                or sampler.best_state()
-            )
+            best_seen_state = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
             best_snapshot_path = save_best_state_snapshot(
                 exp_dir, step, best_seen_state,
                 metric_name=str(problem.metric_name),
                 maximize=bool(problem.maximize),
                 construction=(
-                    _as_float_list(
-                        getattr(best_seen_state, "construction", None),
-                        cfg.max_saved_construction)
-                    if (best_seen_state is not None
-                        and getattr(problem, "saves_construction", False))
+                    _as_float_list(getattr(best_seen_state, "construction", None), cfg.max_saved_construction)
+                    if (best_seen_state is not None and getattr(problem, "saves_construction", False))
                     else None),
             )
             step_summary["best_seen_snapshot"] = (
@@ -14276,10 +12543,9 @@ def main():
             save_step_summary(exp_dir, step, step_summary)
             append_step_result(exp_dir, step, step_summary)
             if getattr(step_cfg, "measure_entropy", False):
-                from entropy_tools import save_step as save_entropy_step
+                from analysis.entropy_tools import save_step as save_entropy_step
                 try:
-                    entropy_summary = save_entropy_step(
-                        exp_dir, step, entropy_observations, step_cfg, stats)
+                    entropy_summary = save_entropy_step(exp_dir, step, entropy_observations, step_cfg, stats)
                     measured = entropy_summary["all"]
                     value = measured["entropy_nats"]
                     label = f"{value:.6f} nats" if value is not None else "unavailable"
@@ -14300,16 +12566,13 @@ def main():
             current_policy_adapter_path = Path(adapter_path)
             removed_adapters = _prune_adapter_snapshots(
                 exp_dir,
-                _live_adapter_snapshots(
-                    exp_dir, current_policy_adapter_path, spo_rs_tracker),
+                _live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker),
             )
             if removed_adapters:
                 retained = (
                     "two rolling adapters for consecutive-policy KL"
                     if (spo_rs_tracker is not None
-                        and len(_live_adapter_snapshots(
-                            exp_dir, current_policy_adapter_path,
-                            spo_rs_tracker)) > 1)
+                        and len(_live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker)) > 1)
                     else Path(adapter_path).name
                 )
                 print(f"[checkpoint] removed {len(removed_adapters)} "
@@ -14325,8 +12588,7 @@ def main():
                 _clear_exact_sharded_recovery(exp_dir)
                 if hasattr(cfg, "_exact_inprocess_recovery_step"):
                     delattr(cfg, "_exact_inprocess_recovery_step")
-            replica_capture_step = getattr(
-                cfg, "_exact_replica_capture_step", None)
+            replica_capture_step = getattr(cfg, "_exact_replica_capture_step", None)
             if replica_capture_step is not None:
                 if int(replica_capture_step) != int(step):
                     raise RuntimeError(
@@ -14340,8 +12602,7 @@ def main():
                     flush=True,
                 )
                 delattr(cfg, "_exact_replica_capture_step")
-            replica_recovery_step = getattr(
-                cfg, "_exact_replica_recovery_step", None)
+            replica_recovery_step = getattr(cfg, "_exact_replica_recovery_step", None)
             if replica_recovery_step is not None:
                 if int(replica_recovery_step) != int(step):
                     raise RuntimeError(
@@ -14355,8 +12616,7 @@ def main():
                     flush=True,
                 )
                 delattr(cfg, "_exact_replica_recovery_step")
-            recovery_step = getattr(
-                cfg, "_exact_sharded_recovery_step", None)
+            recovery_step = getattr(cfg, "_exact_sharded_recovery_step", None)
             if recovery_step is not None:
                 if int(recovery_step) != int(step):
                     raise RuntimeError(
@@ -14376,18 +12636,15 @@ def main():
             raise RuntimeError(
                 "an exact trajectory still failed after distributing the "
                 "trainer across every selected GPU") from error
-        if (active_step is None
-                or configured_advantage_mode != "spo-rs"):
+        if (active_step is None or configured_advantage_mode != "spo-rs"):
             raise
-        recoverable = _recoverable_spo_rs_artifacts(
-            exp_dir, active_step, cfg)
+        recoverable = _recoverable_spo_rs_artifacts(exp_dir, active_step, cfg)
         if recoverable is None:
             raise RuntimeError(
                 "the exact long-context trainer needs a multi-GPU retry, but "
                 "this step does not yet have a complete durable SPO-RS "
                 "rollout/evaluation set") from error
-        marker = _write_exact_sharded_recovery(
-            exp_dir, active_step, error)
+        marker = _write_exact_sharded_recovery(exp_dir, active_step, error)
         restart_for_exact_recovery = True
         recovery = _read_exact_sharded_recovery(exp_dir) or {}
         if recovery.get("overflow_gradient_file"):
@@ -14423,12 +12680,9 @@ def main():
         if gen_pool is not None:
             print("[shutdown] stopping generation pool ...")
             gen_pool.shutdown()
-        if (parallel_trainer is not None
-                and hasattr(parallel_trainer, "shutdown")):
+        if (parallel_trainer is not None and hasattr(parallel_trainer, "shutdown")):
             print("[shutdown] stopping process-distributed trainer ...")
-            parallel_trainer.shutdown(for_restart=(
-                restart_for_exact_recovery
-                or restart_after_exact_recovery))
+            parallel_trainer.shutdown(for_restart=(restart_for_exact_recovery or restart_after_exact_recovery))
 
     if restart_for_exact_recovery or restart_after_exact_recovery:
         _restart_for_exact_resume(exp_dir)
@@ -14439,8 +12693,7 @@ def main():
     print("=" * 70)
     # Use the problem-native best-ever record, not merely the best state that
     # survived archive deduplication/pruning.
-    best = (sampler.best_raw_state(maximize=bool(problem.maximize))
-            or sampler.best_state())
+    best = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
     if best is not None:
         raw = f"  (raw {getattr(problem, 'metric_name', 'metric')} = {best.raw_score:.9f})" \
             if best.raw_score is not None else ""
@@ -14453,8 +12706,7 @@ def main():
                                cfg.max_saved_construction)
                                if getattr(problem, "saves_construction", False)
                                else None),
-                           best_raw_score=(float(best.raw_score)
-                                           if best.raw_score is not None else None))
+                           best_raw_score=(float(best.raw_score) if best.raw_score is not None else None))
     else:
         print("No valid solution was ever produced.")
         save_final_summary(exp_dir, None, None, None)

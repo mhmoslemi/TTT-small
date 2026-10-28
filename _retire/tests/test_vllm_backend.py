@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import call, mock_open, patch
 
-from gen_workers import (
+from generation.gen_workers import (
     GenerationPool,
     HybridHFGenerationPool,
     OnDemandGenerationPool,
@@ -27,7 +27,7 @@ from gen_workers import (
     _vllm_utilization_with_reserve,
     _vllm_worker_loop,
 )
-from gpu_runtime import (
+from runtime.gpu_runtime import (
     GPUMemory,
     align_vllm_layout_to_concurrency,
     allocate_gpu_roles,
@@ -37,7 +37,7 @@ from gpu_runtime import (
     resolve_memory_settings,
     validate_attention_heads,
 )
-from gpu_lease import gpu_lease
+from runtime.gpu_lease import gpu_lease
 
 
 class _Queue:
@@ -144,12 +144,12 @@ class VLLMBackendTests(unittest.TestCase):
         ])
 
     def test_peak_rss_sampler_tracks_increment_over_baseline(self):
-        from host_memory import ProcessRSSPeakSampler
+        from runtime.host_memory import ProcessRSSPeakSampler
 
         readings = iter([100, 180, 260, 220])
         sampler = ProcessRSSPeakSampler(interval_seconds=10.0)
         with patch(
-                "host_memory.process_rss_bytes",
+                'runtime.host_memory.process_rss_bytes',
                 side_effect=lambda: next(readings, 220)):
             sampler._sample()
             sampler._sample()
@@ -165,7 +165,7 @@ class VLLMBackendTests(unittest.TestCase):
                 "PyTorch is required for exact forward/gradient equivalence")
         import copy
         import torch
-        from model_backend import _install_exact_qwen38_gated_norm_chunking
+        from models.model_backend import _install_exact_qwen38_gated_norm_chunking
 
         class Qwen3_5RMSNormGated(torch.nn.Module):
             def __init__(self):
@@ -190,7 +190,7 @@ class VLLMBackendTests(unittest.TestCase):
         chunked = copy.deepcopy(reference)
         cfg = types.SimpleNamespace(coder_model_profile="qwen3.8-27b")
         # Two rows per tile exercises concatenation and nested checkpointing.
-        with patch("model_backend._EXACT_GATED_NORM_TILE_BYTES", 32):
+        with patch('models.model_backend._EXACT_GATED_NORM_TILE_BYTES', 32):
             self.assertEqual(
                 _install_exact_qwen38_gated_norm_chunking(chunked, cfg), 1)
 
@@ -222,7 +222,7 @@ class VLLMBackendTests(unittest.TestCase):
                 "PyTorch is required for exact forward/gradient equivalence")
         import copy
         import torch
-        from model_backend import _install_exact_qwen38_mlp_chunking
+        from models.model_backend import _install_exact_qwen38_mlp_chunking
 
         class Qwen3_5MLP(torch.nn.Module):
             def __init__(self):
@@ -247,7 +247,7 @@ class VLLMBackendTests(unittest.TestCase):
         )
         # Force one-token tiles in this tiny test so it exercises both the
         # concatenation and nested non-reentrant checkpoint backward paths.
-        with patch("model_backend._EXACT_MLP_PROJECTION_TILE_BYTES", 32):
+        with patch('models.model_backend._EXACT_MLP_PROJECTION_TILE_BYTES', 32):
             self.assertEqual(
                 _install_exact_qwen38_mlp_chunking(chunked, cfg), 1)
 
@@ -271,7 +271,7 @@ class VLLMBackendTests(unittest.TestCase):
                 rtol=2e-5, atol=2e-6)
 
     def test_progress_bar_uses_declared_progress_stream(self):
-        from gen_workers import make_progress_bar
+        from generation.gen_workers import make_progress_bar
 
         console = object()
         wrapped_stderr = types.SimpleNamespace(progress_stream=console)
@@ -282,8 +282,8 @@ class VLLMBackendTests(unittest.TestCase):
             return object()
 
         with patch.object(sys, "stderr", wrapped_stderr), \
-             patch("gen_workers._HAS_TQDM", True), \
-             patch("gen_workers.tqdm", side_effect=fake_tqdm):
+             patch('generation.gen_workers._HAS_TQDM', True), \
+             patch('generation.gen_workers.tqdm', side_effect=fake_tqdm):
             make_progress_bar(17, desc="evaluating")
 
         self.assertIs(captured["file"], console)
@@ -344,7 +344,7 @@ class VLLMBackendTests(unittest.TestCase):
                 _TerminalTeeStream,
                 _TimestampedLineStream,
             )
-        from terminal_output import terminal_log_only
+        from diagnostics.terminal_output import terminal_log_only
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "temirnal.log"
@@ -368,7 +368,7 @@ class VLLMBackendTests(unittest.TestCase):
                 "yaml": types.ModuleType("yaml"),
         }):
             from train_multy_CVaR import _NoticeRoutingStream
-            from terminal_output import bind_setting_log
+            from diagnostics.terminal_output import bind_setting_log
 
         class Visible:
             def __init__(self):
@@ -407,14 +407,14 @@ class VLLMBackendTests(unittest.TestCase):
                 bind_setting_log(None)
 
     def test_hf_attention_prefers_flash_and_never_requests_eager(self):
-        from model_backend import _hf_training_attention_implementation
+        from models.model_backend import _hf_training_attention_implementation
 
-        with patch("model_backend.importlib.util.find_spec",
+        with patch('models.model_backend.importlib.util.find_spec',
                    return_value=object()):
             self.assertEqual(
                 _hf_training_attention_implementation(),
                 "flash_attention_2")
-        with patch("model_backend.importlib.util.find_spec",
+        with patch('models.model_backend.importlib.util.find_spec',
                    return_value=None):
             self.assertEqual(
                 _hf_training_attention_implementation(), "sdpa")
@@ -672,7 +672,7 @@ class VLLMBackendTests(unittest.TestCase):
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
 
         with (patch("torch.cuda.empty_cache"),
-              patch("host_memory.reclaim_unused_host_memory"),
+              patch('runtime.host_memory.reclaim_unused_host_memory'),
               patch("torch.autograd.graph.save_on_cpu",
                     return_value=nullcontext()) as offload):
             result, effective, deferred = _run_oom_resilient_backward(
@@ -704,7 +704,7 @@ class VLLMBackendTests(unittest.TestCase):
             return "trained"
 
         with (patch("torch.cuda.empty_cache"),
-              patch("host_memory.reclaim_unused_host_memory"),
+              patch('runtime.host_memory.reclaim_unused_host_memory'),
               patch("torch.autograd.graph.save_on_cpu",
                     return_value=nullcontext()) as offload):
             result, effective, deferred = _run_oom_resilient_backward(
@@ -718,7 +718,7 @@ class VLLMBackendTests(unittest.TestCase):
         offload.assert_called_once()
 
     def test_activation_offload_slots_reserve_node_memory(self):
-        from host_memory import (
+        from runtime.host_memory import (
             GIB, automatic_activation_offload_budget_bytes,
             automatic_activation_offload_slots,
         )
@@ -752,7 +752,7 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_activation_offload_gate_scales_reservation_with_tokens(self):
         import multiprocessing as mp
-        from host_memory import GIB, TokenWeightedActivationOffloadGate
+        from runtime.host_memory import GIB, TokenWeightedActivationOffloadGate
 
         gate = TokenWeightedActivationOffloadGate(
             mp.get_context("spawn"), 896 * GIB, 262_144)
@@ -1062,7 +1062,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertEqual(quarantined, [])
 
     def test_long_rollout_ceiling_counts_other_gpu_processes(self):
-        from fast_distributed import set_long_rollout_memory_ceiling
+        from training.fast_distributed import set_long_rollout_memory_ceiling
 
         with (patch("torch.cuda.device", return_value=nullcontext()),
               patch("torch.cuda.empty_cache"),
@@ -1076,7 +1076,7 @@ class VLLMBackendTests(unittest.TestCase):
         setter.assert_called_once_with(0.86, device=2)
 
     def test_long_rollout_ceiling_can_escalate_to_98_percent(self):
-        from fast_distributed import set_long_rollout_memory_ceiling
+        from training.fast_distributed import set_long_rollout_memory_ceiling
 
         with (patch("torch.cuda.device", return_value=nullcontext()),
               patch("torch.cuda.empty_cache"),
@@ -1090,7 +1090,7 @@ class VLLMBackendTests(unittest.TestCase):
         setter.assert_called_once_with(0.88, device=2)
 
     def test_long_rollout_ceiling_can_escalate_to_99_percent(self):
-        from fast_distributed import (LONG_ROLLOUT_MEMORY_FRACTIONS,
+        from training.fast_distributed import (LONG_ROLLOUT_MEMORY_FRACTIONS,
                                       set_long_rollout_memory_ceiling)
 
         self.assertEqual(LONG_ROLLOUT_MEMORY_FRACTIONS, (0.96, 0.98, 0.99))
@@ -1145,7 +1145,7 @@ class VLLMBackendTests(unittest.TestCase):
         )
 
     def test_multi_gpu_training_uses_balanced_model_parallel_map(self):
-        from model_backend import (_quantization_method, _training_device_map,
+        from models.model_backend import (_quantization_method, _training_device_map,
                                    _training_max_memory)
 
         self.assertEqual(
@@ -1226,7 +1226,7 @@ class VLLMBackendTests(unittest.TestCase):
                 ]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
-                        "gpu_runtime.query_gpu_memory", return_value=memory):
+                        'runtime.gpu_runtime.query_gpu_memory', return_value=memory):
                     with self.assertRaisesRegex(
                             ValueError, "every replica GPU"):
                         load_config()
@@ -1242,7 +1242,7 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertEqual(os.environ["TTT_TRAINING_GPU_IDS"], "7,2,5")
 
     def test_sharded_backend_restores_original_device_map(self):
-        from model_backend import _ModelPlacementBackend
+        from models.model_backend import _ModelPlacementBackend
 
         events = []
 
@@ -1278,7 +1278,7 @@ class VLLMBackendTests(unittest.TestCase):
         self.assertTrue(events[2][2]["force_hooks"])
 
     def test_replica_backend_restores_its_explicit_device(self):
-        from model_backend import _ModelPlacementBackend
+        from models.model_backend import _ModelPlacementBackend
 
         events = []
 
@@ -1320,7 +1320,7 @@ class VLLMBackendTests(unittest.TestCase):
             saved["base_model_name_or_path"], "openai/gpt-oss-120b")
 
     def test_large_moe_lora_avoids_expert_wide_adapters(self):
-        from model_backend import _resolve_lora_target_modules
+        from models.model_backend import _resolve_lora_target_modules
 
         cfg = types.SimpleNamespace(
             target_modules=("q_proj", "k_proj", "v_proj", "o_proj",
@@ -1394,7 +1394,7 @@ class VLLMBackendTests(unittest.TestCase):
                 argv = ["train_multy_CVaR.py", "--config", str(config_path)]
                 with patch.object(sys, "argv", argv), patch.dict(
                         os.environ, {"AVAILABLE_GPUS": "0,1,2"}), patch(
-                        "gpu_runtime.query_gpu_memory", return_value={}):
+                        'runtime.gpu_runtime.query_gpu_memory', return_value={}):
                     cfg, _ = load_config()
 
         self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
@@ -1682,9 +1682,9 @@ class VLLMBackendTests(unittest.TestCase):
     def test_vllm_output_redirects_both_fds_to_append_log(self):
         opened = mock_open()
         opened.return_value.fileno.return_value = 73
-        with patch("gen_workers.open", opened, create=True), patch(
-                "gen_workers.os.makedirs") as makedirs, patch(
-                "gen_workers.os.dup2") as dup2, patch("builtins.print"):
+        with patch('generation.gen_workers.open', opened, create=True), patch(
+                'generation.gen_workers.os.makedirs') as makedirs, patch(
+                'generation.gen_workers.os.dup2') as dup2, patch("builtins.print"):
             handle = _redirect_vllm_output(
                 "/tmp/example-run/vllm.log", 2, [4, 5])
 
@@ -1838,15 +1838,15 @@ class VLLMBackendTests(unittest.TestCase):
             _resolve_reward_workers(cfg, problem, cpu_count=64), 7)
 
     def test_cpu_sandbox_hides_gpus_and_enforces_thread_budget(self):
-        import sandbox
+        import evaluation.sandbox as sandbox
 
         proc = types.SimpleNamespace(
             pid=123456789,
             returncode=1,
             communicate=lambda timeout=None: (b"", b""),
         )
-        with patch("sandbox.subprocess.Popen", return_value=proc) as popen, \
-                patch("sandbox._kill_tree"):
+        with patch('evaluation.sandbox.subprocess.Popen', return_value=proc) as popen, \
+                patch('evaluation.sandbox._kill_tree'):
             sandbox.run_code(
                 "def run():\n    return 1\n",
                 entrypoint="run",
@@ -1863,7 +1863,7 @@ class VLLMBackendTests(unittest.TestCase):
             self.assertEqual(env[key], "6")
 
     def test_problem_passes_eval_cpu_budget_to_sandbox(self):
-        from _retire.problems.base import (ParentContext, Problem, RewardResult,
+        from problems.base import (ParentContext, Problem, RewardResult,
                                    SeedState)
 
         class ExampleProblem(Problem):
@@ -1900,7 +1900,7 @@ class VLLMBackendTests(unittest.TestCase):
         try:
             with patch.dict(sys.modules, {"torch": fake_torch}), patch.dict(
                     os.environ, {"HF_HUB_OFFLINE": "1"}, clear=False):
-                from model_backend import HFBackend, load_backend
+                from models.model_backend import HFBackend, load_backend
 
                 backend = load_backend("auto", types.SimpleNamespace())
 
@@ -2064,9 +2064,9 @@ class VLLMBackendTests(unittest.TestCase):
 
     def test_flashinfer_comm_guard_propagates_to_vllm_children(self):
         stale_module = types.ModuleType("flashinfer.comm.fd_exchange")
-        with patch("gen_workers.importlib.metadata.version",
+        with patch('generation.gen_workers.importlib.metadata.version',
                    return_value="0.6.16.post3"), patch(
-                   "gen_workers._flashinfer_comm_guard_required",
+                   'generation.gen_workers._flashinfer_comm_guard_required',
                    return_value=True), patch.dict(
                    os.environ, {"PYTHONPATH": "/existing/path"},
                    clear=False), patch.dict(
@@ -2167,12 +2167,12 @@ class VLLMBackendTests(unittest.TestCase):
             )
             for gpu_id in range(8)
         }
-        with (patch("gen_workers.mp.get_context",
+        with (patch('generation.gen_workers.mp.get_context',
                     return_value=FakeContext()),
-              patch("gen_workers._assert_vllm_memory_available") as memory_check,
-              patch("gpu_runtime.query_gpu_memory",
+              patch('generation.gen_workers._assert_vllm_memory_available') as memory_check,
+              patch('runtime.gpu_runtime.query_gpu_memory',
                     return_value=fake_memory),
-              patch("gen_workers._resolve_vllm_enforce_eager",
+              patch('generation.gen_workers._resolve_vllm_enforce_eager',
                     return_value=(False, False))):
             pool = GenerationPool(
                 "openai/gpt-oss-120b", 8,
@@ -2375,7 +2375,7 @@ class VLLMBackendTests(unittest.TestCase):
             after_stop=lambda: events.append(("restore", None)),
             model_name="org/model", num_workers=1, gpu_ids=[7],
         )
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             got = list(pool.iter_group_jobs())
             pool.release()
 
@@ -2415,7 +2415,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 events.append(("shutdown", None))
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: events.append(("offload", None)),
                 after_stop=lambda: events.append(("restore", None)),
@@ -2467,7 +2467,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 events.append(("shutdown", self.instance))
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: events.append(("offload", None)),
                 after_stop=lambda: events.append(("restore", None)),
@@ -2512,7 +2512,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 events.append(("shutdown", None))
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: events.append(("offload", None)),
                 after_stop=lambda: events.append(("restore", None)),
@@ -2557,7 +2557,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 pass
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: None,
                 after_stop=lambda: None,
@@ -2598,7 +2598,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 pass
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: None,
                 after_stop=lambda: None,
@@ -2635,7 +2635,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 events.append(("shutdown", None))
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: events.append(("offload", None)),
                 after_stop=lambda: events.append(("restore", None)),
@@ -2683,7 +2683,7 @@ class VLLMBackendTests(unittest.TestCase):
             def shutdown(self):
                 events.append(("shutdown", self.instance))
 
-        with patch("gen_workers.GenerationPool", FakePool):
+        with patch('generation.gen_workers.GenerationPool', FakePool):
             pool = PhasedVLLMGenerationPool(
                 before_start=lambda: events.append(("offload", None)),
                 after_stop=lambda: events.append(("restore", None)),

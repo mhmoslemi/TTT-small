@@ -23,7 +23,7 @@ import inspect
 from typing import Any, List
 import numpy as np
 
-from _retire.problems.base import (
+from problems.base import (
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
 )
 

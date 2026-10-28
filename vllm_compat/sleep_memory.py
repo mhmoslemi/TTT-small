@@ -6,7 +6,7 @@ class SleepMemoryExtension:
         import torch
         from vllm.device_allocator.cumem import CuMemAllocator
         from vllm.device_allocator import cumem
-        from host_memory import reclaim_unused_host_memory
+        from runtime.host_memory import reclaim_unused_host_memory
 
         # A 70-GiB model per engine must not become eight permanently pinned
         # host copies. vLLM uses synchronous cudaMemcpy, which also supports

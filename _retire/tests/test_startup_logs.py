@@ -12,7 +12,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from startup_logs import StartupLog, dashboard_sections, render_dashboard
+from diagnostics.startup_logs import StartupLog, dashboard_sections, render_dashboard
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +46,7 @@ class StartupLogTests(unittest.TestCase):
                   and "hasattr(_terminal_output" in ast.unparse(node)):
                 selected.append(node)
 
-        legacy = ModuleType("terminal_output")
+        legacy = ModuleType('diagnostics.terminal_output')
         legacy_calls = []
         legacy.terminal_log_only = lambda *args, **kwargs: legacy_calls.append(
             (args, kwargs))
@@ -54,7 +54,7 @@ class StartupLogTests(unittest.TestCase):
         code = compile(
             ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
             "trainer logging compatibility", "exec")
-        with patch.dict(sys.modules, {"terminal_output": legacy}):
+        with patch.dict(sys.modules, {'diagnostics.terminal_output': legacy}):
             exec(code, scope)
 
         scope["setting_log_only"]("legacy diagnostic")

@@ -52,8 +52,8 @@ class FixedBatchConfigTests(unittest.TestCase):
             with patch.dict(sys.modules, {"numpy": numpy, "yaml": yaml}), \
                  patch.object(sys, "argv", argv), \
                  patch.dict(os.environ, {"AVAILABLE_GPUS": "0,1"}), \
-                 patch("gpu_runtime.query_gpu_memory", return_value={}), \
-                 patch("gpu_runtime.detect_attention_heads", return_value=32):
+                 patch('runtime.gpu_runtime.query_gpu_memory', return_value={}), \
+                 patch('runtime.gpu_runtime.detect_attention_heads', return_value=32):
                 spec = importlib.util.spec_from_file_location("growth_cleanup_runner", RUNNER)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)

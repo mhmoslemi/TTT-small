@@ -12,7 +12,7 @@ import yaml
 
 from config_validation import validate_problem_config
 from experiment_io import save_parent_selections, save_step_summary
-from sampler import PUCTSampler, State, make_sampler, parent_selection_mode
+from search.sampler import PUCTSampler, State, make_sampler, parent_selection_mode
 from _retire.thompson_sampler import OutcomeStats, ThompsonSampler, expected_max_gain
 
 

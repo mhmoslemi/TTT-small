@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from rollout_allocation import (
+from search.rollout_allocation import (
     _dirichlet_cdf_moments,
     _hurdle_bandwidth,
     _hurdle_kernel_cdfs,
