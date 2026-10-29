@@ -5,7 +5,7 @@ from contextlib import contextmanager, redirect_stdout
 import io
 import json
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -123,6 +123,7 @@ class StrategistModelsTests(unittest.TestCase):
         self.assertTrue(ordinary["enable_lora"])
         self.assertNotIn("tokenizer_mode", ordinary)
         self.assertNotIn("generation_config", ordinary)
+        self.assertNotIn("enable_flashinfer_autotune", ordinary)
         legacy = gen_workers._vllm_engine_kwargs(
             "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", 131072, False, 32, .9,
             engine_options=models.strategist_engine_options(
@@ -143,6 +144,7 @@ class StrategistModelsTests(unittest.TestCase):
             self.assertEqual(kwargs["generation_config"], "vllm")
             self.assertNotIn("speculative_config", kwargs)
             if alias.startswith("deepseek"):
+                self.assertNotIn("enable_flashinfer_autotune", kwargs)
                 self.assertEqual(kwargs["kv_cache_dtype"], "fp8")
                 self.assertEqual(kwargs["attention_config"], {"indexer_kv_dtype": "fp8"})
                 self.assertEqual(kwargs["tokenizer_mode"], "deepseek_v4")
@@ -150,7 +152,63 @@ class StrategistModelsTests(unittest.TestCase):
                 self.assertEqual(kwargs["kv_cache_dtype"], "auto")
                 self.assertEqual(kwargs["dtype"], "bfloat16")
                 self.assertEqual(kwargs["quantization"], "modelopt")
+                self.assertIs(kwargs["enable_flashinfer_autotune"], False)
                 self.assertEqual(kwargs["engram_config"], {"cpu_offload": True})
+
+    def test_startup_watchdog_allows_active_loading_but_rejects_stalls_and_errors(self):
+        for scenario in ("log_activity", "ready_activity", "stalled", "missing_log", "dead", "error"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as folder:
+                log_path = Path(folder) / "vllm.log"
+                if scenario != "missing_log":
+                    log_path.write_text("starting\n")
+                pool = gen_workers.GenerationPool.__new__(gen_workers.GenerationPool)
+                pool.backend, pool.num_workers = "vllm", 2
+                pool._startup_timeout, pool.vllm_log_path = 3., str(log_path)
+                pool._ready_worker_ids, pool._sleep_capable_workers = set(), set()
+                pool.procs = [SimpleNamespace(exitcode=None) for _ in range(2)]
+                pool.shutdown = Mock()
+                elapsed = [0.]
+
+                def receive(timeout):
+                    elapsed[0] += timeout
+                    tick = int(elapsed[0])
+                    if scenario == "log_activity":
+                        if tick in (2, 4):
+                            with log_path.open("a") as handle:
+                                handle.write("compiling\n")
+                        if tick == 5:
+                            return "ready", 0, "sleep:1"
+                        if tick == 6:
+                            return "ready", 1, "ready"
+                    if scenario == "ready_activity":
+                        if tick == 2:
+                            return "ready", 0, "ready"
+                        if tick == 4:
+                            return "ready", 1, "ready"
+                    if scenario == "dead":
+                        pool.procs[1].exitcode = 1
+                    if scenario == "error":
+                        return "error", 1, "initialization failed"
+                    raise Empty
+
+                pool._ready_queue = SimpleNamespace(get=receive)
+                with patch.object(gen_workers.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                        redirect_stdout(io.StringIO()):
+                    if scenario in ("log_activity", "ready_activity"):
+                        pool._wait_workers((0, 1))
+                        self.assertEqual(pool._ready_worker_ids, {0, 1})
+                        self.assertGreater(elapsed[0], pool._startup_timeout)
+                        pool.shutdown.assert_not_called()
+                        if scenario == "log_activity":
+                            self.assertEqual(pool._sleep_capable_workers, {0})
+                    else:
+                        error = TimeoutError if scenario in ("stalled", "missing_log") else RuntimeError
+                        message = ("no progress" if error is TimeoutError else
+                                   "exited during startup" if scenario == "dead" else "initialization failed")
+                        with self.assertRaisesRegex(error, message):
+                            pool._wait_workers((0, 1))
+                        pool.shutdown.assert_called_once_with()
+                        self.assertEqual(elapsed[0], 3. if error is TimeoutError else 1.)
 
     def test_qwen_qsa_native_kv_precision_matches_memory_planning(self):
         for name in ("qwen3.8-flash-next", "Qwen/Qwen3.8-Flash-Next",

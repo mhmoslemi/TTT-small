@@ -1795,12 +1795,24 @@ class GenerationPool:
     def _wait_workers(self, worker_ids):
         pending = {int(rank) for rank in worker_ids}
         deadline = time.monotonic() + self._startup_timeout
+        log_state = None
         while pending:
+            # Cold loading/compilation may exceed the timeout while still making progress.
+            if self.vllm_log_path:
+                try:
+                    stat = os.stat(self.vllm_log_path)
+                except OSError:
+                    pass
+                else:
+                    state = (stat.st_ino, stat.st_size)
+                    if state != log_state:
+                        log_state = state
+                        deadline = time.monotonic() + self._startup_timeout
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.shutdown()
                 raise TimeoutError(
-                    f"vLLM startup exceeded {self._startup_timeout:.0f}s "
+                    f"{self.backend} startup made no progress for {self._startup_timeout:.0f}s "
                     f"while waiting for workers {sorted(pending)}; details: "
                     f"{self.vllm_log_path or 'console'}")
             try:
@@ -1834,6 +1846,7 @@ class GenerationPool:
                 self._sleep_capable_workers.add(rank)
             self._ready_worker_ids.add(rank)
             pending.remove(rank)
+            deadline = time.monotonic() + self._startup_timeout
             print(f"[pool] {len(self._ready_worker_ids)}/"
                   f"{self.num_workers} workers ready", flush=True)
 

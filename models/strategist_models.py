@@ -119,7 +119,8 @@ def strategist_engine_options(model_name):
         options.update(kv_cache_dtype="auto", engram_config={"cpu_offload": True},
                        limit_mm_per_prompt={"image": 0, "video": 0})
         if profile["nvfp4"]:
-            options["quantization"] = "modelopt"
+            # NVIDIA's serving recipe skips the extra cold-start tuning sweep.
+            options.update(quantization="modelopt", enable_flashinfer_autotune=False)
     else:
         # RTX PRO 6000 is SM120, not SM100: its sparse-MLA backend cannot
         # use the B200/GB200 FP4 indexer or deep_gemm_mega_moe.
