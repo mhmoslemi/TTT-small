@@ -140,15 +140,34 @@ class StrategistModelsTests(unittest.TestCase):
             self.assertNotIn("fully_sharded_loras", kwargs)
             self.assertTrue(kwargs["enable_expert_parallel"])
             self.assertEqual(kwargs["max_model_len"], context)
-            self.assertEqual(kwargs["kv_cache_dtype"], "fp8")
             self.assertEqual(kwargs["generation_config"], "vllm")
             self.assertNotIn("speculative_config", kwargs)
             if alias.startswith("deepseek"):
+                self.assertEqual(kwargs["kv_cache_dtype"], "fp8")
                 self.assertEqual(kwargs["attention_config"], {"indexer_kv_dtype": "fp8"})
                 self.assertEqual(kwargs["tokenizer_mode"], "deepseek_v4")
             else:
+                self.assertEqual(kwargs["kv_cache_dtype"], "auto")
+                self.assertEqual(kwargs["dtype"], "bfloat16")
                 self.assertEqual(kwargs["quantization"], "modelopt")
                 self.assertEqual(kwargs["engram_config"], {"cpu_offload": True})
+
+    def test_qwen_qsa_native_kv_precision_matches_memory_planning(self):
+        for name in ("qwen3.8-flash-next", "Qwen/Qwen3.8-Flash-Next",
+                     "Qwen/Qwen3.8-Flash-Next-FP8"):
+            for tp, expected_cache_gib in ((1, 8.0), (2, 4.0), (4, 4.0), (8, 4.0)):
+                kwargs = gen_workers._vllm_engine_kwargs(
+                    models.resolve_strategy_model(name), 262144, False, 32, .9,
+                    tensor_parallel_size=tp,
+                    engine_options=models.strategist_engine_options(name))
+                self.assertEqual((kwargs["dtype"], kwargs["kv_cache_dtype"]),
+                                 ("bfloat16", "auto"))
+                self.assertEqual(kwargs["max_model_len"], 262144)
+                _, cache_gib = models.strategist_memory_per_rank(name, tp, 262144)
+                self.assertEqual(cache_gib, expected_cache_gib)
+        _, deepseek_cache_gib = models.strategist_memory_per_rank(
+            "deepseek-v4-flash-0731", 4, 262144)
+        self.assertEqual(deepseek_cache_gib, 2.0)
 
     def test_new_pool_loading_is_host_memory_admitted(self):
         events = []

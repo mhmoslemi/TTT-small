@@ -33,7 +33,8 @@ def strategist_profile(model_name):
             efforts=("low", "medium", "xhigh"), default_effort="xhigh",
             weights_gib=(126.0 if name.endswith("nvfp4") else
                          175.0 if name.endswith("fp8") else 338.0),
-            ple_gib=48.0, kv_bytes_per_token=8_192,
+            # BF16 QSA K/V plus indexer state; two KV heads shard up to TP=2.
+            ple_gib=48.0, kv_bytes_per_token=32_768, kv_heads=2,
             nvfp4=name.endswith("nvfp4"),
         )
     if name in {"deepseek-v4-flash-0731", "deepseek-v4-flash-0731-nvfp4"}:
@@ -93,12 +94,13 @@ def resolve_strategy_token_limits(model_name, max_seq_length="auto",
 
 
 def strategist_memory_per_rank(model_name, parallel_size, max_length):
-    """FP8 caches are replicated for these single/few-KV-head architectures."""
+    """Account for native caches, replicated once TP exceeds the KV heads."""
     profile = strategist_profile(model_name)
     weight = (profile["weights_gib"] - profile["ple_gib"]) / parallel_size
     # Qwen's large lookup table is offloaded explicitly, not mistaken for
     # sharded GPU memory. vLLM asynchronously fetches the needed rows.
-    kv = profile["kv_bytes_per_token"] * max_length / 2**30
+    kv_shards = min(parallel_size, profile.get("kv_heads", 1))
+    kv = profile["kv_bytes_per_token"] * max_length / kv_shards / 2**30
     return weight, kv
 
 
@@ -113,7 +115,8 @@ def strategist_engine_options(model_name):
         kv_cache_dtype="fp8", safetensors_load_strategy="lazy",
     )
     if profile["family"] == "qwen3.8-flash-next":
-        options.update(engram_config={"cpu_offload": True},
+        # vLLM 0.30 QSA rejects FP8 KV; auto uses the BF16 model dtype.
+        options.update(kv_cache_dtype="auto", engram_config={"cpu_offload": True},
                        limit_mm_per_prompt={"image": 0, "video": 0})
         if profile["nvfp4"]:
             options["quantization"] = "modelopt"
