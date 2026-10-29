@@ -165,6 +165,7 @@ class StrategistModelsTests(unittest.TestCase):
                 pool.backend, pool.num_workers = "vllm", 2
                 pool._startup_timeout, pool.vllm_log_path = 3., str(log_path)
                 pool._ready_worker_ids, pool._sleep_capable_workers = set(), set()
+                pool._async_worker_ids = set()
                 pool.procs = [SimpleNamespace(exitcode=None) for _ in range(2)]
                 pool.shutdown = Mock()
                 elapsed = [0.]
@@ -177,7 +178,7 @@ class StrategistModelsTests(unittest.TestCase):
                             with log_path.open("a") as handle:
                                 handle.write("compiling\n")
                         if tick == 5:
-                            return "ready", 0, "sleep:1"
+                            return "ready", 0, "sleep:1;async"
                         if tick == 6:
                             return "ready", 1, "ready"
                     if scenario == "ready_activity":
@@ -201,6 +202,7 @@ class StrategistModelsTests(unittest.TestCase):
                         pool.shutdown.assert_not_called()
                         if scenario == "log_activity":
                             self.assertEqual(pool._sleep_capable_workers, {0})
+                            self.assertEqual(pool._async_worker_ids, {0})
                     else:
                         error = TimeoutError if scenario in ("stalled", "missing_log") else RuntimeError
                         message = ("no progress" if error is TimeoutError else
