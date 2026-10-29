@@ -5532,6 +5532,9 @@ def main():
         else:
             print("[init] single-GPU generation (no worker pool)")
 
+    if parallel_trainer is not None:
+        # Exact overflow may need the same sleeping-backup reclamation as generation.
+        parallel_trainer._generation_pools = (strategy_pool, gen_pool)
 
     # ---- main loop ----
     from experiment_io import StepPlotter

@@ -73,8 +73,8 @@ def plan_overflow_wave(examples, world_size, minimum_gpus=None):
     return wave
 
 
-def require_parking_capacity(model, world_size, optimizer=None):
-    """Check RAM before moving replicas, not after committing the allocation."""
+def require_parking_capacity(model, world_size, optimizer=None, *, generation_pools=()):
+    """Reclaim sleeping inference backups before admitting CPU trainer copies."""
     from runtime.host_memory import (host_memory_info, GIB, estimated_module_bytes,
                              estimated_optimizer_bytes)
 
@@ -85,6 +85,18 @@ def require_parking_capacity(model, world_size, optimizer=None):
     if info is None:
         raise RuntimeError("cannot safely park replicas: host RAM is unknown")
     reserve = max(128 * GIB, int(0.10 * info["total"]))
+    for pool in generation_pools:
+        if required + reserve <= info["available"]:
+            break
+        discard = getattr(pool, "discard_sleeping_host_residency", None)
+        if not callable(discard) or not discard():
+            continue
+        print("[train-overflow] released a sleeping generation pool's host backup "
+              "to park trainer replicas; it will reload on its next use", flush=True)
+        info = host_memory_info()
+        if info is None:
+            raise RuntimeError("cannot safely park replicas: host RAM is unknown")
+        reserve = max(128 * GIB, int(0.10 * info["total"]))
     if required + reserve > info["available"]:
         raise RuntimeError(
             "insufficient host RAM to park the trainer replicas safely: "
@@ -361,10 +373,10 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
             trainer.reclaim_host_memory()
             if not trainer._offloaded:
                 require_parking_capacity(trainer.model, trainer.world_size,
-                                         trainer.optimizer)
+                                         trainer.optimizer,
+                                         generation_pools=getattr(trainer, "_generation_pools", ()))
                 trainer.offload_for_generation(purge_host_cache=False)
             # All replica weights remain resident in host RAM between waves.
-            # Sleeping vLLM engines are not stopped or reloaded.
             while pending:
                 wave = plan_overflow_wave(
                     [by_key[key] for key in pending], trainer.world_size,

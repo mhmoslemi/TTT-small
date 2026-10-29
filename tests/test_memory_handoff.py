@@ -1,7 +1,9 @@
 """CPU-only regressions for RAM admission and the GPU phase handoff."""
 
+import ast
 from contextlib import nullcontext
 import multiprocessing
+from pathlib import Path
 from types import SimpleNamespace
 import sys
 import threading
@@ -10,6 +12,8 @@ import pytest
 
 import runtime.host_memory as host_memory
 from runtime.host_memory import GIB, HostMemoryAdmission, TokenWeightedActivationOffloadGate
+from generation.gen_workers import PhasedVLLMGenerationPool
+from training import exact_overflow
 
 
 def test_unsloth_offload_releases_storage_and_buffers_can_regrow(monkeypatch):
@@ -291,3 +295,68 @@ def test_transient_handoff_restores_every_trainer_without_sleep():
     pool.release_for_training(trainer)
     assert calls == ["shutdown", list(range(8))]
     assert not pool.active
+
+
+@pytest.mark.parametrize("available, released", [(700., []), (608.5, ["strategy"]),
+                                                (300., ["strategy", "coder"])])
+def test_parking_reclaims_only_the_sleeping_pools_it_needs(monkeypatch, available, released):
+    state, calls = {"available": int(available * host_memory.GIB)}, []
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(
+        total=1717 * host_memory.GIB, available=state["available"]))
+    monkeypatch.setattr(host_memory, "estimated_module_bytes", lambda model: 51 * host_memory.GIB)
+    monkeypatch.setattr(host_memory, "estimated_optimizer_bytes", lambda optimizer: 0)
+
+    def pool(label, freed):
+        def discard():
+            calls.append(label)
+            state["available"] += freed * host_memory.GIB
+            return True
+        return SimpleNamespace(discard_sleeping_host_residency=discard)
+
+    exact_overflow.require_parking_capacity(
+        object(), 8, generation_pools=(pool("strategy", 100), pool("coder", 300)))
+    assert calls == released
+    assert state["available"] >= int(1.1 * 51 * 8 * host_memory.GIB) + int(.1 * 1717 * host_memory.GIB)
+
+
+def test_parking_does_not_stop_an_awake_pool_or_relax_the_safety_reserve(monkeypatch):
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(
+        total=1717 * host_memory.GIB, available=int(608.5 * host_memory.GIB)))
+    monkeypatch.setattr(host_memory, "estimated_module_bytes", lambda model: 51 * host_memory.GIB)
+    monkeypatch.setattr(host_memory, "estimated_optimizer_bytes", lambda optimizer: 0)
+    pool = PhasedVLLMGenerationPool(lambda: None, lambda: None, num_workers=8)
+    pool._awake = True
+    pool._pool = SimpleNamespace(shutdown=lambda: pytest.fail("awake pool was stopped"))
+    with pytest.raises(RuntimeError, match="insufficient host RAM"):
+        exact_overflow.require_parking_capacity(object(), 8, generation_pools=(pool,))
+    assert pool.active
+
+
+def test_parking_refuses_unknown_memory_after_reclamation(monkeypatch):
+    readings = iter([dict(total=1717 * host_memory.GIB, available=300 * host_memory.GIB), None])
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: next(readings))
+    monkeypatch.setattr(host_memory, "estimated_module_bytes", lambda model: 51 * host_memory.GIB)
+    monkeypatch.setattr(host_memory, "estimated_optimizer_bytes", lambda optimizer: 0)
+    pool = SimpleNamespace(discard_sleeping_host_residency=lambda: True)
+    with pytest.raises(RuntimeError, match="host RAM is unknown"):
+        exact_overflow.require_parking_capacity(object(), 8, generation_pools=(pool,))
+
+
+def test_main_registers_pools_before_recovery_and_overflow_passes_them_to_parking():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "train_multy_CVaR.py").read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    registration = next(node for node in ast.walk(main) if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Attribute) and target.attr == "_generation_pools"
+                                for target in node.targets))
+    assert ast.unparse(registration.value) == "(strategy_pool, gen_pool)"
+    loop = next(node for node in main.body if isinstance(node, ast.For)
+                and isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "range" and any(isinstance(arg, ast.Name) and arg.id == "start_step"
+                                                        for arg in node.iter.args))
+    assert registration.lineno < loop.lineno
+    source = ast.parse((root / "training/exact_overflow.py").read_text())
+    call = next(node for node in ast.walk(source) if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id == "require_parking_capacity")
+    pools = next(item.value for item in call.keywords if item.arg == "generation_pools")
+    assert ast.unparse(pools) == "getattr(trainer, '_generation_pools', ())"
