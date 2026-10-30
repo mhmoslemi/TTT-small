@@ -119,7 +119,10 @@ class ErdosMinOverlap(Problem):
 Erdos-specific implementation constraint: `initial_h_values`, when a current
 construction is available, is already supplied to the executed program as a
 NumPy array. Never plan to copy, serialize, reconstruct, or hard-code that
-array.
+array. Never propose a long explicit numeric table or an unrolled pattern.
+Describe compact algorithmic construction using NumPy operations, formulas,
+loops, interpolation, or seeded random generation. The eventual complete
+program must fit comfortably in a few hundred lines.
 
 Erdos mathematical checks for the final plan:
 - The authoritative objective is max(np.correlate(h, 1-h, mode="full")) *
@@ -157,10 +160,10 @@ Erdos mathematical checks for the final plan:
   unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
   values. Build every larger vector algorithmically with NumPy, a compact
   formula, interpolation, tiling, or a loop.
-- No need for commnets or embedded
-  data in the code. Finish `run`, return the required tuple, and close the single Python
-  fence.
-
+- Keep the complete source concise: at most 900 lines and about 50,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
 
 These are hard output constraints even if the proposed strategy suggests
 otherwise.''')
@@ -205,9 +208,10 @@ limit.
   unrolled pattern. A list/tuple/array literal may contain at most 32 scalar
   values. Build every larger vector algorithmically with NumPy, a compact
   formula, interpolation, tiling, or a loop.
-- No need for commnets or embedded
-  data in the code. Finish `run`, return the required tuple, and close the single Python
-  fence.
+- Keep the complete source concise: at most 900 lines and about 50,000
+  characters. Spend tokens on a working algorithm, not comments or embedded
+  data. Finish `run`, return the required tuple, and close the single Python
+  fence well before the generation limit.
 
 These are hard output constraints.'''
 
@@ -231,6 +235,7 @@ With dx = 2.0 / n_points:
 
 The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
 
+Smaller sequences with less than 2.5k samples are preferred - they are faster to optimize and evaluate.
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
@@ -295,9 +300,11 @@ The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
     # ------------------------------------------------------------------
     def seed_states(self) -> List[SeedState]:
         seeds: List[SeedState] = []
+        min_points = self.cfg.get("seed_min_points", 40)
+        max_points = self.cfg.get("seed_max_points", 99)
         for i in range(self.num_seed_states):
             rng = np.random.default_rng(self.seed + i)
-            n_points = int(rng.integers(40, 100))
+            n_points = int(rng.integers(min_points, max_points + 1))
             construction = np.ones(n_points) * 0.5
             perturbation = rng.uniform(-0.4, 0.4, n_points)
             perturbation = perturbation - np.mean(perturbation)

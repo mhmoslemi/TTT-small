@@ -97,7 +97,7 @@ PROBLEM_REQUIRED_KEYS = {
 
 PROBLEM_OPTIONAL_KEYS = {
     "circle_packing": frozenset(),
-    "erdos": frozenset({"target_print"}),
+    "erdos": frozenset({"target_print", "seed_min_points", "seed_max_points"}),
     "erdos-c4": frozenset(),
     "ac1": frozenset({"target_print"}),
     "ac2": frozenset({"target_print"}),
@@ -112,6 +112,8 @@ EXCLUSIVE_KEY_OWNERS = {
     "num_circles": frozenset({"circle_packing"}),
     "degenerate_threshold": frozenset({"circle_packing"}),
     "eval_seed": frozenset({"denoising"}),
+    "seed_min_points": frozenset({"erdos"}),
+    "seed_max_points": frozenset({"erdos"}),
     "budget_s": frozenset({"erdos", "erdos-c4", "ac1", "ac2"}),
     "eval_cpus": CPU_PROBLEMS,
     "max_coeff_count": frozenset({"erdos-c4"}),
@@ -208,12 +210,17 @@ def validate_problem_config(
         )
 
     for key in ("num_steps", "groups_per_step", "group_size",
-                "num_seed_states", "max_new_tokens", "max_seq_length",
+                "num_seed_states", "seed_min_points", "seed_max_points",
+                "max_new_tokens", "max_seq_length",
                 "train_examples_per_microbatch", "strategies_per_parent",
                 "programs_per_strategy", "strategy_archive_top_r",
                 "spo_rs_update_epochs"):
         if key in data:
             _positive_int(data, key, source)
+    if (problem == "erdos"
+            and data.get("seed_min_points", 40) > data.get("seed_max_points", 99)):
+        raise ValueError(
+            f"{_label(source)}: seed_min_points must be <= seed_max_points")
     for key in ("strategy_max_new_tokens", "strategy_max_seq_length"):
         if key in data and data[key] != "auto":
             _positive_int(data, key, source)

@@ -639,6 +639,10 @@ def load_config():
                 saved.pop(key, None)
         profile_explicit_keys.update(saved)
         merged.update(saved)
+        # Older checkpoints must not inherit a new preset's seed resolutions.
+        if merged.get("problem") == "erdos":
+            merged["seed_min_points"] = saved.get("seed_min_points", 40)
+            merged["seed_max_points"] = saved.get("seed_max_points", 99)
         # A changed rollout budget restarts the unfinished step; saved
         # policy/optimizer/search state still comes from the last checkpoint.
         from experiment_io import ROLLOUT_CONFIG_KEYS
