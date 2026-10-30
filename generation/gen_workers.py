@@ -356,6 +356,61 @@ def _canonical_generated_text(tokenizer, token_ids, generated_text):
     return decoded or original
 
 
+def native_final_answer_scope(tokenizer, token_ids, *, require_final_marker=False, prompt_text=""):
+    """Decode the final channel from original IDs, not lookalike text markers.
+
+    None retains legacy extraction for tokenizers without a native reasoning
+    protocol; an empty string means reasoning never reached the final channel.
+    """
+    added_vocab = getattr(tokenizer, "get_added_vocab", None)
+    native = dict(added_vocab()) if callable(added_vocab) else {}
+    native.update(zip(getattr(tokenizer, "all_special_tokens", ()),
+                      getattr(tokenizer, "all_special_ids", ())))
+    closing_ids = {native[tag] for tag in ("</think>", "</analysis>", "</reasoning>") if tag in native}
+    opening_ids = {native[tag] for tag in ("<think>", "<analysis>", "<reasoning>") if tag in native}
+    channel_id, message_id = native.get("<|channel|>"), native.get("<|message|>")
+    harmony = channel_id is not None and message_id is not None
+    if not closing_ids and not harmony:
+        if require_final_marker:
+            raise RuntimeError("the coder tokenizer does not expose its required native reasoning boundary")
+        return None
+
+    def decode(ids):
+        try:
+            return tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        except TypeError:
+            return tokenizer.decode(ids, skip_special_tokens=False)
+
+    final_start = None
+    # Some templates prefill the reasoning opener instead of generating it.
+    prefix = str(prompt_text).rstrip()
+    reasoning = any(prefix.endswith(tag) for tag in ("<think>", "<analysis>", "<reasoning>") if tag in native)
+    if harmony:
+        reasoning = reasoning or prefix.endswith(("<|channel|>analysis", "<|channel|>analysis<|message|>"))
+    for position, token_id in enumerate(token_ids):
+        if not harmony and token_id in closing_ids:
+            final_start = position + 1
+            break
+        if not harmony and token_id in opening_ids:
+            reasoning = True
+        if harmony and token_id == channel_id:
+            end = position + 1
+            while end < len(token_ids) and token_ids[end] not in (message_id, channel_id):
+                end += 1
+            if end < len(token_ids) and token_ids[end] == message_id:
+                channel = decode(token_ids[position + 1:end]).strip()
+                if channel == "final":
+                    final_start = end + 1
+                    break
+                reasoning = reasoning or channel == "analysis"
+    if final_start is None:
+        if require_final_marker or reasoning:
+            return ""
+        final_start = 0
+    final_ids = list(token_ids[final_start:])
+    return _canonical_generated_text(tokenizer, final_ids, decode(final_ids))
+
+
 def _iter_hf_job_batches(gen_model, tokenizer, jobs, device,
                          max_seq_length, gen_kwargs, cap_state=None,
                          log_prefix="hf"):

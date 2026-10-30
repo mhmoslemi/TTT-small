@@ -453,9 +453,9 @@ Rules:
                             construction=[], failure_kind=failure_kind)
 
     def compute_reward(self, response_text: str, parent: ParentContext,
-                       timeout_s: float) -> RewardResult:
+                       timeout_s: float, *, final_answer_text: str | None = None) -> RewardResult:
         from evaluation.reward import extract_python_code
-        code = extract_python_code(response_text)
+        code = extract_python_code(response_text, final_answer_text=final_answer_text)
         if code is None:
             return RewardResult(reward=self.fail_score, parsed=False,
                                 msg="no_code_block", failure_kind="code")

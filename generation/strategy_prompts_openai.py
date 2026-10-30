@@ -15,6 +15,37 @@ from generation.output_retries import final_answer_scope
 from generation.strategy_prompts import API_STRATEGY_PROMPT
 
 
+_QUOTED_STRATEGY_TEXT = re.compile(
+    r"(?P<fence>```|~~~).*?(?P=fence)|"
+    # An unfinished reasoning example must not swallow the real final answer.
+    r"(?:```|~~~).*?(?=^[ \t]*(?:</(?:think|analysis|reasoning)>|"
+    r"<\|channel\|>final<\|message\|>|assistantfinal)|\Z)|"
+    r"(?P<ticks>`+)[^\n]*?(?P=ticks)|"
+    r'"(?:\\.|[^"\\\n])*"|(?<!\w)\'(?:\\.|[^\'\\\n])*\'|'
+    r"“[^”\n]*”|‘[^’\n]*’",
+    flags=re.DOTALL | re.MULTILINE,
+)
+_STRATEGY_BOUNDARIES = re.compile(
+    r"</?(?:strategy|think|analysis|reasoning)\b[^>]*>|"
+    r"<\|channel\|>final<\|message\|>|assistantfinal",
+    flags=re.IGNORECASE,
+)
+
+
+def strategy_boundary_view(text):
+    """Hide quoted protocol examples without changing original text offsets."""
+    return _QUOTED_STRATEGY_TEXT.sub(
+        lambda quoted: _STRATEGY_BOUNDARIES.sub(
+            lambda tag: " " * len(tag.group()), quoted.group()), text)
+
+
+def strategy_answer_scope(response):
+    """Scope planner output without treating quoted reasoning tags as boundaries."""
+    text = str(response or "")
+    scope = final_answer_scope(strategy_boundary_view(text))
+    return text[len(text) - len(scope):] if scope else ""
+
+
 STRATEGY_PLAN_FORMAT = {
     "type": "json_schema",
     "name": "strategy_plan",
@@ -98,7 +129,7 @@ def normalize_strategy_plan(response):
     never promoted to a strategy. Existing validation/retries remain in charge.
     """
     original = str(response or "")
-    text = final_answer_scope(original).strip()
+    text = strategy_answer_scope(original).strip()
     fence = re.fullmatch(r"```(json|plan|strategy)\s*\n(.*?)\n```",
                          text, flags=re.DOTALL | re.IGNORECASE)
     plan = None

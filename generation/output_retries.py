@@ -25,9 +25,10 @@ def final_answer_scope(response, *, require_final_marker=False):
     return text
 
 
-def coder_output_issue(response, *, require_final_marker=False):
+def coder_output_issue(response, *, require_final_marker=False, final_answer_text=None):
     """Check formatting only, never program quality, syntax, or reward."""
-    text = final_answer_scope(response, require_final_marker=require_final_marker)
+    text = (final_answer_scope(response, require_final_marker=require_final_marker)
+            if final_answer_text is None else final_answer_text)
     openings = list(re.finditer(r"```python\b[^\S\n]*\n?", text, re.IGNORECASE))
     if not openings:
         return "missing final Python block"

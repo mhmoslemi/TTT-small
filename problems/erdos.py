@@ -235,7 +235,7 @@ With dx = 2.0 / n_points:
 
 The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
 
-Smaller sequences with less than 2.5k samples are preferred - they are faster to optimize and evaluate.
+Smaller sequences with less than 2k samples are preferred - they are faster to optimize and evaluate.
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 

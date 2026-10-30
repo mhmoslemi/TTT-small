@@ -227,12 +227,14 @@ usage. Return only exactly one fenced Python code block, beginning with
     # ---- default reward path (subprocess sandbox) --------------------
     def compute_reward(self, response_text: str, parent: ParentContext,
                        timeout_s: float, *, cpu_id: Optional[int] = None,
-                       memory_limit_bytes: Optional[int] = None
+                       memory_limit_bytes: Optional[int] = None,
+                       final_answer_text: Optional[str] = None
                        ) -> RewardResult:
         res = RewardResult(reward=self.fail_score)
         code = extract_python_code(
             response_text,
             require_final_marker=self.require_final_code_marker,
+            final_answer_text=final_answer_text,
         )
         if code is None:
             res.msg = "no_code_block"

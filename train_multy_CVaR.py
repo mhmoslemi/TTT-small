@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 from generation.output_retries import (
-    coder_output_issue, coder_retry_gate, coder_retry_prompt_job, final_answer_scope, output_retry_messages,
+    coder_output_issue, coder_retry_gate, coder_retry_prompt_job, output_retry_messages,
     retry_metadata, strategy_retry_needed,
 )
 from models.strategist_models import (
@@ -83,10 +83,6 @@ _STRATEGY_BLOCK_RE = re.compile(
     r"<strategy\b[^>]*>\s*((?:(?!<strategy\b).)*?)\s*</strategy\s*>",
     flags=re.IGNORECASE | re.DOTALL,
 )
-_STRATEGY_FINAL_MARKERS = (
-    "<|channel|>final<|message|>",
-    "assistantfinal",
-)
 _ANSI_ORANGE = "\033[38;5;208m"
 _ANSI_YELLOW = "\033[93m"
 _ANSI_RESET = "\033[0m"
@@ -107,76 +103,47 @@ def _extract_final_strategy(response_text, *, strict=False):
     hands the coder the explicit no-strategy fallback instead of aborting the
     entire rollout step.
     """
-    from generation.strategy_prompts_openai import normalize_strategy_plan
-    raw = final_answer_scope(normalize_strategy_plan(response_text)).strip()
-    if not raw:
+    from generation.strategy_prompts_openai import (
+        normalize_strategy_plan, strategy_answer_scope, strategy_boundary_view,
+    )
+    final_text = strategy_answer_scope(normalize_strategy_plan(response_text)).strip()
+    if not final_text:
         return _STRATEGY_FALLBACK, "empty response"
 
-    lowered = raw.lower()
-    final_position = -1
-    final_marker = ""
-    for marker in _STRATEGY_FINAL_MARKERS:
-        position = lowered.rfind(marker.lower())
-        if position > final_position:
-            final_position = position
-            final_marker = marker
-    if final_position >= 0:
-        final_text = raw[final_position + len(final_marker):].strip()
-    else:
-        # Non-Harmony templates can include reasoning without labeling their
-        # channels. Only the final block below is retained, so the prefix is
-        # never exposed to a later strategist or to the coder.
-        final_text = raw
-
-    matches = list(_STRATEGY_BLOCK_RE.finditer(final_text))
+    boundary_view = strategy_boundary_view(final_text)
+    matches = list(_STRATEGY_BLOCK_RE.finditer(boundary_view))
     if not matches:
         return _STRATEGY_FALLBACK, "missing complete final strategy"
 
-    # The default deliberately preserves the original block-only contract:
-    # accept the final complete, non-empty block, even when it is terse or
-    # contains code-like/placeholder text.  Strict mode adds semantic format
-    # checks, but is opt-in because those checks can create extra retries and
-    # replace an otherwise usable strategy with the direct-solve fallback.
+    match = matches[-1]
+    if re.search(r"<strategy\b", boundary_view[match.end():], flags=re.IGNORECASE):
+        return _STRATEGY_FALLBACK, "unclosed final strategy block"
+    # Match masked boundaries, but hand off the untouched original plan.
+    body = final_text[match.start(1):match.end(1)].strip()
+    if not body:
+        return _STRATEGY_FALLBACK, "empty final strategy"
+    placeholder = re.sub(r"[\W\d_]+", "", body).casefold()
+    if not placeholder or placeholder in {"todo", "tbd", "placeholder"}:
+        return _STRATEGY_FALLBACK, "incomplete final strategy"
     if not strict:
-        match = matches[-1]
-        trailing = final_text[match.end():]
-        if re.search(r"<strategy\b", trailing, flags=re.IGNORECASE):
-            return _STRATEGY_FALLBACK, "unclosed final strategy block"
-        body = match.group(1).strip()
-        if not body:
-            return _STRATEGY_FALLBACK, "empty final strategy"
         return body, None
 
-    last_issue = "missing complete final strategy"
-    for match in reversed(matches):
-        body = match.group(1).strip()
-        if not body:
-            last_issue = "empty final strategy"
-            continue
-        if len(body) < 80:
-            last_issue = "missing complete final strategy"
-            continue
-        # The strategy contract forbids executable source. A bare fence used
-        # only to display a formula is harmless; an explicitly Python/code-like
-        # fence means the planner attempted the coder's job and is retried.
-        if (re.search(r"```\s*python\b", body, flags=re.IGNORECASE)
-                or re.search(
-                    r"```[^`]*(?:^|\n)\s*(?:def |class |from \S+ import |import \S+)",
-                    body, flags=re.IGNORECASE | re.DOTALL)):
-            last_issue = "strategy contained a code fence"
-            continue
-        # Reject explicit stand-ins for omitted work. They satisfy the XML
-        # syntax but hand the coder an intentionally incomplete plan.
-        if re.search(
-                r"<\s*\.\.\.\s*>|\brest of (?:the )?(?:long )?strategy\b|"
-                r"\bcontinue(?:d)? (?:in|with) (?:the )?next response\b|"
-                r"\bplaceholder implementation\b|"
-                r"\bcannot (?:provide|deliver|write) (?:the )?(?:full|complete)\b",
-                body, flags=re.IGNORECASE):
-            last_issue = "incomplete final strategy"
-            continue
-        return body, None
-    return _STRATEGY_FALLBACK, last_issue
+    if len(body) < 80:
+        return _STRATEGY_FALLBACK, "missing complete final strategy"
+    # Extra strict checks remain opt-in; quoted boundaries are never delimiters.
+    if (re.search(r"```\s*python\b", body, flags=re.IGNORECASE)
+            or re.search(
+                r"```[^`]*(?:^|\n)\s*(?:def |class |from \S+ import |import \S+)",
+                body, flags=re.IGNORECASE | re.DOTALL)):
+        return _STRATEGY_FALLBACK, "strategy contained a code fence"
+    if re.search(
+            r"<\s*\.\.\.\s*>|\brest of (?:the )?(?:long )?strategy\b|"
+            r"\bcontinue(?:d)? (?:in|with) (?:the )?next response\b|"
+            r"\bplaceholder implementation\b|"
+            r"\bcannot (?:provide|deliver|write) (?:the )?(?:full|complete)\b",
+            body, flags=re.IGNORECASE):
+        return _STRATEGY_FALLBACK, "incomplete final strategy"
+    return body, None
 
 
 # CLI arg name -> config key (only where they differ)
@@ -1007,7 +974,7 @@ def _finalize_pending_spo_rs_artifacts(
     from queue import Queue
 
     from experiment_io import save_rollout
-    from generation.gen_workers import make_progress_bar
+    from generation.gen_workers import make_progress_bar, native_final_answer_scope
     from problems.base import ParentContext, RewardResult
     from search.sampler import State
 
@@ -1086,20 +1053,28 @@ def _finalize_pending_spo_rs_artifacts(
 
     def evaluate(item):
         meta = item["meta"]
-        issue = meta.get("output_format_issue")
+        response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
+        final_text = native_final_answer_scope(
+            tokenizer, item["response_token_ids"],
+            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
+            prompt_text=item["prompt_path"].read_text(encoding="utf-8", errors="replace"))
+        issue = coder_output_issue(
+            response_text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
+            final_answer_text=final_text)
+        meta["output_format_issue"] = issue
         if issue:
             return RewardResult(reward=float(problem.fail_score), msg=str(issue), failure_kind="code")
-        response_text = item["response_path"].read_text(encoding="utf-8", errors="replace")
+        answer_options = {} if final_text is None else {"final_answer_text": final_text}
         parent_context = parent_contexts[int(meta["parent_group"])]
         if not isolated_eval:
-            return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s)
+            return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s, **answer_options)
         with host_admission.reservation(isolated_memory_limit):
             cpu_id = isolated_slots.get()
             try:
                 return problem.compute_reward(
                     response_text, parent_context, cfg.sandbox_timeout_s,
                     cpu_id=cpu_id,
-                    memory_limit_bytes=isolated_memory_limit)
+                    memory_limit_bytes=isolated_memory_limit, **answer_options)
             finally:
                 isolated_slots.put(cpu_id)
 
@@ -1278,6 +1253,7 @@ def _resume_spo_rs_step_from_artifacts(
     import torch
     from experiment_io import save_rollout
     from evaluation.reward import extract_python_code
+    from generation.gen_workers import native_final_answer_scope
     from search.sampler import State
 
     adaptive_spo_beta = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
@@ -1463,7 +1439,13 @@ def _resume_spo_rs_step_from_artifacts(
                 "_overlap_key": (group, int(meta["rollout"])),
             })
 
-        code = extract_python_code(response_text)
+        # Re-encoded legacy text cannot prove where a native token occurred.
+        final_text = (native_final_answer_scope(
+            tokenizer, response_tokens,
+            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
+            prompt_text=prompt_text)
+            if bool(recovery.get("exact", False)) else None)
+        code = extract_python_code(response_text, final_answer_text=final_text)
         if entropy_descriptor is not None:
             entropy_meta = dict(meta)
             entropy_meta["n_response_tokens"] = len(response_tokens)
@@ -1721,7 +1703,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                save_rollout_artifacts,
                                save_strategy_response)
     from problems.base import ParentContext, RewardResult, is_code_failure
-    from generation.gen_workers import make_progress_bar
+    from generation.gen_workers import make_progress_bar, native_final_answer_scope
 
 
     step_t0 = time.time()
@@ -2185,14 +2167,14 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "rollout generation; set pilot_programs_per_strategy=-1 for the "
             "shared-GPU evaluator")
 
-    def _run_isolated_reward(response_text, parent_ctx):
+    def _run_isolated_reward(response_text, parent_ctx, **answer_options):
         with host_admission.reservation(isolated_memory_limit_bytes):
             cpu_id = isolated_cpu_slots.get()
             try:
                 return problem.compute_reward(
                     response_text, parent_ctx, cfg.sandbox_timeout_s,
                     cpu_id=cpu_id,
-                    memory_limit_bytes=isolated_memory_limit_bytes)
+                    memory_limit_bytes=isolated_memory_limit_bytes, **answer_options)
             finally:
                 isolated_cpu_slots.put(cpu_id)
 
@@ -2201,6 +2183,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         g = int(record["group_id"])
         parent_group = int(job["parent_group"])
         group_responses[g].append(record)
+        final_text = record["_final_answer_text"]
+        answer_options = {} if final_text is None else {"final_answer_text": final_text}
         if record.get("output_format_issue") is not None:
             # A missing artifact is already a verified format failure. Never
             # execute an earlier reasoning snippet or evaluate it twice.
@@ -2209,12 +2193,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 reward=float(problem.fail_score), msg=record["output_format_issue"],
                 failure_kind="code"))
         elif isolated_eval:
-            fut = reward_pool.submit(_run_isolated_reward, record["text"], parent_ctxs[parent_group])
+            fut = reward_pool.submit(
+                _run_isolated_reward, record["text"], parent_ctxs[parent_group], **answer_options)
         else:
             fut = reward_pool.submit(
                 problem.compute_reward, record["text"],
                 parent_ctxs[parent_group],
-                cfg.sandbox_timeout_s
+                cfg.sandbox_timeout_s, **answer_options
             )
         reward_futures[g].append(fut)
         record["_reward_future"] = fut
@@ -2236,6 +2221,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and all(math.isfinite(float(value)) for value in behavior_values)
                 else None)
         job = prompt_jobs[int(job_idx)]
+        final_text = native_final_answer_scope(
+            tokenizer, token_ids,
+            require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
+            prompt_text=job["prompt_text"])
         parent_group = int(job["parent_group"])
         parent_ordinal = queued_by_parent[parent_group]
         if retry_of is not None:
@@ -2254,11 +2243,13 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "context_id": parent_group,
             "rollout_index": rollout_index,
             "text": text,
+            "_final_answer_text": final_text,
             "token_ids": token_ids,
             "behavior_logprobs": behavior_logprobs,
             "reference_logprobs": None,
             "output_format_issue": coder_output_issue(
-                text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False))),
+                text, require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
+                final_answer_text=final_text),
             "retry_attempt": 0 if retry_of is None else 1,
             "retry_of_group": None if retry_of is None else int(retry_of["group_id"]),
             "retry_of_rollout": None if retry_of is None else int(retry_of["rollout_index"]),
@@ -4851,7 +4842,7 @@ def main():
         )
         strategy_validation_label = (
             "strict" if bool(getattr(cfg, "strict_strategy_validation", False))
-            else "previous block-only")
+            else "basic format")
         print(f"Output retries:     strategy up to {cfg.strategy_format_max_retries} "
               f"({strategy_validation_label} validation; direct-solve fallback "
               f"on exhaustion); coder "

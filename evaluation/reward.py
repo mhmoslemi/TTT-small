@@ -78,7 +78,8 @@ def _extract_code_from_scope(text: str) -> str | None:
     return None
 
 
-def extract_python_code(response: str, *, require_final_marker: bool = False
+def extract_python_code(response: str, *, require_final_marker: bool = False,
+                        final_answer_text: str | None = None
                         ) -> str | None:
     """
     Pull the final Python answer out of a response.
@@ -93,6 +94,10 @@ def extract_python_code(response: str, *, require_final_marker: bool = False
     Returns None if the final-answer scope contains no code. Returns code with
     no fences otherwise.
     """
+    # Native token IDs already established this scope; quoted delimiters in
+    # the final program must not be interpreted as another channel boundary.
+    if final_answer_text is not None:
+        return _extract_code_from_scope(final_answer_text)
     if not isinstance(response, str) or not response.strip():
         return None
 
