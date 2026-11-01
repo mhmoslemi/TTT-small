@@ -153,6 +153,8 @@ const data = {
     sameParents: source.same_parent_contexts,
   },
   sources: [
+    { label: 'SPO² historical reference and fixed-beta reward weighting', path: 'training/spo_rs.py' },
+    { label: 'Standard GRPO outcome-reward normalization, DeepSeekMath section 4.1.2', url: 'https://arxiv.org/html/2402.03300v3#S4.SS1.SSS2' },
     { label: 'Supplied presentation', path: '/Users/mohammad/Downloads/IMG_7154 Large.pdf' },
     { label: 'Reference presentation, visual inspiration only', path: '/Users/mohammad/Downloads/IMG_7166 Large.pdf' },
     { label: 'Historical component comparisons', path: reportExperiments.source, pages: reportExperiments.pages, scope: reportExperiments.scope },

@@ -116,6 +116,17 @@ try {
     await evaluate(`(() => {
       const forest=document.querySelector('[data-scene=forest]');
       if(forest.querySelectorAll('path').length!==32||forest.querySelectorAll('path[stroke="#C7000B"]').length!==2||forest.querySelectorAll('circle[fill="#C7000B"]').length!==2)throw new Error('Ancestry must recolor existing links and nodes');
+      if(forest.querySelector('circle[fill=none]'))throw new Error('Unwanted archive ring');
+      const nodes=[...forest.querySelectorAll('circle')].map(e=>[Number(e.getAttribute('cx')),Number(e.getAttribute('cy'))]);nodes.push([555,265]);
+      for(const edge of forest.querySelectorAll('path')){
+        const ends=[edge.getPointAtLength(0),edge.getPointAtLength(edge.getTotalLength())];
+        if(!ends.every(p=>nodes.some(n=>Math.hypot(p.x-n[0],p.y-n[1])<.01)))throw new Error('Archive edge misses node center');
+      }
+      if(document.querySelectorAll('[data-coder]').length!==4)throw new Error('Expected four shared coder calls');
+      for(const p of [.2,.3,.4,.7,1]){
+        framework.setStage(2,p,true);
+        if([...document.querySelectorAll('[data-pilot]')].some(e=>Number(e.style.opacity)>0)&&[...document.querySelectorAll('[data-coder],[data-coder-output]')].some(e=>Number(e.style.opacity)<1))throw new Error('Programs before coder output');
+      }
       for(const p of [0,.3,.6,.7,.9,1]){
         framework.setStage(5,p,true);
         const shaft=document.querySelector('[data-next-flow]'),head=document.querySelector('[data-next-head]');
@@ -124,6 +135,7 @@ try {
       }
       const calls=[...document.querySelectorAll('[data-strategy-call]')];
       if(calls.length!==4)throw new Error('Missing strategist calls');
+      if(document.querySelectorAll('[data-strategist-model]').length!==1)throw new Error('Expected one frozen strategist');
       calls.forEach((g,i)=>{
         const ids=[...g.querySelectorAll('[data-prior-strategy]')].map(e=>Number(e.dataset.priorStrategy));
         if(JSON.stringify(ids)!==JSON.stringify(Array.from({length:i},(_,j)=>j)))throw new Error('Incomplete strategy history');
@@ -131,14 +143,105 @@ try {
       });
       for(let p=0;p<=1;p+=.01){
         framework.setStage(1,p,true);
+        const active=Math.min(3,Math.floor(p*4));
         calls.forEach((g,i)=>{
-          if(Number(g.querySelector('[data-call-result]').style.opacity)>0&&Number(g.querySelector('[data-call-inputs]').style.opacity)!==1)throw new Error('Output before inputs');
-          if(i&&Number(g.style.opacity)>0&&Number(calls[i-1].querySelector('[data-call-result]').style.opacity)!==1)throw new Error('Earlier strategy not ready');
+          if(Number(g.querySelector('[data-call-inputs]').style.opacity)!==(i===active?1:0))throw new Error('Wrong context displayed');
+          if(i>active&&Number(g.querySelector('[data-call-result]').style.opacity)>0)throw new Error('Future strategy generated early');
+          if(i<active&&Number(g.querySelector('[data-call-result] text').style.opacity)!==1)throw new Error('Earlier strategy not ready');
         });
+        document.querySelectorAll('[data-history-transfer]').forEach(g=>{if(Number(g.style.opacity)>0&&Number(calls[Number(g.dataset.historyTransfer)].querySelector('[data-call-result] text').style.opacity)!==1)throw new Error('History copy before strategy is complete');});
       }
+      framework.setStage(3);
+      const attributes=e=>['cx','cy','r','fill','stroke'].map(k=>e.getAttribute(k));
+      const sourceRollouts=[...document.querySelectorAll('[data-pilot],[data-extra]')].map(attributes);
+      framework.seek(framework.starts[4]-1.2);
+      const batch=document.querySelector('.framework-transition').children[3].lastElementChild;
+      if(batch.children.length!==64)throw new Error('Rollout batch lost programs');
+      if(JSON.stringify([...batch.children].map(attributes))!==JSON.stringify(sourceRollouts))throw new Error('Rollout handoff changes its source dots');
+      for(const q of [0,.3,.65,.74,.99]){
+        framework.seek(framework.starts[4]-1.2+q*2.8);
+        if([...batch.children].some(e=>Number(e.style.opacity)!==1))throw new Error('Rollouts disappear while gathering');
+        if(q<=.65&&Number(batch.parentElement.children[1].style.opacity)!==0)throw new Error('Training scene arrives before batch gathers');
+      }
+      framework.seek(framework.starts[4]+1.6-.00001);
+      const gathered=[...batch.children].map(attributes);
+      framework.seek(framework.starts[4]+1.6);
+      if(JSON.stringify([...document.querySelectorAll('[data-outcome]')].map(attributes))!==JSON.stringify(gathered))throw new Error('Batch jumps entering training');
+      for(let p=0;p<=1;p+=.01){
+        framework.setStage(4,p,true);
+        if(document.querySelector('[data-policy-theta]').textContent==='Updated'&&[...document.querySelectorAll('[data-outcome]')].some(e=>Number(e.style.opacity)>0))throw new Error('Model updates before full batch arrives');
+      }
+      const outcomeDots=[...document.querySelectorAll('[data-outcome]')];
+      if(document.querySelector('[data-theory-batch],[data-learning-archive]'))throw new Error('Redundant training layout remains');
+      for(const t of [40,45,...framework.trainingTimes,53,56]){
+        framework.seek(t);
+        if(outcomeDots.length!==64||outcomeDots.some(e=>Number(e.style.opacity)!==1))throw new Error('Training drops a rollout');
+      }
+      framework.seek(framework.trainingTimes[0]);
+      const reference=Number(document.querySelector('[data-history-reference]').dataset.referenceValue);
+      if(Math.abs(reference-2.4420042144696796)>1e-12)throw new Error('Historical moving reference changed');
+      if(document.querySelector('[data-past-batch],[data-history-packet]'))throw new Error('Grouped history blocks remain');
+      if(document.querySelector('.framework-figure').textContent.toLowerCase().includes('batch')||framework.phases.some(p=>p.join(' ').toLowerCase().includes('batch')))throw new Error('Unrequested batch terminology remains');
+      const past=[...document.querySelectorAll('[data-history-rollout]')];
+      if(past.length!==32)throw new Error('Missing individual historical rollouts');
+      const expectedMeans=[1.3,5.8,6.2,3];
+      for(let i=0;i<4;i++){
+        const mean=past.slice(i*8,(i+1)*8).reduce((sum,e)=>sum+Math.exp(2*Number(e.dataset.reward)),0)/8;
+        if(Math.abs(mean-expectedMeans[i])>1e-12)throw new Error('History dots do not reproduce the shared reference');
+      }
+      let beforeReference=1.3;
+      for(const t of [39.7,40.2,40.75,41.6,42.15,43,43.55]){
+        framework.seek(t);
+        const ref=document.querySelector('[data-history-reference]'),value=Number(ref.dataset.referenceValue),edge=ref.querySelector('path');
+        if(Math.abs(edge.getTotalLength()-182)>.001)throw new Error('The full reference line must move together');
+        const point=edge.getPointAtLength(0).matrixTransform(ref.transform.baseVal.consolidate().matrix);
+        if(Math.abs(point.x-(110+200*Math.log(value)))>.001)throw new Error('Reference line position does not match the moving average');
+        if([...document.querySelectorAll('[data-spo-rollout],[data-grpo-rollout]')].some(e=>Number(e.style.opacity)>0))throw new Error('Current rollouts appear before the reference is fixed');
+        if(value<beforeReference)throw new Error('Illustrated history update moved in the wrong direction');
+        beforeReference=value;
+      }
+      if(Math.abs(beforeReference-reference)>1e-12)throw new Error('Historical reference did not reach its final value');
+      framework.seek(framework.trainingTimes[0]);
+      if(document.querySelector('[data-reference-status]').textContent!=='Fixed for this step')throw new Error('Missing fixed-reference explanation');
+      const historyRight=Math.max(...past.map(e=>Number(e.getAttribute('cx'))+Number(e.getAttribute('r'))));
+      const currentLeft=Math.min(...outcomeDots.map(e=>Number(e.getAttribute('cx'))-Number(e.getAttribute('r'))));
+      if(currentLeft-historyRight<50)throw new Error('Past and current rollout clouds are not visually separated');
+      const spo=[...document.querySelectorAll('[data-spo-rollout]')],grpo=[...document.querySelectorAll('[data-grpo-rollout]')];
+      if(spo.length!==8||grpo.length!==8)throw new Error('Comparison must show the same eight rewards');
+      spo.forEach((e,i)=>{
+        const r=Number(e.dataset.reward),other=grpo[i],mean=i<4?.25:.65;
+        if(r!==Number(other.dataset.reward))throw new Error('Comparison changes the rewards between methods');
+        if(Math.abs(Number(e.dataset.advantage)-(Math.exp(2*r)/reference-1)/2)>1e-12)throw new Error('SPO weight differs from the tracker');
+        if(Math.abs(Number(other.dataset.advantage)-(r-mean)/Math.sqrt(.0125))>1e-12)throw new Error('GRPO group normalization is incorrect');
+        const dot=e.querySelector('circle'),otherDot=other.querySelector('circle');
+        if(Number(otherDot.getAttribute('cx'))-Number(dot.getAttribute('cx'))!==600||dot.getAttribute('cy')!==otherDot.getAttribute('cy'))throw new Error('Reward axis differs between methods');
+      });
+      if(!document.querySelector('[data-training-legend]').textContent.includes('Direction only'))throw new Error('Sign-only comparison must be labeled');
+      const shown=e=>{for(let p=e;p&&p.tagName!=='svg';p=p.parentElement){const s=getComputedStyle(p);if(s.visibility==='hidden'||Number(s.opacity)===0)return false;}return true;};
+      for(let t=36.6;t<56.4;t+=.2){framework.seek(t);if(shown(document.querySelector('[data-policy-ring]')))throw new Error('Model appears before the learning explanation');}
+      for(const t of [44,48.5,54.5,60,63]){
+        framework.seek(t);
+        if(Number(document.querySelector('[data-history-reference]').dataset.referenceValue)!==reference)throw new Error('Shared baseline changes during current-rollout comparison');
+        const edge=document.querySelector('[data-baseline-line]'),start=edge.getPointAtLength(0);
+        if(Math.abs(start.x-(110+200*Math.log(reference)))>.001||start.y!==183)throw new Error('Baseline is disconnected from the history reference');
+      }
+      framework.seek(54.5);
+      spo.forEach(e=>{
+        const a=Number(e.dataset.advantage),tip=Number(e.querySelector('[data-learning-arrow]').getAttribute('d').split(' ')[4]),y=Number(e.querySelector('circle').getAttribute('cy'));
+        if(Math.abs(Math.abs(tip-(y-Math.sign(a)*7))-70*Math.abs(a)/Number(spo.at(-1).dataset.advantage))>1e-9)throw new Error('SPO arrow length must match its weight');
+      });
+      let modelAppearances=0,wasVisible=false;
+      for(let t=36.6;t<=64.4;t+=.05){
+        framework.seek(t);const isVisible=shown(document.querySelector('[data-policy-ring]'));
+        if(isVisible&&!wasVisible)modelAppearances++;wasVisible=isVisible;
+        if(isVisible&&document.querySelector('[data-policy-theta]').textContent==='Updated'&&outcomeDots.some(e=>Number(e.style.opacity)>0))throw new Error('Update occurs before every rollout signal arrives');
+      }
+      if(modelAppearances!==1)throw new Error('Model must appear once in the continuous learning sequence');
+      framework.seek(63);if(document.querySelector('[data-policy-theta]').textContent!=='Updated')throw new Error('Missing final model update');
       for (const t of framework.starts.slice(1)) {
         framework.seek(t);
-        if (Number(document.getElementById('pipeline').style.opacity) !== 0) throw new Error('Visible layout change at '+t);
+        if (Number(document.querySelector('.framework-transition').style.opacity) !== 1) throw new Error('Missing scene handoff at '+t);
+        if (Number(document.querySelector('.framework-layout').style.opacity) !== 0) throw new Error('Original scene overlays its handoff');
       }
       for (let t=0;t<framework.total;t+=.25) {
         framework.seek(t);
@@ -162,6 +265,12 @@ try {
       await evaluate(`deck.show(6,${stage})`);
       const shot=await call('Page.captureScreenshot',{format:'png',clip:{x:0,y:0,width:1280,height:720,scale:1}});
       fs.writeFileSync(path.join(build,`framework-stage-${stage+1}.png`),Buffer.from(shot.data,'base64'));
+    }
+    const trainingTimes=await evaluate('framework.trainingTimes');
+    for(const [i,t] of trainingTimes.entries()){
+      await evaluate(`deck.seekFramework(${t})`);
+      const shot=await call('Page.captureScreenshot',{format:'png',clip:{x:0,y:0,width:1280,height:720,scale:1}});
+      fs.writeFileSync(path.join(build,`framework-training-${i+1}.png`),Buffer.from(shot.data,'base64'));
     }
     await evaluate('deck.show(6,5)');
     const overlaps=await evaluate(`(()=>{const visible=e=>{for(let a=e;a&&a.tagName!=='svg';a=a.parentElement){const s=getComputedStyle(a);if(s.visibility==='hidden'||Number(s.opacity)===0)return false;}return true;};const texts=[...document.querySelectorAll('.framework-figure text')].filter(e=>visible(e)&&e.textContent.trim());return texts.flatMap((a,i)=>texts.slice(i+1).filter(b=>{const x=a.getBoundingClientRect(),y=b.getBoundingClientRect();return Math.min(x.right,y.right)-Math.max(x.left,y.left)>1&&Math.min(x.bottom,y.bottom)-Math.max(x.top,y.top)>1;}).map(b=>[a.textContent,b.textContent]));})()`);
