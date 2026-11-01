@@ -1,6 +1,6 @@
 """Bound GPT-OSS startup scratch without changing Marlin's packed weights.
 
-vLLM 0.28's helper allocates a second tensor containing every expert. During
+vLLM's helper allocates a second tensor containing every expert. During
 sleep-mode loading those large temporary allocations also remain in the
 private allocator pool until loading finishes. Reuse the input's storage and
 call the installed vLLM helper for one expert at a time instead. The resulting
@@ -12,7 +12,7 @@ from functools import wraps
 import inspect
 
 
-def repack_experts_in_place(weight, size_n, size_k, perm, is_a_8bit, *, repack):
+def repack_experts_in_place(weight, *args, repack, **kwargs):
     import torch
 
     if (weight.ndim != 3 or weight.shape[0] < 1
@@ -22,8 +22,7 @@ def repack_experts_in_place(weight, size_n, size_k, perm, is_a_8bit, *, repack):
     with torch.no_grad():
         for expert in range(weight.shape[0]):
             # Keep vLLM's actual packing kernel, permutation and precision.
-            converted = repack(
-                weight[expert:expert + 1], size_n, size_k, perm, is_a_8bit)
+            converted = repack(weight[expert:expert + 1], *args, **kwargs)
             if out is None:
                 if (converted.shape[0] != 1 or not converted.is_contiguous()
                         or converted.device != weight.device
@@ -49,13 +48,21 @@ def bounded_marlin_repacking():
     if not callable(original):
         raise RuntimeError(
             "GPT-OSS bounded startup requires vLLM's _repack_marlin_experts "
-            "helper (supported in vLLM 0.28)")
-    inspect.signature(original).bind(None, 1, 1, None, False)
+            "helper")
+    signature = inspect.signature(original)
+    arguments = dict(weight=None, size_n=1, size_k=1, is_a_8bit=False)
+    # vLLM 0.30 removed perm; forward the installed helper's arguments intact.
+    if "perm" in signature.parameters:
+        arguments["perm"] = None
+    try:
+        signature.bind(**arguments)
+    except TypeError as error:
+        raise RuntimeError(
+            f"Unsupported vLLM _repack_marlin_experts signature: {signature}") from error
 
     @wraps(original)
-    def bounded(weight, size_n, size_k, perm, is_a_8bit):
-        return repack_experts_in_place(
-            weight, size_n, size_k, perm, is_a_8bit, repack=original)
+    def bounded(weight, *args, **kwargs):
+        return repack_experts_in_place(weight, *args, repack=original, **kwargs)
 
     marlin_utils_fp4._repack_marlin_experts = bounded
     try:

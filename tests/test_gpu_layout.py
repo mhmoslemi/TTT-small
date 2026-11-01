@@ -191,6 +191,7 @@ def test_custom_worker_scopes_repacking_and_allocator_to_startup(monkeypatch, fa
 
 
 def test_cuda_marlin_packing_matches_installed_vllm():
+    import inspect
     import torch
 
     if not torch.cuda.is_available():
@@ -201,9 +202,12 @@ def test_cuda_marlin_packing_matches_installed_vllm():
     weight = torch.randint(0, 256, (3, 256, 64), dtype=torch.uint8, device="cuda")
     perm = torch.empty(0, dtype=torch.int32, device="cuda")
     original = marlin_utils_fp4._repack_marlin_experts
-    expected = original(weight, 256, 128, perm, False)
+    options = dict(size_n=256, size_k=128, is_a_8bit=False)
+    if "perm" in inspect.signature(original).parameters:
+        options["perm"] = perm
+    expected = original(weight, **options)
     actual = repack_experts_in_place(
-        weight.clone(), 256, 128, perm, False, repack=original)
+        weight.clone(), repack=original, **options)
     torch.cuda.synchronize()
     assert torch.equal(actual, expected)
 
@@ -215,6 +219,7 @@ def test_cuda_gpt_oss_scratch_reuse_and_sleep_wake():
     every iteration. Repeated conversions must instead reuse bounded scratch,
     produce identical packed weights, and survive the normal sleep/wake path.
     """
+    import inspect
     import torch
 
     if not torch.cuda.is_available():
@@ -230,7 +235,10 @@ def test_cuda_gpt_oss_scratch_reuse_and_sleep_wake():
                            dtype=torch.uint8, device="cuda")
     perm = torch.empty(0, dtype=torch.int32, device="cuda")
     original = marlin_utils_fp4._repack_marlin_experts
-    expected = original(weight, 5760, 2880, perm, False)
+    options = dict(size_n=5760, size_k=2880, is_a_8bit=False)
+    if "perm" in inspect.signature(original).parameters:
+        options["perm"] = perm
+    expected = original(weight, **options)
     allocator = CuMemAllocator.get_instance()
     worker = object.__new__(GptOssWorker)
     tag = "gpt_oss_repack_test"
@@ -241,7 +249,7 @@ def test_cuda_gpt_oss_scratch_reuse_and_sleep_wake():
         for _ in range(32):
             storage.copy_(weight)
             actual = repack_experts_in_place(
-                storage, 5760, 2880, perm, False, repack=original)
+                storage, repack=original, **options)
         torch.cuda.synchronize()
         assert allocator.get_current_usage() - before < 128 * 1024**2
     assert torch.equal(actual, expected)
