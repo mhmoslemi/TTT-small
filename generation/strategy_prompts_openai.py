@@ -15,28 +15,74 @@ from generation.output_retries import final_answer_scope
 from generation.strategy_prompts import API_STRATEGY_PROMPT
 
 
-_QUOTED_STRATEGY_TEXT = re.compile(
-    r"(?P<fence>```|~~~).*?(?P=fence)|"
-    # An unfinished reasoning example must not swallow the real final answer.
-    r"(?:```|~~~).*?(?=^[ \t]*(?:</(?:think|analysis|reasoning)>|"
-    r"<\|channel\|>final<\|message\|>|assistantfinal)|\Z)|"
-    r"(?P<ticks>`+)[^\n]*?(?P=ticks)|"
+_INLINE_STRATEGY_QUOTE = (
+    r"(?P<ticks>`+)(?!`)[^\n]*?(?P=ticks)(?!`)|"
     r'"(?:\\.|[^"\\\n])*"|(?<!\w)\'(?:\\.|[^\'\\\n])*\'|'
-    r"“[^”\n]*”|‘[^’\n]*’",
-    flags=re.DOTALL | re.MULTILINE,
+    r"“[^”\n]*”|‘[^’\n]*’"
 )
 _STRATEGY_BOUNDARIES = re.compile(
     r"</?(?:strategy|think|analysis|reasoning)\b[^>]*>|"
     r"<\|channel\|>final<\|message\|>|assistantfinal",
     flags=re.IGNORECASE,
 )
+_STRATEGY_LEXEME = re.compile(
+    r"(?P<quote>" + _INLINE_STRATEGY_QUOTE + r")|(?P<fence>`{3,}|~{3,})|"
+    r"(?P<boundary>" + _STRATEGY_BOUNDARIES.pattern + r")",
+    flags=re.IGNORECASE,
+)
+_REASONING_END = re.compile(
+    r"^[ \t]*(?:</(?:think|analysis|reasoning)>|"
+    r"<\|channel\|>final<\|message\|>|assistantfinal)",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_FINAL_STRATEGY_END = re.compile(r"</strategy\s*>\s*\Z", re.IGNORECASE)
 
 
 def strategy_boundary_view(text):
     """Hide quoted protocol examples without changing original text offsets."""
-    return _QUOTED_STRATEGY_TEXT.sub(
-        lambda quoted: _STRATEGY_BOUNDARIES.sub(
-            lambda tag: " " * len(tag.group()), quoted.group()), text)
+    chunks = []
+    cursor = 0
+    in_plan = reasoning = False
+    while match := _STRATEGY_LEXEME.search(text, cursor):
+        start, end = match.span()
+        hidden = match.group("quote") is not None
+        if match.group("fence"):
+            fence = match.group("fence")
+            closing = re.search(r"^[ \t]*" + re.escape(fence[0]) +
+                                rf"{{{len(fence)},}}[ \t]*\r?$", text[end:], re.MULTILINE)
+            close = end + closing.start() if closing else -1
+            end = end + closing.end() if closing else len(text)
+            # Markdown cannot consume a transport boundary or the outer plan's final tag.
+            for boundary in _REASONING_END.finditer(text, match.end(), end):
+                example = text[boundary.end():close] if close >= 0 else ""
+                if close >= 0 and (in_plan and "<strategy" not in example.lower()
+                                   or re.search(r"<strategy\b[^>]*>.*?</strategy\s*>", example, re.I | re.S)):
+                    continue
+                end = boundary.start()
+                break
+            if in_plan:
+                boundary = _FINAL_STRATEGY_END.search(text, match.end())
+                if boundary and boundary.start() < end:
+                    end = boundary.start()
+            hidden = True
+        elif match.group("boundary"):
+            tag = match.group().lower()
+            if tag.startswith("<strategy"):
+                in_plan = not reasoning
+            elif tag.startswith("</strategy"):
+                in_plan = False
+            else:
+                reasoning = tag.startswith(("<think", "<analysis", "<reasoning"))
+                if not reasoning:
+                    in_plan = False
+        chunks.append(text[cursor:start])
+        part = text[start:end]
+        if hidden:
+            part = _STRATEGY_BOUNDARIES.sub(lambda tag: " " * len(tag.group()), part)
+        chunks.append(part)
+        cursor = end
+    chunks.append(text[cursor:])
+    return "".join(chunks)
 
 
 def strategy_answer_scope(response):

@@ -53,6 +53,71 @@ class StrategyExtractionTests(unittest.TestCase):
                 '<strategy>not a boundary</strategy>\n```\nThen evaluate the parent.')
         self.assertEqual(self.extract('<strategy>' + body + '</strategy>'), (body, None))
 
+    def test_fence_cannot_pair_across_reasoning_and_final_channels(self):
+        body = ('Use the parent.\n```text\nimplementation details\n```\n'
+                'Evaluate and return the best construction.')
+        for marker in ('</think>', '</analysis>', '</reasoning>',
+                       '<|channel|>final<|message|>', 'assistantfinal'):
+            response = ('Private draft\n```\nunfinished example\n' + marker
+                        + '\n<strategy>' + body + '</strategy>')
+            with self.subTest(marker=marker):
+                self.assertEqual(self.extract(response), (body, None))
+
+    def test_unclosed_inner_fence_cannot_hide_outer_strategy_end(self):
+        body = 'Use the parent.\n```text\nalgorithm details without a closing fence.'
+        response = '<think>derivation</think>\n<strategy>' + body + '\n</strategy>'
+        self.assertEqual(self.extract(response), (body, None))
+
+    def test_repeated_reasoning_boundaries_do_not_leak_earlier_drafts(self):
+        response = ('private work\n</think>\n<strategy>unfinished first draft\n'
+                    '```\nmore reasoning\n</think>\n<strategy>'
+                    'actual final plan\n```text\nexample\n```\nfinish</strategy>')
+        self.assertEqual(self.extract(response),
+                         ('actual final plan\n```text\nexample\n```\nfinish', None))
+
+    def test_incomplete_final_cannot_close_a_block_from_reasoning(self):
+        response = ('private work\n```\n<strategy>example</strategy>\n```\n'
+                    '<strategy>draft\n</think>\n...```</strategy>')
+        self.assertIsNotNone(self.extract(response)[1])
+
+    def test_native_tags_in_a_complete_fenced_example_remain_literal(self):
+        body = ('Use the parent.\n```text\n</think>\n'
+                '<strategy>example only</strategy>\n```\nEvaluate the result.')
+        for prefix in ('', '<think>private work</think>\n'):
+            self.assertEqual(self.extract(prefix + '<strategy>' + body + '</strategy>'), (body, None))
+        self.assertIsNotNone(self.extract('<think>```text\n</think>\n'
+                                         '<strategy>example only</strategy>\n```')[1])
+
+    def test_mask_preserves_offsets_and_retains_plan_text_exactly(self):
+        from generation.strategy_prompts_openai import strategy_boundary_view
+        body = 'Use α and β. The example `</strategy>` is literal.\n```text\nλ = 1\n```'
+        raw = 'private ```\nwork\n</think>\n<strategy>' + body + '</strategy>'
+        self.assertEqual(len(strategy_boundary_view(raw)), len(raw))
+        self.assertEqual(self.extract(raw), (body, None))
+
+    def test_inline_backticks_cannot_swallow_later_blocks(self):
+        first = '<strategy>Use ```literal text```.</strategy>'
+        self.assertEqual(self.extract(first + '<strategy>final plan</strategy>'), ('final plan', None))
+        self.assertIsNotNone(self.extract(first + '<strategy>unfinished plan')[1])
+
+    def test_saved_latest_run_false_rejections_extract_the_exact_final_plan(self):
+        directory = ROOT / 'runs/erdos_gpt-oss-120b_1101-0306/step00'
+        if not directory.is_dir():
+            self.skipTest('saved run artifacts are not available')
+        for name in ('step00_group00_fold00_strategy00_attempt00',
+                     'step00_group00_fold00_strategy00_attempt03',
+                     'step00_group03_fold00_strategy00_attempt00',
+                     'step00_group05_fold00_strategy01_attempt02',
+                     'step00_group07_fold00_strategy01_attempt00'):
+            with self.subTest(attempt=name):
+                raw = (directory / (name + '.txt')).read_text()
+                final = raw.rsplit('</think>', 1)[1].strip()
+                self.assertTrue(final.startswith('<strategy>') and final.endswith('</strategy>'))
+                expected = final[len('<strategy>'):-len('</strategy>')].strip()
+                self.assertEqual(self.extract(raw), (expected, None))
+        raw = (directory / 'step00_group07_fold00_strategy02_attempt00.txt').read_text()
+        self.assertIsNotNone(self.extract(raw)[1])
+
     def test_placeholders_fail_even_when_strict_validation_is_off(self):
         for body in ('...', '1.\n...', '…', 'TODO', '1. TBD', 'placeholder', ''):
             for strict in (False, True):
