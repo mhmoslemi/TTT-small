@@ -224,10 +224,8 @@ def _coder_model_profile(model_name):
 
 
 def _coder_vllm_persistent_workers(cfg):
-    """RTX GPT-OSS needs engine contexts released; B200 can retain sleep backups."""
-    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b"
-            and getattr(cfg, "hardware_profile", "RTX6000") != "B200"
-            and not bool(getattr(cfg, "no_train", False))):
+    """Release GPT-OSS coder engines completely during adapter training."""
+    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b" and not bool(getattr(cfg, "no_train", False))):
         return 0
     return None
 

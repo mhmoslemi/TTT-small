@@ -885,17 +885,6 @@ def _prepare_flashinfer_comm_compat():
     return True
 
 
-def _prepare_flashinfer_downloads():
-    from vllm_compat.kernel_cache import install_download_guard
-
-    os.environ["TTT_VLLM_KERNEL_DOWNLOAD_GUARD"] = "1"
-    compat_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vllm_compat")
-    paths = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
-    if compat_dir not in paths:
-        os.environ["PYTHONPATH"] = os.pathsep.join([compat_dir, *paths])
-    install_download_guard()
-
-
 def _redirect_vllm_output(log_path, rank, gpu_group):
     """Send this worker and all engine-core descendants to one append log."""
     if not log_path:
@@ -982,7 +971,6 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # the default while preserving an explicit operator override.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     _prepare_flashinfer_comm_compat()
-    _prepare_flashinfer_downloads()
     if seed is not None:
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -1172,14 +1160,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             result = ("", [], None) if return_logprobs else ("", [])
         result_queue.put((rank, chain, [result]))
 
-    async def _async_control(command, directory=None):
-        if command in {"sleep_disk", "spill_sleeping"}:
-            reports = await llm.collective_rpc(
-                "ttt_disk_offload", args=(directory, command == "spill_sleeping"))
-            if command == "spill_sleeping":
-                return reports
-            await llm.sleep(level=sleep_level)
-            return
+    async def _async_control(command):
         if command == "sleep":
             await llm.sleep(level=sleep_level)
         elif command == "wake_up":
@@ -1234,25 +1215,12 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         if (isinstance(task, tuple) and len(task) >= 2
                 and task[0] == "__control__"):
             command = task[1]
-            directory = task[2] if len(task) > 2 else None
             try:
                 control_detail = ""
                 if not can_sleep:
                     raise RuntimeError(
                         "installed vLLM does not expose LLM.sleep/wake_up")
-                if command in {"sleep_disk", "spill_sleeping"}:
-                    if sleep_level != 1:
-                        raise RuntimeError("disk weight backups require level-1 sleep")
-                    if async_engine:
-                        reports = _run_async(_async_control(command, directory))
-                    else:
-                        reports = llm.collective_rpc(
-                            "ttt_disk_offload", args=(directory, command == "spill_sleeping"))
-                        if command == "sleep_disk":
-                            llm.sleep(level=sleep_level)
-                    if command == "spill_sleeping":
-                        control_detail = {"released_bytes": sum(int(value) for value in reports)}
-                elif command == "sleep":
+                if command == "sleep":
                     print(f"[vllm worker {rank}] entering sleep level "
                           f"{sleep_level}", flush=True)
                     if async_engine:
@@ -1707,10 +1675,9 @@ class GenerationPool:
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None, vllm_engine_options=None,
-                 hardware_profile="RTX6000", host_memory_admission=None):
+                 hardware_profile="RTX6000"):
         self.model_name = model_name
         self.hardware_profile = hardware_profile
-        self.host_memory_admission = host_memory_admission
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
@@ -1915,14 +1882,6 @@ class GenerationPool:
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
-        if self.hardware_profile == "B200" and self.backend == "vllm":
-            # Shared mmap pages avoid one eager checkpoint copy per replica.
-            engine_options = dict(vllm_engine_options or {})
-            engine_options.setdefault("safetensors_load_strategy", "lazy")
-            self._worker_options["engine_options"] = engine_options
-            if self.host_memory_admission is None:
-                from runtime.host_memory import HostMemoryAdmission
-                self.host_memory_admission = HostMemoryAdmission(self._ctx)
         self._load_in_4bit = bool(load_in_4bit)
         self._startup_timeout = _positive_env_timeout(
             "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
@@ -2068,32 +2027,7 @@ class GenerationPool:
                   f"{self.backend} engine(s)"
                   + (" one at a time" if self._staged_loading else "")
                   + " ...", flush=True)
-        if self.backend == "vllm" and self.host_memory_admission is not None:
-            from runtime.gpu_runtime import _estimated_weight_gib
-            from runtime.host_memory import GIB
-            # Charge conversion/staging too; release each wave's reservation
-            # only after its engines are ready. Live RSS remains charged.
-            weights = _estimated_weight_gib(self.model_name, self._worker_options.get("quantization"))
-            per_engine = int((weights + 8.0 * len(self._gpu_groups[worker_ids[0]])) * GIB)
-            pending = list(worker_ids)
-            try:
-                while pending:
-                    available = self.host_memory_admission.available_bytes()
-                    if available is None:
-                        raise RuntimeError("B200 engine loading requires readable host RAM limits")
-                    count = 1 if self._staged_loading else max(1, min(len(pending), available // per_engine))
-                    wave = pending[:count]
-                    with self.host_memory_admission.reservation(per_engine * count, wait_for_external=False):
-                        print(f"[pool] RAM-admitted loading: {count} engine(s), "
-                              f"{per_engine * count / GIB:.1f} GiB startup reservation", flush=True)
-                        for rank in wave:
-                            self._start_worker(rank)
-                        self._wait_workers(wave)
-                    pending = pending[count:]
-            except BaseException:
-                self.shutdown()
-                raise
-        elif self._staged_loading:
+        if self._staged_loading:
             for rank in worker_ids:
                 self._start_worker(rank)
                 self._wait_workers((rank,))
@@ -2155,17 +2089,11 @@ class GenerationPool:
                     or task_queue is None):
                 raise RuntimeError(
                     f"vLLM worker {rank} is unavailable during {command}")
-            if command in {"sleep_disk", "spill_sleeping"}:
-                from pathlib import Path
-                directory = str(Path(self.vllm_log_path or "runs/vllm.log").resolve().parent / ".offload")
-                task_queue.put(("__control__", command, directory))
-            else:
-                task_queue.put(("__control__", command))
+            task_queue.put(("__control__", command))
         completed_workers = set()
         details = {}
         control_timeout = _positive_env_timeout(
-            "TTT_VLLM_CONTROL_TIMEOUT_S",
-            3600.0 if command in {"sleep_disk", "spill_sleeping", "wake_up"} else 600.0)
+            "TTT_VLLM_CONTROL_TIMEOUT_S", 600.0)
         control_deadline = time.monotonic() + control_timeout
         while len(completed_workers) < len(worker_ids):
             remaining = control_deadline - time.monotonic()
@@ -2247,11 +2175,18 @@ class GenerationPool:
                         after_sleep([gpu for rank in wave
                                      for gpu in self._gpu_groups[rank]])
             except HostMemoryUnavailable:
+                # No admitted CPU work can return RAM to unblock this copy.
+                # Keep all rollout GPUs; reload only the unretainable engines
+                # next phase instead of hanging or overcommitting the host.
                 print(f"[pool] host RAM cannot retain engines {list(wave)}; "
-                      "streaming exact weight backups to temporary disk", flush=True)
-                # No full CPU copy is allocated first; each rank transfers
-                # at most 64 MiB of mapped pages before flushing/evicting them.
-                self._vllm_control("sleep_disk", wave)
+                      "releasing them for training and reloading next phase",
+                      flush=True)
+                self._stop_workers(wave)
+                self._persistent_worker_ids = tuple(
+                    rank for rank in self._persistent_worker_ids if rank not in wave)
+                self._transient_worker_ids = tuple(sorted(
+                    set(self._transient_worker_ids).union(wave)))
+                self.persistent_workers = len(self._persistent_worker_ids)
                 if after_sleep:
                     after_sleep([gpu for rank in wave
                                  for gpu in self._gpu_groups[rank]])
@@ -2262,15 +2197,6 @@ class GenerationPool:
                   f"{time.monotonic() - transfer_started:.1f}s; "
                   f"host RAM available={available_label}", flush=True)
             pending = [rank for rank in pending if rank not in wave]
-
-    def spill_sleeping_to_disk(self, required_bytes=None):
-        released = 0
-        for rank in self._persistent_worker_ids:
-            reports = self._vllm_control("spill_sleeping", (rank,))
-            released += int(reports[rank]["released_bytes"])
-            if required_bytes is not None and released >= required_bytes:
-                break
-        return released
 
     def wake_up(self):
         if not self.vllm_co_resident_sleep:
@@ -3040,8 +2966,6 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
-        if self.host_memory_admission is not None:
-            self._pool_kwargs["host_memory_admission"] = self.host_memory_admission
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
         if requested_sleep_level not in (1, 2):
@@ -3107,19 +3031,23 @@ class PhasedVLLMGenerationPool:
                 self._pool_kwargs.get("num_workers", 1) or 1)
         return True
 
-    def spill_sleeping_to_disk(self, required_bytes=None):
-        if self._awake or self._pool is None or self._sleep_level != 1:
-            return 0
-        released = self._pool.spill_sleeping_to_disk(required_bytes)
-        if released:
-            print(f"[pool] spilled {released / 2**30:.1f} GiB of sleeping weights "
-                  "to temporary disk; files are released after wake", flush=True)
-        return released
-
     def _create_pool(self, **options):
-        # GenerationPool admits individual loading waves; do not reserve the
-        # same checkpoint again around those inner reservations.
-        return GenerationPool(**self._pool_kwargs, **options)
+        startup_reservation = nullcontext()
+        if (self.host_memory_admission is not None
+                and not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
+                    "enable_lora", True)):
+            from models.strategist_models import strategist_profile
+            profile = strategist_profile(self._pool_kwargs["model_name"])
+            cards = int(self._pool_kwargs["num_workers"])
+            # Lazy mmap shares one reclaimable checkpoint cache across
+            # replicas. Charge every rank's separate host lookup table and
+            # staging headroom, not a duplicate full checkpoint per replica.
+            host_gib = (profile["weights_gib"]
+                        + (profile["ple_gib"] + 4.0) * cards)
+            startup_reservation = self.host_memory_admission.reservation(
+                int(host_gib * 2**30 * 1.05), wait_for_external=False)
+        with startup_reservation:
+            return GenerationPool(**self._pool_kwargs, **options)
 
     def _ensure_started(self):
         if self._awake:

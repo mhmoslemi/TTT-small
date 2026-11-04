@@ -9,8 +9,10 @@ RAM are detected, not assumed to equal the advertised machine size.
 The seven installed checkpoints under `/root/nas/Mohammad/models/` are preferred
 over their matching Hub IDs on B200 when present; explicit paths stay explicit.
 
-B200 uses memory-fitting replicas/TP groups, GPU-resident Qwen Flash Next lookup
-tables, larger automatic generation batches, and RAM-admitted model loading.
+B200 uses the same loading, sleep/wake and model-specific engine settings as
+RTX6000, with replicas/TP groups and generation batches sized to its larger
+GPU memory. Qwen Flash Next keeps its CPU-offloaded lookup table and the RTX
+NVFP4 autotuning setting. No B200-only startup tuning or disk-spill path is used.
 The existing adaptive parallel trainer, evaluation/transfer/offload RAM gate and
 exact long-rollout handling remain in use. Sampling, precision, context limits
 and the RL objective are unchanged. Explicit YAML/CLI capacity settings still
@@ -22,16 +24,11 @@ evaluated, while other parents can still be generating/evaluating pilots.
 Automatic concurrency scales with available KV memory and the rollout workload,
 with no fixed 64-request ceiling. vLLM controls paged-KV admission as outputs grow.
 
-Loading, sleeping model backups and CPU activation offloads share live RAM
-admission with evaluation, leaving OS headroom and respecting Linux cgroup
-limits. Sleeping model replicas that cannot fit in RAM spill their exact loaded
-weights to disk in 64-MiB transfers. Each rank has at most one temporary file,
-released after wake; Linux also reclaims it if the worker is killed. Storage is
-under the run's `.offload/` directory, never a RAM-backed `/tmp`. Disk capacity
-is checked before spilling. RAM-resident backups remain the fast normal path.
-FlashInfer downloads remain on demand during normal vLLM initialization. Its
-HTTP and cache-lock timeouts allow a slow cold-cache download shared by multiple
-engines; there is no extra startup process or bulk-kernel preflight.
+The original shared RAM admission and bounded transfers remain in place,
+including OS headroom and Linux cgroup limits. Under genuine RAM pressure,
+unretainable sleeping engines are released and reloaded next phase, as on RTX.
+FlashInfer initialization and downloads use the original vLLM path; there is
+no extra startup process, download hook or bulk-kernel preflight.
 This is bounded resource planning, not a guarantee against arbitrary external
 allocations or a claim of benchmarked maximum throughput.
 
