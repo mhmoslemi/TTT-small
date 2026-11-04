@@ -229,14 +229,18 @@ class StrategistModelsTests(unittest.TestCase):
             "deepseek-v4-flash-0731", 4, 262144)
         self.assertEqual(deepseek_cache_gib, 2.0)
 
-    def test_new_pool_passes_ram_gate_without_double_reserving(self):
+    def test_new_pool_loading_is_host_memory_admitted(self):
         events = []
-        gate = SimpleNamespace(reservation=Mock(side_effect=AssertionError("duplicate outer reservation")))
-        received = []
+        @contextmanager
+        def reservation(size, **kwargs):
+            self.assertGreater(size, 400 * 2**30)
+            self.assertFalse(kwargs["wait_for_external"])
+            events.append("reserve")
+            yield
+            events.append("release")
         class Pool:
             num_workers, sleep_supported, persistent_workers = 4, True, 4
             def __init__(self, **kwargs):
-                received.append(kwargs["host_memory_admission"])
                 events.append("load")
         name = models.resolve_strategy_model("qwen3.8-flash-next")
         with patch.object(gen_workers, "GenerationPool", Pool):
@@ -244,10 +248,9 @@ class StrategistModelsTests(unittest.TestCase):
                 before_start=lambda: events.append("offload"), after_stop=lambda: None,
                 model_name=name, num_workers=8, vllm_tensor_parallel_size=2,
                 vllm_engine_options=models.strategist_engine_options(name),
-                host_memory_admission=gate)
+                host_memory_admission=SimpleNamespace(reservation=reservation))
             pool.prepare()
-        self.assertEqual(events, ["offload", "load"])
-        self.assertEqual(received, [gate])
+        self.assertEqual(events, ["offload", "reserve", "load", "release"])
 
     def test_profile_does_not_override_yaml_sampling_or_token_limits(self):
         source = ast.parse((ROOT / "models/coder_profiles.py").read_text())

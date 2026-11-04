@@ -1,13 +1,13 @@
 """Hardware planning and host admission contracts, without torch/CUDA."""
 
-from contextlib import contextmanager, redirect_stdout
+from contextlib import redirect_stdout
 import io
 from pathlib import Path
 import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import generation.gen_workers as workers
 import models.coder_profiles as coders
@@ -88,7 +88,7 @@ class HardwareProfileTests(unittest.TestCase):
             ("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", 131072, True, 1),
             ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", 131072, True, 1),
             ("qwen3.8-flash-next", 262144, True, 1),
-            ("Qwen/Qwen3.8-Flash-Next-FP8", 262144, True, 2),
+            ("Qwen/Qwen3.8-Flash-Next-FP8", 262144, True, 1),
             ("Qwen/Qwen3.8-Flash-Next", 262144, True, 4),
             ("deepseek-v4-flash-0731", 262144, True, 2),
         ]
@@ -115,27 +115,31 @@ class HardwareProfileTests(unittest.TestCase):
                         self.assertLessEqual(folded.replicas, parents)
                         self.assertEqual(folded.replicas * folded.tensor_parallel_size * folded.pipeline_parallel_size, 8)
 
-    def test_engine_options_match_gpu_weight_plan_without_changing_precision(self):
+    def test_engine_options_and_handoff_match_rtx(self):
         for name in strategists.STRATEGIST_ALIASES:
-            old = strategists.strategist_engine_options(name)
-            new = strategists.strategist_engine_options(name, hardware_profile="B200")
-            for key in ("enable_lora", "kv_cache_dtype", "quantization", "generation_config"):
-                self.assertEqual(old.get(key), new.get(key))
+            options = strategists.strategist_engine_options(name)
+            self.assertEqual(options["safetensors_load_strategy"], "lazy")
+            if name == "qwen3.8-flash-next":
+                self.assertIs(options["enable_flashinfer_autotune"], False)
+                self.assertTrue(options["engram_config"]["cpu_offload"])
+            profile = strategists.strategist_profile(name)
             for tp in (1, 2, 4, 8):
-                old_weight, old_kv = strategists.strategist_memory_per_rank(name, tp, 262144)
-                weight, kv = strategists.strategist_memory_per_rank(name, tp, 262144, hardware_profile="B200")
-                self.assertEqual(kv, old_kv)
-                self.assertEqual(weight - old_weight, strategists.strategist_profile(name)["ple_gib"] / tp)
-        self.assertFalse(strategists.strategist_engine_options("qwen3.8-flash-next", hardware_profile="B200")["engram_config"]["cpu_offload"])
-        cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b", no_train=False, hardware_profile="B200")
-        self.assertIsNone(coders._coder_vllm_persistent_workers(cfg))
-        cfg.hardware_profile = "RTX6000"
-        self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0)
+                expected = strategists.strategist_memory_per_rank(name, tp, 262144)
+                self.assertEqual(expected[0], (profile["weights_gib"] - profile["ple_gib"]) / tp)
+                with patch.object(gpu, "_checkpoint_weight_gib", return_value=None):
+                    for hardware_profile in ("RTX6000", "B200"):
+                        self.assertEqual(gpu._vllm_memory_per_rank(dict(
+                            model_name=name, max_seq_length=262144,
+                            hardware_profile=hardware_profile, strategy_inference_profile=True), tp), expected)
+        for hardware_profile in ("RTX6000", "B200"):
+            cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b", no_train=False,
+                                  hardware_profile=hardware_profile)
+            self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0)
         with patch.object(gpu, "_checkpoint_weight_gib", return_value=200.0):
             weight, _ = gpu._vllm_memory_per_rank(dict(
                 model_name="qwen3.8-flash-next", max_seq_length=262144,
                 hardware_profile="B200", strategy_inference_profile=True), 2)
-            self.assertEqual(weight, 100.0)
+            self.assertEqual(weight, 76.0)
 
     def test_b200_automatic_batch_scales_to_memory_and_real_work(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")
@@ -154,38 +158,21 @@ class HardwareProfileTests(unittest.TestCase):
         self.assertLessEqual(resolve("RTX6000")["gen_micro_batch"], 32)
         self.assertEqual(resolve("B200")["max_seq_length"], 262144)
 
-    def test_loading_waves_are_admitted_before_spawning(self):
+    def test_b200_starts_workers_concurrently_like_rtx(self):
         events = []
-        @contextmanager
-        def reservation(size, **kwargs):
-            self.assertLessEqual(size, 300 * host.GIB)
-            self.assertFalse(kwargs["wait_for_external"])
-            events.append("reserve")
-            yield
-            events.append("release")
         pool = workers.GenerationPool.__new__(workers.GenerationPool)
         pool.hardware_profile, pool.backend = "B200", "vllm"
-        pool.model_name, pool._worker_options = "Qwen/Qwen3.8-27B", {}
-        pool._gpu_groups = [[i] for i in range(8)]
         pool._staged_loading = False
-        pool.host_memory_admission = SimpleNamespace(available_bytes=lambda: 300*host.GIB, reservation=reservation)
         pool._start_worker = lambda rank: events.append(("start", rank))
         pool._wait_workers = lambda ids: events.append(("ready", tuple(ids)))
-        pool.shutdown = Mock()
-        with redirect_stdout(io.StringIO()):
-            pool._start_workers(range(8), initial=True)
-        self.assertEqual(events[0], "reserve")
-        self.assertEqual([x for x in events if isinstance(x, tuple) and x[0] == "ready"],
-                         [("ready", (0, 1, 2, 3, 4)), ("ready", (5, 6, 7))])
-        self.assertEqual(events.count("reserve"), events.count("release"))
-        pool.host_memory_admission.available_bytes = lambda: None
-        with self.assertRaises(RuntimeError):
-            pool._start_workers((0,), initial=True)
-        pool.shutdown.assert_called_once()
-        gate = pool.host_memory_admission
+        pool._start_workers(range(8), initial=True)
+        self.assertEqual(events, [("start", rank) for rank in range(8)] + [("ready", tuple(range(8)))])
+        gate = object()
         phased = workers.PhasedVLLMGenerationPool(before_start=lambda: None, after_stop=lambda: None,
-                    model_name=pool.model_name, num_workers=8, hardware_profile="B200", host_memory_admission=gate)
-        self.assertIs(phased._pool_kwargs["host_memory_admission"], gate)
+                    model_name="Qwen/Qwen3.8-27B", num_workers=8, hardware_profile="B200",
+                    host_memory_admission=gate)
+        self.assertIs(phased.host_memory_admission, gate)
+        self.assertNotIn("host_memory_admission", phased._pool_kwargs)
 
     def test_ram_reserve_and_outstanding_work_are_not_spent_twice(self):
         context = SimpleNamespace(Value=lambda *a, **k: SimpleNamespace(value=0),

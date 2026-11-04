@@ -5376,8 +5376,11 @@ def main():
                         flush=True,
                     )
 
-                # Move only inactive backups to disk when CPU trainer copies
-                # need the RAM; never discard their converted model weights.
+                # Normally the cache purge above is sufficient and both vLLM
+                # pools remain RAM-resident.  Under genuine pressure, discard
+                # only sleeping level-1 backups, largest/unused peer first.
+                # This trades one later checkpoint reload for survival instead
+                # of permanently choosing a slower level-2/transient policy.
                 if memory is not None:
                     reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
                     target_available = required_bytes + reserve_bytes
@@ -5394,13 +5397,14 @@ def main():
                     for pool_label, pool in pressure_candidates:
                         if memory["available"] >= target_available:
                             break
-                        spill = getattr(pool, "spill_sleeping_to_disk", None)
-                        if not callable(spill) or not spill(target_available - memory["available"]):
+                        discard = getattr(pool, "discard_sleeping_host_residency", None)
+                        if pool is None or not callable(discard) or not discard():
                             continue
                         memory = host_memory_info() or memory
                         print(
-                            f"[host-memory] moved sleeping {pool_label} "
-                            "weights to disk to make room for trainer offload",
+                            f"[host-memory] low-RAM guard discarded the "
+                            f"sleeping {pool_label} vLLM weight backup; it "
+                            "will reload on its next use",
                             flush=True,
                         )
                     if memory["available"] < target_available:
@@ -5443,32 +5447,6 @@ def main():
                         "the training model could not be offloaded for the "
                         "shared vLLM rollout phase; use generation_backend=hf "
                         "for live-model generation on this runtime") from exc
-
-            def _prepare_generation_phase(phase):
-                _offload_trainer_for_generation(phase)
-                # This must also run when the trainer is *already* on CPU:
-                # strategist -> coder previously bypassed the RAM check.
-                from runtime.gpu_runtime import _estimated_weight_gib
-                from runtime.host_memory import GIB, host_memory_info, host_memory_reserve_bytes
-                pool = strategy_pool if phase == "strategy" else gen_pool
-                if pool is None or pool._pool is not None:
-                    return
-                options = pool._pool_kwargs
-                width = max(1, int(options.get("vllm_tensor_parallel_size") or 1)
-                            * int(options.get("vllm_pipeline_parallel_size") or 1))
-                # Make room for at least one engine, not eight hypothetical
-                # full CPU copies. Loading waves use all remaining RAM safely.
-                wanted = int((_estimated_weight_gib(options["model_name"], options.get("vllm_quantization"))
-                              + 8 * width) * GIB)
-                memory = host_memory_info()
-                if memory is not None:
-                    target = wanted + host_memory_reserve_bytes(memory)
-                    for peer in (gen_pool, strategy_pool):
-                        if memory["available"] >= target:
-                            break
-                        if peer is not None and peer is not pool:
-                            peer.spill_sleeping_to_disk(target - memory["available"])
-                            memory = host_memory_info() or memory
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
@@ -5525,7 +5503,7 @@ def main():
                 ensure_trainer_ready = _ensure_sharded_trainer_ready
 
             gen_pool = PhasedVLLMGenerationPool(
-                before_start=lambda: _prepare_generation_phase("coder"),
+                before_start=lambda: _offload_trainer_for_generation("coder"),
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
@@ -5542,8 +5520,7 @@ def main():
                 # strategist pool transient so its processes are completely
                 # gone before the coder wakes.
                 strategy_persistent_workers = getattr(cfg, "strategy_vllm_persistent_workers", None)
-                if (str(getattr(cfg, "coder_model_profile", "")).lower() == "gpt-oss-120b"
-                        and cfg.hardware_profile != "B200"):
+                if str(getattr(cfg, "coder_model_profile", "")).lower() == ("gpt-oss-120b"):
                     strategy_persistent_workers = 0
                     setting_log_only(
                         "[memory] GPT-OSS-120B coder: local strategist "
@@ -5553,8 +5530,7 @@ def main():
                     )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
-                    "vllm_engine_options": strategist_engine_options(
-                        cfg.strategy_model_name, hardware_profile=cfg.hardware_profile),
+                    "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name),
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
                     "gen_micro_batch": getattr(cfg, "strategy_gen_micro_batch", cfg.gen_micro_batch),
@@ -5572,7 +5548,7 @@ def main():
                     "vllm_log_path": strategy_vllm_log_path,
                 })
                 strategy_pool = PhasedVLLMGenerationPool(
-                    before_start=lambda: _prepare_generation_phase("strategy"),
+                    before_start=lambda: _offload_trainer_for_generation("strategy"),
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )

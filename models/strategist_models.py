@@ -93,18 +93,18 @@ def resolve_strategy_token_limits(model_name, max_seq_length="auto",
     return max_seq_length, max_new_tokens
 
 
-def strategist_memory_per_rank(model_name, parallel_size, max_length, *, hardware_profile="RTX6000"):
+def strategist_memory_per_rank(model_name, parallel_size, max_length):
     """Account for native caches, replicated once TP exceeds the KV heads."""
     profile = strategist_profile(model_name)
-    offloaded = 0.0 if hardware_profile == "B200" else profile["ple_gib"]
-    weight = (profile["weights_gib"] - offloaded) / parallel_size
-    # RTX offloads the lookup table; B200 budgets its TP-sharded GPU copy.
+    weight = (profile["weights_gib"] - profile["ple_gib"]) / parallel_size
+    # Qwen's large lookup table is offloaded explicitly, not mistaken for
+    # sharded GPU memory. vLLM asynchronously fetches the needed rows.
     kv_shards = min(parallel_size, profile.get("kv_heads", 1))
     kv = profile["kv_bytes_per_token"] * max_length / kv_shards / 2**30
     return weight, kv
 
 
-def strategist_engine_options(model_name, *, hardware_profile="RTX6000"):
+def strategist_engine_options(model_name):
     profile = strategist_profile(model_name)
     # Checkpoint generation_config can impose its own server-wide output cap.
     options = dict(generation_config="vllm")
@@ -116,14 +116,14 @@ def strategist_engine_options(model_name, *, hardware_profile="RTX6000"):
     )
     if profile["family"] == "qwen3.8-flash-next":
         # vLLM 0.30 QSA rejects FP8 KV; auto uses the BF16 model dtype.
-        options.update(kv_cache_dtype="auto", engram_config={"cpu_offload": hardware_profile != "B200"},
+        options.update(kv_cache_dtype="auto", engram_config={"cpu_offload": True},
                        limit_mm_per_prompt={"image": 0, "video": 0})
         if profile["nvfp4"]:
-            # Retain the RTX cold-start shortcut; let B200 tune native kernels.
-            options.update(quantization="modelopt", enable_flashinfer_autotune=hardware_profile == "B200")
+            # NVIDIA's serving recipe skips the extra cold-start tuning sweep.
+            options.update(quantization="modelopt", enable_flashinfer_autotune=False)
     else:
-        # Retain FP8 indexer precision on both devices; auto selects a
-        # compatible MoE kernel for SM120 (RTX) or SM100 (B200).
+        # RTX PRO 6000 is SM120, not SM100: its sparse-MLA backend cannot
+        # use the B200/GB200 FP4 indexer or deep_gemm_mega_moe.
         options.update(tokenizer_mode="deepseek_v4", block_size=256,
                        attention_config={"indexer_kv_dtype": "fp8"},
                        moe_backend="auto")
@@ -143,7 +143,7 @@ def validate_strategist_runtime(model_name, *, prepare_encoder=False):
     if numbers < (0, 30, 0):
         raise RuntimeError(
             f"{model_name} needs vLLM >= 0.30 with its current NVIDIA "
-            f"NVFP4 kernels for the selected GPU; installed {version}. Use a compatible "
+            f"NVFP4/SM120 kernels; installed {version}. Use a compatible "
             "recent build. No packages are installed automatically.")
     if (prepare_encoder and strategist_profile(model_name)["family"]
             == "deepseek-v4-flash-0731"):

@@ -331,8 +331,7 @@ def _vllm_memory_per_rank(cfg, parallel_size, max_length=None):
     max_length = _effective_max_length(cfg) if max_length is None else max_length
     if cfg.get("strategy_inference_profile"):
         weight, kv = strategist_memory_per_rank(
-            cfg["model_name"], parallel_size, max_length,
-            hardware_profile=cfg.get("hardware_profile", "RTX6000"))
+            cfg["model_name"], parallel_size, max_length)
         if cfg.get("hardware_profile") == "B200":
             # A larger locally installed revision must not undercut admission.
             profile = strategist_profile(cfg["model_name"])
