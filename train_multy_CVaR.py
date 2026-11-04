@@ -4720,6 +4720,7 @@ def main():
         print(f"Training model:     {cfg.training_model_name}")
     print(f"Training backend:   {cfg.backend}")
     print(f"Generation backend: {cfg.generation_backend}")
+    print(f"Hardware profile:   {cfg.hardware_profile}")
     print(f"Training GPUs:      physical {cfg.training_gpu_ids}")
     training_layout = (
         "disabled (--no-train)" if cfg.no_train
@@ -5231,6 +5232,7 @@ def main():
             vllm_runtime_reserve_gib=float(cfg.vllm_runtime_reserve_gib),
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
+            hardware_profile=cfg.hardware_profile,
         )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
@@ -5429,7 +5431,8 @@ def main():
                 # strategist pool transient so its processes are completely
                 # gone before the coder wakes.
                 strategy_persistent_workers = getattr(cfg, "strategy_vllm_persistent_workers", None)
-                if str(getattr(cfg, "coder_model_profile", "")).lower() == ("gpt-oss-120b"):
+                if (str(getattr(cfg, "coder_model_profile", "")).lower() == "gpt-oss-120b"
+                        and cfg.hardware_profile != "B200"):
                     strategy_persistent_workers = 0
                     setting_log_only(
                         "[memory] GPT-OSS-120B coder: local strategist "
@@ -5439,7 +5442,8 @@ def main():
                     )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
-                    "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name),
+                    "vllm_engine_options": strategist_engine_options(
+                        cfg.strategy_model_name, hardware_profile=cfg.hardware_profile),
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
                     "gen_micro_batch": getattr(cfg, "strategy_gen_micro_batch", cfg.gen_micro_batch),

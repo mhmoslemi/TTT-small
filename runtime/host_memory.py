@@ -70,6 +70,34 @@ def validate_memory_handoff_runtime(training_file):
     }
 
 
+def _cgroup_memory_bounds(root="/sys/fs/cgroup", membership="/proc/self/cgroup"):
+    """Account for container/service limits, including a tighter ancestor."""
+    root = Path(root)
+    candidates = {root, root / "memory"}
+    try:
+        for line in Path(membership).read_text().splitlines():
+            _, controllers, relative = line.split(":", 2)
+            if not controllers or "memory" in controllers.split(","):
+                base = root / "memory" if controllers else root
+                path = base / relative.lstrip("/")
+                if ".." not in path.parts:
+                    candidates.update(p for p in (path, *path.parents) if p == base or base in p.parents)
+    except (OSError, ValueError):
+        pass
+    bounds = []
+    for path in candidates:
+        for limit_name, usage_name in (("memory.max", "memory.current"),
+                                       ("memory.limit_in_bytes", "memory.usage_in_bytes")):
+            try:
+                limit = int((path / limit_name).read_text().strip())
+                used = int((path / usage_name).read_text().strip())
+                if limit > 0 and used >= 0:
+                    bounds.append((limit, max(0, limit - used)))
+            except (OSError, ValueError):
+                pass  # Missing controller or the v2 unlimited value "max".
+    return bounds
+
+
 def host_memory_info(meminfo_path="/proc/meminfo"):
     """Return Linux total/available memory in bytes, or ``None`` off Linux."""
     try:
@@ -82,6 +110,9 @@ def host_memory_info(meminfo_path="/proc/meminfo"):
         total = int(values["MemTotal"])
         available = int(values.get("MemAvailable", values.get("MemFree", 0)))
         if total > 0 and available >= 0:
+            if str(meminfo_path) == "/proc/meminfo":
+                for limit, free in _cgroup_memory_bounds():
+                    total, available = min(total, limit), min(available, free)
             return {"total": total, "available": available}
     except (OSError, KeyError, TypeError, ValueError):
         pass

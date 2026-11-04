@@ -176,6 +176,7 @@ def dashboard_sections(fields, run_dir, *, resuming=False):
             row("SPO-RS clip eps low/high"),
         ]),
         ("HARDWARE & EVALUATION", 94, [
+            row("Hardware profile"),
             row("Training backend", "Generation backend"),
             row("Training GPUs", "Generation GPUs"),
             row("vLLM parallelism", "Evaluation GPU"),

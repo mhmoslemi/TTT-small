@@ -330,8 +330,15 @@ def uses_bounded_gpt_oss_repack(model_name, quantization=None) -> bool:
 def _vllm_memory_per_rank(cfg, parallel_size, max_length=None):
     max_length = _effective_max_length(cfg) if max_length is None else max_length
     if cfg.get("strategy_inference_profile"):
-        return strategist_memory_per_rank(
-            cfg["model_name"], parallel_size, max_length)
+        weight, kv = strategist_memory_per_rank(
+            cfg["model_name"], parallel_size, max_length,
+            hardware_profile=cfg.get("hardware_profile", "RTX6000"))
+        if cfg.get("hardware_profile") == "B200":
+            # A larger locally installed revision must not undercut admission.
+            profile = strategist_profile(cfg["model_name"])
+            weight += max(0.0, (_checkpoint_weight_gib(cfg["model_name"]) or 0.0)
+                          - profile["weights_gib"]) / parallel_size
+        return weight, kv
     return (
         _estimated_weight_gib(cfg.get("model_name", ""),
                               cfg.get("vllm_quantization", "")) / parallel_size,
@@ -450,7 +457,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # Keep CUDA graph/admission metadata bounded even when short responses
         # would permit hundreds of sequences. One is retained as a safe floor;
         # vLLM profiles graph memory before fixing the KV-cache size.
-        cap = max(1, min(32, estimated_active_sequences))
+        ceiling = 64 if cfg.get("hardware_profile") == "B200" else 32
+        cap = max(1, min(ceiling, estimated_active_sequences))
         # Wide MoE models on sub-60-GiB cards rely on a comparatively tight
         # tensor-parallel layout.  Bound scheduler/CUDA-graph concurrency even
         # when the remaining paged-KV budget could theoretically admit many
@@ -474,6 +482,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # temporary batch.  This is scheduling work per iteration, not the KV
         # capacity or maximum request length.
         batched = min(max_len, 8192 if min_total >= 60 else 4096)
+        if cfg.get("hardware_profile") == "B200" and cfg.get("frozen_strategy"):
+            batched = min(max_len, 16384)
         cfg["vllm_max_num_batched_tokens"] = max(2048, batched)
         if using_vllm:
             notes.append("vLLM max batched tokens="

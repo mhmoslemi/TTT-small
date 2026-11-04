@@ -41,6 +41,7 @@ sandbox_timeout_s reward_workers print_responses max_saved_construction
 """.split())
 
 COMMON_OPTIONAL_KEYS = frozenset({
+    "hardware_profile",
     "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
     "advantage_mode", "fast", "isolate_eval",
     "fused_long_attention",
@@ -190,6 +191,9 @@ def validate_problem_config(
                 f"{_label(source)}: unknown or misplaced keys: {sorted(unknown)}"
             )
 
+    if "hardware_profile" in data:
+        from runtime.hardware_profiles import hardware_profile
+        hardware_profile(data["hardware_profile"])
     if problem in ("ac1", "ac2") and data.get("problem_type") != problem:
         raise ValueError(
             f"{_label(source)}: {problem} requires problem_type={problem}"

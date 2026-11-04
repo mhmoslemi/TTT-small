@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import yaml
+from runtime.hardware_profiles import local_checkpoint, restore_hardware_settings, validate_hardware_profile
 
 from models.strategist_models import (
     resolve_strategy_effort, resolve_strategy_model, resolve_strategy_token_limits, strategist_profile,
@@ -676,6 +677,8 @@ def load_config():
               f"{resume_dir / 'config.json'}; current YAML rollout counts "
               "and strategy limits/sampling override saved values")
 
+    restore_hardware_settings(merged, ydict, saved)
+
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
     for arg_name, value in vars(args).items():
@@ -736,6 +739,8 @@ def load_config():
 
     # Resolve after the hierarchy chooses its coder and before validating the
     # resulting training layout and precision.
+    for key in ("model_name", "coder_model_name", "training_model_name", "coder_training_model_name"):
+        merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
     _apply_coder_model_profile(merged, profile_explicit_keys)
     _resolve_coder_token_limits(merged)
 
@@ -885,6 +890,8 @@ def load_config():
         strategy_model_name = str(merged.get("strategy_model_name") or merged["model_name"]).strip()
         if not merged["api_strategy"]:
             strategy_model_name = resolve_strategy_model(strategy_model_name)
+            if str(merged.get("strategy_backend") or "local").lower() == "local":
+                strategy_model_name = local_checkpoint(strategy_model_name, merged["hardware_profile"])
             _apply_strategy_model_profile(merged, strategy_model_name, profile_explicit_keys)
         strategy_backend = "api" if merged["api_strategy"] else str(
             merged.get("strategy_backend") or "local"
@@ -1119,6 +1126,7 @@ def load_config():
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
+    validate_hardware_profile(merged, roles.available, memory)
 
     merged["training_model_name"] = _resolve_training_model_name(
         merged.get("model_name", ""), merged.get("training_model_name"),
@@ -1253,6 +1261,7 @@ def load_config():
             strategy_layout_cfg = dict(merged)
             strategy_layout_cfg.update({
                 "model_name": strategy_name,
+                "frozen_strategy": True,
                 "strategy_inference_profile": bool(strategist_profile(strategy_name)),
                 "max_seq_length": int(merged["strategy_max_seq_length"]),
                 "load_in_4bit": False,
@@ -1277,6 +1286,12 @@ def load_config():
             strategy_layout_cfg["vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
             for note in resolve_memory_settings(strategy_layout_cfg, roles, memory):
                 print(f"[memory] auto strategy: {note}")
+            if merged["hardware_profile"] == "B200":
+                # Only one strategy per parent can be in flight; do not build
+                # large CUDA graphs for request batches this pool cannot see.
+                strategy_layout_cfg["gen_micro_batch"] = min(
+                    strategy_layout_cfg["gen_micro_batch"] or strategy_frontier,
+                    strategy_frontier)
             merged["strategy_vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
             merged["strategy_vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
             merged["strategy_gen_micro_batch"] = int(strategy_layout_cfg["gen_micro_batch"])

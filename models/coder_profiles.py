@@ -224,8 +224,10 @@ def _coder_model_profile(model_name):
 
 
 def _coder_vllm_persistent_workers(cfg):
-    """Release GPT-OSS coder engines completely during adapter training."""
-    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b" and not bool(getattr(cfg, "no_train", False))):
+    """RTX GPT-OSS needs engine contexts released; B200 can retain sleep backups."""
+    if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b"
+            and getattr(cfg, "hardware_profile", "RTX6000") != "B200"
+            and not bool(getattr(cfg, "no_train", False))):
         return 0
     return None
 
@@ -467,6 +469,11 @@ def _uses_sequence_level_policy_ratio(cfg):
 
 def _dual_resident_qwen3_8b_strategy_coder_pools(config):
     """Select independent co-resident strategist and coder Qwen3-8B pools."""
+    if config.get("hardware_profile") == "B200":
+        from runtime.hardware_profiles import checkpoint_identity
+        config = dict(config)
+        for key in ("model_name", "coder_model_name", "strategy_model_name"):
+            config[key] = checkpoint_identity(config.get(key))
     return bool(
         config.get("strategies", False)
         and str(config.get("strategy_backend") or "local").lower() == "local"

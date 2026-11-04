@@ -1663,8 +1663,11 @@ class GenerationPool:
                  vllm_token_scoring=False,
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
-                 vllm_log_path=None, vllm_engine_options=None):
+                 vllm_log_path=None, vllm_engine_options=None,
+                 hardware_profile="RTX6000", host_memory_admission=None):
         self.model_name = model_name
+        self.hardware_profile = hardware_profile
+        self.host_memory_admission = host_memory_admission
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
@@ -1869,6 +1872,14 @@ class GenerationPool:
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
+        if self.hardware_profile == "B200" and self.backend == "vllm":
+            # Shared mmap pages avoid one eager checkpoint copy per replica.
+            engine_options = dict(vllm_engine_options or {})
+            engine_options.setdefault("safetensors_load_strategy", "lazy")
+            self._worker_options["engine_options"] = engine_options
+            if self.host_memory_admission is None:
+                from runtime.host_memory import HostMemoryAdmission
+                self.host_memory_admission = HostMemoryAdmission(self._ctx)
         self._load_in_4bit = bool(load_in_4bit)
         self._startup_timeout = _positive_env_timeout(
             "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
@@ -2014,7 +2025,32 @@ class GenerationPool:
                   f"{self.backend} engine(s)"
                   + (" one at a time" if self._staged_loading else "")
                   + " ...", flush=True)
-        if self._staged_loading:
+        if getattr(self, "hardware_profile", "RTX6000") == "B200" and self.backend == "vllm":
+            from runtime.gpu_runtime import _estimated_weight_gib
+            from runtime.host_memory import GIB
+            # Charge conversion/staging too; release each wave's reservation
+            # only after its engines are ready. Live RSS remains charged.
+            weights = _estimated_weight_gib(self.model_name, self._worker_options.get("quantization"))
+            per_engine = int((weights + 8.0 * len(self._gpu_groups[worker_ids[0]])) * GIB)
+            pending = list(worker_ids)
+            try:
+                while pending:
+                    available = self.host_memory_admission.available_bytes()
+                    if available is None:
+                        raise RuntimeError("B200 engine loading requires readable host RAM limits")
+                    count = 1 if self._staged_loading else max(1, min(len(pending), available // per_engine))
+                    wave = pending[:count]
+                    with self.host_memory_admission.reservation(per_engine * count, wait_for_external=False):
+                        print(f"[pool] RAM-admitted loading: {count} engine(s), "
+                              f"{per_engine * count / GIB:.1f} GiB startup reservation", flush=True)
+                        for rank in wave:
+                            self._start_worker(rank)
+                        self._wait_workers(wave)
+                    pending = pending[count:]
+            except BaseException:
+                self.shutdown()
+                raise
+        elif self._staged_loading:
             for rank in worker_ids:
                 self._start_worker(rank)
                 self._wait_workers((rank,))
@@ -2913,6 +2949,8 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
+        if self._pool_kwargs.get("hardware_profile") == "B200":
+            self._pool_kwargs["host_memory_admission"] = self.host_memory_admission
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
         if requested_sleep_level not in (1, 2):
@@ -2981,6 +3019,7 @@ class PhasedVLLMGenerationPool:
     def _create_pool(self, **options):
         startup_reservation = nullcontext()
         if (self.host_memory_admission is not None
+                and self._pool_kwargs.get("hardware_profile") != "B200"
                 and not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
                     "enable_lora", True)):
             from models.strategist_models import strategist_profile
