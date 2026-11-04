@@ -7,7 +7,7 @@ ttt_project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ttt_project_dir"
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export AVAILABLE_GPUS="${AVAILABLE_GPUS:-2,3,4,5,6,7}"
+export AVAILABLE_GPUS="${AVAILABLE_GPUS:-2,3,4,5}"
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
 config_path="${TTT_CONFIG:-configs/erdos.yaml}"
 # config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
