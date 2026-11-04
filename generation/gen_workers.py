@@ -904,8 +904,8 @@ def _redirect_vllm_output(log_path, rank, gpu_group):
     return handle
 
 
-async def _serve_strategy_requests(task_queue, generate):
-    """Accept strategy continuations while other requests are still decoding."""
+async def _serve_generation_requests(task_queue, generate, *, done_marker="__strategies_done__"):
+    """Accept ready requests while other requests are still decoding."""
     pending = set()
     try:
         while True:
@@ -916,14 +916,14 @@ async def _serve_strategy_requests(task_queue, generate):
                     break
                 if task is None:
                     return True
-                if task == ("__strategies_done__",):
+                if task == (done_marker,):
                     if any(not future.done() for future in pending):
-                        raise RuntimeError("strategy session ended with requests in flight")
+                        raise RuntimeError("generation session ended with requests in flight")
                     for future in pending:
                         future.result()
                     return False
                 if not isinstance(task, tuple) or len(task) != 4:
-                    raise RuntimeError("unexpected task during strategy generation")
+                    raise RuntimeError("unexpected task during continuous generation")
                 pending.add(asyncio.create_task(generate(task)))
             if pending:
                 done, _ = await asyncio.wait(
@@ -1108,10 +1108,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                 f"vLLM request {request_id} completed without an output")
         return final_output
 
-    async def _generate_strategy_request(task):
+    async def _generate_single_request(task):
         step, adapter_path, jobs, options = task
         if len(jobs) != 1 or int(jobs[0][2]) != 1:
-            raise RuntimeError("strategy requests must contain exactly one sample")
+            raise RuntimeError("continuous generation requests must contain exactly one sample")
         if (engine_options and not engine_options.get("enable_lora", True)
                 and adapter_path is not None):
             raise RuntimeError("a frozen strategist cannot receive a LoRA adapter")
@@ -1138,20 +1138,36 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             sampling["top_k"] = -1 if int(options["top_k"]) == 0 else int(options["top_k"])
         if options.get("min_p") is not None:
             sampling["min_p"] = float(options["min_p"])
+        if options.get("full_policy_sampling", False):
+            sampling.update(top_k=-1, repetition_penalty=1.0)
+        return_logprobs = bool(options.get("return_logprobs", False))
+        if return_logprobs:
+            sampling["logprobs"] = 0
         output = await _async_final_output(
             prompt, SamplingParams(**sampling), _lora_request(adapter_path),
-            _next_request_id("strategy"))
+            _next_request_id("strategy" if engine_options and not engine_options.get("enable_lora", True)
+                             else "rollout"))
         candidates = getattr(output, "outputs", None) or []
         if candidates:
             candidate = candidates[0]
             token_ids = list(candidate.token_ids)
             text = _canonical_generated_text(tokenizer, token_ids, candidate.text)
             result = (text, token_ids)
+            if return_logprobs:
+                values = _chosen_token_logprobs(token_ids, getattr(candidate, "logprobs", None))
+                result += (array("f", values) if values is not None else None,)
         else:
-            result = ("", [])
+            result = ("", [], None) if return_logprobs else ("", [])
         result_queue.put((rank, chain, [result]))
 
-    async def _async_control(command):
+    async def _async_control(command, directory=None):
+        if command in {"sleep_disk", "spill_sleeping"}:
+            reports = await llm.collective_rpc(
+                "ttt_disk_offload", args=(directory, command == "spill_sleeping"))
+            if command == "spill_sleeping":
+                return reports
+            await llm.sleep(level=sleep_level)
+            return
         if command == "sleep":
             await llm.sleep(level=sleep_level)
         elif command == "wake_up":
@@ -1184,15 +1200,17 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         task = task_queue.get()
         if task is None:
             break
-        if task == ("__strategies__",):
+        if task in (("__strategies__",), ("__rollouts__",)):
             try:
                 if not async_engine:
-                    raise RuntimeError("continuous strategy batching requires AsyncLLM")
-                stopping = _run_async(_serve_strategy_requests(
-                    task_queue, _generate_strategy_request))
+                    raise RuntimeError("continuous generation requires AsyncLLM")
+                stopping = _run_async(_serve_generation_requests(
+                    task_queue, _generate_single_request,
+                    done_marker=("__strategies_done__" if task == ("__strategies__",)
+                                 else "__rollouts_done__")))
             except Exception:
                 detail = traceback.format_exc()
-                print(f"[vllm worker {rank}] strategy generation failed:\n{detail}",
+                print(f"[vllm worker {rank}] continuous generation failed:\n{detail}",
                       file=sys.stderr, flush=True)
                 if vllm_log_path:
                     detail = f"details: {os.path.abspath(os.fspath(vllm_log_path))}"
@@ -1204,12 +1222,25 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         if (isinstance(task, tuple) and len(task) >= 2
                 and task[0] == "__control__"):
             command = task[1]
+            directory = task[2] if len(task) > 2 else None
             try:
                 control_detail = ""
                 if not can_sleep:
                     raise RuntimeError(
                         "installed vLLM does not expose LLM.sleep/wake_up")
-                if command == "sleep":
+                if command in {"sleep_disk", "spill_sleeping"}:
+                    if sleep_level != 1:
+                        raise RuntimeError("disk weight backups require level-1 sleep")
+                    if async_engine:
+                        reports = _run_async(_async_control(command, directory))
+                    else:
+                        reports = llm.collective_rpc(
+                            "ttt_disk_offload", args=(directory, command == "spill_sleeping"))
+                        if command == "sleep_disk":
+                            llm.sleep(level=sleep_level)
+                    if command == "spill_sleeping":
+                        control_detail = {"released_bytes": sum(int(value) for value in reports)}
+                elif command == "sleep":
                     print(f"[vllm worker {rank}] entering sleep level "
                           f"{sleep_level}", flush=True)
                     if async_engine:
@@ -2025,7 +2056,7 @@ class GenerationPool:
                   f"{self.backend} engine(s)"
                   + (" one at a time" if self._staged_loading else "")
                   + " ...", flush=True)
-        if getattr(self, "hardware_profile", "RTX6000") == "B200" and self.backend == "vllm":
+        if self.backend == "vllm" and self.host_memory_admission is not None:
             from runtime.gpu_runtime import _estimated_weight_gib
             from runtime.host_memory import GIB
             # Charge conversion/staging too; release each wave's reservation
@@ -2112,11 +2143,17 @@ class GenerationPool:
                     or task_queue is None):
                 raise RuntimeError(
                     f"vLLM worker {rank} is unavailable during {command}")
-            task_queue.put(("__control__", command))
+            if command in {"sleep_disk", "spill_sleeping"}:
+                from pathlib import Path
+                directory = str(Path(self.vllm_log_path or "runs/vllm.log").resolve().parent / ".offload")
+                task_queue.put(("__control__", command, directory))
+            else:
+                task_queue.put(("__control__", command))
         completed_workers = set()
         details = {}
         control_timeout = _positive_env_timeout(
-            "TTT_VLLM_CONTROL_TIMEOUT_S", 600.0)
+            "TTT_VLLM_CONTROL_TIMEOUT_S",
+            3600.0 if command in {"sleep_disk", "spill_sleeping", "wake_up"} else 600.0)
         control_deadline = time.monotonic() + control_timeout
         while len(completed_workers) < len(worker_ids):
             remaining = control_deadline - time.monotonic()
@@ -2198,18 +2235,11 @@ class GenerationPool:
                         after_sleep([gpu for rank in wave
                                      for gpu in self._gpu_groups[rank]])
             except HostMemoryUnavailable:
-                # No admitted CPU work can return RAM to unblock this copy.
-                # Keep all rollout GPUs; reload only the unretainable engines
-                # next phase instead of hanging or overcommitting the host.
                 print(f"[pool] host RAM cannot retain engines {list(wave)}; "
-                      "releasing them for training and reloading next phase",
-                      flush=True)
-                self._stop_workers(wave)
-                self._persistent_worker_ids = tuple(
-                    rank for rank in self._persistent_worker_ids if rank not in wave)
-                self._transient_worker_ids = tuple(sorted(
-                    set(self._transient_worker_ids).union(wave)))
-                self.persistent_workers = len(self._persistent_worker_ids)
+                      "streaming exact weight backups to temporary disk", flush=True)
+                # No full CPU copy is allocated first; each rank transfers
+                # at most 64 MiB of mapped pages before flushing/evicting them.
+                self._vllm_control("sleep_disk", wave)
                 if after_sleep:
                     after_sleep([gpu for rank in wave
                                  for gpu in self._gpu_groups[rank]])
@@ -2220,6 +2250,15 @@ class GenerationPool:
                   f"{time.monotonic() - transfer_started:.1f}s; "
                   f"host RAM available={available_label}", flush=True)
             pending = [rank for rank in pending if rank not in wave]
+
+    def spill_sleeping_to_disk(self, required_bytes=None):
+        released = 0
+        for rank in self._persistent_worker_ids:
+            reports = self._vllm_control("spill_sleeping", (rank,))
+            released += int(reports[rank]["released_bytes"])
+            if required_bytes is not None and released >= required_bytes:
+                break
+        return released
 
     def wake_up(self):
         if not self.vllm_co_resident_sleep:
@@ -2434,6 +2473,23 @@ class GenerationPool:
         worker_jobs = distribute_jobs(
             prompts_by_group, group_size, self.num_workers,
             counts_by_group=counts_by_group)
+        if (getattr(self, "hardware_profile", "RTX6000") == "B200"
+                and getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
+                and (self._worker_options.get("engine_options") or {}).get("enable_lora", True)):
+            counts = ([int(group_size)] * len(prompts_by_group) if counts_by_group is None
+                      else [int(count) for count in counts_by_group])
+            jobs = [dict(key=index, prompt_text=prompt, count=count, step_idx=step_idx)
+                    for index, (prompt, count) in enumerate(zip(prompts_by_group, counts)) if count]
+            def poll():
+                nonlocal jobs
+                ready, jobs = jobs, []
+                return ready, True
+            yield from self.iter_ready_jobs(
+                poll, total_expected=sum(counts), adapter_path=adapter_path,
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                return_logprobs=return_logprobs, full_policy_sampling=full_policy_sampling,
+                top_k=top_k, min_p=min_p, progress_desc=progress_desc, show_progress=show_progress)
+            return
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
@@ -2486,8 +2542,9 @@ class GenerationPool:
     def iter_ready_jobs(self, poll_jobs, *, total_expected, adapter_path,
                         max_new_tokens, temperature, top_p,
                         return_logprobs=False, full_policy_sampling=False,
-                        top_k=None, min_p=None, progress_desc="API coder rollouts"):
-        """Feed newly ready API-conditioned jobs to every available engine.
+                        top_k=None, min_p=None, progress_desc="coder rollouts",
+                        show_progress=True):
+        """Feed newly ready jobs into each available decoding slot.
 
         ``poll_jobs`` returns (new jobs, producer finished). Each job has a
         unique ``key``, ``prompt_text``, ``count``, and ``step_idx``. It also
@@ -2511,14 +2568,21 @@ class GenerationPool:
             options["min_p"] = float(min_p)
         if full_policy_sampling:
             options.update(top_k=0, repetition_penalty=1.0)
-        bar = make_progress_bar(total_expected, desc=progress_desc)
+        bar = make_progress_bar(total_expected, desc=progress_desc) if show_progress else None
+        continuous = getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
+        capacity = self.gen_micro_batch or max(1, (int(total_expected) + self.num_workers - 1) // self.num_workers)
         try:
+            if continuous:
+                for tasks in self.task_queues:
+                    tasks.put(("__rollouts__",))
             while not done or pending or any(inflight.values()):
                 jobs, done = poll_jobs()
                 for job in jobs:
                     key, count = job["key"], int(job["count"])
                     if key in seen_keys or count < 1:
                         raise RuntimeError("duplicate or empty ready coder job")
+                    if next_sample + count > int(total_expected):
+                        raise RuntimeError("ready coder jobs exceeded rollout budget")
                     seen_keys.add(key)
                     for ordinal in range(count):
                         # Distinct per-sample IDs prevent repeated vLLM seeds
@@ -2530,54 +2594,69 @@ class GenerationPool:
                         pending.append((sample, job["prompt_text"],
                                         int(job["step_idx"])))
                         next_sample += 1
-                    if next_sample > int(total_expected):
-                        raise RuntimeError("ready coder jobs exceeded rollout budget")
 
-                for rank in range(self.num_workers):
-                    if inflight[rank] or not pending:
-                        continue
-                    # Keep a backlog available for other engines instead of
-                    # assigning all remaining work to the first idle worker.
-                    count = max(1, (len(pending) + self.num_workers - 1)
-                                // self.num_workers)
-                    if self.gen_micro_batch > 0:
-                        count = min(count, self.gen_micro_batch)
-                    task_step = pending[0][2]
-                    batch = []
-                    while pending and len(batch) < count and pending[0][2] == task_step:
-                        sample, prompt, _step = pending.popleft()
-                        batch.append((sample, prompt, 1))
+                available_ranks = [rank for rank in range(self.num_workers)
+                                   if len(inflight[rank]) < capacity and (continuous or not inflight[rank])]
+                if continuous:
+                    # Effort variants arrive grouped; round robin keeps long
+                    # xhigh requests from collecting on the first engine.
+                    available = deque(sorted(available_ranks, key=lambda rank: len(inflight[rank])))
+                    while pending and available:
+                        rank = available.popleft()
+                        sample, prompt, task_step = pending.popleft()
                         inflight[rank].add(sample)
-                    self.task_queues[rank].put((
-                        task_step, adapter_path, batch, dict(options)))
+                        self.task_queues[rank].put((task_step, adapter_path, [(sample, prompt, 1)], dict(options)))
+                        if len(inflight[rank]) < capacity:
+                            available.append(rank)
+                else:
+                    for position, rank in enumerate(available_ranks):
+                        if not pending:
+                            break
+                        remaining_ranks = len(available_ranks) - position
+                        count = min(capacity, max(1, (len(pending) + remaining_ranks - 1) // remaining_ranks))
+                        task_step = pending[0][2]
+                        batch = []
+                        while pending and len(batch) < count and pending[0][2] == task_step:
+                            sample, prompt, _step = pending.popleft()
+                            batch.append((sample, prompt, 1))
+                            inflight[rank].add(sample)
+                        self.task_queues[rank].put((task_step, adapter_path, batch, dict(options)))
 
                 if done and not pending and not any(inflight.values()):
                     break
                 try:
-                    rank, sample, results = self.result_queue.get(timeout=0.1)
+                    rank, sample, results = self.result_queue.get(timeout=0.01 if continuous else 0.1)
                 except queue.Empty:
                     dead = [(rank, None if proc is None else proc.exitcode)
                             for rank, proc in enumerate(self.procs)
                             if proc is None or proc.exitcode is not None]
                     if dead:
-                        raise RuntimeError(f"coder worker(s) exited during API pipeline: {dead}")
+                        raise RuntimeError(f"coder worker(s) exited during generation: {dead}")
                     continue
                 if sample is None and isinstance(results, dict):
                     raise RuntimeError(
-                        f"coder worker {rank} failed during API pipeline:\n"
+                        f"coder worker {rank} failed during generation:\n"
                         f"{results.get('error', 'unknown worker failure')}")
                 if (rank not in inflight or sample not in inflight[rank]
                         or len(results) != 1):
                     raise RuntimeError("unexpected, duplicate, or malformed pipelined coder result")
                 inflight[rank].remove(sample)
                 collected += 1
-                bar.update(1)
+                if bar is not None:
+                    bar.update(1)
                 yield requests.pop(sample), results
             if collected != int(total_expected):
                 raise RuntimeError(
-                    f"API coder pipeline returned {collected}/{total_expected} rollouts")
+                    f"coder pipeline returned {collected}/{total_expected} rollouts")
         finally:
-            bar.close()
+            if bar is not None:
+                bar.close()
+            if continuous:
+                if collected == int(total_expected) and not any(inflight.values()) and not pending:
+                    for tasks in self.task_queues:
+                        tasks.put(("__rollouts_done__",))
+                else:
+                    self.shutdown()
 
     def score_token_logprobs(self, prompt_response_pairs, show_progress=True,
                              adapter_path=None, require_complete=False,
@@ -2949,7 +3028,7 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
-        if self._pool_kwargs.get("hardware_profile") == "B200":
+        if self.host_memory_admission is not None:
             self._pool_kwargs["host_memory_admission"] = self.host_memory_admission
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
@@ -3016,24 +3095,19 @@ class PhasedVLLMGenerationPool:
                 self._pool_kwargs.get("num_workers", 1) or 1)
         return True
 
+    def spill_sleeping_to_disk(self, required_bytes=None):
+        if self._awake or self._pool is None or self._sleep_level != 1:
+            return 0
+        released = self._pool.spill_sleeping_to_disk(required_bytes)
+        if released:
+            print(f"[pool] spilled {released / 2**30:.1f} GiB of sleeping weights "
+                  "to temporary disk; files are released after wake", flush=True)
+        return released
+
     def _create_pool(self, **options):
-        startup_reservation = nullcontext()
-        if (self.host_memory_admission is not None
-                and self._pool_kwargs.get("hardware_profile") != "B200"
-                and not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
-                    "enable_lora", True)):
-            from models.strategist_models import strategist_profile
-            profile = strategist_profile(self._pool_kwargs["model_name"])
-            cards = int(self._pool_kwargs["num_workers"])
-            # Lazy mmap shares one reclaimable checkpoint cache across
-            # replicas. Charge every rank's separate host lookup table and
-            # staging headroom, not a duplicate full checkpoint per replica.
-            host_gib = (profile["weights_gib"]
-                        + (profile["ple_gib"] + 4.0) * cards)
-            startup_reservation = self.host_memory_admission.reservation(
-                int(host_gib * 2**30 * 1.05), wait_for_external=False)
-        with startup_reservation:
-            return GenerationPool(**self._pool_kwargs, **options)
+        # GenerationPool admits individual loading waves; do not reserve the
+        # same checkpoint again around those inner reservations.
+        return GenerationPool(**self._pool_kwargs, **options)
 
     def _ensure_started(self):
         if self._awake:

@@ -36,6 +36,7 @@ def validate_memory_handoff_runtime(training_file):
     import hashlib
     import inspect
     import generation.gen_workers as gen_workers
+    from runtime import disk_offload
     from vllm_compat import sleep_memory
 
     root = Path(training_file).resolve().parent
@@ -44,6 +45,7 @@ def validate_memory_handoff_runtime(training_file):
         'runtime/host_memory.py': Path(__file__).resolve(),
         'generation/gen_workers.py': Path(gen_workers.__file__).resolve(),
         "vllm_compat/sleep_memory.py": Path(sleep_memory.__file__).resolve(),
+        "runtime/disk_offload.py": Path(disk_offload.__file__).resolve(),
     }
     for name, loaded_path in components.items():
         if loaded_path != root / name:
@@ -56,17 +58,19 @@ def validate_memory_handoff_runtime(training_file):
             or not callable(getattr(gen_workers.PhasedVLLMGenerationPool,
                                     "release_for_training", None))
             or not callable(getattr(sleep_memory.SleepMemoryExtension,
-                                    "ttt_host_memory", None))):
+                                    "ttt_host_memory", None))
+            or not callable(getattr(sleep_memory.SleepMemoryExtension,
+                                    "ttt_disk_offload", None))):
         raise RuntimeError(
             "incomplete memory-handoff update: update train_multy_CVaR.py, "
             "generation/gen_workers.py, runtime/host_memory.py and "
-            "vllm_compat/sleep_memory.py "
+            "vllm_compat/sleep_memory.py and runtime/disk_offload.py "
             "together, then launch a fresh process")
     return {
         "checkout": str(root),
         "files": {name: hashlib.sha256(path.read_bytes()).hexdigest()
                   for name, path in components.items()},
-        "memory_handoff": "pageable backups; bounded transfers; incremental trainer restore",
+        "memory_handoff": "RAM-admitted pageable/disk backups; bounded transfers; incremental trainer restore",
     }
 
 

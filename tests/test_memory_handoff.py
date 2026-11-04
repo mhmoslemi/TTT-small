@@ -202,7 +202,7 @@ def test_sleep_extension_uses_pageable_backups_and_reclaims_only_unused_cache(mo
     assert len(allocations) == 2
 
 
-def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
+def test_unaffordable_backup_spills_to_disk_instead_of_removing_engines(monkeypatch):
     from generation.gen_workers import GenerationPool
 
     memory = {"total": 200 * GIB, "available": 30 * GIB}
@@ -214,18 +214,20 @@ def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
     pool._gpu_groups = [[0], [1]]
     pool.num_workers = pool.persistent_workers = 2
     pool.sleep_level = 1
-    stopped, restored = [], []
+    stopped, restored, spilled = [], [], []
     pool._stop_workers = lambda ranks: stopped.extend(ranks)
 
     def control(command, ranks):
-        assert command == "host_memory", "cannot allocate a 70-GiB backup here"
-        return {rank: {"backup_bytes": 70 * GIB} for rank in ranks}
+        if command == "host_memory":
+            return {rank: {"backup_bytes": 70 * GIB} for rank in ranks}
+        assert command == "sleep_disk", "cannot allocate a 70-GiB RAM backup here"
+        spilled.extend(ranks)
 
     pool._vllm_control = control
     pool.sleep(after_sleep=lambda ids: restored.extend(ids), host_admission=gate)
-    assert stopped == restored == [0, 1]
-    assert pool._transient_worker_ids == (0, 1)
-    assert pool.persistent_workers == 0 and pool.num_workers == 2
+    assert stopped == [] and restored == spilled == [0, 1]
+    assert pool._transient_worker_ids == ()
+    assert pool.persistent_workers == pool.num_workers == 2
 
 
 def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):

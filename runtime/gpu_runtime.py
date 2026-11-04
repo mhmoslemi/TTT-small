@@ -449,6 +449,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # estimate, not an output/context cap.
         active_target = (16_384 if using_vllm and uses_bounded_gpt_oss_repack(
             cfg.get("model_name"), cfg.get("vllm_quantization")) else 65_536)
+        if using_vllm and cfg.get("hardware_profile") == "B200":
+            active_target = 16_384
         active_tokens = min(max_len, active_target)
         _, kv_gib_per_active_seq_gpu = _vllm_memory_per_rank(
             cfg, parallel_size, active_tokens)
@@ -457,7 +459,13 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # Keep CUDA graph/admission metadata bounded even when short responses
         # would permit hundreds of sequences. One is retained as a safe floor;
         # vLLM profiles graph memory before fixing the KV-cache size.
-        ceiling = 64 if cfg.get("hardware_profile") == "B200" else 32
+        ceiling = 32
+        if cfg.get("hardware_profile") == "B200":
+            replicas = max(1, len(roles.generation) // parallel_size)
+            workload = int(cfg.get("groups_per_step", 0)) * int(cfg.get("group_size", 0))
+            # Size scheduler metadata to real work; paged KV admission remains
+            # vLLM's responsibility as response lengths grow during decoding.
+            ceiling = math.ceil(workload / replicas) if workload > 0 else 256
         cap = max(1, min(ceiling, estimated_active_sequences))
         # Wide MoE models on sub-60-GiB cards rely on a comparatively tight
         # tensor-parallel layout.  Bound scheduler/CUDA-graph concurrency even

@@ -114,7 +114,7 @@ def test_strategy_worker_accepts_followups_before_slow_request_finishes():
 
         tasks.put(("slow", None, [], {}))
         tasks.put(("fast", None, [], {}))
-        session = asyncio.create_task(gen_workers._serve_strategy_requests(tasks, generate))
+        session = asyncio.create_task(gen_workers._serve_generation_requests(tasks, generate))
         await events["fast"].wait()
         assert started == ["slow", "fast"] and not events["slow"].is_set()
         tasks.put(("followup", None, [], {}))
@@ -147,7 +147,7 @@ def test_strategy_worker_cancels_inflight_requests_on_shutdown_or_error(failure)
                 cancelled.set()
 
         tasks.put(("slow", None, [], {}))
-        session = asyncio.create_task(gen_workers._serve_strategy_requests(tasks, generate))
+        session = asyncio.create_task(gen_workers._serve_generation_requests(tasks, generate))
         await started.wait()
         if failure:
             tasks.put(("fail", None, [], {}))
@@ -164,7 +164,7 @@ def test_strategy_worker_cancels_inflight_requests_on_shutdown_or_error(failure)
 def test_strategy_worker_preserves_native_prompt_sampling_seed_and_context_limit():
     tree = ast.parse(Path(gen_workers.__file__).read_text())
     method = next(node for node in ast.walk(tree)
-                  if isinstance(node, ast.AsyncFunctionDef) and node.name == "_generate_strategy_request")
+                  if isinstance(node, ast.AsyncFunctionDef) and node.name == "_generate_single_request")
     encoded, requests, sampling = [], [], []
     results = Queue()
 

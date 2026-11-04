@@ -2,6 +2,23 @@
 
 
 class SleepMemoryExtension:
+    def ttt_disk_offload(self, directory, spill_sleeping=False):
+        import torch
+        from vllm.device_allocator import cumem
+        from runtime.disk_offload import VLLMDiskOffload
+        from runtime.host_memory import reclaim_unused_host_memory
+
+        storage = getattr(self, "_ttt_disk_storage", None)
+        if storage is None:
+            storage = self._ttt_disk_storage = VLLMDiskOffload(
+                cumem.CuMemAllocator.get_instance(), cumem, torch, directory)
+        if spill_sleeping:
+            released = storage.spill_sleeping()
+            reclaim_unused_host_memory(torch, force=True)
+            return released
+        storage.next_sleep_on_disk = True
+        return 0
+
     def ttt_host_memory(self):
         import torch
         from vllm.device_allocator.cumem import CuMemAllocator

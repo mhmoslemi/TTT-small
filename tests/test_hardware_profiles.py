@@ -107,7 +107,7 @@ class HardwareProfileTests(unittest.TestCase):
                 gpu.resolve_memory_settings(cfg, roles, self.cards())
                 self.assertEqual(cfg["max_seq_length"], context)
                 self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
-                self.assertLessEqual(cfg["gen_micro_batch"], 64)
+                self.assertLessEqual(cfg["gen_micro_batch"], 256)
                 self.assertEqual(cfg["vllm_max_num_batched_tokens"], 16384 if frozen else 8192)
                 if frozen:
                     for parents in (1, 3, 4, 8):
@@ -136,6 +136,23 @@ class HardwareProfileTests(unittest.TestCase):
                 model_name="qwen3.8-flash-next", max_seq_length=262144,
                 hardware_profile="B200", strategy_inference_profile=True), 2)
             self.assertEqual(weight, 100.0)
+
+    def test_b200_automatic_batch_scales_to_memory_and_real_work(self):
+        roles = gpu.allocate_gpu_roles(range(8), "erdos")
+        def resolve(profile, **overrides):
+            cfg = dict(model_name="Qwen/Qwen3.8-27B", max_seq_length=262144,
+                hardware_profile=profile, generation_backend="vllm", vllm_gpu_memory_utilization="auto",
+                vllm_runtime_reserve_gib=16, vllm_tensor_parallel_size=1, vllm_pipeline_parallel_size=1,
+                groups_per_step=8, group_size=512)
+            cfg.update(overrides)
+            gpu.resolve_memory_settings(cfg, roles, self.cards())
+            return cfg
+        full = resolve("B200")["gen_micro_batch"]
+        self.assertGreater(full, 64)
+        self.assertLessEqual(resolve("B200", groups_per_step=1, group_size=64)["gen_micro_batch"], 8)
+        self.assertEqual(resolve("B200", gen_micro_batch=4)["gen_micro_batch"], 4)
+        self.assertLessEqual(resolve("RTX6000")["gen_micro_batch"], 32)
+        self.assertEqual(resolve("B200")["max_seq_length"], 262144)
 
     def test_loading_waves_are_admitted_before_spawning(self):
         events = []

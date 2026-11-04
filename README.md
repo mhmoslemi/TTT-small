@@ -16,9 +16,21 @@ exact long-rollout handling remain in use. Sampling, precision, context limits
 and the RL objective are unchanged. Explicit YAML/CLI capacity settings still
 override automatic batch sizing. Inspect `setting.log` for resolved layouts.
 
+B200 coder requests use a shared queue and refill engines after individual
+rollouts finish. A parent's phase 2 starts as soon as its complete pilot set is
+evaluated, while other parents can still be generating/evaluating pilots.
+Automatic concurrency scales with available KV memory and the rollout workload,
+with no fixed 64-request ceiling. vLLM controls paged-KV admission as outputs grow.
+
 Loading, sleeping model backups and CPU activation offloads share live RAM
 admission with evaluation, leaving OS headroom and respecting Linux cgroup
-limits. Engines whose sleep backups cannot fit are released and reloaded.
+limits. Sleeping model replicas that cannot fit in RAM spill their exact loaded
+weights to disk in 64-MiB transfers. Each rank has at most one temporary file,
+released after wake; Linux also reclaims it if the worker is killed. Storage is
+under the run's `.offload/` directory, never a RAM-backed `/tmp`. Disk capacity
+is checked before spilling. RAM-resident backups remain the fast normal path.
+B200 launches verify/cache FlashInfer attention kernels before loading models,
+so worker initialization does not race eight downloads of missing artifacts.
 This is bounded resource planning, not a guarantee against arbitrary external
 allocations or a claim of benchmarked maximum throughput.
 

@@ -2861,7 +2861,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     )
                 print(line, flush=True)
 
-    def _run_adaptive_followups_as_ready(pilot_records, source_job_indices, run_phase):
+    def _run_adaptive_followups_as_ready(pilot_records, source_job_indices, run_phase, *,
+                                       pipelined=False, streaming_pilots=False):
         """Allocate and generate each parent as soon as its pilots finish.
 
         The selected allocator sees all strategies and every pilot for that
@@ -2878,7 +2879,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 raise RuntimeError(f"pilot record references unknown strategy {source_idx}")
             records_by_source[source_idx].append(record)
         for source_idx, records in records_by_source.items():
-            if len(records) != pilot_programs_per_strategy:
+            if len(records) > pilot_programs_per_strategy or (not streaming_pilots and len(records) != pilot_programs_per_strategy):
                 raise RuntimeError(
                     f"strategy job {source_idx} has {len(records)} pilot "
                     f"records; expected {pilot_programs_per_strategy}")
@@ -2908,9 +2909,25 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         all_followup_counts = [0] * len(source_job_indices)
         dispatched = 0
         dispatch_index = 0
-        while pending_chains:
+        seen_pilots = len(pilot_records)
+
+        def poll_phases():
+            nonlocal dispatched, dispatch_index, seen_pilots
+            if streaming_pilots:
+                for record in pilot_records[seen_pilots:]:
+                    source_idx = int(record["strategy_source_job_idx"])
+                    if source_idx not in records_by_source:
+                        raise RuntimeError(f"pilot record references unknown strategy {source_idx}")
+                    records_by_source[source_idx].append(record)
+                    if len(records_by_source[source_idx]) > pilot_programs_per_strategy:
+                        raise RuntimeError(f"strategy {source_idx} exceeded its pilot budget")
+                seen_pilots = len(pilot_records)
+            if not pending_chains:
+                return [], True
             ready_keys = []
             for key, chain_indices in pending_chains.items():
+                if any(len(records_by_source[index]) < pilot_programs_per_strategy for index in chain_indices):
+                    continue
                 chain_futures = [
                     record.get("_reward_future")
                     for source_idx in chain_indices
@@ -2924,17 +2941,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     ready_keys.append(key)
 
             if not ready_keys:
-                incomplete = {
-                    record["_reward_future"]
-                    for chain_indices in pending_chains.values()
-                    for source_idx in chain_indices
-                    for record in records_by_source[source_idx]
-                    if not record["_reward_future"].done()
-                }
-                if not incomplete:
-                    raise RuntimeError('adaptive pilot scheduler has no ready chain or pending reward')
-                wait(incomplete, return_when=FIRST_COMPLETED)
-                continue
+                return [], False
 
             ready_keys.sort()
             ready_sources = [source_idx for key in ready_keys for source_idx in pending_chains[key]]
@@ -2946,12 +2953,34 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 batch_counts[position] = int(count)
                 all_followup_counts[position] = int(count)
             batch_total = sum(batch_counts)
+            phases = []
             if batch_total:
-                run_phase(batch_counts, dispatch_index, batch_total, dispatched + batch_total, expected_followups)
+                phases.append((batch_counts, dispatch_index, batch_total,
+                               dispatched + batch_total, expected_followups))
                 dispatched += batch_total
                 dispatch_index += 1
             for key in ready_keys:
                 del pending_chains[key]
+            return phases, not pending_chains
+
+        if pipelined:
+            run_phase(poll_phases, expected_followups)
+        else:
+            while pending_chains:
+                phases, done = poll_phases()
+                for phase in phases:
+                    run_phase(*phase)
+                if not phases and not done:
+                    incomplete = {
+                        record["_reward_future"]
+                        for chain_indices in pending_chains.values()
+                        for source_idx in chain_indices
+                        for record in records_by_source[source_idx]
+                        if not record["_reward_future"].done()
+                    }
+                    if not incomplete:
+                        raise RuntimeError('adaptive pilot scheduler has no ready chain or pending reward')
+                    wait(incomplete, return_when=FIRST_COMPLETED)
 
         if dispatched != expected_followups:
             raise RuntimeError(
@@ -3165,11 +3194,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "starts as each program arrives",
                         flush=True,
                     )
-                    pilot_records = _run_vllm_code_phase(
-                        [pilot_programs_per_strategy]
-                        * len(source_job_indices),
-                        phase="pilot", seed_offset=0,
-                        progress_desc="pilot rollouts",
+                    stream_followups = bool(
+                        getattr(cfg, "hardware_profile", "RTX6000") == "B200"
+                        and cfg.generation_backend == "vllm")
+                    pilot_records = [] if stream_followups else _run_vllm_code_phase(
+                        [pilot_programs_per_strategy] * len(source_job_indices),
+                        phase="pilot", seed_offset=0, progress_desc="pilot rollouts",
                         defer_format_retries=True)
 
                     def _run_ready_vllm_followups(
@@ -3181,7 +3211,66 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             progress_desc=(f'adaptive rollouts {dispatched_after}/{expected_total}'),
                             defer_format_retries=True)
 
-                    _run_adaptive_followups_as_ready(pilot_records, source_job_indices, _run_ready_vllm_followups)
+                    def _run_streamed_vllm_followups(poll_phases, expected_total, *, pilot_records=None):
+                        phase_records, jobs_by_key = [], {}
+
+                        def ready_jobs(counts, phase, seed_offset):
+                            ready = []
+                            entries = _coder_effort_entries(
+                                prompt_jobs, source_job_indices, counts, cfg, step_idx, phase)
+                            for source_idx, count, effort in entries:
+                                prompt_idx = _phase_coder_prompt_job(
+                                    prompt_jobs, source_idx, phase, cfg, _render,
+                                    phase_prompt_job_cache, effort=effort)
+                                key = len(jobs_by_key)
+                                jobs_by_key[key] = (source_idx, prompt_idx, phase)
+                                ready.append(dict(
+                                    key=key, prompt_text=prompt_jobs[prompt_idx]["prompt_text"],
+                                    count=count, step_idx=int(step_idx) + seed_offset))
+                            return ready
+
+                        initial_jobs = []
+                        expected_pilots = 0
+                        if pilot_records is not None:
+                            expected_pilots = pilot_programs_per_strategy * len(source_job_indices)
+                            initial_jobs = ready_jobs(
+                                [pilot_programs_per_strategy] * len(source_job_indices), "pilot", 0)
+
+                        def poll_jobs():
+                            nonlocal initial_jobs
+                            phases, done = poll_phases()
+                            ready, initial_jobs = initial_jobs, []
+                            for counts, dispatch_index, _total, _dispatched, _expected in phases:
+                                ready.extend(ready_jobs(counts, "adaptive", 4_000_000 + dispatch_index * 100_000))
+                            return ready, done
+
+                        for key, results in gen_pool.iter_ready_jobs(
+                                poll_jobs, total_expected=expected_total + expected_pilots, adapter_path=adapter_path,
+                                max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature,
+                                top_p=cfg.top_p, top_k=getattr(cfg, "sampling_top_k", None),
+                                min_p=getattr(cfg, "sampling_min_p", None),
+                                return_logprobs=training_enabled,
+                                full_policy_sampling=_uses_sequence_level_policy_ratio(cfg),
+                                progress_desc="coder rollouts" if expected_pilots else "adaptive rollouts"):
+                            source_idx, prompt_idx, phase = jobs_by_key[key]
+                            for result in results:
+                                record = _queue_rollout(
+                                    prompt_idx, result[0], result[1], result[2] if len(result) > 2 else None,
+                                    rollout_phase=phase, strategy_source_job_idx=source_idx)
+                                _attach_strategy_plan(record, source_idx, phase)
+                                phase_records.append(record)
+                                if phase == "pilot":
+                                    pilot_records.append(record)
+                        if pilot_records is not None and len(pilot_records) != expected_pilots:
+                            raise RuntimeError("continuous generation changed the pilot budget")
+                        _defer_coder_format_retries(
+                            phase_records, seed_offset=0 if expected_pilots else 4_000_000)
+
+                    _run_adaptive_followups_as_ready(
+                        pilot_records, source_job_indices,
+                        (lambda poll, total: _run_streamed_vllm_followups(poll, total, pilot_records=pilot_records))
+                        if stream_followups else _run_ready_vllm_followups,
+                        pipelined=stream_followups, streaming_pilots=stream_followups)
                     _drain_deferred_coder_format_retries()
                 else:
                     # Keep the disabled path structurally identical to the
@@ -4892,6 +4981,9 @@ def main():
     print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
     # ---- backend + model ----
+    if cfg.generation_backend == "vllm":
+        from vllm_compat.kernel_cache import prepare_kernel_cache
+        prepare_kernel_cache(_parse_gpu_ids(cfg.gpu_ids), dependency_log_path)
     # Load backend FIRST so Unsloth can patch transformers if used.
     with startup_log.capture(loading=True), _route_dependency_notices(dependency_log_path):
         from models.model_backend import load_backend
@@ -5287,11 +5379,8 @@ def main():
                         flush=True,
                     )
 
-                # Normally the cache purge above is sufficient and both vLLM
-                # pools remain RAM-resident.  Under genuine pressure, discard
-                # only sleeping level-1 backups, largest/unused peer first.
-                # This trades one later checkpoint reload for survival instead
-                # of permanently choosing a slower level-2/transient policy.
+                # Move only inactive backups to disk when CPU trainer copies
+                # need the RAM; never discard their converted model weights.
                 if memory is not None:
                     reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
                     target_available = required_bytes + reserve_bytes
@@ -5308,14 +5397,13 @@ def main():
                     for pool_label, pool in pressure_candidates:
                         if memory["available"] >= target_available:
                             break
-                        discard = getattr(pool, "discard_sleeping_host_residency", None)
-                        if pool is None or not callable(discard) or not discard():
+                        spill = getattr(pool, "spill_sleeping_to_disk", None)
+                        if not callable(spill) or not spill(target_available - memory["available"]):
                             continue
                         memory = host_memory_info() or memory
                         print(
-                            f"[host-memory] low-RAM guard discarded the "
-                            f"sleeping {pool_label} vLLM weight backup; it "
-                            "will reload on its next use",
+                            f"[host-memory] moved sleeping {pool_label} "
+                            "weights to disk to make room for trainer offload",
                             flush=True,
                         )
                     if memory["available"] < target_available:
@@ -5358,6 +5446,31 @@ def main():
                         "the training model could not be offloaded for the "
                         "shared vLLM rollout phase; use generation_backend=hf "
                         "for live-model generation on this runtime") from exc
+
+            def _prepare_generation_phase(phase):
+                _offload_trainer_for_generation(phase)
+                # This must also run when the trainer is *already* on CPU:
+                # strategist -> coder previously bypassed the RAM check.
+                from runtime.gpu_runtime import _estimated_weight_gib
+                from runtime.host_memory import GIB, host_memory_info, host_memory_reserve_bytes
+                pool = strategy_pool if phase == "strategy" else gen_pool
+                if pool is None or pool._pool is not None:
+                    return
+                options = pool._pool_kwargs
+                cards = len(options["gpu_ids"])
+                width = max(1, int(options.get("vllm_tensor_parallel_size") or 1)
+                            * int(options.get("vllm_pipeline_parallel_size") or 1))
+                wanted = int((_estimated_weight_gib(options["model_name"], options.get("vllm_quantization"))
+                              * (cards // width) + 8 * cards) * GIB)
+                memory = host_memory_info()
+                if memory is not None:
+                    target = wanted + host_memory_reserve_bytes(memory)
+                    for peer in (gen_pool, strategy_pool):
+                        if memory["available"] >= target:
+                            break
+                        if peer is not None and peer is not pool:
+                            peer.spill_sleeping_to_disk(target - memory["available"])
+                            memory = host_memory_info() or memory
 
             def _restore_trainer_after_generation():
                 nonlocal trainer_offloaded
@@ -5414,7 +5527,7 @@ def main():
                 ensure_trainer_ready = _ensure_sharded_trainer_ready
 
             gen_pool = PhasedVLLMGenerationPool(
-                before_start=lambda: _offload_trainer_for_generation("coder"),
+                before_start=lambda: _prepare_generation_phase("coder"),
                 after_stop=_restore_trainer_after_generation,
                 **pool_options,
             )
@@ -5461,7 +5574,7 @@ def main():
                     "vllm_log_path": strategy_vllm_log_path,
                 })
                 strategy_pool = PhasedVLLMGenerationPool(
-                    before_start=lambda: _offload_trainer_for_generation("strategy"),
+                    before_start=lambda: _prepare_generation_phase("strategy"),
                     after_stop=_restore_trainer_after_generation,
                     **strategy_pool_options,
                 )
