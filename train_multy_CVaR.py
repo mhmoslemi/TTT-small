@@ -5457,11 +5457,12 @@ def main():
                 if pool is None or pool._pool is not None:
                     return
                 options = pool._pool_kwargs
-                cards = len(options["gpu_ids"])
                 width = max(1, int(options.get("vllm_tensor_parallel_size") or 1)
                             * int(options.get("vllm_pipeline_parallel_size") or 1))
+                # Make room for at least one engine, not eight hypothetical
+                # full CPU copies. Loading waves use all remaining RAM safely.
                 wanted = int((_estimated_weight_gib(options["model_name"], options.get("vllm_quantization"))
-                              * (cards // width) + 8 * cards) * GIB)
+                              + 8 * width) * GIB)
                 memory = host_memory_info()
                 if memory is not None:
                     target = wanted + host_memory_reserve_bytes(memory)
