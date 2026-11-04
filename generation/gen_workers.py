@@ -885,6 +885,17 @@ def _prepare_flashinfer_comm_compat():
     return True
 
 
+def _prepare_flashinfer_downloads():
+    from vllm_compat.kernel_cache import install_download_guard
+
+    os.environ["TTT_VLLM_KERNEL_DOWNLOAD_GUARD"] = "1"
+    compat_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vllm_compat")
+    paths = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    if compat_dir not in paths:
+        os.environ["PYTHONPATH"] = os.pathsep.join([compat_dir, *paths])
+    install_download_guard()
+
+
 def _redirect_vllm_output(log_path, rank, gpu_group):
     """Send this worker and all engine-core descendants to one append log."""
     if not log_path:
@@ -971,6 +982,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # the default while preserving an explicit operator override.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     _prepare_flashinfer_comm_compat()
+    _prepare_flashinfer_downloads()
     if seed is not None:
         # vLLM documents this setting for deterministic V1 offline inference.
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")

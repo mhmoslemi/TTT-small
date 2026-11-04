@@ -1,67 +1,43 @@
-"""Prepare shared FlashInfer attention artifacts before expensive GPU work."""
+"""Download compatibility installed lazily inside vLLM workers only."""
 
-import os
-from pathlib import Path
-import subprocess
+import functools
+import importlib.abc
+import importlib.machinery
 import sys
 
 
-def prepare_kernel_cache(gpu_ids, log_path):
-    from runtime.gpu_runtime import query_gpu_memory
-    cards = query_gpu_memory()
-    if not any("B200" in cards[gpu].name.upper() for gpu in gpu_ids if gpu in cards):
+def _configure_downloads(module):
+    download = module.download_file
+    if getattr(download, "_ttt_download_guard", False):
         return
-    print("[init] checking shared FlashInfer attention kernel cache ...", flush=True)
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
-    # Keep torch/FlashInfer imports out of the trainer: Unsloth must patch first.
-    with open(log_path, "a", encoding="utf-8") as log:
-        try:
-            subprocess.run([sys.executable, "-m", "vllm_compat.kernel_cache"],
-                           cwd=Path(__file__).resolve().parents[1], env=environment,
-                           stdout=log, stderr=log, check=True, timeout=900)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError(f"FlashInfer kernel cache preparation failed before model loading; see {log_path}") from exc
-    print("[init] shared FlashInfer attention kernels ready", flush=True)
+    # Let other engines wait for a cold-cache download instead of failing
+    # at FlashInfer's default 10s HTTP / 30s cache-lock deadlines.
+    module.download_file = functools.partial(download, retries=4, timeout=60, lock_timeout=600)
+    module.download_file._ttt_download_guard = True
 
 
-def cache_attention_artifacts():
-    import functools
-    from concurrent.futures import ThreadPoolExecutor
-    from pathlib import PurePosixPath
-    from flashinfer import artifacts
-    from flashinfer.jit import cubin_loader
+class _FlashInferDownloadGuard(importlib.abc.MetaPathFinder):
+    _ttt_download_guard = True
 
-    # The default 10s download/30s lock limits failed while eight engines
-    # competed for one cold cache. Fetch once, retaining upstream SHA checks.
-    cubin_loader.download_file = functools.partial(
-        cubin_loader.download_file, retries=4, timeout=60, lock_timeout=600)
-    get_artifact = getattr(cubin_loader, "get_artifact", None) or cubin_loader.get_cubin
-    subdir = artifacts.ArtifactPath.TRTLLM_GEN_FMHA.rstrip("/")
-    checksum = get_artifact(f"{subdir}/checksums.txt", artifacts.CheckSumHash.TRTLLM_GEN_FMHA)
-    if not checksum:
-        raise RuntimeError(f"cannot fetch verified FlashInfer manifest: {subdir}")
-    files = []
-    for line in checksum.decode("utf-8").splitlines():
-        if not line.strip():
-            continue
-        digest, name = line.split(maxsplit=1)
-        name = name.lstrip("*")
-        path = PurePosixPath(name)
-        if path.is_absolute() or ".." in path.parts or len(digest) != 64:
-            raise ValueError(f"invalid FlashInfer manifest entry: {name}")
-        files.append((f"{subdir}/{path}", digest))
-    if not files:
-        raise RuntimeError("FlashInfer manifest contained no kernel files")
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != "flashinfer.jit.cubin_loader":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is not None and spec.loader is not None:
+            execute = spec.loader.exec_module
 
-    def fetch(item):
-        name, digest = item
-        if not get_artifact(name, digest):
-            raise RuntimeError(f"cannot fetch verified FlashInfer artifact: {name}")
+            def exec_module(module):
+                execute(module)
+                _configure_downloads(module)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        list(executor.map(fetch, files))
-    print(f"[kernel-cache] verified {len(files)} FlashInfer attention artifacts", flush=True)
+            spec.loader.exec_module = exec_module
+        return spec
 
 
-if __name__ == "__main__":
-    cache_attention_artifacts()
+def install_download_guard():
+    """No torch/FlashInfer import, downloads, subprocesses or waiting here."""
+    module = sys.modules.get("flashinfer.jit.cubin_loader")
+    if module is not None:
+        _configure_downloads(module)
+    elif not any(getattr(finder, "_ttt_download_guard", False) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _FlashInferDownloadGuard())

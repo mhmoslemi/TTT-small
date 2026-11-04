@@ -4981,9 +4981,6 @@ def main():
     print_dashboard(startup_log.fields, exp_dir, resuming=bool(resume_dir))
 
     # ---- backend + model ----
-    if cfg.generation_backend == "vllm":
-        from vllm_compat.kernel_cache import prepare_kernel_cache
-        prepare_kernel_cache(_parse_gpu_ids(cfg.gpu_ids), dependency_log_path)
     # Load backend FIRST so Unsloth can patch transformers if used.
     with startup_log.capture(loading=True), _route_dependency_notices(dependency_log_path):
         from models.model_backend import load_backend

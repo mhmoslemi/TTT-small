@@ -29,8 +29,9 @@ weights to disk in 64-MiB transfers. Each rank has at most one temporary file,
 released after wake; Linux also reclaims it if the worker is killed. Storage is
 under the run's `.offload/` directory, never a RAM-backed `/tmp`. Disk capacity
 is checked before spilling. RAM-resident backups remain the fast normal path.
-B200 launches verify/cache FlashInfer attention kernels before loading models,
-so worker initialization does not race eight downloads of missing artifacts.
+FlashInfer downloads remain on demand during normal vLLM initialization. Its
+HTTP and cache-lock timeouts allow a slow cold-cache download shared by multiple
+engines; there is no extra startup process or bulk-kernel preflight.
 This is bounded resource planning, not a guarantee against arbitrary external
 allocations or a claim of benchmarked maximum throughput.
 
