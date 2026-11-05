@@ -7,7 +7,7 @@ ttt_project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ttt_project_dir"
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3,4,5,6,7}"
+export AVAILABLE_GPUS="${AVAILABLE_GPUS:-6,7}"
 # Hard host-RAM cap for this entire run, including all child processes (decimal GB).
 # Requires Linux cgroup v2 + systemd; refuses to launch if not enforced.
 # Override the limit explicitly; HOST_RAM_GB='' opts out of the cap.
