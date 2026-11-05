@@ -653,3 +653,67 @@ def estimated_optimizer_bytes(optimizer):
             seen.add(identity)
             total += max(0, size)
     return total
+
+
+def verify_host_memory_limit(limit_bytes, root="/sys/fs/cgroup", membership="/proc/self/cgroup"):
+    """Fail closed unless this process is inside the requested v2 memory cap."""
+    for line in Path(membership).read_text().splitlines():
+        hierarchy, controllers, relative = line.split(":", 2)
+        if hierarchy != "0" or controllers:
+            continue
+        relative = Path(relative.lstrip("/"))
+        if ".." in relative.parts:
+            continue
+        scope = Path(root) / relative
+        maximum = (scope / "memory.max").read_text().strip()
+        if (maximum != "max" and 0 < int(maximum) <= limit_bytes
+                and (scope / "memory.swap.max").read_text().strip() == "0"
+                and (scope / "memory.oom.group").read_text().strip() == "1"):
+            return
+    raise RuntimeError("requested whole-run RAM/swap limit is not enforced; refusing to start training")
+
+
+def _host_memory_limit_main(argv=None):
+    """Run under a private OS limit; the existing admission gate reads it too."""
+    import argparse
+    import shutil
+    import sys
+
+    parser = argparse.ArgumentParser(description="Enforce a whole-run host-RAM cap (decimal GB).")
+    parser.add_argument("--limit-gb", type=int, required=True)
+    parser.add_argument("--verify", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if args.limit_gb <= 0 or not command:
+        parser.error("--limit-gb must be positive and a command is required after --")
+    limit_bytes = args.limit_gb * 1_000_000_000
+    if args.verify:
+        try:
+            verify_host_memory_limit(limit_bytes)
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.error(str(error))
+        print(f"[memory] whole-run host-RAM cap: {args.limit_gb} GB "
+              f"({limit_bytes / GIB:.1f} GiB), swap disabled; "
+              "includes trainers, generation and evaluation workers. "
+              "Exhausting the cap can terminate this run.", flush=True)
+        os.execvp(command[0], command)
+    else:
+        runner = shutil.which("systemd-run")
+        if sys.platform != "linux" or runner is None or not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            parser.error("HOST_RAM_GB requires Linux cgroup v2 and systemd-run; "
+                         "in a container, configure its memory limit on the host. "
+                         "Refusing an uncapped launch.")
+        manager = [] if os.geteuid() == 0 else ["--user"]
+        print(f"[memory] requesting {args.limit_gb}-GB whole-run cap; "
+              "systemd permission/manager failures abort launch (no uncapped fallback)", flush=True)
+        os.execvp(runner, [runner, *manager, "--scope", "--collect",
+                          "--expand-environment=no",
+                          f"--property=MemoryMax={limit_bytes}",
+                          "--property=MemorySwapMax=0", "--property=MemoryOOMGroup=yes",
+                          "--", sys.executable, "-m", "runtime.host_memory",
+                          "--limit-gb", str(args.limit_gb), "--verify", "--", *command])
+
+
+if __name__ == "__main__":
+    _host_memory_limit_main()
