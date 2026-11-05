@@ -677,6 +677,7 @@ def _host_memory_limit_main(argv=None):
     """Run under a private OS limit; the existing admission gate reads it too."""
     import argparse
     import shutil
+    import subprocess
     import sys
 
     parser = argparse.ArgumentParser(description="Enforce a whole-run host-RAM cap (decimal GB).")
@@ -705,10 +706,17 @@ def _host_memory_limit_main(argv=None):
                          "in a container, configure its memory limit on the host. "
                          "Refusing an uncapped launch.")
         manager = [] if os.geteuid() == 0 else ["--user"]
+        try:
+            help_text = subprocess.run([runner, "--help"], capture_output=True,
+                                       text=True, check=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            parser.error(f"cannot inspect systemd-run options: {error}; refusing an uncapped launch")
+        # Before v254, --scope already passes arguments literally and has no such option.
+        literal_args = ["--expand-environment=no"] if "--expand-environment" in help_text else []
         print(f"[memory] requesting {args.limit_gb}-GB whole-run cap; "
               "systemd permission/manager failures abort launch (no uncapped fallback)", flush=True)
         os.execvp(runner, [runner, *manager, "--scope", "--collect",
-                          "--expand-environment=no",
+                          *literal_args,
                           f"--property=MemoryMax={limit_bytes}",
                           "--property=MemorySwapMax=0", "--property=MemoryOOMGroup=yes",
                           "--", sys.executable, "-m", "runtime.host_memory",
