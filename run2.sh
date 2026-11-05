@@ -8,9 +8,11 @@ cd "$ttt_project_dir"
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-0,1,2,3,4,5,6,7}"
-# Optional hard host-RAM cap for this entire run, including all child processes.
+# Hard host-RAM cap for this entire run, including all child processes (decimal GB).
 # Requires Linux cgroup v2 + systemd; refuses to launch if not enforced.
-# AVAILABLE_GPUS=6,7 HOST_RAM_GB=300 sh run2.sh
+# Override the limit explicitly; HOST_RAM_GB='' opts out of the cap.
+export HOST_RAM_GB="${HOST_RAM_GB-350}"
+# AVAILABLE_GPUS=6,7 HOST_RAM_GB=350 sh run2.sh
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
 config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
