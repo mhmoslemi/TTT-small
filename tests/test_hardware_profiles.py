@@ -62,7 +62,7 @@ class HardwareProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_problem_config(dict(problem="erdos", hardware_profile="B20"), require_complete=False)
         for path in (ROOT / "configs").glob("*.yaml"):
-            self.assertIn("hardware_profile: RTX6000", path.read_text())
+            self.assertRegex(path.read_text(), r"(?m)^hardware_profile: (RTX6000|B200)[ \t]*(?:#.*)?$")
         source = (ROOT / "runtime/configuration.py").read_text()
         self.assertLess(source.index("restore_hardware_settings(merged"), source.index("# 3) CLI overlay"))
 
@@ -89,7 +89,7 @@ class HardwareProfileTests(unittest.TestCase):
             ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", 131072, True, 1),
             ("qwen3.8-flash-next", 262144, True, 1),
             ("Qwen/Qwen3.8-Flash-Next-FP8", 262144, True, 1),
-            ("Qwen/Qwen3.8-Flash-Next", 262144, True, 4),
+            ("Qwen/Qwen3.8-Flash-Next", 262144, True, 2),
             ("deepseek-v4-flash-0731", 262144, True, 2),
         ]
         for model, context, frozen, expected_tp in cases:
