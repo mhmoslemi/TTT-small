@@ -196,9 +196,14 @@ class Problem(ABC):
 ## Code-stage output
 
 Use the task information and strategy above to produce the complete solution.
-Treat the strategy as planning guidance: preserve useful ideas, but correct any
-mistake or conflict with the task, required interface, or current parent
-construction. Do not output analysis, reasoning, a strategy, notes, or example
+Read the strategy critically and extract useful mathematical insights,
+algorithmic ideas, and implementation details. Build on the parts you judge
+helpful. Treat its proposals as suggestions, not requirements: you are free to
+adapt, simplify, combine, replace, or discard any part, including choosing a
+different overall approach. Use your own judgment to produce the best valid
+solution, while following the original task, evaluator, required interface,
+and execution constraints.
+Do not output analysis, reasoning, a strategy, notes, or example
 usage. Return only exactly one fenced Python code block, beginning with
 ```python and ending with ```."""
         if staged and staged[-1].get("role") == "user":
