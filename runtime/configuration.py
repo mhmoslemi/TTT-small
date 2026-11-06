@@ -435,6 +435,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of local strategist engines to retain between phases; "
                         "0 shuts down all engines after planning and reloads them next step "
                         "without keeping host-RAM weight backups.")
+    p.add_argument("--trainer-offload-dir", type=str, default=None,
+                   help="Park ordinary frozen trainer weights on disk during generation; "
+                        "only adapters/optimizer stay in RAM. Use a disk filesystem, not tmpfs.")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
                    help="Fraction of each generation GPU reserved by vLLM's "
                         "weights and KV cache (default: 0.9).")
@@ -696,6 +699,8 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
+    # Disk parking is launch-local; do not inherit another machine's directory.
+    merged["trainer_offload_dir"] = args.trainer_offload_dir
     from search.sampler import can_migrate_parent_selection, parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"

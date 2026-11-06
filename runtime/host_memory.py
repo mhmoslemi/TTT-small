@@ -149,6 +149,12 @@ def automatic_activation_offload_budget_bytes(
 def host_memory_reserve_bytes(info):
     """Leave OS/runtime headroom without assuming a particular model or node."""
     total = max(1, int(info["total"]))
+    override = os.environ.get("TTT_HOST_MEMORY_RESERVE_GIB")
+    if override is not None:
+        reserve = float(override)
+        if not math.isfinite(reserve) or reserve <= 0:
+            raise ValueError("TTT_HOST_MEMORY_RESERVE_GIB must be finite and positive")
+        return min(total // 4, int(reserve * GIB))
     return min(total // 4, max(GIB, min(128 * GIB, total // 10)))
 
 
@@ -607,11 +613,15 @@ def reclaim_unused_host_memory(
     return result
 
 
-def estimated_module_bytes(model):
+def estimated_module_bytes(model, *, frozen_to_disk=False):
     """Estimate bytes needed for one full CPU copy of a model replica."""
     total = 0
     seen = set()
     tensors = list(model.parameters()) + list(model.buffers())
+    if frozen_to_disk:
+        tensors = [tensor for tensor in tensors if tensor.requires_grad]
+        tensors += [parameter.grad for parameter in model.parameters()
+                    if parameter.grad is not None]
     for tensor in tensors:
         try:
             storage = tensor.untyped_storage()

@@ -620,7 +620,7 @@ class _ModelPlacementBackend:
                 "provide more training GPUs; silent spill would be unstable")
         self._trainer_is_offloaded = False
 
-    def offload_for_generation(self):
+    def offload_for_generation(self, *, disk_directory=None):
         if getattr(self, "_trainer_is_offloaded", False):
             return
         placement_model = getattr(self, "_placement_model", self.model)
@@ -633,6 +633,9 @@ class _ModelPlacementBackend:
             except (ImportError, AttributeError):
                 pass
         try:
+            if disk_directory:
+                from runtime.disk_offload import DiskWeightOffload
+                self._disk_weights = DiskWeightOffload(self.model, disk_directory)
             self.model.to("cpu")
             self._trainer_is_offloaded = True
         except Exception:
@@ -649,6 +652,9 @@ class _ModelPlacementBackend:
     def restore_after_generation(self):
         if not getattr(self, "_trainer_is_offloaded", False):
             return
+        if getattr(self, "_disk_weights", None) is not None:
+            self._disk_weights.restore()
+            self._disk_weights = None
         device_map = getattr(self, "_training_device_map", None) or {}
         placement_model = getattr(self, "_placement_model", self.model)
         devices = {str(target) for target in device_map.values()
@@ -1252,13 +1258,16 @@ class UnslothBackend(_ModelPlacementBackend):
     def set_inference_mode(self):
         self._FastLanguageModel.for_inference(self.model)
 
-    def offload_for_generation(self):
+    def offload_for_generation(self, *, disk_directory=None):
         if (not getattr(self, "_trainer_is_offloaded", False)
                 and str(getattr(self.cfg, "coder_model_profile", ""))
                 == "gpt-oss-120b"):
             from models.gpt_oss_training import release_checkpoint_workspaces
             release_checkpoint_workspaces()
-        super().offload_for_generation()
+        if disk_directory:
+            super().offload_for_generation(disk_directory=disk_directory)
+        else:
+            super().offload_for_generation()
 
     def set_training_mode(self):
         self._FastLanguageModel.for_training(self.model)
@@ -1490,8 +1499,8 @@ class _AutoFallbackBackend:
     def disable_adapter(self):
         return self._inner.disable_adapter()
 
-    def offload_for_generation(self):
-        return self._inner.offload_for_generation()
+    def offload_for_generation(self, *, disk_directory=None):
+        return self._inner.offload_for_generation(disk_directory=disk_directory)
 
     def restore_after_generation(self):
         return self._inner.restore_after_generation()

@@ -5333,6 +5333,7 @@ def main():
 
             def _offload_trainer_for_generation(phase="coder"):
                 nonlocal trainer_offloaded
+                disk_directory = getattr(cfg, "trainer_offload_dir", None)
                 if (parallel_trainer is not None and parallel_trainer.is_offloaded):
                     return
                 if parallel_trainer is None and trainer_offloaded:
@@ -5348,7 +5349,8 @@ def main():
                 # gradients untouched and runs only once per rollout step.
                 if parallel_trainer is not None:
                     cleanups = parallel_trainer.reclaim_host_memory()
-                    required_bytes = (parallel_trainer.estimated_host_offload_bytes())
+                    required_bytes = parallel_trainer.estimated_host_offload_bytes(
+                        frozen_to_disk=bool(disk_directory))
                 else:
                     torch.cuda.synchronize()
                     cleanups = [reclaim_unused_host_memory(
@@ -5357,7 +5359,8 @@ def main():
                         force=True,
                     )]
                     required_bytes = int(
-                        1.05 * (estimated_module_bytes(model) + estimated_optimizer_bytes(optimizer))
+                        1.05 * (estimated_module_bytes(model, frozen_to_disk=bool(disk_directory))
+                                + estimated_optimizer_bytes(optimizer))
                         + GIB
                     )
 
@@ -5382,7 +5385,11 @@ def main():
                 # This trades one later checkpoint reload for survival instead
                 # of permanently choosing a slower level-2/transient policy.
                 if memory is not None:
-                    reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
+                    if disk_directory:
+                        from runtime.host_memory import host_memory_reserve_bytes
+                        reserve_bytes = host_memory_reserve_bytes(memory)
+                    else:
+                        reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
                     target_available = required_bytes + reserve_bytes
                     if phase == "strategy":
                         pressure_candidates = (
@@ -5420,15 +5427,18 @@ def main():
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
+                destination = (f"disk ({disk_directory}); only adapters/optimizer stay in RAM"
+                               if disk_directory else "CPU")
                 setting_log_only(
-                    f"[gpu] offloading {replica_label} to CPU before "
+                    f"[gpu] offloading {replica_label} to {destination} before "
                     "shared-GPU vLLM generation", flush=True)
                 try:
                     if parallel_trainer is not None:
-                        parallel_trainer.offload_for_generation(purge_host_cache=False)
+                        parallel_trainer.offload_for_generation(
+                            purge_host_cache=False, disk_directory=disk_directory)
                     else:
                         _move_optimizer_state(optimizer, "cpu")
-                        backend.offload_for_generation()
+                        backend.offload_for_generation(disk_directory=disk_directory)
                         import gc
                         gc.collect()
                         torch.cuda.empty_cache()

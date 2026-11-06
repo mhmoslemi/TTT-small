@@ -1761,11 +1761,12 @@ class ReplicatedDataParallelTrainer:
     def is_offloaded(self):
         return self._offloaded
 
-    def estimated_host_offload_bytes(self):
+    def estimated_host_offload_bytes(self, *, frozen_to_disk=False):
         """RAM required to move every live trainer replica off its GPU."""
         from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
 
-        model_bytes = sum(estimated_module_bytes(model) for _, model, _, _ in self.replicas)
+        model_bytes = sum(estimated_module_bytes(model, frozen_to_disk=frozen_to_disk)
+                          for _, model, _, _ in self.replicas)
         optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
         # The model estimate is storage-exact.  The small margin covers Python
         # tensor metadata, allocator alignment, and one GiB of workspace per
@@ -2502,7 +2503,7 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self, *, purge_host_cache=True):
+    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None):
         """Release every replica before an all-GPU vLLM phase."""
         if self._offloaded:
             return
@@ -2518,7 +2519,10 @@ class ReplicatedDataParallelTrainer:
                 torch.cuda.synchronize(logical_id)
             _move_optimizer_state(self.optimizer, "cpu")
             for backend, _, _, _ in self.replicas:
-                backend.offload_for_generation()
+                if disk_directory:
+                    backend.offload_for_generation(disk_directory=disk_directory)
+                else:
+                    backend.offload_for_generation()
             gc.collect()
             for logical_id in range(self.world_size):
                 with torch.cuda.device(logical_id):
@@ -2706,11 +2710,11 @@ class ProcessDistributedTrainer:
     def is_offloaded(self):
         return self._offloaded
 
-    def estimated_host_offload_bytes(self):
+    def estimated_host_offload_bytes(self, *, frozen_to_disk=False):
         """RAM required to move every live trainer replica off its GPU."""
         from runtime.host_memory import (GIB, estimated_module_bytes, estimated_optimizer_bytes)
 
-        model_bytes = estimated_module_bytes(self.model)
+        model_bytes = estimated_module_bytes(self.model, frozen_to_disk=frozen_to_disk)
         optimizer_bytes = estimated_optimizer_bytes(self.optimizer)
         # All worker models have the same storage layout as rank zero.  The
         # optimizer exists only on rank zero; workers retain gradients/model
@@ -3974,7 +3978,7 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self, *, purge_host_cache=True):
+    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None):
         if self._offloaded:
             return
         import gc
@@ -3991,10 +3995,13 @@ class ProcessDistributedTrainer:
         self._offloaded_ranks = set(range(self._world_size))
         try:
             for command_queue in self._command_queues.values():
-                command_queue.put({"kind": "offload"})
+                command_queue.put({"kind": "offload", "disk_directory": disk_directory})
             torch.cuda.synchronize(0)
             _move_optimizer_state(self.optimizer, "cpu")
-            self.backend.offload_for_generation()
+            if disk_directory:
+                self.backend.offload_for_generation(disk_directory=disk_directory)
+            else:
+                self.backend.offload_for_generation()
             gc.collect()
             with torch.cuda.device(0):
                 torch.cuda.empty_cache()

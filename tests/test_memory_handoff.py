@@ -16,6 +16,176 @@ from generation.gen_workers import PhasedVLLMGenerationPool
 from training import exact_overflow
 
 
+def test_disk_parking_preserves_weights_ties_buffers_and_adam_updates(tmp_path, monkeypatch):
+    import copy
+    import torch
+    from runtime import disk_offload
+
+    monkeypatch.setattr(disk_offload, "CHUNK_BYTES", 16)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = torch.nn.Linear(5, 3, bias=False).requires_grad_(False)
+            self.adapter = torch.nn.Linear(5, 3, bias=False)
+            self.tied = self.base.weight
+            self.register_buffer("offset", torch.arange(3.))
+            self.register_buffer("counter", torch.tensor(7), persistent=False)
+            self.register_buffer("bf16", torch.arange(11, dtype=torch.bfloat16))
+
+        def forward(self, inputs):
+            return self.base(inputs) + self.adapter(inputs) + self.offset
+
+    model = Model()
+    baseline = copy.deepcopy(model)
+    optimizer = torch.optim.Adam(model.adapter.parameters(), lr=.001)
+    reference = torch.optim.Adam(baseline.adapter.parameters(), lr=.001)
+    inputs = torch.arange(10.).reshape(2, 5)
+    parameter_ids = [id(p) for p in model.parameters()]
+    for _ in range(2):
+        for network, adam in ((model, optimizer), (baseline, reference)):
+            adam.zero_grad()
+            network(inputs).square().mean().backward()
+            adam.step()
+        expected = copy.deepcopy(model.state_dict())
+        parked = disk_offload.DiskWeightOffload(model, tmp_path)
+        assert model.base.weight.numel() == model.offset.numel() == model.counter.numel() == 0
+        assert model.adapter.weight.numel() == 15
+        assert model.tied is model.base.weight
+        assert [id(p) for p in model.parameters()] == parameter_ids
+        assert next(iter(optimizer.state)) is model.adapter.weight
+        parked.restore()
+        parked.restore()  # idempotent after the first successful restore
+        assert parked.file.closed and not parked.entries
+        assert model.counter.item() == 7
+        for name, tensor in model.state_dict().items():
+            assert torch.equal(tensor, expected[name]), name
+            assert torch.equal(tensor, baseline.state_dict()[name]), name
+        assert torch.equal(model(inputs), baseline(inputs))
+
+
+def test_disk_parking_write_failure_restores_already_parked_weights(tmp_path, monkeypatch):
+    import torch
+    from runtime import disk_offload
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)).requires_grad_(False)
+    expected = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+    original = disk_offload.DiskWeightOffload._release_file_cache
+    calls = []
+
+    def fail_once(parked):
+        calls.append(True)
+        if len(calls) == 2:
+            raise OSError("disk write failed")
+        original(parked)
+
+    monkeypatch.setattr(disk_offload.DiskWeightOffload, "_release_file_cache", fail_once)
+    with pytest.raises(OSError, match="disk write failed"):
+        disk_offload.DiskWeightOffload(model, tmp_path)
+    for name, tensor in model.state_dict().items():
+        assert torch.equal(tensor, expected[name]), name
+
+
+def test_disk_parking_checks_capacity_before_changing_weights(tmp_path, monkeypatch):
+    import torch
+    from runtime import disk_offload
+
+    model = torch.nn.Linear(2, 2).requires_grad_(False)
+    expected = model.weight.clone()
+    monkeypatch.setattr(disk_offload.shutil, "disk_usage", lambda _: SimpleNamespace(free=0))
+    with pytest.raises(OSError, match="insufficient disk space"):
+        disk_offload.DiskWeightOffload(model, tmp_path)
+    assert torch.equal(model.weight, expected)
+
+
+def test_backend_disk_handoff_restores_before_training_and_keeps_parameter_objects(tmp_path, monkeypatch):
+    import torch
+    from models.model_backend import HFBackend
+
+    backend = HFBackend(SimpleNamespace())
+    model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 2))
+    model[0].requires_grad_(False)
+    backend.model = model
+    expected = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+    identities = [id(p) for p in model.parameters()]
+    moves = []
+    original_to = model.to
+
+    def move(target):
+        moves.append(target)
+        if target != "cpu":
+            for name, tensor in model.state_dict().items():
+                assert torch.equal(tensor, expected[name]), name
+        return original_to("cpu")  # Exercise placement order on the CPU test host.
+
+    monkeypatch.setattr(model, "to", move)
+    backend.offload_for_generation(disk_directory=tmp_path)
+    assert model[0].weight.numel() == 0 and model[1].weight.numel() == 6
+    backend.offload_for_generation(disk_directory=tmp_path)
+    backend.restore_after_generation()
+    backend.restore_after_generation()
+    assert moves == ["cpu", "cuda:0"]
+    assert backend._disk_weights is None and not backend._trainer_is_offloaded
+    assert [id(p) for p in model.parameters()] == identities
+
+
+def test_process_trainer_forwards_disk_handoff_to_all_ranks(tmp_path, monkeypatch):
+    import torch
+    from training.trainers import ProcessDistributedTrainer
+
+    events = []
+    trainer = object.__new__(ProcessDistributedTrainer)
+    trainer._offloaded, trainer._world_size = False, 2
+    trainer.optimizer = SimpleNamespace(state={})
+    trainer._command_queues = {1: SimpleNamespace(put=lambda message: events.append(message))}
+    trainer.backend = SimpleNamespace(offload_for_generation=lambda **options: events.append(options))
+    trainer._collect_event = lambda name, ranks: events.append((name, tuple(ranks)))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda *a: nullcontext())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    trainer.offload_for_generation(purge_host_cache=False, disk_directory=str(tmp_path))
+    assert events == [{"kind": "offload", "disk_directory": str(tmp_path)},
+                      {"disk_directory": str(tmp_path)}, ("offloaded", (1,))]
+    assert trainer._offloaded_ranks == {0, 1}
+
+
+def test_disk_offload_estimate_keeps_adapter_gradients_and_optimizer():
+    import torch
+    from training.trainers import ProcessDistributedTrainer
+
+    model = torch.nn.Sequential(torch.nn.Linear(128, 128), torch.nn.Linear(128, 2))
+    model[0].requires_grad_(False)
+    model(torch.ones(1, 128)).sum().backward()
+    optimizer = torch.optim.Adam(model[1].parameters())
+    optimizer.step()
+    trainer = object.__new__(ProcessDistributedTrainer)
+    trainer.model, trainer.optimizer, trainer._world_size = model, optimizer, 2
+    adapter_bytes = sum(t.numel() * t.element_size() for p in model[1].parameters()
+                        for t in (p, p.grad))
+    assert host_memory.estimated_module_bytes(model, frozen_to_disk=True) == adapter_bytes
+    expected = int(1.05 * (2 * adapter_bytes + host_memory.estimated_optimizer_bytes(optimizer)) + 2 * GIB)
+    assert trainer.estimated_host_offload_bytes(frozen_to_disk=True) == expected
+    assert trainer.estimated_host_offload_bytes() > expected
+
+
+def test_run_specific_ram_reserve_admits_small_strategy_without_changing_defaults(monkeypatch):
+    memory = dict(total=1696 * GIB, available=int(112.9 * GIB))
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: memory)
+    monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
+    assert host_memory.host_memory_reserve_bytes(memory) == 128 * GIB
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
+    with pytest.raises(host_memory.HostMemoryUnavailable):
+        with gate.reservation(26 * GIB, wait_for_external=False):
+            pass
+    monkeypatch.setenv("TTT_HOST_MEMORY_RESERVE_GIB", "16")
+    with gate.reservation(26 * GIB, wait_for_external=False):
+        assert gate.reserved_bytes == 26 * GIB
+    for invalid in ("0", "-1", "nan", "inf"):
+        monkeypatch.setenv("TTT_HOST_MEMORY_RESERVE_GIB", invalid)
+        with pytest.raises(ValueError, match="finite and positive"):
+            host_memory.host_memory_reserve_bytes(memory)
+
+
 def test_unsloth_offload_releases_storage_and_buffers_can_regrow(monkeypatch):
     import torch
     from models.model_backend import UnslothBackend, _ModelPlacementBackend
