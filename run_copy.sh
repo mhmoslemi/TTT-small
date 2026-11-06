@@ -71,9 +71,10 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
+# Keep the small strategist's existing RAM cache; reload only coder generation engines.
 exec python3 train_multy_CVaR.py --config "$config_path" --advantage-mode spo-rs --fast --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
-    --isolate-eval --fused-long-attention "$@"
+    --isolate-eval --fused-long-attention --reload-coder-between-phases "$@"
     # 
     # 
     # 

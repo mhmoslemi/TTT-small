@@ -130,7 +130,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                        strategy_top_k=0, strategy_min_p=0.),
             merged=dict(self.current, problem="erdos"), profile_explicit_keys=set(),
             RETIRED_BATCH_GROWTH_KEYS=set(), resume_dir=self.run,
-            args=SimpleNamespace(groups_per_step=12), skip=set(),
+            args=SimpleNamespace(groups_per_step=12, reload_coder_between_phases=True), skip=set(),
             _CLI_TO_CFG={}, parser=SimpleNamespace(get_default=lambda key: None),
         )
         with patch.dict(sys.modules, {'search.sampler': sampler}), redirect_stdout(io.StringIO()):
@@ -154,6 +154,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             exec(compile(ast.Module(body=[cli], type_ignores=[]),
                          "cli_overlay", "exec"), namespace)
         self.assertEqual(namespace["merged"]["groups_per_step"], 12)
+        self.assertTrue(namespace["merged"]["reload_coder_between_phases"])
 
 
 if __name__ == "__main__":

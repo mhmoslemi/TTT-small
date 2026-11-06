@@ -224,7 +224,9 @@ def _coder_model_profile(model_name):
 
 
 def _coder_vllm_persistent_workers(cfg):
-    """Release GPT-OSS coder engines completely during adapter training."""
+    """Release coder engines when requested, or for GPT-OSS adapter training."""
+    if bool(getattr(cfg, "reload_coder_between_phases", False)):
+        return 0
     if (str(getattr(cfg, "coder_model_profile", "")) == "gpt-oss-120b" and not bool(getattr(cfg, "no_train", False))):
         return 0
     return None

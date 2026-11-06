@@ -8,11 +8,6 @@ cd "$ttt_project_dir"
 
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-6,7}"
-# Hard host-RAM cap for this entire run, including all child processes (decimal GB).
-# Requires Linux cgroup v2 + systemd; refuses to launch if not enforced.
-# Override the limit explicitly; HOST_RAM_GB='' opts out of the cap.
-export HOST_RAM_GB="${HOST_RAM_GB-350}"
-# AVAILABLE_GPUS=6,7 HOST_RAM_GB=350 sh run2.sh
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
 config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # config_path="${TTT_CONFIG:-configs/erdos-c4.yaml}"
@@ -72,13 +67,9 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
-set -- python3 train_multy_CVaR.py --config "$config_path" --advantage-mode spo-rs --fast --measure-entropy \
+exec python3 train_multy_CVaR.py --config "$config_path" --advantage-mode spo-rs --fast --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
     --isolate-eval --fused-long-attention "$@"
-if [ -n "${HOST_RAM_GB:-}" ]; then
-    exec python3 -m runtime.host_memory --limit-gb "$HOST_RAM_GB" -- "$@"
-fi
-exec "$@"
     # 
     # 
     # 

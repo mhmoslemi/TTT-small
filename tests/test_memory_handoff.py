@@ -297,6 +297,59 @@ def test_transient_handoff_restores_every_trainer_without_sleep():
     assert not pool.active
 
 
+def test_coder_reload_is_opt_in_and_keeps_existing_model_defaults():
+    from models.coder_profiles import _coder_vllm_persistent_workers
+    from runtime.configuration import _build_arg_parser
+
+    parser = _build_arg_parser()
+    assert parser.parse_args([]).reload_coder_between_phases is None
+    args = parser.parse_args(["--resume", "runs/ac1", "--reload-coder-between-phases"])
+    args.coder_model_profile = "qwen3.8-27b"
+    assert _coder_vllm_persistent_workers(args) == 0
+    assert _coder_vllm_persistent_workers(SimpleNamespace(coder_model_profile="qwen3.8-27b")) is None
+    assert _coder_vllm_persistent_workers(SimpleNamespace(coder_model_profile="gpt-oss-120b")) == 0
+
+
+def test_coder_reloads_current_adapter_while_strategist_stays_cached(monkeypatch):
+    events = []
+
+    def create(pool, **options):
+        name = pool._pool_kwargs["model_name"]
+        persistent = pool._pool_kwargs["vllm_persistent_workers"] != 0
+        events.append((name, "load"))
+        return SimpleNamespace(
+            num_workers=2, persistent_workers=2 if persistent else 0,
+            sleep_supported=persistent,
+            shutdown=lambda: events.append((name, "shutdown")),
+            sleep=lambda: events.append((name, "sleep")),
+            wake_up=lambda: events.append((name, "wake")),
+            generate_groups=lambda **kwargs: events.append((name, kwargs["adapter_path"])))
+
+    monkeypatch.setattr(PhasedVLLMGenerationPool, "_create_pool", create)
+    coder = PhasedVLLMGenerationPool(
+        lambda: None, lambda: None, model_name="Qwen/Qwen3.8-27B", gpu_ids=[6, 7],
+        num_workers=2, vllm_persistent_workers=0)
+    strategy = PhasedVLLMGenerationPool(
+        lambda: None, lambda: None, model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+        gpu_ids=[6, 7], num_workers=2, vllm_persistent_workers=None, vllm_sleep_level=1)
+    trainer = SimpleNamespace(host_memory_admission=None,
+                              restore_on_gpus=lambda ids: events.append(("restore", ids)))
+    for step in (1, 2):
+        strategy.generate_groups(adapter_path=None)
+        strategy.release()
+        coder.generate_groups(adapter_path=f"adapter_step{step:03d}")
+        coder.release_for_training(trainer)
+
+    coder_name, strategy_name = coder._pool_kwargs["model_name"], strategy._pool_kwargs["model_name"]
+    assert events.count((coder_name, "load")) == events.count((coder_name, "shutdown")) == 2
+    assert (coder_name, "sleep") not in events
+    assert (coder_name, "adapter_step001") in events and (coder_name, "adapter_step002") in events
+    assert events.count((strategy_name, "load")) == events.count((strategy_name, "wake")) == 1
+    assert events.count((strategy_name, "sleep")) == 2
+    assert (strategy_name, "shutdown") not in events
+    assert events.count(("restore", [6, 7])) == 2
+
+
 @pytest.mark.parametrize("available, released", [(700., []), (608.5, ["strategy"]),
                                                 (300., ["strategy", "coder"])])
 def test_parking_reclaims_only_the_sleeping_pools_it_needs(monkeypatch, available, released):

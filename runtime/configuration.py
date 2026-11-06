@@ -427,6 +427,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "rollouts are done, so group_size can be anything while "
                         "per-GPU KV memory stays bounded by this. With vLLM this "
                         "sets max_num_seqs. 0 lets the backend choose.")
+    p.add_argument("--reload-coder-between-phases", action="store_const", const=True, default=None,
+                   help="Release coder vLLM engines instead of keeping host-RAM weight backups; "
+                        "reload the base model and current LoRA adapter for the next generation phase. "
+                        "Does not change strategist residency or training.")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
                    help="Fraction of each generation GPU reserved by vLLM's "
                         "weights and KV cache (default: 0.9).")
