@@ -121,6 +121,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         sampler.parent_selection_mode = lambda config: config.get("parent_selection", "puct")
         namespace = dict(
             saved=dict(self.saved, problem="erdos", num_seed_states=10,
+                       strategy_vllm_persistent_workers=2,
                        learning_rate=0.01, strategy_max_seq_length=131072,
                        strategy_max_new_tokens=65536, strategy_temperature=.6, strategy_top_p=.95,
                        strategy_top_k=50, strategy_min_p=.1),
@@ -130,7 +131,8 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                        strategy_top_k=0, strategy_min_p=0.),
             merged=dict(self.current, problem="erdos"), profile_explicit_keys=set(),
             RETIRED_BATCH_GROWTH_KEYS=set(), resume_dir=self.run,
-            args=SimpleNamespace(groups_per_step=12, reload_coder_between_phases=True), skip=set(),
+            args=SimpleNamespace(groups_per_step=12, reload_coder_between_phases=True,
+                                 strategy_vllm_persistent_workers=0), skip=set(),
             _CLI_TO_CFG={}, parser=SimpleNamespace(get_default=lambda key: None),
         )
         with patch.dict(sys.modules, {'search.sampler': sampler}), redirect_stdout(io.StringIO()):
@@ -140,6 +142,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             self.assertEqual(namespace["merged"]["programs_per_strategy"], 10)
             self.assertEqual(namespace["merged"]["pilot_programs_per_strategy"], 6)
             self.assertEqual(namespace["merged"]["learning_rate"], 0.01)
+            self.assertEqual(namespace["merged"]["strategy_vllm_persistent_workers"], 2)
             self.assertEqual(tuple(namespace["merged"][key] for key in (
                 "num_seed_states", "seed_min_points", "seed_max_points")), (10, 40, 99))
             self.assertEqual(tuple(namespace["merged"][key] for key in (
@@ -155,6 +158,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                          "cli_overlay", "exec"), namespace)
         self.assertEqual(namespace["merged"]["groups_per_step"], 12)
         self.assertTrue(namespace["merged"]["reload_coder_between_phases"])
+        self.assertEqual(namespace["merged"]["strategy_vllm_persistent_workers"], 0)
 
 
 if __name__ == "__main__":

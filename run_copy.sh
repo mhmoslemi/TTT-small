@@ -50,7 +50,7 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # No extra model forwards; skipped/unscored examples have missing coverage.
 #   sh run.sh --measure-entropy
 # Opt into hierarchical rollouts. The frozen strategist runs first, is fully
-# offloaded, then the LoRA coder generates programs and trains. With this flag
+# unloaded, then the LoRA coder generates programs and trains. With this flag
 # absent and api_strategy empty, the coder uses direct one-stage rollouts:
 #   sh run.sh --strategies
 # Retry a coder response missing its required final code block once. Coder
@@ -71,10 +71,11 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
-# Keep the small strategist's existing RAM cache; reload only coder generation engines.
+# Reload both generation models each step; keep no sleeping weight backups in RAM.
 exec python3 train_multy_CVaR.py --config "$config_path" --advantage-mode spo-rs --fast --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
-    --isolate-eval --fused-long-attention --reload-coder-between-phases "$@"
+    --isolate-eval --fused-long-attention --reload-coder-between-phases \
+    --strategy-vllm-persistent-workers 0 "$@"
     # 
     # 
     # 

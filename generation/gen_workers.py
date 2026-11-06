@@ -3101,8 +3101,9 @@ class PhasedVLLMGenerationPool:
                     elif int(self._pool_kwargs.get(
                             "vllm_persistent_workers", -1)) == 0:
                         setting_log_only(
-                            "[pool] transient coder engines selected; all "
-                            "CUDA/NCCL residency is released before training",
+                            "[pool] transient generation engines selected; no "
+                            "host-RAM weight backups, and all CUDA/NCCL "
+                            "residency is released at phase handoff",
                             flush=True,
                         )
                     else:

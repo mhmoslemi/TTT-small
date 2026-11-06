@@ -431,6 +431,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Release coder vLLM engines instead of keeping host-RAM weight backups; "
                         "reload the base model and current LoRA adapter for the next generation phase. "
                         "Does not change strategist residency or training.")
+    p.add_argument("--strategy-vllm-persistent-workers", type=int, default=None,
+                   help="Number of local strategist engines to retain between phases; "
+                        "0 shuts down all engines after planning and reloads them next step "
+                        "without keeping host-RAM weight backups.")
     p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None,
                    help="Fraction of each generation GPU reserved by vLLM's "
                         "weights and KV cache (default: 0.9).")

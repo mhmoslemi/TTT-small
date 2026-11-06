@@ -297,20 +297,31 @@ def test_transient_handoff_restores_every_trainer_without_sleep():
     assert not pool.active
 
 
-def test_coder_reload_is_opt_in_and_keeps_existing_model_defaults():
+def test_generation_reload_controls_keep_existing_model_defaults():
     from models.coder_profiles import _coder_vllm_persistent_workers
     from runtime.configuration import _build_arg_parser
 
     parser = _build_arg_parser()
     assert parser.parse_args([]).reload_coder_between_phases is None
-    args = parser.parse_args(["--resume", "runs/ac1", "--reload-coder-between-phases"])
+    assert parser.parse_args([]).strategy_vllm_persistent_workers is None
+    args = parser.parse_args(["--resume", "runs/ac1", "--reload-coder-between-phases",
+                             "--strategy-vllm-persistent-workers", "0"])
     args.coder_model_profile = "qwen3.8-27b"
     assert _coder_vllm_persistent_workers(args) == 0
+    assert args.strategy_vllm_persistent_workers == 0
     assert _coder_vllm_persistent_workers(SimpleNamespace(coder_model_profile="qwen3.8-27b")) is None
     assert _coder_vllm_persistent_workers(SimpleNamespace(coder_model_profile="gpt-oss-120b")) == 0
 
 
-def test_coder_reloads_current_adapter_while_strategist_stays_cached(monkeypatch):
+@pytest.mark.parametrize("strategy_persistent_workers", [None, 0])
+def test_coder_reloads_current_adapter_with_optional_strategy_cache(monkeypatch, strategy_persistent_workers):
+    from models.coder_profiles import _coder_vllm_persistent_workers
+    from runtime.configuration import _build_arg_parser
+
+    arguments = ["--reload-coder-between-phases"]
+    if strategy_persistent_workers == 0:
+        arguments += ["--strategy-vllm-persistent-workers", "0"]
+    args = _build_arg_parser().parse_args(arguments)
     events = []
 
     def create(pool, **options):
@@ -328,10 +339,11 @@ def test_coder_reloads_current_adapter_while_strategist_stays_cached(monkeypatch
     monkeypatch.setattr(PhasedVLLMGenerationPool, "_create_pool", create)
     coder = PhasedVLLMGenerationPool(
         lambda: None, lambda: None, model_name="Qwen/Qwen3.8-27B", gpu_ids=[6, 7],
-        num_workers=2, vllm_persistent_workers=0)
+        num_workers=2, vllm_persistent_workers=_coder_vllm_persistent_workers(args))
     strategy = PhasedVLLMGenerationPool(
         lambda: None, lambda: None, model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-        gpu_ids=[6, 7], num_workers=2, vllm_persistent_workers=None, vllm_sleep_level=1)
+        gpu_ids=[6, 7], num_workers=2,
+        vllm_persistent_workers=args.strategy_vllm_persistent_workers, vllm_sleep_level=1)
     trainer = SimpleNamespace(host_memory_admission=None,
                               restore_on_gpus=lambda ids: events.append(("restore", ids)))
     for step in (1, 2):
@@ -344,9 +356,16 @@ def test_coder_reloads_current_adapter_while_strategist_stays_cached(monkeypatch
     assert events.count((coder_name, "load")) == events.count((coder_name, "shutdown")) == 2
     assert (coder_name, "sleep") not in events
     assert (coder_name, "adapter_step001") in events and (coder_name, "adapter_step002") in events
-    assert events.count((strategy_name, "load")) == events.count((strategy_name, "wake")) == 1
-    assert events.count((strategy_name, "sleep")) == 2
-    assert (strategy_name, "shutdown") not in events
+    if strategy_persistent_workers == 0:
+        assert strategy._pool is None and coder._pool is None
+        assert events == [event for step in (1, 2) for event in (
+            (strategy_name, "load"), (strategy_name, None), (strategy_name, "shutdown"),
+            (coder_name, "load"), (coder_name, f"adapter_step{step:03d}"),
+            (coder_name, "shutdown"), ("restore", [6, 7]))]
+    else:
+        assert events.count((strategy_name, "load")) == events.count((strategy_name, "wake")) == 1
+        assert events.count((strategy_name, "sleep")) == 2
+        assert (strategy_name, "shutdown") not in events
     assert events.count(("restore", [6, 7])) == 2
 
 
