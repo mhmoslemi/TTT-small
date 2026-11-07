@@ -2038,6 +2038,18 @@ class GenerationPool:
 
     def _stop_workers(self, worker_ids):
         worker_ids = tuple(int(rank) for rank in worker_ids)
+        descendants = {}
+        if self.backend == "vllm":
+            import psutil
+
+            # Capture children before shutdown can orphan an EngineCore in its own group.
+            for rank in worker_ids:
+                process = self.procs[rank]
+                if process is not None and process.pid is not None:
+                    try:
+                        descendants[rank] = psutil.Process(process.pid).children(recursive=True)
+                    except psutil.NoSuchProcess:
+                        pass
         for rank in worker_ids:
             process = self.procs[rank]
             task_queue = self.task_queues[rank]
@@ -2062,6 +2074,25 @@ class GenerationPool:
                 if process.is_alive():
                     process.kill()
                     process.join(timeout=5)
+            if descendants.get(rank):
+                for child in descendants[rank]:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                _, alive = psutil.wait_procs(descendants[rank], timeout=5)
+                for child in alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                _, alive = psutil.wait_procs(alive, timeout=5)
+                for child in alive:
+                    try:
+                        if child.status() != psutil.STATUS_ZOMBIE:
+                            raise RuntimeError(f"vLLM child {child.pid} did not exit; refusing GPU handoff")
+                    except psutil.NoSuchProcess:
+                        pass
             self.procs[rank] = None
             self._ready_worker_ids.discard(rank)
             self._sleep_capable_workers.discard(rank)

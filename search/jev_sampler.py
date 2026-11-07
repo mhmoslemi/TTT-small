@@ -80,12 +80,17 @@ def _probabilities(response):
 
 
 class PUCTJevSampler(PUCTSampler):
-    def __init__(self, *args, exp_dir, problem, model_path=None, **kwargs):
+    def __init__(self, *args, exp_dir, problem, model_path=None,
+                 candidate_multiplier=3, **kwargs):
         if exp_dir is None or problem is None:
             raise ValueError("puct-jev requires the run directory and problem")
+        if (isinstance(candidate_multiplier, bool)
+                or not isinstance(candidate_multiplier, int) or candidate_multiplier < 1):
+            raise ValueError("jev_candidate_multiplier must be a positive integer")
         super().__init__(*args, **kwargs)
         self.exp_dir, self.problem = Path(exp_dir), problem
         self.model_path = model_path or MODEL_ID
+        self.candidate_multiplier = candidate_multiplier
         self.gpu_id = 0
         self.before_judge = self.after_judge = None
         self._selection_step, self._selected = None, []
@@ -144,6 +149,7 @@ class PUCTJevSampler(PUCTSampler):
         else:
             saved = {"version": 1, "signature": signature, "step": step,
                      "requested": count, "model": str(self.model_path),
+                     "candidate_multiplier": self.candidate_multiplier,
                      "threshold": SAME_CORE_THRESHOLD, "seeds": self._seed_manifest(),
                      "problem_description": description, "question": QUESTION,
                      "sources": {}, "comparisons": [], "selected": None}
@@ -171,7 +177,17 @@ class PUCTJevSampler(PUCTSampler):
         return picks
 
     def _diverse_picks(self, count, path, saved, description):
-        scored = self._ranked_states()
+        # Keep the unfinished step's budget when the YAML changes on resume.
+        multiplier = saved.get("candidate_multiplier", self.candidate_multiplier)
+        if (isinstance(multiplier, bool) or not isinstance(multiplier, int)
+                or multiplier < 1):
+            raise ValueError("saved jev_candidate_multiplier must be a positive integer")
+        ranked = self._ranked_states()
+        scored = ranked[:count * multiplier]
+        saved.update(candidate_multiplier=multiplier, candidate_limit=len(scored))
+        _write(path, saved)
+        print(f"[puct-jev] considering top {len(scored)}/{len(ranked)} candidates "
+              f"(X={multiplier}, requested parents={count})", flush=True)
         children = self._build_children_map()
         blocked, picked, rejected = set(), set(), set()
         picks, infos, decisions = [], [], []
@@ -237,14 +253,14 @@ class PUCTJevSampler(PUCTSampler):
                                comparisons=comparisons, lineage_relaxed=relax_lineage)
                         decisions.append({"candidate_id": candidate.id, "accepted": True})
 
-            # A finite archive may not contain enough distinct algorithms.
+            # Fill within the same bounded window without further comparisons.
             for entry in scored:
                 if len(picks) >= count:
                     break
                 if entry[2].id in picked:
                     continue
                 accept(entry, "duplicate_fallback", lineage_relaxed=True)
-                print(f"[puct-jev] diversity exhausted; filling with "
+                print(f"[puct-jev] candidate window exhausted; filling with "
                       f"{entry[2].id} in PUCT order", flush=True)
         saved["decisions"] = decisions
         self.last_picks_info = infos

@@ -514,7 +514,9 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
                    topk_children=sampler.topk_children)
     if cfg.parent_selection == "puct-jev":
         from search.jev_sampler import PUCTJevSampler
-        migrated = PUCTJevSampler(model_path=getattr(cfg, "jev_model_path", None), **options)
+        migrated = PUCTJevSampler(
+            model_path=getattr(cfg, "jev_model_path", None),
+            candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3), **options)
         detail = "PUCT ordering with GLiDE-9B semantic comparisons"
     else:
         from search.llm_sampler import LLMSampler
@@ -806,6 +808,43 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
     artifacts.sort(key=lambda item: (
         int(item["meta"]["group"]), int(item["meta"]["rollout"])))
     return artifacts
+
+
+def _require_saved_rollouts(exp_dir, checkpoint, cfg):
+    """Refuse a fresh step before model loading or unfinished-step mutation."""
+    from experiment_io import ROLLOUT_BUDGET_KEYS
+
+    if checkpoint is None:
+        raise FileNotFoundError(
+            f"--require-saved-rollouts needs {Path(exp_dir) / 'training_state.pt'}; "
+            "use the original cluster run, including its Git-ignored checkpoint and adapters")
+    if cfg.advantage_mode != "spo-rs":
+        raise ValueError("--require-saved-rollouts requires SPO-RS")
+    step = int(checkpoint["next_step"])
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    parents_path = step_dir / f"step{step:02d}.parents.json"
+    saved = json.loads(parents_path.read_text()).get("rollout_config")
+    if saved is None:
+        saved = json.loads((Path(exp_dir) / "config.json").read_text())
+    changed = [key for key in ROLLOUT_BUDGET_KEYS
+               if key in saved and getattr(cfg, key, None) != int(saved[key])]
+    if changed:
+        raise ValueError("--require-saved-rollouts refuses changed rollout counts: "
+                         + ", ".join(changed))
+    artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, cfg)
+                 or _recoverable_pending_spo_rs_artifacts(exp_dir, step, cfg))
+    if artifacts is None:
+        raise RuntimeError(
+            f"--require-saved-rollouts: step {step} has no complete recoverable "
+            f"batch in {step_dir}; refusing to regenerate. Pending rollouts need "
+            "their .meta.json, .txt, .prompt.txt, .tokens.zlib and "
+            ".behavior_logprobs.zlib files from the original cluster run")
+    tracker = checkpoint.get("spo_rs_tracker") or {}
+    for name in (checkpoint["adapter_dir"], tracker.get("last_policy_adapter")):
+        if not name or not (Path(exp_dir) / name).is_dir():
+            raise FileNotFoundError(f"saved-rollout recovery is missing adapter: {name}")
+    print(f"[resume] step {step}: {len(artifacts)} saved rollouts found; "
+          "regeneration is disabled for this interrupted step", flush=True)
 
 
 def _literal_metadata_mapping(value):
@@ -1287,8 +1326,9 @@ def _finalize_pending_spo_rs_artifacts(
     completed = _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg)
     if completed is None:
         raise RuntimeError("generated-step recovery failed to seal complete rollout metadata")
-    _prepare_recoverable_response_tokens(None, tokenizer, completed)
-    return completed
+    # Keep the already loaded trajectories instead of doubling recovery RAM.
+    cached = {item["meta_path"]: item for item in artifacts}
+    return [{**cached[item["meta_path"]], **item} for item in completed]
 
 
 def _resume_spo_rs_step_from_artifacts(
@@ -4721,10 +4761,13 @@ def main():
                                    save_best_state_snapshot,
                                    save_final_summary, save_step_summary)
         resume_dir = merged.pop("_resume_dir", None)
+        require_saved_rollouts = merged.pop("_require_saved_rollouts", False)
         if resume_dir:
             # Read only the cursor via memory-mapped CPU storage before model
             # loading, so stale overflow recovery cannot consume a new batch.
             checkpoint = _load_training_checkpoint(resume_dir, mmap=True)
+            if require_saved_rollouts:
+                _require_saved_rollouts(resume_dir, checkpoint, cfg)
             if checkpoint is not None:
                 restart_step = int(checkpoint["next_step"])
             else:
@@ -4737,6 +4780,7 @@ def main():
                 # Re-resolve layout without the old step's overflow marker.
                 cfg, merged = load_config()
                 merged.pop("_resume_dir", None)
+                merged.pop("_require_saved_rollouts", None)
         exp_dir = make_experiment_dir(cfg, resume_dir=resume_dir, config_dict=merged)
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
         startup_log.title = ("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
@@ -4890,7 +4934,8 @@ def main():
     selection_detail = ("gpt-6-luna, reasoning=max; first pick=best raw score"
                         if selection == "llm" else f"c={cfg.puct_c}")
     if selection == "puct-jev":
-        selection_detail += f"; GLiDE-9B={cfg.jev_model_path}; same-core threshold=0.90; step 0=PUCT"
+        selection_detail += (f"; GLiDE-9B={cfg.jev_model_path}; same-core threshold=0.90; "
+                             f"candidate window={cfg.jev_candidate_multiplier}x parents; step 0=PUCT")
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     print(f"Groups per step:    {cfg.groups_per_step}")
@@ -5163,6 +5208,7 @@ def main():
         group_size=int(cfg.group_size), seed=int(cfg.seed),
         exp_dir=exp_dir, problem=problem,
         jev_model_path=getattr(cfg, "jev_model_path", None),
+        jev_candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
@@ -5731,6 +5777,9 @@ def main():
                     interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
                 if interrupted_spo_rs_artifacts is None:
                     pending_spo_rs_artifacts = (_recoverable_pending_spo_rs_artifacts(exp_dir, step, step_cfg))
+                if (require_saved_rollouts and interrupted_spo_rs_artifacts is None
+                        and pending_spo_rs_artifacts is None):
+                    raise RuntimeError("saved rollouts became unavailable; refusing to regenerate")
             else:
                 interrupted_spo_rs_artifacts = None
                 pending_spo_rs_artifacts = None

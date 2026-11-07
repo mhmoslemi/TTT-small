@@ -48,12 +48,19 @@ environment and the checkpoint's native inference code; its `requirements.txt`
 lists the vendor's validated dependencies. No packages are installed at runtime.
 
 Step 0 uses ordinary PUCT and never loads GLiDE. On later steps PUCT proposes
-parents in score order. GLiDE receives the problem description and two complete
+parents in score order, considering at most the top
+`jev_candidate_multiplier * groups_per_step` candidates. Every YAML defaults
+`jev_candidate_multiplier` to `3`: eight requested parents means a window of
+24 candidates, including the first accepted parent. Selection stops early when
+the batch is full. One candidate can require comparisons with multiple accepted
+parents, so this bounds candidates rather than individual model requests.
+GLiDE receives the problem description and two complete
 proposed Python programs, returning probabilities for `same_core_idea`,
 `meaningful_variant`, and `different_approach`. A candidate is skipped if any
 accepted parent matches with `same_core_idea >= 0.90`; uncertain cases remain
-eligible. Original lineage blocking is relaxed if needed, then semantically
-rejected candidates fill any remaining slots in PUCT order, explicitly logged
+eligible. Original lineage blocking is relaxed within that window if needed,
+then rejected candidates fill any remaining slots in PUCT order without
+further comparisons or looking outside the window, explicitly logged
 as `duplicate_fallback`. The archive and expansion statistics are preserved.
 
 The trainer is parked before the first comparison, GLiDE loads on the first
@@ -64,8 +71,10 @@ than silently truncating source or bypassing comparison.
 
 Each step saves its problem, compared sources, probabilities, and final picks
 in `stepNN/stepNN.jev.json`; worker diagnostics are in `stepNN.jev.worker.log`.
-Completed comparisons and parent selections are reused on resume. An existing
-PUCT checkpoint can switch to `puct-jev` at the next fresh step while preserving
+Completed comparisons and parent selections are reused on resume. An
+unfinished selection retains its saved candidate multiplier; edits to the
+current YAML apply to fresh selections. Older saved selections still replay.
+A PUCT checkpoint can switch to `puct-jev` at the next fresh step while preserving
 the archive, adapter, optimizer and visit counts.
 
 ## Directory guide

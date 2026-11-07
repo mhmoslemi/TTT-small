@@ -61,7 +61,8 @@ class ParentPickerContractTests(unittest.TestCase):
                 elif mode == "puct-jev":
                     self.assertIs(actual, local.PUCTJevSampler.return_value)
                     local.PUCTJevSampler.assert_called_once_with(
-                        exp_dir="run", problem="task", model_path=None, num_seeds=2)
+                        exp_dir="run", problem="task", model_path=None,
+                        candidate_multiplier=3, num_seeds=2)
                 else:
                     self.assertIs(actual, self.scope["PUCTSampler"].return_value)
                     self.scope["PUCTSampler"].assert_called_with(use_uct=(mode == "uct"), num_seeds=2)

@@ -57,7 +57,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_api_max_retries",
     "strategy_format_max_retries",
     "strict_strategy_validation",
-    "uct", "parent_selection", "jev_model_path",
+    "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
     "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
     "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
@@ -246,6 +246,8 @@ def validate_problem_config(
     if "jev_model_path" in data and (not isinstance(data["jev_model_path"], str)
                                     or not data["jev_model_path"].strip()):
         raise ValueError(f"{_label(source)}: jev_model_path must be a nonempty path")
+    if "jev_candidate_multiplier" in data:
+        _positive_int(data, "jev_candidate_multiplier", source)
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

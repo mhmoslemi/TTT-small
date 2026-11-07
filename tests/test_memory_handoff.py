@@ -398,6 +398,83 @@ def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
     assert pool.persistent_workers == 0 and pool.num_workers == 2
 
 
+@pytest.mark.parametrize("released", [True, False])
+def test_restore_waits_for_gpu_release_but_keeps_total_limit(monkeypatch, released):
+    import torch
+    from training import fast_distributed as fast
+
+    usage = iter([(9 * GIB, 100 * GIB),
+                  ((95 if released else 9) * GIB, 100 * GIB)])
+    clock = iter([0, 0, 1])
+    sleeps, limits = [], []
+    monkeypatch.setattr(fast, "time", SimpleNamespace(
+        monotonic=lambda: next(clock), sleep=sleeps.append))
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: GIB)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 2 * GIB)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: next(usage))
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
+                        lambda fraction, **kw: limits.append(fraction))
+    if released:
+        assert fast.set_total_memory_ceiling(1, .88, wait_seconds=1) == pytest.approx(.85)
+        assert limits == [pytest.approx(.85)]
+    else:
+        with pytest.raises(RuntimeError, match="89.0 GiB outside"):
+            fast.set_total_memory_ceiling(1, .88, wait_seconds=1)
+        assert not limits
+    assert sleeps == [.5]
+
+
+def test_vllm_shutdown_reaps_children_outside_wrapper_process_group():
+    import os
+    import subprocess
+    import psutil
+    from generation import gen_workers as workers
+
+    if os.name != "posix":
+        pytest.skip("private process groups require POSIX")
+    script = ("import subprocess, sys\n"
+              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+              "print(child.pid, flush=True)\n"
+              "sys.stdin.readline()\n")
+    wrapper = subprocess.Popen([sys.executable, "-c", script], start_new_session=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                 start_new_session=True)
+    child = None
+    try:
+        child = psutil.Process(int(wrapper.stdout.readline()))
+        assert os.getpgid(child.pid) != os.getpgid(wrapper.pid)
+        def stop(_):
+            wrapper.stdin.write("stop\n")
+            wrapper.stdin.flush()
+        pool = object.__new__(workers.GenerationPool)
+        pool.backend = "vllm"
+        pool.procs = [SimpleNamespace(pid=wrapper.pid, is_alive=lambda: wrapper.poll() is None,
+            join=wrapper.wait, terminate=wrapper.terminate, kill=wrapper.kill)]
+        pool.task_queues = [SimpleNamespace(put=stop, close=lambda: None, join_thread=lambda: None)]
+        pool._ready_worker_ids = {0}
+        pool._sleep_capable_workers = {0}
+        pool._async_worker_ids = {0}
+        pool._stop_workers([0])
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+        assert unrelated.poll() is None
+        assert pool.procs == [None] and not pool._ready_worker_ids
+    finally:
+        if child is not None:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        for process in (wrapper, unrelated):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        wrapper.stdin.close()
+        wrapper.stdout.close()
+
+
 def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     import torch
     import training.fast_distributed as fast_distributed
@@ -424,7 +501,7 @@ def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
-    monkeypatch.setattr(fast_distributed, "set_total_memory_ceiling", lambda *a: None)
+    monkeypatch.setattr(fast_distributed, "set_total_memory_ceiling", lambda *a, **kw: None)
     monkeypatch.setattr(fast_distributed, "validate_model_device", lambda *a: None)
     monkeypatch.setattr("training.trainers._restore_optimizer_state_to_parameters", lambda *a: None)
     monkeypatch.setattr(host_memory, "reclaim_unused_host_memory", lambda *a, **kw: None)

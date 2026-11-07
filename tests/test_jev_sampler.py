@@ -28,9 +28,10 @@ def response(same=.01, variant=.01):
         "different_approach": 1 - same - variant}}}, "usage": {"input_tokens": 123}}
 
 
-def sampler(tmp_path, codes=("A", "B", "C", "D", "E")):
+def sampler(tmp_path, codes=("A", "B", "C", "D", "E"), *, candidate_multiplier=3):
     result = make_sampler(parent_selection="puct-jev", num_seeds=0,
-                          exp_dir=tmp_path, problem=problem(), puct_c=0.)
+                          exp_dir=tmp_path, problem=problem(), puct_c=0.,
+                          jev_candidate_multiplier=candidate_multiplier)
     result._states = [State.make(0, 20. - i, code) for i, code in enumerate(codes)]
     return result
 
@@ -181,6 +182,104 @@ def test_no_judge_for_one_parent_or_empty_sources(tmp_path, monkeypatch):
     assert len(actual.sample_states(3, selection_step=1)) == 3
 
 
+@pytest.mark.parametrize("multiplier", [1, 2, 3])
+def test_candidate_window_caps_scan_and_fills_without_searching_later_ideas(tmp_path, monkeypatch, multiplier):
+    codes = tuple("ABCDEFGH")
+    actual = sampler(tmp_path, codes, candidate_multiplier=multiplier)
+    before = copy.deepcopy(actual.state_dict())
+    requests, _ = fake_judge(monkeypatch, lambda req:
+        response() if "```python\nH\n```" in req["state"] else response(.98, .01))
+    picks = actual.sample_states(2, selection_step=1)
+    assert [s.code for s in picks] == ["A", "B"]
+    assert len(requests) == 2 * multiplier - 1
+    assert actual.state_dict() == before
+    saved = json.loads((tmp_path / "step01/step01.jev.json").read_text())
+    assert saved["candidate_multiplier"] == multiplier
+    assert saved["candidate_limit"] == 2 * multiplier
+    assert set(saved["sources"].values()) == set(codes[:2 * multiplier])
+    assert actual.last_picks_info[-1]["jev"]["decision"] == "duplicate_fallback"
+
+
+def test_lineage_blocked_nodes_count_toward_candidate_window(tmp_path, monkeypatch):
+    actual = sampler(tmp_path, candidate_multiplier=2)
+    a = actual._states[0]
+    for child in actual._states[1:4]:
+        child.parents = [{"id": a.id, "timestep": 0}]
+    requests, _ = fake_judge(monkeypatch, lambda req: response(.98, .01))
+    assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "B"]
+    assert len(requests) == 3
+    assert all("```python\nE\n```" not in req["state"] for req in requests)
+
+
+def test_candidate_window_stops_early_and_does_not_cap_pairwise_questions(tmp_path, monkeypatch):
+    actual = sampler(tmp_path, tuple(f"program-{i}" for i in range(20)), candidate_multiplier=1)
+    requests, _ = fake_judge(monkeypatch, lambda req: response())
+    assert [s.code for s in actual.sample_states(4, selection_step=1)] == [
+        "program-0", "program-1", "program-2", "program-3"]
+    assert len(requests) == 6  # Four candidates require all six pairwise judgments.
+    saved = json.loads((tmp_path / "step01/step01.jev.json").read_text())
+    assert saved["candidate_limit"] == len(saved["decisions"]) == 4
+    actual = sampler(tmp_path / "early", tuple(f"program-{i}" for i in range(20)))
+    requests, _ = fake_judge(monkeypatch, lambda req: response())
+    assert len(actual.sample_states(2, selection_step=1)) == 2
+    assert len(requests) == 1
+
+
+def test_partial_selection_freezes_multiplier_and_next_step_uses_current_yaml(tmp_path, monkeypatch):
+    codes = tuple("ABCDEFGH")
+    actual = sampler(tmp_path, codes, candidate_multiplier=2)
+    payload = copy.deepcopy(actual.state_dict())
+    calls = []
+
+    def fail_second(request):
+        calls.append(request)
+        if len(calls) == 2:
+            raise RuntimeError("interrupted")
+        return response(.98, .01)
+
+    fake_judge(monkeypatch, fail_second)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        actual.sample_states(2, selection_step=1)
+    resumed = sampler(tmp_path, codes, candidate_multiplier=1)
+    resumed.load_state_dict(payload)
+    requests, _ = fake_judge(monkeypatch, lambda req: response(.98, .01))
+    resumed.sample_states(2, selection_step=1)
+    assert len(requests) == 2  # B is cached; C and D finish the saved window.
+    saved = json.loads((tmp_path / "step01/step01.jev.json").read_text())
+    assert saved["candidate_multiplier"] == 2 and saved["candidate_limit"] == 4
+    requests, _ = fake_judge(monkeypatch, lambda req: response(.98, .01))
+    resumed.sample_states(2, selection_step=2)
+    assert len(requests) == 1
+    saved = json.loads((tmp_path / "step02/step02.jev.json").read_text())
+    assert saved["candidate_multiplier"] == 1 and saved["candidate_limit"] == 2
+
+
+def test_legacy_selected_parents_replay_even_outside_new_window(tmp_path, monkeypatch):
+    actual = sampler(tmp_path, tuple("ABCDEFGH"), candidate_multiplier=4)
+    payload = copy.deepcopy(actual.state_dict())
+    fake_judge(monkeypatch, lambda req:
+        response() if "```python\nH\n```" in req["state"] else response(.98, .01))
+    assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "H"]
+    path = tmp_path / "step01/step01.jev.json"
+    saved = json.loads(path.read_text())
+    del saved["candidate_multiplier"], saved["candidate_limit"]
+    path.write_text(json.dumps(saved))
+    actual.candidate_multiplier = 1
+    actual.load_state_dict(payload)
+    monkeypatch.setattr(jev, "GlideWorker", lambda *a, **kw: pytest.fail("replayed GLiDE"))
+    assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "H"]
+
+
+@pytest.mark.parametrize("value", [0, -1, True, False, 1.5, "3", None])
+def test_candidate_multiplier_requires_a_positive_integer(tmp_path, value):
+    from config_validation import validate_problem_config
+    with pytest.raises(ValueError, match="jev_candidate_multiplier"):
+        sampler(tmp_path, candidate_multiplier=value)
+    with pytest.raises(ValueError, match="jev_candidate_multiplier"):
+        validate_problem_config({"problem": "erdos", "jev_candidate_multiplier": value},
+                                require_complete=False)
+
+
 def test_replay_rejects_changed_problem_count_or_archive(tmp_path, monkeypatch):
     actual = sampler(tmp_path)
     payload = actual.state_dict()
@@ -280,7 +379,8 @@ def test_migration_preserves_archive_and_defers_already_selected_step(tmp_path, 
     import train_multy_CVaR as training
     old = PUCTSampler(2)
     old.record_expansion(old._states[0], 64)
-    cfg = SimpleNamespace(parent_selection="puct-jev", jev_model_path="GLiDE-9B")
+    cfg = SimpleNamespace(parent_selection="puct-jev", jev_model_path="GLiDE-9B",
+                          jev_candidate_multiplier=5)
     (tmp_path / "config.json").write_text('{"parent_selection":"puct"}')
     checkpoint = Mock()
     monkeypatch.setattr(training, "_save_training_checkpoint", checkpoint)
@@ -293,6 +393,7 @@ def test_migration_preserves_archive_and_defers_already_selected_step(tmp_path, 
     selected.unlink()
     migrated = training._migrate_parent_selection(*args, recovery_pending=False, problem=problem())
     assert migrated.state_dict() == dict(old.state_dict(), selection_mode="puct-jev")
+    assert migrated.candidate_multiplier == 5
     assert checkpoint.call_args.args[3] is migrated
     assert json.loads((tmp_path / "config.json").read_text())["parent_selection"] == "puct-jev"
 
@@ -342,6 +443,7 @@ def test_config_resolves_sibling_checkpoint_and_cli_override(tmp_path, monkeypat
     root = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load((root / "configs/erdos.yaml").read_text())
     cfg["hardware_profile"] = "RTX6000"
+    cfg["jev_candidate_multiplier"] = 5
     cfg["model_name"] = cfg["coder_model_name"] = str(tmp_path / "Qwen3.8-27B")
     (tmp_path / "Qwen3.8-27B").mkdir()
     sibling = tmp_path / "GLiDE-9B"
@@ -355,6 +457,7 @@ def test_config_resolves_sibling_checkpoint_and_cli_override(tmp_path, monkeypat
     resolved, _ = training.load_config()
     assert resolved.parent_selection == "puct-jev"
     assert resolved.jev_model_path == str(sibling)
+    assert resolved.jev_candidate_multiplier == 5
     monkeypatch.setattr(sys, "argv", argv + ["--jev-model-path", str(tmp_path / "explicit")])
     resolved, _ = training.load_config()
     assert resolved.jev_model_path == str(tmp_path / "explicit")

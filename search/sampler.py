@@ -57,7 +57,8 @@ def can_migrate_parent_selection(source, target):
 
 
 def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
-                 exp_dir=None, problem=None, jev_model_path=None, **kwargs):
+                 exp_dir=None, problem=None, jev_model_path=None,
+                 jev_candidate_multiplier=3, **kwargs):
     mode = parent_selection_mode({"parent_selection": parent_selection})
     if mode == "llm":
         from search.llm_sampler import LLMSampler
@@ -65,7 +66,8 @@ def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
     if mode == "puct-jev":
         from search.jev_sampler import PUCTJevSampler
         return PUCTJevSampler(exp_dir=exp_dir, problem=problem,
-                              model_path=jev_model_path, **kwargs)
+                              model_path=jev_model_path,
+                              candidate_multiplier=jev_candidate_multiplier, **kwargs)
     return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
 
 

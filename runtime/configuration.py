@@ -155,6 +155,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    metavar="RUN_DIR",
                    help="Continue an existing run directory from its latest "
                         "completed checkpoint.")
+    p.add_argument("--require-saved-rollouts", action="store_true",
+                   help="With --resume, refuse to regenerate the interrupted "
+                        "SPO-RS step if its saved rollouts cannot be recovered.")
     p.add_argument("--gpu-type", default=None,
                    help="Target hardware for a kernel problem: L40S, A100, H100, "
                         "H200, ... Sets the prompt's arch notes and rules line, "
@@ -584,6 +587,8 @@ def load_config():
     """
     parser = _build_arg_parser()
     args = parser.parse_args()
+    if args.require_saved_rollouts and args.resume is None:
+        parser.error("--require-saved-rollouts requires --resume")
 
     # Read the saved run identity early enough to select its YAML. New runs
     # persist the complete merged config; older ones can recover standard
@@ -665,6 +670,9 @@ def load_config():
         for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
+        # An unfinished PUCT-JEV selection retains its own saved window.
+        if "jev_candidate_multiplier" in ydict:
+            merged["jev_candidate_multiplier"] = ydict["jev_candidate_multiplier"]
         # Current strategist controls must not inherit stale resolved limits
         # or sampling defaults from a previous checkpoint's config.json.
         for key in ("strategy_max_seq_length", "strategy_max_new_tokens",
@@ -695,7 +703,7 @@ def load_config():
     restore_hardware_settings(merged, ydict, saved)
 
     # 3) CLI overlay (only explicitly-provided values)
-    skip = {"problem", "config", "problem_type", "resume"}
+    skip = {"problem", "config", "problem_type", "resume", "require_saved_rollouts"}
     for arg_name, value in vars(args).items():
         if arg_name in skip or value is None:
             continue
@@ -759,6 +767,7 @@ def load_config():
     for key in ("model_name", "coder_model_name", "training_model_name", "coder_training_model_name"):
         merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
     if merged["parent_selection"] == "puct-jev":
+        merged.setdefault("jev_candidate_multiplier", 3)
         jev_path = merged.get("jev_model_path")
         if not jev_path:
             sibling = Path(merged["model_name"]).expanduser().parent / "GLiDE-9B"
@@ -1388,6 +1397,7 @@ def load_config():
               f"{engine_gpus} GPU(s)/engine")
     print(f"[config] rollout thinking: {('enabled' if cfg.thinking else 'disabled')}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
+    merged["_require_saved_rollouts"] = args.require_saved_rollouts
     return cfg, merged
 
 

@@ -4047,7 +4047,7 @@ class ProcessDistributedTrainer:
                 gc.collect()
                 with torch.cuda.device(0):
                     torch.cuda.empty_cache()
-                    set_total_memory_ceiling(0, self._memory_fraction)
+                    set_total_memory_ceiling(0, self._memory_fraction, wait_seconds=30)
                     self.backend.restore_after_generation()
                     self.backend.set_training_mode()
                     torch.cuda.synchronize(0)
