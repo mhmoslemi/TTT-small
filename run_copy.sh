@@ -30,9 +30,7 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 #   TTT_CONFIG=configs/gpu_mode_trimul.yaml sh run.sh
 # Resume keeps saved experiment settings; AVAILABLE_GPUS still defines this
 # launch's physical inventory:
-#   sh run_copy.sh --resume /path/to/run
-# Reuse the interrupted AC1 batch; stop if its recovery files are missing:
-#   sh run_copy.sh --resume runs/ac1_Qwen3.8-27B_1107-0624 --require-saved-rollouts
+#   sh run.sh --resume /path/to/run
 # Opt into the process-per-GPU adaptive trainer. Omitting --fast keeps the
 # current training implementation exactly as the default:
 #   sh run.sh --fast

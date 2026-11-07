@@ -155,9 +155,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    metavar="RUN_DIR",
                    help="Continue an existing run directory from its latest "
                         "completed checkpoint.")
-    p.add_argument("--require-saved-rollouts", action="store_true",
-                   help="With --resume, refuse to regenerate the interrupted "
-                        "SPO-RS step if its saved rollouts cannot be recovered.")
     p.add_argument("--gpu-type", default=None,
                    help="Target hardware for a kernel problem: L40S, A100, H100, "
                         "H200, ... Sets the prompt's arch notes and rules line, "
@@ -587,8 +584,6 @@ def load_config():
     """
     parser = _build_arg_parser()
     args = parser.parse_args()
-    if args.require_saved_rollouts and args.resume is None:
-        parser.error("--require-saved-rollouts requires --resume")
 
     # Read the saved run identity early enough to select its YAML. New runs
     # persist the complete merged config; older ones can recover standard
@@ -703,7 +698,7 @@ def load_config():
     restore_hardware_settings(merged, ydict, saved)
 
     # 3) CLI overlay (only explicitly-provided values)
-    skip = {"problem", "config", "problem_type", "resume", "require_saved_rollouts"}
+    skip = {"problem", "config", "problem_type", "resume"}
     for arg_name, value in vars(args).items():
         if arg_name in skip or value is None:
             continue
@@ -1397,7 +1392,6 @@ def load_config():
               f"{engine_gpus} GPU(s)/engine")
     print(f"[config] rollout thinking: {('enabled' if cfg.thinking else 'disabled')}")
     merged["_resume_dir"] = str(resume_dir) if resume_dir is not None else None
-    merged["_require_saved_rollouts"] = args.require_saved_rollouts
     return cfg, merged
 
 

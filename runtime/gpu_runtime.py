@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -130,10 +129,6 @@ def query_gpu_memory() -> Dict[int, GPUMemory]:
         "--query-gpu=index,name,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ]
-    selected = os.environ.get("AVAILABLE_GPUS", "").strip()
-    if selected:
-        ids = parse_gpu_ids(selected, field="AVAILABLE_GPUS")
-        cmd.append("--id=" + ",".join(str(gpu) for gpu in ids))
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True,
                               timeout=10)
@@ -387,9 +382,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     notes: List[str] = []
     using_vllm = str(cfg.get("generation_backend", "hf")).lower() == "vllm"
     selected = [memory[g] for g in roles.generation if g in memory]
-    # A missing telemetry sample must not size a declared B200 as an 80-GiB card.
-    fallback_total = 178.0 if cfg.get("hardware_profile") == "B200" else 80.0
-    min_total = min((item.total_gib for item in selected), default=fallback_total)
+    min_total = min((item.total_gib for item in selected), default=80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
@@ -400,10 +393,9 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # immediately before GenerationPool starts its engines.
         cfg["vllm_gpu_memory_utilization"] = round(util, 3)
         if using_vllm:
-            estimate = "profile estimate; " if not selected else ""
             notes.append(f"vLLM memory utilization={util:.3f} "
                          f"(steady-state total={min_total:.1f} GiB/GPU; "
-                         f"{estimate}live free memory checked at pool startup)")
+                         "live free memory checked at pool startup)")
     else:
         cfg["vllm_gpu_memory_utilization"] = util
 
@@ -644,8 +636,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
         compatible_tp = [max_compatible_tp]
 
     selected = [memory[g] for g in roles.generation if g in memory]
-    fallback_total = 178.0 if cfg.get("hardware_profile") == "B200" else 80.0
-    min_total = min((item.total_gib for item in selected), default=fallback_total)
+    min_total = min((item.total_gib for item in selected), default=80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)

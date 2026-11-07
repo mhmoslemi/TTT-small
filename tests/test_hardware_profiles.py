@@ -22,20 +22,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HardwareProfileTests(unittest.TestCase):
-    def test_gpu_query_uses_launcher_physical_ids(self):
-        import os
-
-        result = SimpleNamespace(stdout="6, NVIDIA B200, 183359, 175000\n7, NVIDIA B200, 183359, 174000\n")
-        for inventory in ("", "6,7"):
-            with self.subTest(inventory=inventory), \
-                 patch.dict(os.environ, AVAILABLE_GPUS=inventory), \
-                 patch.object(gpu.subprocess, "run", return_value=result) as query:
-                memory = gpu.query_gpu_memory()
-            self.assertEqual(set(memory), {6, 7})
-            command = query.call_args.args[0]
-            self.assertEqual("--id=6,7" in command, bool(inventory))
-            self.assertAlmostEqual(memory[6].total_gib, 183359 / 1024)
-
     def cards(self, b200=True):
         size = 183359 / 1024 if b200 else 95.6
         return {i: gpu.GPUMemory(i, "NVIDIA B200" if b200 else "RTX6000", size, size)
@@ -82,56 +68,14 @@ class HardwareProfileTests(unittest.TestCase):
 
     def test_live_validation_never_invents_b200_memory(self):
         cfg = dict(hardware_profile="B200")
+        for cards in ({}, self.cards(False)):
+            with self.assertRaises(ValueError):
+                hardware.validate_hardware_profile(cfg, range(8), cards)
         with patch.object(hardware, "host_memory_info", return_value=None):
             with self.assertRaises(RuntimeError):
                 hardware.validate_hardware_profile(cfg, range(8), self.cards())
-        for cards in ({}, {0: self.cards()[0]}, self.cards(False), self.cards()):
-            output = io.StringIO()
-            with self.subTest(cards=cards), patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=1000*host.GIB)), redirect_stdout(output):
-                hardware.validate_hardware_profile(cfg, range(8), cards)
-            self.assertIn("host RAM=1200.0 GiB", output.getvalue())
-            if len(cards) < 8:
-                self.assertIn("GPU memory telemetry unavailable", output.getvalue())
-            else:
-                self.assertIn(f"{cards[0].total_gib:.1f} GiB/GPU", output.getvalue())
-
-    def test_ac1_strict_resume_accepts_missing_gpu_telemetry(self):
-        import json
-        import os
-        import sys
-        import yaml
-        from runtime import configuration
-
-        config_path = ROOT / "configs/ac1.yaml"
-        with tempfile.TemporaryDirectory() as folder:
-            run = Path(folder)
-            (run / "config.json").write_text(json.dumps(yaml.safe_load(config_path.read_text())))
-            argv = ["train_multy_CVaR.py", "--config", str(config_path),
-                    "--resume", str(run), "--require-saved-rollouts",
-                    "--advantage-mode", "spo-rs", "--fast", "--measure-entropy",
-                    "--spo-rs-clip-epsilon-low", "0.2", "--spo-rs-clip-epsilon-high", "0.38",
-                    "--strategies", "--coder-retry", "--isolate-eval", "--fused-long-attention",
-                    "--reload-coder-between-phases", "--strategy-vllm-persistent-workers", "0",
-                    "--trainer-offload-dir", str(run / ".offload")]
-            unnamed = {i: gpu.GPUMemory(i, "", 178., 175.) for i in (6, 7)}
-            for cards in ({}, unnamed):
-                with self.subTest(cards=cards), \
-                     patch.dict(os.environ, AVAILABLE_GPUS="6,7", HF_HUB_OFFLINE="1"), \
-                     patch.object(sys, "argv", argv), \
-                     patch.object(gpu, "query_gpu_memory", return_value=cards), \
-                     patch.object(gpu, "detect_attention_heads", return_value=32), \
-                     patch.object(configuration, "_isolated_evaluation_cpu_ids", return_value=[0, 1]), \
-                     patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=40*host.GIB)), \
-                     redirect_stdout(io.StringIO()):
-                    cfg, merged = configuration.load_config()
-                self.assertEqual(cfg.hardware_profile, "B200")
-                self.assertEqual(cfg.training_gpu_ids, "6,7")
-                self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
-                self.assertEqual(cfg.num_gpus, 2)
-                self.assertEqual(cfg.strategy_vllm_persistent_workers, 0)
-                self.assertTrue(cfg.reload_coder_between_phases)
-                self.assertEqual(cfg.trainer_offload_dir, str(run / ".offload"))
-                self.assertTrue(merged["_require_saved_rollouts"])
+        with patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=1000*host.GIB)), redirect_stdout(io.StringIO()):
+            hardware.validate_hardware_profile(cfg, range(8), self.cards())
 
     def test_all_profiled_models_fit_full_context_and_use_every_card(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")

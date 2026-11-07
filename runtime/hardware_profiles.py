@@ -63,16 +63,15 @@ def restore_hardware_settings(merged, current_yaml, saved):
 def validate_hardware_profile(cfg, gpu_ids, memory):
     if cfg.get("hardware_profile") != "B200":
         return
-    # The configured profile is authoritative; nvidia-smi can time out or omit names.
+    if any(gpu not in memory or "B200" not in memory[gpu].name.upper()
+           for gpu in gpu_ids):
+        raise ValueError("hardware_profile=B200 requires nvidia-smi to report B200 for every selected GPU")
     info = host_memory_info()
     if not info:
         raise RuntimeError("B200 profile requires readable host RAM limits for memory admission")
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    capacity = (f"{min(memory[gpu].total_gib for gpu in gpu_ids):.1f} GiB/GPU"
-                if gpu_ids and all(gpu in memory for gpu in gpu_ids)
-                else "GPU memory telemetry unavailable")
     print(f"[hardware] B200: {len(gpu_ids)} GPUs, "
-          f"{capacity}; "
+          f"{min(memory[gpu].total_gib for gpu in gpu_ids):.1f} GiB/GPU; "
           f"{cpus} available CPUs; host RAM={info['total'] / GIB:.1f} GiB, "
           f"available={info['available'] / GIB:.1f} GiB, "
           f"reserve={host_memory_reserve_bytes(info) / GIB:.1f} GiB; live shared RAM admission")

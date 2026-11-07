@@ -8,7 +8,6 @@ parameters are communicated, each as one flattened NCCL buffer per update.
 
 from types import SimpleNamespace
 import math
-import time
 import traceback
 
 
@@ -93,26 +92,6 @@ def trainable_parameter_signature(model):
     )
 
 
-def model_state_signature(model):
-    """Check the full parameter/buffer layout before copying GPU replicas."""
-    return tuple(
-        (kind, name, tuple(tensor.shape), str(tensor.dtype))
-        for kind, tensors in (("parameter", model.named_parameters()),
-                              ("buffer", model.named_buffers()))
-        for name, tensor in tensors
-    )
-
-
-def broadcast_model_state(model, source_rank=0):
-    """Copy the complete model in place, without a second model-sized buffer."""
-    import torch
-    import torch.distributed as dist
-
-    with torch.no_grad():
-        for tensor in (*model.parameters(), *model.buffers()):
-            dist.broadcast(tensor.detach(), src=int(source_rank))
-
-
 def validate_model_device(model, logical_id):
     """A fast replica must be wholly resident on its one assigned GPU."""
     import torch
@@ -149,7 +128,7 @@ def set_allocator_memory_ceiling(
         label="fast trainer")
 
 
-def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label, wait_seconds=0):
+def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label):
     """Cap this allocator plus allocations owned by other GPU processes."""
     import torch
 
@@ -161,30 +140,18 @@ def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label, wait_seco
         # Release only unused cache before measuring the model's persistent base.
         # This runs at worker load/update boundaries, never per microbatch.
         torch.cuda.empty_cache()
-        deadline = time.monotonic() + wait_seconds
-        announced = False
-        while True:
-            allocated = int(torch.cuda.memory_allocated())
-            reserved = int(torch.cuda.memory_reserved())
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            outside_allocator = max(
-                0, int(total_bytes) - int(free_bytes) - reserved)
-            process_limit = int(fraction * int(total_bytes)) - outside_allocator
-            if process_limit > allocated:
-                break
+        allocated = int(torch.cuda.memory_allocated())
+        reserved = int(torch.cuda.memory_reserved())
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        outside_allocator = max(
+            0, int(total_bytes) - int(free_bytes) - reserved)
+        process_limit = int(fraction * int(total_bytes)) - outside_allocator
+        if process_limit <= allocated:
             occupied = (outside_allocator + allocated) / max(1, int(total_bytes))
-            detail = (
-                f"{label} rank {logical_id}: {100.0 * occupied:.1f}% GPU memory "
-                f"occupied before a batch ({allocated / 1024**3:.1f} GiB in "
-                f"this allocator, {outside_allocator / 1024**3:.1f} GiB outside "
-                f"it); {100.0 * fraction:.0f}% total ceiling cannot be honored")
-            if time.monotonic() >= deadline:
-                raise RuntimeError(detail)
-            if not announced:
-                print(f"[handoff] waiting up to {wait_seconds}s for released "
-                      f"GPU memory; {detail}", flush=True)
-                announced = True
-            time.sleep(0.5)
+            raise RuntimeError(
+                f"{label} rank {logical_id} already needs "
+                f"{100.0 * occupied:.1f}% GPU memory before a batch, so the "
+                f"{100.0 * fraction:.0f}% total ceiling cannot be honored")
         allocator_fraction = min(
             fraction, process_limit / max(1, int(total_bytes)))
         _set_allocator_memory_ceiling(
@@ -194,12 +161,12 @@ def _set_total_memory_ceiling(logical_id, fraction, *, maximum, label, wait_seco
 
 
 def set_total_memory_ceiling(
-        logical_id, fraction=STANDARD_TRAINING_MEMORY_FRACTION, *, wait_seconds=0):
+        logical_id, fraction=STANDARD_TRAINING_MEMORY_FRACTION):
     """Apply the normal conservative limit used by adaptive microbatches."""
     return _set_total_memory_ceiling(
         logical_id, fraction,
         maximum=MAX_STANDARD_TRAINING_MEMORY_FRACTION,
-        label="fast trainer", wait_seconds=wait_seconds)
+        label="fast trainer")
 
 
 def set_long_rollout_memory_ceiling(
@@ -1226,16 +1193,11 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
             cfg.training_replica_device = int(rank)
             cfg.num_training_gpus = 1
             backend = load_backend(cfg.backend, cfg)
-            copy_from_primary = bool(cfg_dict.get("_copy_model_from_primary", False))
-            if copy_from_primary:
-                model, tokenizer = backend.load(initialize_from_primary=True)
-            else:
-                model, tokenizer = backend.load()
+            model, tokenizer = backend.load()
         validate_model_device(model, int(rank))
         result_queue.put({
             "event": "loaded", "rank": int(rank),
             "parameter_signature": trainable_parameter_signature(model),
-            "model_signature": (model_state_signature(model) if copy_from_primary else None),
         })
 
         command = command_queue.get()
@@ -1246,10 +1208,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
             rank=int(rank), world_size=int(world_size),
             timeout=timedelta(minutes=30))
         dist_initialized = True
-        if copy_from_primary:
-            broadcast_model_state(model, source_rank=0)
-        else:
-            broadcast_trainable_parameters(model, source_rank=0)
+        broadcast_trainable_parameters(model, source_rank=0)
         result_queue.put({"event": "ready", "rank": int(rank)})
         offloaded = False
         context_groups = None
@@ -1288,7 +1247,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                     with torch.cuda.device(int(rank)):
                         torch.cuda.empty_cache()
                         set_total_memory_ceiling(
-                            int(rank), memory_fraction, wait_seconds=30)
+                            int(rank), memory_fraction)
                         backend.restore_after_generation()
                         backend.set_training_mode()
                         torch.cuda.synchronize(int(rank))
