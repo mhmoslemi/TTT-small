@@ -9,10 +9,16 @@ RAM are detected, not assumed to equal the advertised machine size.
 Matching local checkpoints under `/root/nas/Mohammad/models/` are preferred
 over their matching Hub IDs on B200 when present; explicit paths stay explicit.
 
-B200 uses the same loading, sleep/wake and model-specific engine settings as
-RTX6000, with replicas/TP groups and generation batches sized to its larger
-GPU memory. Qwen Flash Next keeps its CPU-offloaded lookup table and the RTX
-NVFP4 autotuning setting. No B200-only startup tuning or disk-spill path is used.
+B200 uses the standard RTX6000 model loaders, with replicas/TP groups and
+generation batches sized to its larger GPU memory. Inference workers load on
+demand and exit after each phase; there are no model-weight sleep backups in RAM.
+Inactive frozen trainer weights use the existing disk parking in `.offload/`
+(override with `--trainer-offload-dir`); adapters and optimizer state are retained.
+Those temporary files are removed after restoration. Use a disk filesystem,
+not tmpfs. B200 leaves 16 GiB of host headroom by default; an explicit
+`TTT_HOST_MEMORY_RESERVE_GIB` takes precedence. Checkpoint loading is lazy rather
+than prefetching the entire model into RAM. Qwen Flash Next keeps its lookup
+table on GPU on B200; RTX6000 retains the existing CPU offload and NVFP4 settings.
 The existing adaptive parallel trainer, evaluation/transfer/offload RAM gate and
 exact long-rollout handling remain in use. Sampling, precision, context limits
 and the RL objective are unchanged. Explicit YAML/CLI capacity settings still
@@ -25,8 +31,8 @@ Automatic concurrency scales with available KV memory and the rollout workload,
 with no fixed 64-request ceiling. vLLM controls paged-KV admission as outputs grow.
 
 The original shared RAM admission and bounded transfers remain in place,
-including OS headroom and Linux cgroup limits. Under genuine RAM pressure,
-unretainable sleeping engines are released and reloaded next phase, as on RTX.
+including OS headroom and Linux cgroup limits. RTX6000 keeps its existing
+sleep/wake policy and releases unaffordable sleeping backups under RAM pressure.
 FlashInfer initialization and downloads use the original vLLM path; there is
 no extra startup process, download hook or bulk-kernel preflight.
 This is bounded resource planning, not a guarantee against arbitrary external

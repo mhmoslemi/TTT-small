@@ -696,6 +696,8 @@ def load_config():
               "and strategy limits/sampling override saved values")
 
     restore_hardware_settings(merged, ydict, saved)
+    if merged["hardware_profile"] == "B200":
+        profile_explicit_keys.add("strategy_vllm_persistent_workers")
 
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
@@ -708,6 +710,10 @@ def load_config():
             profile_explicit_keys.add(key)
     # Disk parking is launch-local; do not inherit another machine's directory.
     merged["trainer_offload_dir"] = args.trainer_offload_dir
+    if merged["hardware_profile"] == "B200":
+        os.environ.setdefault("TTT_HOST_MEMORY_RESERVE_GIB", "16")
+        if not merged["trainer_offload_dir"]:
+            merged["trainer_offload_dir"] = str(Path(__file__).resolve().parents[1] / ".offload")
     from search.sampler import can_migrate_parent_selection, parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"

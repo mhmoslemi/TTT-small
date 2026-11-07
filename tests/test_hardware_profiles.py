@@ -68,9 +68,12 @@ class HardwareProfileTests(unittest.TestCase):
 
     def test_live_validation_never_invents_b200_memory(self):
         cfg = dict(hardware_profile="B200")
-        for cards in ({}, self.cards(False)):
+        for cards in (self.cards(False),):
             with self.assertRaises(ValueError):
                 hardware.validate_hardware_profile(cfg, range(8), cards)
+        with patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=50*host.GIB)), redirect_stdout(io.StringIO()):
+            for cards in ({}, {6: gpu.GPUMemory(6, "", 178., 175.)}):
+                hardware.validate_hardware_profile(cfg, [6, 7], cards)
         with patch.object(hardware, "host_memory_info", return_value=None):
             with self.assertRaises(RuntimeError):
                 hardware.validate_hardware_profile(cfg, range(8), self.cards())
@@ -88,8 +91,8 @@ class HardwareProfileTests(unittest.TestCase):
             ("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", 131072, True, 1),
             ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", 131072, True, 1),
             ("qwen3.8-flash-next", 262144, True, 1),
-            ("Qwen/Qwen3.8-Flash-Next-FP8", 262144, True, 1),
-            ("Qwen/Qwen3.8-Flash-Next", 262144, True, 2),
+            ("Qwen/Qwen3.8-Flash-Next-FP8", 262144, True, 2),
+            ("Qwen/Qwen3.8-Flash-Next", 262144, True, 4),
             ("deepseek-v4-flash-0731", 262144, True, 2),
         ]
         for model, context, frozen, expected_tp in cases:
@@ -128,9 +131,14 @@ class HardwareProfileTests(unittest.TestCase):
                 self.assertEqual(expected[0], (profile["weights_gib"] - profile["ple_gib"]) / tp)
                 with patch.object(gpu, "_checkpoint_weight_gib", return_value=None):
                     for hardware_profile in ("RTX6000", "B200"):
-                        self.assertEqual(gpu._vllm_memory_per_rank(dict(
+                        actual = gpu._vllm_memory_per_rank(dict(
                             model_name=name, max_seq_length=262144,
-                            hardware_profile=hardware_profile, strategy_inference_profile=True), tp), expected)
+                            hardware_profile=hardware_profile, strategy_inference_profile=True), tp)
+                        weight = expected[0] + (profile["ple_gib"] / tp if hardware_profile == "B200" else 0)
+                        self.assertEqual(actual, (weight, expected[1]))
+                        options = strategists.strategist_engine_options(name, hardware_profile)
+                        if profile["ple_gib"]:
+                            self.assertEqual(options["engram_config"]["cpu_offload"], hardware_profile == "RTX6000")
         for hardware_profile in ("RTX6000", "B200"):
             cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b", no_train=False,
                                   hardware_profile=hardware_profile)
@@ -139,7 +147,46 @@ class HardwareProfileTests(unittest.TestCase):
             weight, _ = gpu._vllm_memory_per_rank(dict(
                 model_name="qwen3.8-flash-next", max_seq_length=262144,
                 hardware_profile="B200", strategy_inference_profile=True), 2)
-            self.assertEqual(weight, 76.0)
+            self.assertEqual(weight, 100.0)
+
+    def test_b200_fresh_and_resume_use_transient_workers_with_50_gib_free(self):
+        import os
+        import sys
+        from runtime import configuration
+
+        argv = ["train_multy_CVaR.py", "--config", str(ROOT / "configs/ac1.yaml"),
+                "--advantage-mode", "spo-rs", "--fast", "--strategies", "--isolate-eval"]
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.dict(os.environ, AVAILABLE_GPUS="6,7", HF_HUB_OFFLINE="1"), \
+             patch.object(gpu, "query_gpu_memory", return_value={}), \
+             patch.object(gpu, "detect_attention_heads", return_value=32), \
+             patch.object(configuration, "_isolated_evaluation_cpu_ids", return_value=[0, 1]), \
+             patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=50*host.GIB)), \
+             redirect_stdout(io.StringIO()):
+            os.environ.pop("TTT_HOST_MEMORY_RESERVE_GIB", None)
+            for resume in (False, True):
+                if resume:
+                    import json
+                    saved = dict(merged, strategy_vllm_persistent_workers=None,
+                                 reload_coder_between_phases=False)
+                    (Path(folder) / "config.json").write_text(json.dumps(saved))
+                with patch.object(sys, "argv", argv + (["--resume", folder] if resume else [])):
+                    cfg, merged = configuration.load_config()
+                self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+                self.assertEqual(cfg.num_training_gpus, 2)
+                self.assertEqual(cfg.strategy_vllm_persistent_workers, 0)
+                self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0)
+                self.assertTrue(cfg.trainer_offload_dir)
+                self.assertEqual(os.environ["TTT_HOST_MEMORY_RESERVE_GIB"], "16")
+
+    def test_gpu_query_is_limited_to_launcher_devices(self):
+        import os
+
+        with patch.dict(os.environ, AVAILABLE_GPUS="6,7"), \
+             patch.object(gpu.subprocess, "run", return_value=SimpleNamespace(
+                 stdout="6, NVIDIA B200, 183359, 175000\n7, NVIDIA B200, 183359, 175000\n")) as query:
+            self.assertEqual(set(gpu.query_gpu_memory()), {6, 7})
+        self.assertIn("--id=6,7", query.call_args.args[0])
 
     def test_b200_automatic_batch_scales_to_memory_and_real_work(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")

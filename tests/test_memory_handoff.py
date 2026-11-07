@@ -439,6 +439,77 @@ def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     assert len(calls) == 3
 
 
+def test_vllm_shutdown_reaps_children_outside_wrapper_process_group():
+    import os
+    import subprocess
+    import psutil
+    from generation import gen_workers as workers
+
+    if os.name != "posix":
+        pytest.skip("private process groups require POSIX")
+    script = ("import subprocess, sys\n"
+              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+              "print(child.pid, flush=True)\n"
+              "sys.stdin.readline()\n")
+    wrapper = subprocess.Popen([sys.executable, "-c", script], start_new_session=True,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                 start_new_session=True)
+    child = None
+    try:
+        child = psutil.Process(int(wrapper.stdout.readline()))
+        assert os.getpgid(child.pid) != os.getpgid(wrapper.pid)
+
+        def stop(_):
+            wrapper.stdin.write("stop\n")
+            wrapper.stdin.flush()
+
+        pool = object.__new__(workers.GenerationPool)
+        pool.backend = "vllm"
+        pool.procs = [SimpleNamespace(pid=wrapper.pid, is_alive=lambda: wrapper.poll() is None,
+            join=wrapper.wait, terminate=wrapper.terminate, kill=wrapper.kill)]
+        pool.task_queues = [SimpleNamespace(put=stop, close=lambda: None, join_thread=lambda: None)]
+        pool._ready_worker_ids, pool._sleep_capable_workers, pool._async_worker_ids = {0}, {0}, {0}
+        pool._stop_workers([0])
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+        assert unrelated.poll() is None
+        assert pool.procs == [None] and not pool._ready_worker_ids
+    finally:
+        if child is not None:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        for process in (wrapper, unrelated):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        wrapper.stdin.close()
+        wrapper.stdout.close()
+
+
+def test_strategy_startup_charges_resident_tables_not_the_whole_checkpoint(monkeypatch):
+    from generation import gen_workers as workers
+    from models.strategist_models import strategist_engine_options
+
+    monkeypatch.setenv("TTT_HOST_MEMORY_RESERVE_GIB", "16")
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1200*GIB, available=50*GIB))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
+    reservations = []
+    monkeypatch.setattr(workers, "GenerationPool",
+                        lambda **kwargs: reservations.append(gate.reserved_bytes))
+    pool = PhasedVLLMGenerationPool(
+        lambda: None, lambda: None, model_name="nvidia/Qwen3.8-Flash-Next-NVFP4",
+        num_workers=8, gpu_ids=list(range(8)), host_memory_admission=gate,
+        vllm_engine_options=strategist_engine_options("qwen3.8-flash-next", "B200"))
+    pool._create_pool()
+    assert reservations == [int(32 * GIB * 1.05)]
+    assert gate.reserved_bytes == 0
+    pool._pool_kwargs["vllm_engine_options"] = strategist_engine_options("qwen3.8-flash-next")
+    with pytest.raises(host_memory.HostMemoryUnavailable):
+        pool._create_pool()
+
+
 def test_shutdown_does_not_allocate_sleep_backups():
     from generation.gen_workers import PhasedVLLMGenerationPool
 
@@ -497,6 +568,7 @@ def test_coder_reloads_current_adapter_with_optional_strategy_cache(monkeypatch,
     def create(pool, **options):
         name = pool._pool_kwargs["model_name"]
         persistent = pool._pool_kwargs["vllm_persistent_workers"] != 0
+        assert bool(options.get("vllm_enable_sleep_mode")) == persistent
         events.append((name, "load"))
         return SimpleNamespace(
             num_workers=2, persistent_workers=2 if persistent else 0,

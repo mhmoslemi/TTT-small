@@ -478,7 +478,7 @@ def _load_training_checkpoint(exp_dir, *, mmap=False):
     if not path.is_file():
         return None
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False, **({"mmap": True} if mmap else {}))
+        payload = torch.load(str(path), map_location="cpu", weights_only=False, **({"mmap": True} if mmap else {}))
     except TypeError:
         payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
@@ -1289,8 +1289,8 @@ def _finalize_pending_spo_rs_artifacts(
     completed = _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg)
     if completed is None:
         raise RuntimeError("generated-step recovery failed to seal complete rollout metadata")
-    _prepare_recoverable_response_tokens(None, tokenizer, completed)
-    return completed
+    cached = {item["meta_path"]: item for item in artifacts}
+    return [{**cached[item["meta_path"]], **item} for item in completed]
 
 
 def _resume_spo_rs_step_from_artifacts(
@@ -5073,7 +5073,7 @@ def main():
     start_step = 0
     current_policy_adapter_path = None
     if resume_dir:
-        resume_payload = _load_training_checkpoint(exp_dir)
+        resume_payload = _load_training_checkpoint(exp_dir, mmap=True)
         if resume_payload is not None:
             start_step = int(resume_payload["next_step"])
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
@@ -5260,6 +5260,10 @@ def main():
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
 
+    del resume_payload
+    from runtime.host_memory import reclaim_unused_host_memory
+    reclaim_unused_host_memory(torch, force=True)
+
     removed_adapters = _prune_adapter_snapshots(
         exp_dir,
         _live_adapter_snapshots(exp_dir, current_policy_adapter_path, spo_rs_tracker),
@@ -5376,6 +5380,8 @@ def main():
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
             hardware_profile=cfg.hardware_profile,
+            vllm_engine_options=({"safetensors_load_strategy": "lazy"}
+                                 if cfg.hardware_profile == "B200" else None),
         )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
@@ -5595,7 +5601,7 @@ def main():
                     )
                 strategy_pool_options.update({
                     "model_name": cfg.strategy_model_name,
-                    "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name),
+                    "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name, cfg.hardware_profile),
                     "max_seq_length": cfg.strategy_max_seq_length,
                     "load_in_4bit": False,
                     "gen_micro_batch": getattr(cfg, "strategy_gen_micro_batch", cfg.gen_micro_batch),

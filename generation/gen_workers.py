@@ -2038,6 +2038,16 @@ class GenerationPool:
 
     def _stop_workers(self, worker_ids):
         worker_ids = tuple(int(rank) for rank in worker_ids)
+        descendants = {}
+        if self.backend == "vllm":
+            import psutil
+            for rank in worker_ids:
+                process = self.procs[rank]
+                if process is not None and process.pid is not None:
+                    try:
+                        descendants[rank] = psutil.Process(process.pid).children(recursive=True)
+                    except psutil.NoSuchProcess:
+                        pass
         for rank in worker_ids:
             process = self.procs[rank]
             task_queue = self.task_queues[rank]
@@ -2062,6 +2072,25 @@ class GenerationPool:
                 if process.is_alive():
                     process.kill()
                     process.join(timeout=5)
+            if descendants.get(rank):
+                for child in descendants[rank]:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                _, alive = psutil.wait_procs(descendants[rank], timeout=5)
+                for child in alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                _, alive = psutil.wait_procs(alive, timeout=5)
+                for child in alive:
+                    try:
+                        if child.status() != psutil.STATUS_ZOMBIE:
+                            raise RuntimeError(f"vLLM child {child.pid} did not exit; refusing GPU handoff")
+                    except psutil.NoSuchProcess:
+                        pass
             self.procs[rank] = None
             self._ready_worker_ids.discard(rank)
             self._sleep_capable_workers.discard(rank)
@@ -3039,11 +3068,10 @@ class PhasedVLLMGenerationPool:
             from models.strategist_models import strategist_profile
             profile = strategist_profile(self._pool_kwargs["model_name"])
             cards = int(self._pool_kwargs["num_workers"])
-            # Lazy mmap shares one reclaimable checkpoint cache across
-            # replicas. Charge every rank's separate host lookup table and
-            # staging headroom, not a duplicate full checkpoint per replica.
-            host_gib = (profile["weights_gib"]
-                        + (profile["ple_gib"] + 4.0) * cards)
+            # Lazy checkpoint pages are reclaimable; charge only CPU-resident tables and staging.
+            cpu_tables = (self._pool_kwargs.get("vllm_engine_options") or {}).get(
+                "engram_config", {}).get("cpu_offload", True)
+            host_gib = ((profile["ple_gib"] if cpu_tables else 0.0) + 4.0) * cards
             startup_reservation = self.host_memory_admission.reservation(
                 int(host_gib * 2**30 * 1.05), wait_for_external=False)
         with startup_reservation:
@@ -3059,7 +3087,7 @@ class PhasedVLLMGenerationPool:
                 # loaded every engine, immediately slept it, restored training,
                 # then reloaded the same weights for step 0. More importantly,
                 # a broken initial sleep could hang before the run even began.
-                if self._force_transient:
+                if self._force_transient or self._pool_kwargs.get("vllm_persistent_workers") == 0:
                     self._pool = self._create_pool()
                 else:
                     self._pool = self._create_pool(

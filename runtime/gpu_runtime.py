@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -129,6 +130,9 @@ def query_gpu_memory() -> Dict[int, GPUMemory]:
         "--query-gpu=index,name,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ]
+    selected = os.environ.get("AVAILABLE_GPUS", "").strip()
+    if selected:
+        cmd.append("--id=" + ",".join(str(gpu) for gpu in parse_gpu_ids(selected, field="AVAILABLE_GPUS")))
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True,
                               timeout=10)
@@ -335,6 +339,7 @@ def _vllm_memory_per_rank(cfg, parallel_size, max_length=None):
         if cfg.get("hardware_profile") == "B200":
             # A larger locally installed revision must not undercut admission.
             profile = strategist_profile(cfg["model_name"])
+            weight += profile["ple_gib"] / parallel_size
             weight += max(0.0, (_checkpoint_weight_gib(cfg["model_name"]) or 0.0)
                           - profile["weights_gib"]) / parallel_size
         return weight, kv
@@ -382,7 +387,8 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     notes: List[str] = []
     using_vllm = str(cfg.get("generation_backend", "hf")).lower() == "vllm"
     selected = [memory[g] for g in roles.generation if g in memory]
-    min_total = min((item.total_gib for item in selected), default=80.0)
+    min_total = min((item.total_gib for item in selected),
+                    default=178.0 if cfg.get("hardware_profile") == "B200" else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
@@ -636,7 +642,8 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
         compatible_tp = [max_compatible_tp]
 
     selected = [memory[g] for g in roles.generation if g in memory]
-    min_total = min((item.total_gib for item in selected), default=80.0)
+    min_total = min((item.total_gib for item in selected),
+                    default=178.0 if cfg.get("hardware_profile") == "B200" else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)
