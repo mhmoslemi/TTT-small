@@ -16,6 +16,137 @@ from generation.gen_workers import PhasedVLLMGenerationPool
 from training import exact_overflow
 
 
+def _broadcast_replica_state_worker(rank, rendezvous, output):
+    from datetime import timedelta
+    import torch
+    import torch.distributed as dist
+    from training.fast_distributed import broadcast_model_state, model_state_signature
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen = torch.nn.Linear(3, 3, bias=False).requires_grad_(False)
+            self.adapter = torch.nn.Linear(3, 2)
+            self.tied_weight = self.frozen.weight
+            self.register_buffer("offset", torch.arange(2, dtype=torch.float32) + rank)
+            self.register_buffer("counter", torch.tensor(rank), persistent=False)
+
+        def forward(self, inputs):
+            return self.adapter(self.frozen(inputs)) + self.offset
+
+    torch.manual_seed(100 + rank)
+    model = Model()
+    pointers = [tensor.data_ptr() for tensor in (*model.parameters(), *model.buffers())]
+    signature = model_state_signature(model)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=20))
+    try:
+        broadcast_model_state(model)
+        assert signature == model_state_signature(model)
+        assert pointers == [tensor.data_ptr() for tensor in (*model.parameters(), *model.buffers())]
+        assert model.tied_weight is model.frozen.weight
+        output.put((rank, [tensor.tolist() for tensor in (*model.parameters(), *model.buffers())],
+                    model(torch.ones(1, 3)).detach().tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_replica_copy_preserves_complete_weights_buffers_and_forward(tmp_path):
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("requires the CPU distributed backend")
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    processes = [context.Process(target=_broadcast_replica_state_worker,
+        args=(rank, (tmp_path / "rendezvous").as_uri(), output)) for rank in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=35)
+            assert process.exitcode == 0
+        results = sorted(output.get(timeout=5) for _ in processes)
+        assert results[0][1:] == results[1][1:]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        output.close()
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_hf_replica_allocation_uses_config_without_loading_checkpoint(monkeypatch, tied):
+    import torch
+    from transformers import AutoModelForCausalLM, LlamaConfig
+    from models.model_backend import _allocate_hf_replica
+    from training.fast_distributed import model_state_signature
+
+    config = LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+        max_position_embeddings=32, tie_word_embeddings=tied)
+    source = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16,
+                                             attn_implementation="eager")
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained",
+                        lambda *a, **kw: pytest.fail("read replica checkpoint again"))
+    replica = _allocate_hf_replica(AutoModelForCausalLM, config, "cpu", "eager")
+    assert model_state_signature(replica) == model_state_signature(source)
+    assert (replica.lm_head.weight is replica.model.embed_tokens.weight) == tied
+    replica.load_state_dict(source.state_dict())
+    inputs = torch.tensor([[1, 2, 3]])
+    torch.testing.assert_close(source.float()(inputs).logits, replica.float()(inputs).logits,
+                               rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_trainer_startup_reports_waiting_and_detects_dead_workers(monkeypatch, capsys, alive):
+    import queue
+    from training import trainers
+
+    trainer = object.__new__(trainers.ProcessDistributedTrainer)
+    trainer._process_label = "train-fast"
+    trainer._queue_module = queue
+    trainer._processes = {1: SimpleNamespace(pid=123, is_alive=lambda: alive, exitcode=9)}
+    messages = iter([None, {"event": "loaded", "rank": 1}])
+    def get(**kwargs):
+        message = next(messages)
+        if message is None:
+            raise queue.Empty
+        return message
+    trainer._result_queue = SimpleNamespace(get=get)
+    clock = iter([0, 31])
+    monkeypatch.setattr(trainers, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    if alive:
+        assert trainer._collect_event("loaded", [1]) == {1: {"event": "loaded", "rank": 1}}
+        output = capsys.readouterr().out
+        assert "31s elapsed" in output and "alive rank/PID={1: 123}" in output
+    else:
+        with pytest.raises(RuntimeError, match="exited while waiting for loaded"):
+            trainer._collect_event("loaded", [1])
+
+
+def test_mapped_resume_optimizer_survives_releasing_checkpoint(tmp_path):
+    import torch
+    import train_multy_CVaR as training
+
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    torch.save(dict(version=2, next_step=3, adapter_dir="adapter_step002",
+                    sampler={}, optimizer=optimizer.state_dict()), tmp_path / "training_state.pt")
+    payload = training._load_training_checkpoint(tmp_path, mmap=True)
+    restored = torch.optim.AdamW(model.parameters(), lr=.01)
+    restored.load_state_dict(payload["optimizer"])
+    del payload
+    assert all(state["step"].item() == 1 for state in restored.state.values())
+    restored.step()
+    assert all(state["step"].item() == 2 for state in restored.state.values())
+    original = training._load_training_checkpoint(tmp_path, mmap=True)
+    assert all(state["step"].item() == 1 for state in original["optimizer"]["state"].values())
+
+
 def test_disk_parking_preserves_weights_ties_buffers_and_adam_updates(tmp_path, monkeypatch):
     import copy
     import torch

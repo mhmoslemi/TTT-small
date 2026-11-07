@@ -150,6 +150,21 @@ def _requires_unsloth_gpt_oss_loader(model_name):
     return "gpt-oss" in name and "unsloth-bnb-4bit" in name
 
 
+def _allocate_hf_replica(model_class, config, device, attention_implementation):
+    """Allocate on the target device; rank zero supplies every saved weight."""
+    try:
+        from transformers.initialization import no_init_weights
+    except ImportError:
+        from transformers.modeling_utils import no_init_weights
+
+    with torch.device(device), no_init_weights():
+        model = model_class.from_config(
+            config, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            attn_implementation=attention_implementation)
+    model.tie_weights()
+    return model
+
+
 def _training_device_map(cfg):
     """Choose replicated data parallelism or single-process model sharding."""
     replica_device = getattr(cfg, "training_replica_device", None)
@@ -1287,7 +1302,7 @@ class HFBackend(_ModelPlacementBackend):
         self.model = None
         self.tokenizer = None
 
-    def load(self):
+    def load(self, *, initialize_from_primary=False):
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -1375,8 +1390,15 @@ class HFBackend(_ModelPlacementBackend):
                 self.cfg.effective_load_in_4bit = False
                 print("[backend=hf] bitsandbytes not available; using default precision")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            training_name, **model_kwargs)
+        if initialize_from_primary:
+            if replica_device is None or use_4bit or native_quantization:
+                raise ValueError("GPU replica initialization requires an unquantized single-GPU HF model")
+            model = _allocate_hf_replica(
+                AutoModelForCausalLM, hf_config,
+                f"cuda:{int(replica_device)}", attention_implementation)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                training_name, **model_kwargs)
         if qwen_training_kernels is not None:
             from models.qwen_training_kernels import install_training_kernels
             count = install_training_kernels(model, qwen_training_kernels)

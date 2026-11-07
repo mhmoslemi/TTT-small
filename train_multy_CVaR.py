@@ -478,7 +478,7 @@ def _load_training_checkpoint(exp_dir, *, mmap=False):
     if not path.is_file():
         return None
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False, **({"mmap": True} if mmap else {}))
+        payload = torch.load(str(path), map_location="cpu", weights_only=False, **({"mmap": True} if mmap else {}))
     except TypeError:
         payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict) or payload.get("version") not in (1, 2):
@@ -5115,7 +5115,7 @@ def main():
     start_step = 0
     current_policy_adapter_path = None
     if resume_dir:
-        resume_payload = _load_training_checkpoint(exp_dir)
+        resume_payload = _load_training_checkpoint(exp_dir, mmap=True)
         if resume_payload is not None:
             start_step = int(resume_payload["next_step"])
             adapter_path = Path(exp_dir) / resume_payload["adapter_dir"]
@@ -5301,6 +5301,13 @@ def main():
                   f"v={initialization['value_after']:.9f}, "
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
+
+    if resume_payload is not None:
+        # Restored components own their state; do not retain the CPU checkpoint during replica loading.
+        del resume_payload
+        from runtime.host_memory import reclaim_unused_host_memory
+        reclaim_unused_host_memory(torch, force=True)
+        print("[resume] released checkpoint loading buffers before trainer replica startup", flush=True)
 
     removed_adapters = _prune_adapter_snapshots(
         exp_dir,

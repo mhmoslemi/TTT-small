@@ -2567,7 +2567,8 @@ class ProcessDistributedTrainer:
         import torch.distributed as dist
         import torch.multiprocessing as mp
         from training.fast_distributed import (
-            broadcast_trainable_parameters, set_total_memory_ceiling,
+            broadcast_model_state, broadcast_trainable_parameters,
+            model_state_signature, set_total_memory_ceiling,
             trainable_parameter_signature, validate_model_device, worker_main,
         )
 
@@ -2634,17 +2635,28 @@ class ProcessDistributedTrainer:
         rendezvous_path = sync_dir / (f"nccl-{os.getpid()}-{uuid.uuid4().hex}")
         self._init_method = rendezvous_path.as_uri()
         cfg_dict = dict(vars(cfg))
+        copy_from_primary = bool(
+            cfg.backend == "hf"
+            and getattr(cfg, "hardware_profile", None) == "B200"
+            and getattr(cfg, "coder_model_profile", None) == "qwen3.8-27b"
+            and not getattr(cfg, "effective_load_in_4bit", getattr(cfg, "load_in_4bit", False))
+            and not getattr(self.model, "is_quantized", False)
+            and all(tensor.device.type == "cuda"
+                    for tensor in (*self.model.parameters(), *self.model.buffers())))
+        cfg_dict["_copy_model_from_primary"] = copy_from_primary
+        expected_model_signature = model_state_signature(self.model) if copy_from_primary else None
         cfg_dict["_terminal_log_path"] = str(Path(exp_dir).resolve() / "temirnal.log")
         cfg_dict["_setting_log_path"] = str(Path(exp_dir).resolve() / "setting.log")
         cfg_dict["_log_time_offset_seconds"] = _LOG_TIME_OFFSET_SECONDS
 
-        setting_log_only(
+        print(
             f"[{self._process_label}] starting "
             f"{self._world_size - 1} persistent "
             "worker processes; main process is rank 0", flush=True)
-        setting_log_only(
-            f"[{self._process_label}] loading trainer replicas one at a time "
-            "to cap host/GPU initialization peaks", flush=True)
+        print(f"[{self._process_label}] " + (
+            "allocating trainer replicas on GPU; weights will be copied from rank 0"
+            if copy_from_primary else
+            "loading trainer replicas one at a time to cap host/GPU initialization peaks"), flush=True)
         try:
             for rank in range(1, self._world_size):
                 command_queue = self._context.Queue(maxsize=2)
@@ -2661,21 +2673,37 @@ class ProcessDistributedTrainer:
                 process.start()
                 self._command_queues[rank] = command_queue
                 self._processes[rank] = process
+                detail = (f"; details: {dependency_log_path}.trainer-rank{rank}"
+                          if dependency_log_path else "")
+                print(f"[{self._process_label}] loading trainer rank {rank} "
+                      f"on physical GPU {self._physical_ids[rank]} (PID {process.pid}){detail}",
+                      flush=True)
                 message = self._collect_event("loaded", [rank])[rank]
                 if message.get("parameter_signature") != expected_signature:
                     raise RuntimeError(f'fast trainer rank {rank} has a different trainable parameter layout')
+                if copy_from_primary and message.get("model_signature") != expected_model_signature:
+                    raise RuntimeError(f'fast trainer rank {rank} has a different full model layout')
                 print(f"[{self._process_label}] trainer replica {rank + 1}/"
-                      f"{self._world_size} loaded on logical GPU {rank}",
+                      f"{self._world_size} {'allocated' if copy_from_primary else 'loaded'} "
+                      f"on logical GPU {rank}",
                       flush=True)
             for command_queue in self._command_queues.values():
                 command_queue.put({"kind": "init_distributed"})
+            print(f"[{self._process_label}] initializing NCCL on "
+                  f"physical GPUs {self._physical_ids}", flush=True)
             dist.init_process_group(
                 backend="nccl", init_method=self._init_method,
                 rank=0, world_size=self._world_size,
                 timeout=timedelta(minutes=30))
             self._dist_initialized = True
-            broadcast_trainable_parameters(self.model, source_rank=0)
+            if copy_from_primary:
+                print(f"[{self._process_label}] copying complete trainer weights "
+                      "directly from GPU rank 0 to the other GPU replicas", flush=True)
+                broadcast_model_state(self.model, source_rank=0)
+            else:
+                broadcast_trainable_parameters(self.model, source_rank=0)
             self._collect_event("ready", range(1, self._world_size))
+            print(f"[{self._process_label}] all trainer GPUs ready", flush=True)
         except BaseException:
             self._abort_workers()
             raise
@@ -2746,6 +2774,8 @@ class ProcessDistributedTrainer:
     def _collect_event(self, event, ranks):
         pending = set(int(rank) for rank in ranks)
         results = {}
+        started = time.monotonic()
+        next_report = started + 30
         while pending:
             try:
                 message = self._result_queue.get(timeout=5.0)
@@ -2754,6 +2784,12 @@ class ProcessDistributedTrainer:
                 if dead:
                     codes = {rank: self._processes[rank].exitcode for rank in dead}
                     raise RuntimeError(f'fast trainer worker(s) exited while waiting for {event}: {codes}')
+                now = time.monotonic()
+                if event in ("loaded", "ready") and now >= next_report:
+                    workers = {rank: self._processes[rank].pid for rank in sorted(pending)}
+                    print(f"[{self._process_label}] waiting for trainer {event}: "
+                          f"{now - started:.0f}s elapsed; alive rank/PID={workers}", flush=True)
+                    next_report = now + 30
                 continue
             message_event = message.get("event")
             rank = int(message.get("rank", -1))

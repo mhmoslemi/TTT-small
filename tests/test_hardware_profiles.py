@@ -22,6 +22,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HardwareProfileTests(unittest.TestCase):
+    def test_gpu_query_uses_launcher_physical_ids(self):
+        import os
+
+        result = SimpleNamespace(stdout="6, NVIDIA B200, 183359, 175000\n7, NVIDIA B200, 183359, 174000\n")
+        for inventory in ("", "6,7"):
+            with self.subTest(inventory=inventory), \
+                 patch.dict(os.environ, AVAILABLE_GPUS=inventory), \
+                 patch.object(gpu.subprocess, "run", return_value=result) as query:
+                memory = gpu.query_gpu_memory()
+            self.assertEqual(set(memory), {6, 7})
+            command = query.call_args.args[0]
+            self.assertEqual("--id=6,7" in command, bool(inventory))
+            self.assertAlmostEqual(memory[6].total_gib, 183359 / 1024)
+
     def cards(self, b200=True):
         size = 183359 / 1024 if b200 else 95.6
         return {i: gpu.GPUMemory(i, "NVIDIA B200" if b200 else "RTX6000", size, size)
@@ -112,6 +126,8 @@ class HardwareProfileTests(unittest.TestCase):
                     cfg, merged = configuration.load_config()
                 self.assertEqual(cfg.hardware_profile, "B200")
                 self.assertEqual(cfg.training_gpu_ids, "6,7")
+                self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+                self.assertEqual(cfg.num_gpus, 2)
                 self.assertEqual(cfg.strategy_vllm_persistent_workers, 0)
                 self.assertTrue(cfg.reload_coder_between_phases)
                 self.assertEqual(cfg.trainer_offload_dir, str(run / ".offload"))

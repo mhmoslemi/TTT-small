@@ -93,6 +93,26 @@ def trainable_parameter_signature(model):
     )
 
 
+def model_state_signature(model):
+    """Check the full parameter/buffer layout before copying GPU replicas."""
+    return tuple(
+        (kind, name, tuple(tensor.shape), str(tensor.dtype))
+        for kind, tensors in (("parameter", model.named_parameters()),
+                              ("buffer", model.named_buffers()))
+        for name, tensor in tensors
+    )
+
+
+def broadcast_model_state(model, source_rank=0):
+    """Copy the complete model in place, without a second model-sized buffer."""
+    import torch
+    import torch.distributed as dist
+
+    with torch.no_grad():
+        for tensor in (*model.parameters(), *model.buffers()):
+            dist.broadcast(tensor.detach(), src=int(source_rank))
+
+
 def validate_model_device(model, logical_id):
     """A fast replica must be wholly resident on its one assigned GPU."""
     import torch
@@ -1206,11 +1226,16 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
             cfg.training_replica_device = int(rank)
             cfg.num_training_gpus = 1
             backend = load_backend(cfg.backend, cfg)
-            model, tokenizer = backend.load()
+            copy_from_primary = bool(cfg_dict.get("_copy_model_from_primary", False))
+            if copy_from_primary:
+                model, tokenizer = backend.load(initialize_from_primary=True)
+            else:
+                model, tokenizer = backend.load()
         validate_model_device(model, int(rank))
         result_queue.put({
             "event": "loaded", "rank": int(rank),
             "parameter_signature": trainable_parameter_signature(model),
+            "model_signature": (model_state_signature(model) if copy_from_primary else None),
         })
 
         command = command_queue.get()
@@ -1221,7 +1246,10 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
             rank=int(rank), world_size=int(world_size),
             timeout=timedelta(minutes=30))
         dist_initialized = True
-        broadcast_trainable_parameters(model, source_rank=0)
+        if copy_from_primary:
+            broadcast_model_state(model, source_rank=0)
+        else:
+            broadcast_trainable_parameters(model, source_rank=0)
         result_queue.put({"event": "ready", "rank": int(rank)})
         offloaded = False
         context_groups = None
