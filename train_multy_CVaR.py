@@ -501,19 +501,26 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
     from search.sampler import can_migrate_parent_selection
     if not can_migrate_parent_selection(sampler.selection_mode, cfg.parent_selection):
         raise ValueError("unsupported resume parent-selection change")
-    if recovery_pending:
+    if (recovery_pending or (cfg.parent_selection == "puct-jev"
+            and (Path(exp_dir) / f"step{next_step:02d}" /
+                 f"step{next_step:02d}.parents.json").exists())):
         print(f"[resume] finishing interrupted step {next_step} with "
               f"{sampler.selection_mode.upper()}; "
               f"{cfg.parent_selection.upper()} starts at the next fresh step",
               flush=True)
         return sampler
-    from search.llm_sampler import LLMSampler
-    migrated = LLMSampler(
-        num_seeds=0, exp_dir=exp_dir, problem=problem,
-        puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
-        topk_children=sampler.topk_children)
-    migrated.load_state_dict(dict(sampler.state_dict(), selection_mode="llm"))
-    detail = "the full evaluated tree is available for LLM selection"
+    options = dict(num_seeds=0, exp_dir=exp_dir, problem=problem,
+                   puct_c=sampler.puct_c, max_buffer_size=sampler.max_buffer_size,
+                   topk_children=sampler.topk_children)
+    if cfg.parent_selection == "puct-jev":
+        from search.jev_sampler import PUCTJevSampler
+        migrated = PUCTJevSampler(model_path=getattr(cfg, "jev_model_path", None), **options)
+        detail = "PUCT ordering with GLiDE-9B semantic comparisons"
+    else:
+        from search.llm_sampler import LLMSampler
+        migrated = LLMSampler(**options)
+        detail = "the full evaluated tree is available for LLM selection"
+    migrated.load_state_dict(dict(sampler.state_dict(), selection_mode=cfg.parent_selection))
     # Persist intent first: a crash before checkpoint replacement repeats the
     # migration, never recovers new-picker decisions with the legacy picker.
     path = Path(exp_dir) / "config.json"
@@ -527,6 +534,45 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
           f"{cfg.parent_selection.upper()} at step {next_step}; {detail}; "
           "archive, adapter, optimizer and SPO tracker preserved", flush=True)
     return migrated
+
+
+def _configure_jev_sampler(sampler, cfg, backend, optimizer, parallel_trainer,
+                           gen_pool, strategy_pool, prepare_trainer):
+    """Give the transient judge the same GPU handoff as generation."""
+    if sampler.selection_mode != "puct-jev":
+        return
+    sampler.gpu_id = _parse_gpu_ids(cfg.gpu_ids)[0]
+
+    def before():
+        if cfg.generation_backend == "vllm":
+            from generation.gen_workers import PhasedVLLMGenerationPool
+            # Also drop sleeping engines and their host weight backups.
+            for pool in (strategy_pool, gen_pool):
+                if isinstance(pool, PhasedVLLMGenerationPool):
+                    pool.shutdown()
+            if prepare_trainer is None:
+                raise RuntimeError("puct-jev has no configured trainer/GPU handoff")
+            prepare_trainer("jev")
+        elif parallel_trainer is not None:
+            parallel_trainer.offload_for_generation(
+                disk_directory=getattr(cfg, "trainer_offload_dir", None))
+        else:
+            _move_optimizer_state(optimizer, "cpu")
+            backend.offload_for_generation(
+                disk_directory=getattr(cfg, "trainer_offload_dir", None))
+        print(f"[puct-jev] loading GLiDE-9B on GPU {sampler.gpu_id}", flush=True)
+
+    def after():
+        if cfg.generation_backend != "vllm":
+            if parallel_trainer is not None:
+                parallel_trainer.restore_after_generation()
+            else:
+                backend.restore_after_generation()
+                _restore_optimizer_state_to_parameters(optimizer)
+                backend.set_training_mode()
+        print("[puct-jev] GLiDE worker exited; GPU released", flush=True)
+
+    sampler.before_judge, sampler.after_judge = before, after
 
 
 def _prefetch_resume_parents(sampler, cfg, exp_dir, next_step, adapter_path,
@@ -4843,6 +4889,8 @@ def main():
     selection = cfg.parent_selection
     selection_detail = ("gpt-6-luna, reasoning=max; first pick=best raw score"
                         if selection == "llm" else f"c={cfg.puct_c}")
+    if selection == "puct-jev":
+        selection_detail += f"; GLiDE-9B={cfg.jev_model_path}; same-core threshold=0.90; step 0=PUCT"
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
     print(f"Groups per step:    {cfg.groups_per_step}")
@@ -5114,6 +5162,7 @@ def main():
         parent_selection=restored_selection,
         group_size=int(cfg.group_size), seed=int(cfg.seed),
         exp_dir=exp_dir, problem=problem,
+        jev_model_path=getattr(cfg, "jev_model_path", None),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
@@ -5240,6 +5289,7 @@ def main():
     gen_pool = None
     strategy_pool = None
     ensure_trainer_ready = None
+    prepare_jev_trainer = None
     # Generation callbacks consult it so all later steps follow the genuine
     # no-training residency path instead of waiting for a nonexistent update.
     runtime_training_active = {"value": not bool(cfg.no_train)}
@@ -5511,6 +5561,7 @@ def main():
 
             if cfg.training_layout == "sharded":
                 ensure_trainer_ready = _ensure_sharded_trainer_ready
+            prepare_jev_trainer = _offload_trainer_for_generation
 
             gen_pool = PhasedVLLMGenerationPool(
                 before_start=lambda: _offload_trainer_for_generation("coder"),
@@ -5689,6 +5740,9 @@ def main():
                 optimizer, spo_rs_tracker,
                 recovery_pending=(interrupted_spo_rs_artifacts is not None or pending_spo_rs_artifacts is not None),
                 problem=problem)
+            _configure_jev_sampler(sampler, step_cfg, backend, optimizer,
+                                   parallel_trainer, gen_pool, strategy_pool,
+                                   prepare_jev_trainer)
 
             if interrupted_spo_rs_artifacts is not None:
                 stats = _resume_spo_rs_step_from_artifacts(

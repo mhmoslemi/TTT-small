@@ -6,7 +6,7 @@ Set `hardware_profile: B200` in the selected YAML for the B200 machine;
 `RTX6000` preserves the existing placement policy. The current YAML hardware
 selection also applies on resume. GPU capacity, CPU affinity and available host
 RAM are detected, not assumed to equal the advertised machine size.
-The seven installed checkpoints under `/root/nas/Mohammad/models/` are preferred
+Matching local checkpoints under `/root/nas/Mohammad/models/` are preferred
 over their matching Hub IDs on B200 when present; explicit paths stay explicit.
 
 B200 uses the same loading, sleep/wake and model-specific engine settings as
@@ -31,6 +31,42 @@ FlashInfer initialization and downloads use the original vLLM path; there is
 no extra startup process, download hook or bulk-kernel preflight.
 This is bounded resource planning, not a guarantee against arbitrary external
 allocations or a claim of benchmarked maximum throughput.
+
+## Semantic parent selection
+
+Enable PUCT with GLiDE-9B comparisons using:
+
+```sh
+sh run_copy.sh --parent-selection puct-jev
+```
+
+Download the complete BF16 `fastino/GLiDE-9B` repository (including `glide/`
+and `readout.safetensors`) to `/root/nas/Mohammad/models/GLiDE-9B` on B200,
+or put `GLiDE-9B` beside the local coder checkpoint. Override its location
+with `--jev-model-path /path/to/GLiDE-9B`. The worker uses the launch Python
+environment and the checkpoint's native inference code; its `requirements.txt`
+lists the vendor's validated dependencies. No packages are installed at runtime.
+
+Step 0 uses ordinary PUCT and never loads GLiDE. On later steps PUCT proposes
+parents in score order. GLiDE receives the problem description and two complete
+proposed Python programs, returning probabilities for `same_core_idea`,
+`meaningful_variant`, and `different_approach`. A candidate is skipped if any
+accepted parent matches with `same_core_idea >= 0.90`; uncertain cases remain
+eligible. Original lineage blocking is relaxed if needed, then semantically
+rejected candidates fill any remaining slots in PUCT order, explicitly logged
+as `duplicate_fallback`. The archive and expansion statistics are preserved.
+
+The trainer is parked before the first comparison, GLiDE loads on the first
+rollout GPU, and its process exits before strategist/coder generation. It has
+no persistent host-RAM weight backup. Full rendered prompts are checked against
+40,000 tokens; oversized pairs and inference failures stop with an error rather
+than silently truncating source or bypassing comparison.
+
+Each step saves its problem, compared sources, probabilities, and final picks
+in `stepNN/stepNN.jev.json`; worker diagnostics are in `stepNN.jev.worker.log`.
+Completed comparisons and parent selections are reused on resume. An existing
+PUCT checkpoint can switch to `puct-jev` at the next fresh step while preserving
+the archive, adapter, optimizer and visit counts.
 
 ## Directory guide
 

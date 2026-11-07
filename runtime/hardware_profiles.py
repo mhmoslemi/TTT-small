@@ -8,6 +8,7 @@ from runtime.host_memory import host_memory_info, host_memory_reserve_bytes, GIB
 
 B200_MODEL_DIR = Path("/root/nas/Mohammad/models")
 B200_LOCAL_MODELS = {
+    "fastino/GLiDE-9B": "GLiDE-9B",
     "openai/gpt-oss-120b": "gpt-oss-120b",
     "Qwen/Qwen3.8-27B": "Qwen3.8-27B",
     "nvidia/Qwen3.8-Flash-Next-NVFP4": "Qwen3.8-Flash-Next-NVFP4",

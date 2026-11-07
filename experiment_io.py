@@ -248,8 +248,9 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     directory = run / f"step{step:02d}"
     parents_path = directory / f"step{step:02d}.parents.json"
     request_path = directory / f"step{step:02d}.sampler.request.json"
+    jev_path = directory / f"step{step:02d}.jev.json"
     if ((directory / f"step{step:02d}.summary.json").is_file()
-            or not (parents_path.is_file() or request_path.is_file())):
+            or not (parents_path.is_file() or request_path.is_file() or jev_path.is_file())):
         return None
     if parents_path.is_file():
         event = json.loads(parents_path.read_text())
@@ -263,6 +264,8 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if request_path.is_file():
         values["groups_per_step"] = int(
             json.loads(request_path.read_text())["num_parents"])
+    if jev_path.is_file():
+        values["groups_per_step"] = int(json.loads(jev_path.read_text())["requested"])
     if all(getattr(cfg, key, None) == value for key, value in values.items()):
         return None
 
@@ -456,6 +459,7 @@ def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
             "selection_score": (float(info["score"])
                                 if info.get("score") is not None else None),
             **({"llm": info["llm"]} if "llm" in info else {}),
+            **({"jev": info["jev"]} if "jev" in info else {}),
         })
     payload = {
         "version": 1,

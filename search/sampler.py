@@ -38,7 +38,7 @@ import numpy as np
 from dataclasses import asdict, dataclass, field
 
 
-PARENT_SELECTION_MODES = ("puct", "uct", "llm")
+PARENT_SELECTION_MODES = ("puct", "uct", "llm", "puct-jev")
 
 
 def parent_selection_mode(config):
@@ -47,20 +47,25 @@ def parent_selection_mode(config):
     if mode is None:
         mode = "uct" if config.get("uct", False) else "puct"
     if not isinstance(mode, str) or mode.lower() not in PARENT_SELECTION_MODES:
-        raise ValueError("parent_selection must be 'puct', 'uct', or 'llm'")
+        raise ValueError("parent_selection must be 'puct', 'uct', 'llm', or 'puct-jev'")
     return mode.lower()
 
 
 def can_migrate_parent_selection(source, target):
-    return target == "llm" and source in ("puct", "uct")
+    return (target == "llm" and source in ("puct", "uct")
+            or source == "puct" and target == "puct-jev")
 
 
 def make_sampler(*, parent_selection="puct", group_size=1, seed=0,
-                 exp_dir=None, problem=None, **kwargs):
+                 exp_dir=None, problem=None, jev_model_path=None, **kwargs):
     mode = parent_selection_mode({"parent_selection": parent_selection})
     if mode == "llm":
         from search.llm_sampler import LLMSampler
         return LLMSampler(exp_dir=exp_dir, problem=problem, **kwargs)
+    if mode == "puct-jev":
+        from search.jev_sampler import PUCTJevSampler
+        return PUCTJevSampler(exp_dir=exp_dir, problem=problem,
+                              model_path=jev_model_path, **kwargs)
     return PUCTSampler(use_uct=(mode == "uct"), **kwargs)
 
 
@@ -223,11 +228,8 @@ class PUCTSampler:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def sample_states(self, num_states: int, *, selection_step=None):
-        """Pick `num_states` parent states for the next batch."""
-        if not self._states:
-            return []
-
+    def _ranked_states(self):
+        """The unchanged PUCT/UCT scores, shared with semantic selection."""
         values = np.array([s.value if s.value is not None else -np.inf
                            for s in self._states])
         scale = self._scale()
@@ -255,6 +257,22 @@ class PUCTSampler:
 
         # Sort by (score, value) descending
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return scored
+
+    def _pick_info(self, entry):
+        return {
+            "value": entry[1], "n": entry[3], "Q": entry[4],
+            "P": None if self.use_uct else entry[5],
+            "bonus": entry[6], "score": entry[0],
+            "selection_mode": self.selection_mode,
+            "is_seed": entry[2].id in self._seed_ids,
+        }
+
+    def sample_states(self, num_states: int, *, selection_step=None):
+        """Pick `num_states` parent states for the next batch."""
+        if not self._states:
+            return []
+        scored = self._ranked_states()
 
         # Lineage blocking across the batch
         children_map = self._build_children_map()
@@ -266,13 +284,7 @@ class PUCTSampler:
             if s.id in blocked:
                 continue
             picks.append(s)
-            info.append({
-                "value": entry[1], "n": entry[3], "Q": entry[4],
-                "P": None if self.use_uct else entry[5],
-                "bonus": entry[6], "score": entry[0],
-                "selection_mode": "uct" if self.use_uct else "puct",
-                "is_seed": s.id in self._seed_ids,
-            })
+            info.append(self._pick_info(entry))
             blocked.update(self._full_lineage(s, children_map))
             if len(picks) >= num_states:
                 break
@@ -287,13 +299,7 @@ class PUCTSampler:
                 if s.id in picked_ids:
                     continue
                 picks.append(s)
-                info.append({
-                    "value": entry[1], "n": entry[3], "Q": entry[4],
-                    "P": None if self.use_uct else entry[5],
-                    "bonus": entry[6], "score": entry[0],
-                    "selection_mode": "uct" if self.use_uct else "puct",
-                    "is_seed": s.id in self._seed_ids,
-                })
+                info.append(self._pick_info(entry))
 
         self.last_picks_info = info
         return picks

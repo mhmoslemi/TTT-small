@@ -95,6 +95,15 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertEqual(json.loads(request.read_text())["num_parents"], 8)
         self.assertFalse(self.step.exists())
 
+    def test_changed_jev_parent_count_restarts_partial_comparisons(self):
+        path = self.step / "step03.jev.json"
+        path.write_text('{"requested": 8, "comparisons": [{"done": true}]}')
+        backup = self.resume(SimpleNamespace(**self.current))
+        saved = json.loads((backup / "step03/step03.jev.json").read_text())
+        self.assertEqual(saved["requested"], 8)
+        self.assertEqual(saved["comparisons"], [{"done": True}])
+        self.assertFalse(self.step.exists())
+
     def test_unchanged_budget_or_effort_only_edits_keep_recovery(self):
         (self.step / "step03.parents.json").write_text('{"parents": []}')
         cfg = SimpleNamespace(**dict(self.saved, pilot_medium_programs_per_strategy=3))

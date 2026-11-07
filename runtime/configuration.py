@@ -274,10 +274,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "from each generated strategy before applying the existing "
              "topk_children_per_parent archive limit.")
     p.add_argument("--num-seed-states", type=int, default=None)
-    p.add_argument("--parent-selection", choices=("puct", "uct", "llm"),
+    p.add_argument("--parent-selection", choices=("puct", "uct", "llm", "puct-jev"),
                    default=None, help="Override the YAML picker; on resume, "
                    "a switch to llm starts at the next fresh step. "
-                   "llm uses GPT-6 Luna with maximum reasoning.")
+                   "llm uses GPT-6 Luna with maximum reasoning; puct-jev "
+                   "uses local GLiDE-9B to filter same-idea parents after step 0.")
+    p.add_argument("--jev-model-path", default=None,
+                   help="Complete local GLiDE-9B repository. Defaults to "
+                   "GLiDE-9B beside the coder checkpoint (B200 models directory).")
     p.add_argument("--uct", dest="parent_selection", action="store_const",
                    const="uct", default=None,
                    help="Compatibility alias for --parent-selection uct.")
@@ -706,7 +710,7 @@ def load_config():
     merged["uct"] = merged["parent_selection"] == "uct"
     if saved and merged["parent_selection"] != parent_selection_mode(saved):
         if not can_migrate_parent_selection(parent_selection_mode(saved), merged["parent_selection"]):
-            raise ValueError('cannot change parent_selection while resuming except PUCT/UCT to LLM')
+            raise ValueError('cannot change parent_selection while resuming except PUCT/UCT to LLM or PUCT to PUCT-JEV')
         if not (resume_dir / "training_state.pt").is_file():
             raise ValueError('parent-picker migration requires training_state.pt; refusing to reset the trained run')
     if (saved and args.spo_rs_adaptive_beta is not None
@@ -754,6 +758,13 @@ def load_config():
     # resulting training layout and precision.
     for key in ("model_name", "coder_model_name", "training_model_name", "coder_training_model_name"):
         merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
+    if merged["parent_selection"] == "puct-jev":
+        jev_path = merged.get("jev_model_path")
+        if not jev_path:
+            sibling = Path(merged["model_name"]).expanduser().parent / "GLiDE-9B"
+            jev_path = (str(sibling.resolve()) if sibling.is_dir() else
+                        local_checkpoint("fastino/GLiDE-9B", merged["hardware_profile"]))
+        merged["jev_model_path"] = str(Path(jev_path).expanduser())
     _apply_coder_model_profile(merged, profile_explicit_keys)
     _resolve_coder_token_limits(merged)
 

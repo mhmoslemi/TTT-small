@@ -159,7 +159,7 @@ def test_all_yaml_presets_accept_supported_pickers():
     for path in paths:
         config = yaml.safe_load(path.read_text())
         assert config["parent_selection"] in ("puct", "uct", "llm")
-        for mode in ("puct", "uct", "llm"):
+        for mode in ("puct", "uct", "llm", "puct-jev"):
             config["parent_selection"] = mode
             validate_problem_config(config, source=path)
     assert parent_selection_mode({}) == "puct"

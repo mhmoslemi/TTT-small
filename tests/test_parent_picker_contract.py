@@ -31,7 +31,7 @@ class ParentPickerContractTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "pickers", "exec"), self.scope)
 
     def test_registry_factory_cli_and_validation_agree(self):
-        allowed = ("puct", "uct", "llm")
+        allowed = ("puct", "uct", "llm", "puct-jev")
         self.assertEqual(self.scope["PARENT_SELECTION_MODES"], allowed)
         source = ast.parse((ROOT / "runtime/configuration.py").read_text())
         argument = next(node for node in ast.walk(source) if isinstance(node, ast.Call)
@@ -45,7 +45,9 @@ class ParentPickerContractTests(unittest.TestCase):
                      "picker_cli", "exec"), {"p": parser})
         remote = ModuleType('search.llm_sampler')
         remote.LLMSampler = Mock()
-        with patch.dict(sys.modules, {'search.llm_sampler': remote}):
+        local = ModuleType('search.jev_sampler')
+        local.PUCTJevSampler = Mock()
+        with patch.dict(sys.modules, {'search.llm_sampler': remote, 'search.jev_sampler': local}):
             for mode in allowed:
                 self.assertEqual(parser.parse_args(["--parent-selection", mode]).parent_selection, mode)
                 validate_problem_config(dict(problem="erdos", parent_selection=mode),
@@ -56,6 +58,10 @@ class ParentPickerContractTests(unittest.TestCase):
                 if mode == "llm":
                     self.assertIs(actual, remote.LLMSampler.return_value)
                     remote.LLMSampler.assert_called_once_with(exp_dir="run", problem="task", num_seeds=2)
+                elif mode == "puct-jev":
+                    self.assertIs(actual, local.PUCTJevSampler.return_value)
+                    local.PUCTJevSampler.assert_called_once_with(
+                        exp_dir="run", problem="task", model_path=None, num_seeds=2)
                 else:
                     self.assertIs(actual, self.scope["PUCTSampler"].return_value)
                     self.scope["PUCTSampler"].assert_called_with(use_uct=(mode == "uct"), num_seeds=2)
@@ -68,12 +74,13 @@ class ParentPickerContractTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--parent-selection", "removed-picker"])
 
-    def test_migration_is_only_from_puct_or_uct_to_llm(self):
+    def test_migration_only_allows_supported_picker_changes(self):
         migrate = self.scope["can_migrate_parent_selection"]
-        for source in ("puct", "uct", "llm"):
-            for target in ("puct", "uct", "llm"):
+        for source in ("puct", "uct", "llm", "puct-jev"):
+            for target in ("puct", "uct", "llm", "puct-jev"):
                 self.assertEqual(migrate(source, target),
-                                 target == "llm" and source in ("puct", "uct"))
+                                 (target == "llm" and source in ("puct", "uct")
+                                  or source == "puct" and target == "puct-jev"))
         self.assertEqual(self.scope["parent_selection_mode"]({"uct": True}), "uct")
         self.assertEqual(self.scope["parent_selection_mode"]({}), "puct")
 

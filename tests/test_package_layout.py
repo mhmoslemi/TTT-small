@@ -19,7 +19,7 @@ PACKAGES = {
     "models": "model_backend coder_profiles strategist_models qwen_training_kernels gpt_oss_training",
     "training": "trainers fast_distributed spo_rs advantage context_parallel exact_overflow training_checkpointing",
     "generation": "gen_workers strategy_api strategy_prompts strategy_prompts_openai output_retries",
-    "search": "sampler llm_sampler rollout_allocation",
+    "search": "sampler llm_sampler jev_sampler jev_worker rollout_allocation",
     "evaluation": "reward sandbox",
     "runtime": "configuration gpu_runtime host_memory gpu_lease",
     "diagnostics": "console startup_logs loading_logs terminal_output",
