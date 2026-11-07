@@ -2440,23 +2440,6 @@ class GenerationPool:
         worker_jobs = distribute_jobs(
             prompts_by_group, group_size, self.num_workers,
             counts_by_group=counts_by_group)
-        if (getattr(self, "hardware_profile", "RTX6000") == "B200"
-                and getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
-                and (self._worker_options.get("engine_options") or {}).get("enable_lora", True)):
-            counts = ([int(group_size)] * len(prompts_by_group) if counts_by_group is None
-                      else [int(count) for count in counts_by_group])
-            jobs = [dict(key=index, prompt_text=prompt, count=count, step_idx=step_idx)
-                    for index, (prompt, count) in enumerate(zip(prompts_by_group, counts)) if count]
-            def poll():
-                nonlocal jobs
-                ready, jobs = jobs, []
-                return ready, True
-            yield from self.iter_ready_jobs(
-                poll, total_expected=sum(counts), adapter_path=adapter_path,
-                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
-                return_logprobs=return_logprobs, full_policy_sampling=full_policy_sampling,
-                top_k=top_k, min_p=min_p, progress_desc=progress_desc, show_progress=show_progress)
-            return
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
@@ -2995,6 +2978,12 @@ class PhasedVLLMGenerationPool:
         self._after_stop = after_stop
         self.host_memory_admission = pool_kwargs.pop("host_memory_admission", None)
         self._pool_kwargs = dict(pool_kwargs)
+        self._b200_transient = self._pool_kwargs.get("hardware_profile", "RTX6000") == "B200"
+        if self._b200_transient:
+            self._pool_kwargs["vllm_persistent_workers"] = 0
+            options = dict(self._pool_kwargs.get("vllm_engine_options") or {})
+            options["safetensors_load_strategy"] = "lazy"
+            self._pool_kwargs["vllm_engine_options"] = options
         requested_sleep_level = int(
             self._pool_kwargs.pop("vllm_sleep_level", 1))
         if requested_sleep_level not in (1, 2):
@@ -3030,8 +3019,8 @@ class PhasedVLLMGenerationPool:
         # original parameter names and fails (for example, w2_bias is no
         # longer present).  A fresh process is exact and also releases the
         # residual CUDA allocations that level-2 sleep keeps alive.
-        self._force_transient = bool(
-            self._sleep_level == 2 and "gpt-oss" in model_name)
+        self._force_transient = bool(self._b200_transient or (
+            self._sleep_level == 2 and "gpt-oss" in model_name))
         self._pool = None
         self._persistent = False
         self._awake = False
@@ -3099,7 +3088,10 @@ class PhasedVLLMGenerationPool:
                     not self._force_transient
                     and self._pool.sleep_supported)
                 if not self._sleep_mode_announced:
-                    if self._force_transient:
+                    if self._b200_transient:
+                        print("[pool] B200: inference workers exit at phase handoff; "
+                              "no sleep or host weight backups", flush=True)
+                    elif self._force_transient:
                         print(
                             "[pool] GPT-OSS level-2 weight reload is unsafe; "
                             "using a fresh transient vLLM pool for each phase",

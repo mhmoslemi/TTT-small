@@ -41,9 +41,10 @@ class HardwareProfileTests(unittest.TestCase):
             explicit = "/my/custom/Qwen3-8B"
             self.assertEqual(hardware.local_checkpoint(explicit, "B200"), explicit)
             name = str(Path(folder) / "Qwen3-8B")
-            self.assertTrue(coders._dual_resident_qwen3_8b_strategy_coder_pools(dict(
-                hardware_profile="B200", model_name=name, coder_model_name=name,
-                strategy_model_name=name, strategies=True, generation_backend="vllm")))
+            for profile in ("RTX6000", "B200"):
+                self.assertEqual(coders._dual_resident_qwen3_8b_strategy_coder_pools(dict(
+                    hardware_profile=profile, model_name=name, coder_model_name=name,
+                    strategy_model_name=name, strategies=True, generation_backend="vllm")), profile != "B200")
 
     def test_yaml_resume_refreshes_capacity_not_policy_and_rejects_typos(self):
         saved = dict(gen_micro_batch=3, logprob_chunk=128, spo_rs_beta=4,
@@ -66,19 +67,20 @@ class HardwareProfileTests(unittest.TestCase):
         source = (ROOT / "runtime/configuration.py").read_text()
         self.assertLess(source.index("restore_hardware_settings(merged"), source.index("# 3) CLI overlay"))
 
-    def test_live_validation_never_invents_b200_memory(self):
-        cfg = dict(hardware_profile="B200")
-        for cards in (self.cards(False),):
-            with self.assertRaises(ValueError):
-                hardware.validate_hardware_profile(cfg, range(8), cards)
-        with patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=50*host.GIB)), redirect_stdout(io.StringIO()):
-            for cards in ({}, {6: gpu.GPUMemory(6, "", 178., 175.)}):
-                hardware.validate_hardware_profile(cfg, [6, 7], cards)
-        with patch.object(hardware, "host_memory_info", return_value=None):
-            with self.assertRaises(RuntimeError):
-                hardware.validate_hardware_profile(cfg, range(8), self.cards())
-        with patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=1000*host.GIB)), redirect_stdout(io.StringIO()):
-            hardware.validate_hardware_profile(cfg, range(8), self.cards())
+    def test_profile_changes_only_refresh_gpu_capacity(self):
+        for previous in ("RTX6000", "B200"):
+            for profile in ("RTX6000", "B200"):
+                saved = dict(hardware_profile=previous, gen_micro_batch=7, logprob_chunk=128,
+                             vllm_staged_loading=True, strategy_vllm_staged_loading=True,
+                             strategy_vllm_persistent_workers=1, reload_coder_between_phases=True)
+                cfg = dict(saved)
+                hardware.restore_hardware_settings(cfg, dict(hardware_profile=profile), saved)
+                expected = dict(saved, hardware_profile=profile)
+                if previous != profile:
+                    expected.update(gen_micro_batch="auto", logprob_chunk="auto",
+                                    vllm_gpu_memory_utilization="auto",
+                                    vllm_max_num_batched_tokens="auto")
+                self.assertEqual(cfg, expected)
 
     def test_all_profiled_models_fit_full_context_and_use_every_card(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")
@@ -111,7 +113,7 @@ class HardwareProfileTests(unittest.TestCase):
                 self.assertEqual(cfg["max_seq_length"], context)
                 self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
                 self.assertLessEqual(cfg["gen_micro_batch"], 256)
-                self.assertEqual(cfg["vllm_max_num_batched_tokens"], 16384 if frozen else 8192)
+                self.assertEqual(cfg["vllm_max_num_batched_tokens"], 8192)
                 if frozen:
                     for parents in (1, 3, 4, 8):
                         folded = gpu.align_vllm_layout_to_concurrency(cfg, layout, 8, heads, parents)
@@ -134,50 +136,67 @@ class HardwareProfileTests(unittest.TestCase):
                         actual = gpu._vllm_memory_per_rank(dict(
                             model_name=name, max_seq_length=262144,
                             hardware_profile=hardware_profile, strategy_inference_profile=True), tp)
-                        weight = expected[0] + (profile["ple_gib"] / tp if hardware_profile == "B200" else 0)
-                        self.assertEqual(actual, (weight, expected[1]))
+                        extra = profile["ple_gib"] / tp if hardware_profile == "B200" else 0
+                        self.assertEqual(actual, (expected[0] + extra, expected[1]))
                         options = strategists.strategist_engine_options(name, hardware_profile)
                         if profile["ple_gib"]:
-                            self.assertEqual(options["engram_config"]["cpu_offload"], hardware_profile == "RTX6000")
+                            self.assertEqual(options["engram_config"]["cpu_offload"], hardware_profile != "B200")
+                        else:
+                            self.assertEqual(options, strategists.strategist_engine_options(name))
         for hardware_profile in ("RTX6000", "B200"):
             cfg = SimpleNamespace(coder_model_profile="gpt-oss-120b", no_train=False,
                                   hardware_profile=hardware_profile)
             self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0)
-        with patch.object(gpu, "_checkpoint_weight_gib", return_value=200.0):
-            weight, _ = gpu._vllm_memory_per_rank(dict(
-                model_name="qwen3.8-flash-next", max_seq_length=262144,
-                hardware_profile="B200", strategy_inference_profile=True), 2)
-            self.assertEqual(weight, 100.0)
+        self.assertEqual(
+            strategists.strategist_engine_options("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", "B200"),
+            strategists.strategist_engine_options("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"))
 
-    def test_b200_fresh_and_resume_use_transient_workers_with_50_gib_free(self):
+    def test_b200_fresh_and_resume_force_transient_coder_without_saved_flags(self):
         import os
         import sys
         from runtime import configuration
 
-        argv = ["train_multy_CVaR.py", "--config", str(ROOT / "configs/ac1.yaml"),
-                "--advantage-mode", "spo-rs", "--fast", "--strategies", "--isolate-eval"]
+        preset = configuration.yaml.safe_load((ROOT / "configs/ac1.yaml").read_text())
         with tempfile.TemporaryDirectory() as folder, \
              patch.dict(os.environ, AVAILABLE_GPUS="6,7", HF_HUB_OFFLINE="1"), \
-             patch.object(gpu, "query_gpu_memory", return_value={}), \
+             patch.object(gpu, "query_gpu_memory", return_value=self.cards()), \
              patch.object(gpu, "detect_attention_heads", return_value=32), \
              patch.object(configuration, "_isolated_evaluation_cpu_ids", return_value=[0, 1]), \
-             patch.object(hardware, "host_memory_info", return_value=dict(total=1200*host.GIB, available=50*host.GIB)), \
+             patch.object(host, "host_memory_info", side_effect=AssertionError("no profile-only RAM preflight")), \
              redirect_stdout(io.StringIO()):
             os.environ.pop("TTT_HOST_MEMORY_RESERVE_GIB", None)
+            config_path = Path(folder) / "ac1.yaml"
+            argv = ["train_multy_CVaR.py", "--config", str(config_path),
+                    "--advantage-mode", "spo-rs", "--fast", "--strategies", "--isolate-eval"]
+            snapshots = {}
+            for profile in ("RTX6000", "B200"):
+                config_path.write_text(configuration.yaml.safe_dump(dict(preset, hardware_profile=profile)))
+                for resume in (False, True):
+                    if resume:
+                        import json
+                        saved = dict(merged, strategy_vllm_persistent_workers=0,
+                                     reload_coder_between_phases=True,
+                                     trainer_offload_dir="/old/low-ram/.offload")
+                        (Path(folder) / "config.json").write_text(json.dumps(saved))
+                    with patch.object(sys, "argv", argv + (["--resume", folder] if resume else [])):
+                        cfg, merged = configuration.load_config()
+                    self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
+                    self.assertEqual(cfg.num_training_gpus, 2)
+                    self.assertEqual(cfg.strategy_vllm_persistent_workers, 0 if resume else None)
+                    self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0 if resume or profile == "B200" else None)
+                    self.assertEqual(getattr(cfg, "reload_coder_between_phases", False), resume)
+                    self.assertIsNone(cfg.trainer_offload_dir)
+                    self.assertNotIn("TTT_HOST_MEMORY_RESERVE_GIB", os.environ)
+                    snapshots[profile, resume] = dict(vars(cfg))
+                    snapshots[profile, resume].pop("hardware_profile")
             for resume in (False, True):
-                if resume:
-                    import json
-                    saved = dict(merged, strategy_vllm_persistent_workers=None,
-                                 reload_coder_between_phases=False)
-                    (Path(folder) / "config.json").write_text(json.dumps(saved))
-                with patch.object(sys, "argv", argv + (["--resume", folder] if resume else [])):
-                    cfg, merged = configuration.load_config()
-                self.assertEqual(cfg.vllm_tensor_parallel_size, 1)
-                self.assertEqual(cfg.num_training_gpus, 2)
-                self.assertEqual(cfg.strategy_vllm_persistent_workers, 0)
-                self.assertEqual(coders._coder_vllm_persistent_workers(cfg), 0)
-                self.assertTrue(cfg.trainer_offload_dir)
-                self.assertEqual(os.environ["TTT_HOST_MEMORY_RESERVE_GIB"], "16")
+                self.assertEqual(snapshots["RTX6000", resume], snapshots["B200", resume])
+
+    def test_run_copy_has_the_same_execution_flags_as_run2(self):
+        normal = (ROOT / "run2.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
+        copy = (ROOT / "run_copy.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
+        self.assertEqual(normal, copy)
+        self.assertNotIn("TTT_HOST_MEMORY_RESERVE_GIB", (ROOT / "run_copy.sh").read_text())
 
     def test_gpu_query_is_limited_to_launcher_devices(self):
         import os
@@ -188,7 +207,7 @@ class HardwareProfileTests(unittest.TestCase):
             self.assertEqual(set(gpu.query_gpu_memory()), {6, 7})
         self.assertIn("--id=6,7", query.call_args.args[0])
 
-    def test_b200_automatic_batch_scales_to_memory_and_real_work(self):
+    def test_b200_automatic_batches_follow_rtx_rules(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")
         def resolve(profile, **overrides):
             cfg = dict(model_name="Qwen/Qwen3.8-27B", max_seq_length=262144,
@@ -198,9 +217,11 @@ class HardwareProfileTests(unittest.TestCase):
             cfg.update(overrides)
             gpu.resolve_memory_settings(cfg, roles, self.cards())
             return cfg
-        full = resolve("B200")["gen_micro_batch"]
-        self.assertGreater(full, 64)
-        self.assertLessEqual(resolve("B200", groups_per_step=1, group_size=64)["gen_micro_batch"], 8)
+        for overrides in ({}, dict(groups_per_step=1, group_size=64), dict(frozen_strategy=True)):
+            b200, rtx = resolve("B200", **overrides), resolve("RTX6000", **overrides)
+            for key in ("gen_micro_batch", "vllm_max_num_batched_tokens", "logprob_chunk",
+                        "vllm_gpu_memory_utilization", "vllm_runtime_reserve_gib"):
+                self.assertEqual(b200[key], rtx[key], key)
         self.assertEqual(resolve("B200", gen_micro_batch=4)["gen_micro_batch"], 4)
         self.assertLessEqual(resolve("RTX6000")["gen_micro_batch"], 32)
         self.assertEqual(resolve("B200")["max_seq_length"], 262144)

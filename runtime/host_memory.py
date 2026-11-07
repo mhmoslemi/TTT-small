@@ -146,7 +146,7 @@ def automatic_activation_offload_budget_bytes(
     )
 
 
-def host_memory_reserve_bytes(info):
+def host_memory_reserve_bytes(info, hardware_profile="RTX6000"):
     """Leave OS/runtime headroom without assuming a particular model or node."""
     total = max(1, int(info["total"]))
     override = os.environ.get("TTT_HOST_MEMORY_RESERVE_GIB")
@@ -155,6 +155,9 @@ def host_memory_reserve_bytes(info):
         if not math.isfinite(reserve) or reserve <= 0:
             raise ValueError("TTT_HOST_MEMORY_RESERVE_GIB must be finite and positive")
         return min(total // 4, int(reserve * GIB))
+    if hardware_profile == "B200":
+        # This job may own two GPUs on a busy multi-TiB host, not all its RAM.
+        return min(total // 4, 16 * GIB)
     return min(total // 4, max(GIB, min(128 * GIB, total // 10)))
 
 
@@ -171,7 +174,8 @@ class HostMemoryAdmission:
     spend the same free RAM. No GPU-resident forward acquires this gate.
     """
 
-    def __init__(self, multiprocessing_context):
+    def __init__(self, multiprocessing_context, *, hardware_profile="RTX6000"):
+        self.hardware_profile = hardware_profile
         self._reserved = multiprocessing_context.Value("q", 0, lock=False)
         self._condition = multiprocessing_context.Condition(
             multiprocessing_context.RLock())
@@ -187,7 +191,7 @@ class HostMemoryAdmission:
             if info is None:
                 return None
             return max(0, int(info["available"])
-                       - host_memory_reserve_bytes(info)
+                       - host_memory_reserve_bytes(info, self.hardware_profile)
                        - int(self._reserved.value))
 
     @contextmanager
@@ -198,7 +202,7 @@ class HostMemoryAdmission:
                 info = host_memory_info()
                 if info is None:
                     break
-                reserve = host_memory_reserve_bytes(info)
+                reserve = host_memory_reserve_bytes(info, self.hardware_profile)
                 if size_bytes > int(info["total"]) - reserve:
                     raise HostMemoryUnavailable(
                         "host-memory request exceeds node capacity")
@@ -373,7 +377,7 @@ class TokenWeightedActivationOffloadGate:
         # cannot make this request fit, don't wait forever on resident models.
         return units * self.unit_bytes <= (
             int(info["available"]) + self.host_admission.reserved_bytes
-            - host_memory_reserve_bytes(info))
+            - host_memory_reserve_bytes(info, self.host_admission.hardware_profile))
 
     def reservation(self, work):
         units = self.request_units(work)

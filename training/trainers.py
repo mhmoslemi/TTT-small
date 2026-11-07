@@ -2607,9 +2607,15 @@ class ProcessDistributedTrainer:
 
         from runtime.host_memory import (
             GIB, TokenWeightedActivationOffloadGate,
-            automatic_activation_offload_budget_bytes,
+            automatic_activation_offload_budget_bytes, host_memory_info,
+            host_memory_reserve_bytes,
         )
-        self._activation_offload_budget_bytes = (automatic_activation_offload_budget_bytes())
+        hardware_profile = getattr(cfg, "hardware_profile", "RTX6000")
+        memory_info = host_memory_info() if hardware_profile == "B200" else None
+        self._activation_offload_budget_bytes = automatic_activation_offload_budget_bytes(
+            **({"memory_info": memory_info,
+                "free_reserve_bytes": host_memory_reserve_bytes(memory_info, hardware_profile)}
+               if memory_info else {}))
         self._activation_offload_semaphore = (
             TokenWeightedActivationOffloadGate(
                 self._context,
@@ -2617,6 +2623,7 @@ class ProcessDistributedTrainer:
                 max(1, int(cfg.max_seq_length)),
             ))
         self._activation_offload_slots = (self._activation_offload_semaphore.full_context_concurrency)
+        self._activation_offload_semaphore.host_admission.hardware_profile = hardware_profile
         self._activation_offload_budget_gib = (self._activation_offload_budget_bytes / GIB)
 
         # Eight independent Python processes must not each create a full-sized

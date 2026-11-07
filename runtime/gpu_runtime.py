@@ -337,11 +337,7 @@ def _vllm_memory_per_rank(cfg, parallel_size, max_length=None):
         weight, kv = strategist_memory_per_rank(
             cfg["model_name"], parallel_size, max_length)
         if cfg.get("hardware_profile") == "B200":
-            # A larger locally installed revision must not undercut admission.
-            profile = strategist_profile(cfg["model_name"])
-            weight += profile["ple_gib"] / parallel_size
-            weight += max(0.0, (_checkpoint_weight_gib(cfg["model_name"]) or 0.0)
-                          - profile["weights_gib"]) / parallel_size
+            weight += strategist_profile(cfg["model_name"])["ple_gib"] / parallel_size
         return weight, kv
     return (
         _estimated_weight_gib(cfg.get("model_name", ""),
@@ -454,8 +450,6 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # estimate, not an output/context cap.
         active_target = (16_384 if using_vllm and uses_bounded_gpt_oss_repack(
             cfg.get("model_name"), cfg.get("vllm_quantization")) else 65_536)
-        if using_vllm and cfg.get("hardware_profile") == "B200":
-            active_target = 16_384
         active_tokens = min(max_len, active_target)
         _, kv_gib_per_active_seq_gpu = _vllm_memory_per_rank(
             cfg, parallel_size, active_tokens)
@@ -465,12 +459,6 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # would permit hundreds of sequences. One is retained as a safe floor;
         # vLLM profiles graph memory before fixing the KV-cache size.
         ceiling = 32
-        if cfg.get("hardware_profile") == "B200":
-            replicas = max(1, len(roles.generation) // parallel_size)
-            workload = int(cfg.get("groups_per_step", 0)) * int(cfg.get("group_size", 0))
-            # Size scheduler metadata to real work; paged KV admission remains
-            # vLLM's responsibility as response lengths grow during decoding.
-            ceiling = math.ceil(workload / replicas) if workload > 0 else 256
         cap = max(1, min(ceiling, estimated_active_sequences))
         # Wide MoE models on sub-60-GiB cards rely on a comparatively tight
         # tensor-parallel layout.  Bound scheduler/CUDA-graph concurrency even
@@ -495,8 +483,6 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # temporary batch.  This is scheduling work per iteration, not the KV
         # capacity or maximum request length.
         batched = min(max_len, 8192 if min_total >= 60 else 4096)
-        if cfg.get("hardware_profile") == "B200" and cfg.get("frozen_strategy"):
-            batched = min(max_len, 16384)
         cfg["vllm_max_num_batched_tokens"] = max(2048, batched)
         if using_vllm:
             notes.append("vLLM max batched tokens="

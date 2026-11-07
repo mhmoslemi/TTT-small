@@ -1,9 +1,6 @@
 """Launch-scoped hardware selection; never change the policy or task settings."""
 
-import os
 from pathlib import Path
-
-from runtime.host_memory import host_memory_info, host_memory_reserve_bytes, GIB
 
 
 B200_MODEL_DIR = Path("/root/nas/Mohammad/models")
@@ -50,30 +47,9 @@ def restore_hardware_settings(merged, current_yaml, saved):
     selected = hardware_profile(current_yaml.get("hardware_profile", "RTX6000"))
     previous = hardware_profile(saved.get("hardware_profile", "RTX6000"))
     merged["hardware_profile"] = selected
-    if selected == "B200" or previous != selected:
+    if saved and previous != selected:
         for key, default in {
             "gen_micro_batch": "auto", "vllm_gpu_memory_utilization": "auto",
             "vllm_max_num_batched_tokens": "auto", "logprob_chunk": "auto",
-            "vllm_staged_loading": False, "strategy_vllm_staged_loading": False,
-            "strategy_vllm_persistent_workers": 0 if selected == "B200" else None,
-            "reload_coder_between_phases": selected == "B200",
         }.items():
             merged[key] = current_yaml.get(key, default)
-
-
-def validate_hardware_profile(cfg, gpu_ids, memory):
-    if cfg.get("hardware_profile") != "B200":
-        return
-    observed = [memory[gpu] for gpu in gpu_ids if gpu in memory]
-    if any(item.name and "B200" not in item.name.upper() for item in observed):
-        raise ValueError("hardware_profile=B200 requires nvidia-smi to report B200 for every selected GPU")
-    info = host_memory_info()
-    if not info:
-        raise RuntimeError("B200 profile requires readable host RAM limits for memory admission")
-    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    capacity = (f"{min(item.total_gib for item in observed):.1f} GiB/GPU"
-                if len(observed) == len(gpu_ids) else "GPU telemetry unavailable; using profile estimate")
-    print(f"[hardware] B200: {len(gpu_ids)} GPUs, {capacity}; "
-          f"{cpus} available CPUs; host RAM={info['total'] / GIB:.1f} GiB, "
-          f"available={info['available'] / GIB:.1f} GiB, "
-          f"reserve={host_memory_reserve_bytes(info) / GIB:.1f} GiB; live shared RAM admission")

@@ -108,8 +108,6 @@ def strategist_engine_options(model_name, hardware_profile="RTX6000"):
     profile = strategist_profile(model_name)
     # Checkpoint generation_config can impose its own server-wide output cap.
     options = dict(generation_config="vllm")
-    if hardware_profile == "B200":
-        options["safetensors_load_strategy"] = "lazy"
     if not profile:
         return options
     options.update(

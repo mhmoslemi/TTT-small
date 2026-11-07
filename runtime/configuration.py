@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import yaml
-from runtime.hardware_profiles import local_checkpoint, restore_hardware_settings, validate_hardware_profile
+from runtime.hardware_profiles import local_checkpoint, restore_hardware_settings
 
 from models.strategist_models import (
     resolve_strategy_effort, resolve_strategy_model, resolve_strategy_token_limits, strategist_profile,
@@ -696,8 +696,6 @@ def load_config():
               "and strategy limits/sampling override saved values")
 
     restore_hardware_settings(merged, ydict, saved)
-    if merged["hardware_profile"] == "B200":
-        profile_explicit_keys.add("strategy_vllm_persistent_workers")
 
     # 3) CLI overlay (only explicitly-provided values)
     skip = {"problem", "config", "problem_type", "resume"}
@@ -710,10 +708,6 @@ def load_config():
             profile_explicit_keys.add(key)
     # Disk parking is launch-local; do not inherit another machine's directory.
     merged["trainer_offload_dir"] = args.trainer_offload_dir
-    if merged["hardware_profile"] == "B200":
-        os.environ.setdefault("TTT_HOST_MEMORY_RESERVE_GIB", "16")
-        if not merged["trainer_offload_dir"]:
-            merged["trainer_offload_dir"] = str(Path(__file__).resolve().parents[1] / ".offload")
     from search.sampler import can_migrate_parent_selection, parent_selection_mode
     merged["parent_selection"] = parent_selection_mode(merged)
     merged["uct"] = merged["parent_selection"] == "uct"
@@ -1160,7 +1154,6 @@ def load_config():
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
-    validate_hardware_profile(merged, roles.available, memory)
 
     merged["training_model_name"] = _resolve_training_model_name(
         merged.get("model_name", ""), merged.get("training_model_name"),
@@ -1237,6 +1230,7 @@ def load_config():
             and merged.get("strategy_backend", "local") == "local"
             and (str(merged.get("strategy_model_name") or merged.get("model_name"))
                  != str(merged.get("model_name"))
+                 or merged["hardware_profile"] == "B200"
                  or merged["dual_resident_qwen3_8b_strategy_coder_pools"]))
         # This must match GenerationPool's two runtime flags.  The old layout
         # used the uncapped 90% allocator budget, then process startup lowered
@@ -1320,12 +1314,6 @@ def load_config():
             strategy_layout_cfg["vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
             for note in resolve_memory_settings(strategy_layout_cfg, roles, memory):
                 print(f"[memory] auto strategy: {note}")
-            if merged["hardware_profile"] == "B200":
-                # Only one strategy per parent can be in flight; do not build
-                # large CUDA graphs for request batches this pool cannot see.
-                strategy_layout_cfg["gen_micro_batch"] = min(
-                    strategy_layout_cfg["gen_micro_batch"] or strategy_frontier,
-                    strategy_frontier)
             merged["strategy_vllm_tensor_parallel_size"] = (strategy_layout.tensor_parallel_size)
             merged["strategy_vllm_pipeline_parallel_size"] = (strategy_layout.pipeline_parallel_size)
             merged["strategy_gen_micro_batch"] = int(strategy_layout_cfg["gen_micro_batch"])
@@ -1334,6 +1322,7 @@ def load_config():
             merged["strategy_generation_frontier"] = strategy_frontier
             merged["separate_strategy_inference_pool"] = bool(
                 strategy_name != str(merged.get("model_name"))
+                or merged["hardware_profile"] == "B200"
                 or merged["dual_resident_qwen3_8b_strategy_coder_pools"]
                 or strategy_layout.tensor_parallel_size
                 != layout.tensor_parallel_size

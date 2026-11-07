@@ -1097,7 +1097,7 @@ def _finalize_pending_spo_rs_artifacts(
     from runtime.host_memory import HostMemoryAdmission
     import multiprocessing
     host_admission = (getattr(gen_pool, "host_memory_admission", None)
-                      or HostMemoryAdmission(multiprocessing.get_context("spawn")))
+                      or HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=getattr(cfg, "hardware_profile", "RTX6000")))
 
     def evaluate(item):
         meta = item["meta"]
@@ -2130,7 +2130,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         host_admission = getattr(gen_pool, "host_memory_admission", None)
     if host_admission is None:
         import multiprocessing
-        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"))
+        host_admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile)
     isolated_eval = bool(getattr(cfg, "isolate_eval", False))
     isolated_cpu_slots = None
     isolated_cpu_count = 0
@@ -3242,10 +3242,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "starts as each program arrives",
                         flush=True,
                     )
-                    stream_followups = bool(
-                        getattr(cfg, "hardware_profile", "RTX6000") == "B200"
-                        and cfg.generation_backend == "vllm")
-                    pilot_records = [] if stream_followups else _run_vllm_code_phase(
+                    pilot_records = _run_vllm_code_phase(
                         [pilot_programs_per_strategy] * len(source_job_indices),
                         phase="pilot", seed_offset=0, progress_desc="pilot rollouts",
                         defer_format_retries=True)
@@ -3315,10 +3312,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             phase_records, seed_offset=0 if expected_pilots else 4_000_000)
 
                     _run_adaptive_followups_as_ready(
-                        pilot_records, source_job_indices,
-                        (lambda poll, total: _run_streamed_vllm_followups(poll, total, pilot_records=pilot_records))
-                        if stream_followups else _run_ready_vllm_followups,
-                        pipelined=stream_followups, streaming_pilots=stream_followups)
+                        pilot_records, source_job_indices, _run_ready_vllm_followups)
                     _drain_deferred_coder_format_retries()
                 else:
                     # Keep the disabled path structurally identical to the
@@ -5335,6 +5329,7 @@ def main():
             and bool(getattr(
                 cfg, "separate_strategy_inference_pool",
                 cfg.strategy_model_name != cfg.model_name
+                or cfg.hardware_profile == "B200"
                 or dual_resident_qwen3_8b_pools)))
         generation_utilization = float(cfg.vllm_gpu_memory_utilization)
         if dual_resident_qwen3_8b_pools:
@@ -5380,20 +5375,19 @@ def main():
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
             hardware_profile=cfg.hardware_profile,
-            vllm_engine_options=({"safetensors_load_strategy": "lazy"}
-                                 if cfg.hardware_profile == "B200" else None),
         )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
             import multiprocessing
             pool_options["host_memory_admission"] = (
                 getattr(parallel_trainer, "host_memory_admission", None)
-                or HostMemoryAdmission(multiprocessing.get_context("spawn")))
+                or HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=cfg.hardware_profile))
             trainer_offloaded = False
 
             def _offload_trainer_for_generation(phase="coder"):
                 nonlocal trainer_offloaded
                 disk_directory = getattr(cfg, "trainer_offload_dir", None)
+                frozen_to_disk = bool(disk_directory or cfg.hardware_profile == "B200")
                 if (parallel_trainer is not None and parallel_trainer.is_offloaded):
                     return
                 if parallel_trainer is None and trainer_offloaded:
@@ -5410,7 +5404,7 @@ def main():
                 if parallel_trainer is not None:
                     cleanups = parallel_trainer.reclaim_host_memory()
                     required_bytes = parallel_trainer.estimated_host_offload_bytes(
-                        frozen_to_disk=bool(disk_directory))
+                        frozen_to_disk=frozen_to_disk)
                 else:
                     torch.cuda.synchronize()
                     cleanups = [reclaim_unused_host_memory(
@@ -5419,7 +5413,7 @@ def main():
                         force=True,
                     )]
                     required_bytes = int(
-                        1.05 * (estimated_module_bytes(model, frozen_to_disk=bool(disk_directory))
+                        1.05 * (estimated_module_bytes(model, frozen_to_disk=frozen_to_disk)
                                 + estimated_optimizer_bytes(optimizer))
                         + GIB
                     )
@@ -5445,9 +5439,9 @@ def main():
                 # This trades one later checkpoint reload for survival instead
                 # of permanently choosing a slower level-2/transient policy.
                 if memory is not None:
-                    if disk_directory:
+                    if frozen_to_disk:
                         from runtime.host_memory import host_memory_reserve_bytes
-                        reserve_bytes = host_memory_reserve_bytes(memory)
+                        reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:
                         reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
                     target_available = required_bytes + reserve_bytes
@@ -5487,7 +5481,9 @@ def main():
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
-                destination = (f"disk ({disk_directory}); only adapters/optimizer stay in RAM"
+                destination = ("reusable disk snapshot; only adapters/optimizer stay in RAM"
+                               if cfg.hardware_profile == "B200" else
+                               f"disk ({disk_directory}); only adapters/optimizer stay in RAM"
                                if disk_directory else "CPU")
                 setting_log_only(
                     f"[gpu] offloading {replica_label} to {destination} before "

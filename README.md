@@ -9,34 +9,31 @@ RAM are detected, not assumed to equal the advertised machine size.
 Matching local checkpoints under `/root/nas/Mohammad/models/` are preferred
 over their matching Hub IDs on B200 when present; explicit paths stay explicit.
 
-B200 uses the standard RTX6000 model loaders, with replicas/TP groups and
-generation batches sized to its larger GPU memory. Inference workers load on
-demand and exit after each phase; there are no model-weight sleep backups in RAM.
-Inactive frozen trainer weights use the existing disk parking in `.offload/`
-(override with `--trainer-offload-dir`); adapters and optimizer state are retained.
-Those temporary files are removed after restoration. Use a disk filesystem,
-not tmpfs. B200 leaves 16 GiB of host headroom by default; an explicit
-`TTT_HOST_MEMORY_RESERVE_GIB` takes precedence. Checkpoint loading is lazy rather
-than prefetching the entire model into RAM. Qwen Flash Next keeps its lookup
-table on GPU on B200; RTX6000 retains the existing CPU offload and NVFP4 settings.
-The existing adaptive parallel trainer, evaluation/transfer/offload RAM gate and
-exact long-rollout handling remain in use. Sampling, precision, context limits
-and the RL objective are unchanged. Explicit YAML/CLI capacity settings still
-override automatic batch sizing. Inspect `setting.log` for resolved layouts.
+B200 automatically uses a disk-backed trainer and transient inference workers,
+including on resume, regardless of saved sleep/reload settings. Each trainer
+writes its immutable base weights once per process to `.offload/`, reuses that
+snapshot across steps, and transfers weights in 64-MiB chunks. Only adapters,
+optimizer state and mutable buffers remain in host RAM while generation runs.
+Two Qwen3.8-27B replicas need approximately 100 GiB of free disk for snapshots;
+they are temporary files, not resume checkpoints. A new process rebuilds them
+from its loaded checkpoint. `--trainer-offload-dir` can choose another disk.
 
-B200 coder requests use a shared queue and refill engines after individual
-rollouts finish. A parent's phase 2 starts as soon as its complete pilot set is
-evaluated, while other parents can still be generating/evaluating pilots.
-Automatic concurrency scales with available KV memory and the rollout workload,
-with no fixed 64-request ceiling. vLLM controls paged-KV admission as outputs grow.
+GLiDE exits after parent selection. Strategist workers exit before coding;
+coder workers stay loaded through pilot, phase 2, retries and scoring, then
+exit before training resumes. No inference weights are backed up in host RAM.
+Flash-Next's lookup tables stay on GPU and are included in GPU placement estimates.
+The B200 RAM admission reserve is 16 GiB (capped at a quarter of node/cgroup
+capacity); an explicit `TTT_HOST_MEMORY_RESERVE_GIB` still overrides it.
 
-The original shared RAM admission and bounded transfers remain in place,
-including OS headroom and Linux cgroup limits. RTX6000 keeps its existing
-sleep/wake policy and releases unaffordable sleeping backups under RAM pressure.
+RTX6000 retains its existing placement and sleep/wake policy. Both profiles
+retain shared RAM admission, bounded transfers and Linux cgroup accounting.
+`run_copy.sh` uses the same execution flags as `run2.sh`; no extra B200 flags
+are needed. Sampling, precision, context limits, prompts, rollout scheduling,
+evaluation worker limits and the RL objective are unchanged.
 FlashInfer initialization and downloads use the original vLLM path; there is
 no extra startup process, download hook or bulk-kernel preflight.
-This is bounded resource planning, not a guarantee against arbitrary external
-allocations or a claim of benchmarked maximum throughput.
+Disk reload and worker initialization add phase-transition time; compute speed
+is not benchmarked. This cannot protect against arbitrary external allocations.
 
 ## Semantic parent selection
 

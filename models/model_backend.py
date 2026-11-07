@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+from pathlib import Path
 import torch
 import types
 import weakref
@@ -633,10 +634,18 @@ class _ModelPlacementBackend:
             except (ImportError, AttributeError):
                 pass
         try:
-            if disk_directory:
+            if getattr(getattr(self, "cfg", None), "hardware_profile", "RTX6000") == "B200":
+                from runtime.disk_offload import FrozenWeightSnapshot
+                if getattr(self, "_b200_frozen_weights", None) is None:
+                    directory = disk_directory or Path(__file__).resolve().parents[1] / ".offload"
+                    self._b200_frozen_weights = FrozenWeightSnapshot(self.model, directory)
+                self._b200_frozen_weights.park()
+            elif disk_directory:
                 from runtime.disk_offload import DiskWeightOffload
                 self._disk_weights = DiskWeightOffload(self.model, disk_directory)
-            self.model.to("cpu")
+                self.model.to("cpu")
+            else:
+                self.model.to("cpu")
             self._trainer_is_offloaded = True
         except Exception:
             # A quantized module can fail after earlier layers already moved.
@@ -652,7 +661,10 @@ class _ModelPlacementBackend:
     def restore_after_generation(self):
         if not getattr(self, "_trainer_is_offloaded", False):
             return
-        if getattr(self, "_disk_weights", None) is not None:
+        b200_snapshot = getattr(self, "_b200_frozen_weights", None)
+        if b200_snapshot is not None:
+            b200_snapshot.restore()
+        elif getattr(self, "_disk_weights", None) is not None:
             self._disk_weights.restore()
             self._disk_weights = None
         device_map = getattr(self, "_training_device_map", None) or {}
@@ -663,7 +675,7 @@ class _ModelPlacementBackend:
             from accelerate import dispatch_model
             dispatch_model(
                 placement_model, device_map=device_map, force_hooks=True)
-        else:
+        elif b200_snapshot is None:
             target = next(iter(devices), "0")
             target = target if str(target).startswith("cuda:") else f"cuda:{target}"
             self.model.to(target)

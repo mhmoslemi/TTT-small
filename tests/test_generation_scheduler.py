@@ -29,29 +29,18 @@ def load_nested(path, name, scope):
 
 
 class GenerationSchedulerTests(unittest.TestCase):
-    def test_fixed_pilot_and_retry_calls_use_continuous_queue_only_on_b200(self):
+    def test_b200_and_rtx_use_the_same_fixed_job_scheduler(self):
         pool = workers.GenerationPool.__new__(workers.GenerationPool)
         pool.num_workers, pool.gen_micro_batch = 2, 2
         pool._async_worker_ids, pool._worker_options = {0, 1}, {}
-        pool.hardware_profile = "B200"
-        def ready(poll, **options):
-            jobs, done = poll()
-            self.assertTrue(done)
-            self.assertEqual([(job["key"], job["count"]) for job in jobs], [(0, 3), (2, 1)])
-            self.assertEqual(options["total_expected"], 4)
-            self.assertEqual(poll(), ([], True))
-            yield 2, [("last prompt", [7])]
-        pool.iter_ready_jobs = Mock(side_effect=ready)
-        results = list(pool.iter_group_jobs(["pilot", "empty", "retry"], 3, None, 262144, 1., 1.,
-            counts_by_group=[3, 0, 1], show_progress=False))
-        self.assertEqual(results, [(2, [("last prompt", [7])])])
-        pool.hardware_profile = "RTX6000"
         pool.iter_ready_jobs = Mock(side_effect=AssertionError("legacy path must keep its scheduler"))
         pool.task_queues = [SimpleNamespace(put=lambda task: None)] * 2
         pool.procs = [SimpleNamespace(exitcode=None)] * 2
         pool.result_queue = SimpleNamespace(get=lambda **kwargs: (0, 0, [("legacy", [7])]))
-        self.assertEqual(list(pool.iter_group_jobs(["prompt"], 1, None, 99, 1., 1., show_progress=False)),
-                         [(0, [("legacy", [7])])])
+        for profile in ("RTX6000", "B200"):
+            pool.hardware_profile = profile
+            self.assertEqual(list(pool.iter_group_jobs(["prompt"], 1, None, 99, 1., 1., show_progress=False)),
+                             [(0, [("legacy", [7])])])
         pool.iter_ready_jobs.assert_not_called()
 
     def test_refill_before_slow_request_finishes_and_keep_exact_counts(self):

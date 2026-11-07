@@ -70,14 +70,10 @@ config_path="${TTT_CONFIG:-configs/ac1.yaml}"
 # for all pilot results belonging to the same parent.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
-export TTT_HOST_MEMORY_RESERVE_GIB="${TTT_HOST_MEMORY_RESERVE_GIB:-16}"
 
-# Reload inference engines; park frozen training weights on disk between updates.
 exec python3 train_multy_CVaR.py --config "$config_path" --advantage-mode spo-rs --fast --measure-entropy \
     --spo-rs-clip-epsilon-low 0.2 --spo-rs-clip-epsilon-high 0.38 --strategies --coder-retry \
-    --isolate-eval --fused-long-attention --reload-coder-between-phases \
-    --strategy-vllm-persistent-workers 0 \
-    --trainer-offload-dir "${TTT_TRAINER_OFFLOAD_DIR:-$ttt_project_dir/.offload}" "$@"
+    --isolate-eval --fused-long-attention "$@"
     # 
     # 
     # 

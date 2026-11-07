@@ -493,7 +493,7 @@ def test_strategy_startup_charges_resident_tables_not_the_whole_checkpoint(monke
     from models.strategist_models import strategist_engine_options
 
     monkeypatch.setenv("TTT_HOST_MEMORY_RESERVE_GIB", "16")
-    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1200*GIB, available=50*GIB))
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1200*GIB, available=1000*GIB))
     gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
     reservations = []
     monkeypatch.setattr(workers, "GenerationPool",
@@ -503,9 +503,12 @@ def test_strategy_startup_charges_resident_tables_not_the_whole_checkpoint(monke
         num_workers=8, gpu_ids=list(range(8)), host_memory_admission=gate,
         vllm_engine_options=strategist_engine_options("qwen3.8-flash-next", "B200"))
     pool._create_pool()
-    assert reservations == [int(32 * GIB * 1.05)]
+    assert reservations == [int(4 * 8 * GIB * 1.05)]
     assert gate.reserved_bytes == 0
     pool._pool_kwargs["vllm_engine_options"] = strategist_engine_options("qwen3.8-flash-next")
+    pool._create_pool()
+    assert reservations[1] == int((48 + 4) * 8 * GIB * 1.05)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1200*GIB, available=50*GIB))
     with pytest.raises(host_memory.HostMemoryUnavailable):
         pool._create_pool()
 
@@ -520,6 +523,190 @@ def test_shutdown_does_not_allocate_sleep_backups():
     pool.release = lambda: pytest.fail("shutdown must not back up weights")
     pool.shutdown()
     assert calls == ["shutdown"] and not pool.active
+
+
+def test_b200_snapshot_reuses_disk_and_preserves_optimizer_and_mutable_buffers(tmp_path, monkeypatch):
+    import copy
+    import torch
+    from models.model_backend import _ModelPlacementBackend
+    from runtime import disk_offload
+
+    monkeypatch.setattr(disk_offload, "CHUNK_BYTES", 16)
+    model = torch.nn.Sequential(torch.nn.Linear(5, 3), torch.nn.Linear(3, 2))
+    model[0].requires_grad_(False)
+    model.register_buffer("counter", torch.tensor(0))
+    model.tied = model[0].weight
+    baseline = copy.deepcopy(model)
+    optimizer = torch.optim.Adam(model[1].parameters(), lr=.01)
+    reference = torch.optim.Adam(baseline[1].parameters(), lr=.01)
+    backend = _ModelPlacementBackend()
+    backend.model = model
+    backend.cfg = SimpleNamespace(hardware_profile="B200")
+    backend._trainer_is_offloaded = False
+    identities = [id(p) for p in model.parameters()]
+    snapshot = None
+    writes = []
+    drop_cache = disk_offload.FrozenWeightSnapshot._drop_cache
+
+    def observe(self, offset, size, *, written=False):
+        if written:
+            writes.append(size)
+        drop_cache(self, offset, size, written=written)
+
+    monkeypatch.setattr(disk_offload.FrozenWeightSnapshot, "_drop_cache", observe)
+    for step in range(3):
+        x = torch.ones(2, 5) * (step + 1)
+        for network, adam in ((model, optimizer), (baseline, reference)):
+            adam.zero_grad()
+            network(x).square().mean().backward()
+            adam.step()
+            network.counter.add_(1)
+        backend.offload_for_generation(disk_directory=tmp_path)
+        assert model[0].weight.numel() == 0 and model[1].weight.numel() == 6
+        if snapshot is None:
+            snapshot = backend._b200_frozen_weights
+            initial_writes = list(writes)
+        assert backend._b200_frozen_weights is snapshot
+        assert writes == initial_writes
+        backend.restore_after_generation()
+        backend.restore_after_generation()
+        assert not snapshot.parked and not snapshot.file.closed
+        assert model.tied is model[0].weight
+        assert [id(p) for p in model.parameters()] == identities
+        assert next(iter(optimizer.state)) is model[1].weight
+        for name, tensor in model.state_dict().items():
+            assert torch.equal(tensor, baseline.state_dict()[name]), name
+        for p, q in zip(model[1].parameters(), baseline[1].parameters()):
+            for name, value in optimizer.state[p].items():
+                assert torch.equal(value, reference.state[q][name])
+
+
+def test_b200_snapshot_preserves_packed_scale_storage_and_rejects_corruption(tmp_path, monkeypatch):
+    import torch
+    from runtime.disk_offload import FrozenWeightSnapshot
+
+    class Packed(torch.nn.Parameter):
+        pass
+
+    model = torch.nn.Module()
+    model.weight = torch.Tensor._make_subclass(Packed, torch.arange(16, dtype=torch.uint8), False)
+    model.weight.mxfp4_scales = torch.arange(4, dtype=torch.uint8)
+    scales = model.weight.mxfp4_scales
+    snapshot = FrozenWeightSnapshot(model, tmp_path)
+    for _ in range(2):
+        snapshot.park()
+        assert model.weight.numel() == scales.numel() == 0
+        snapshot.restore()
+        assert torch.equal(model.weight, torch.arange(16, dtype=torch.uint8))
+        assert model.weight.mxfp4_scales is scales
+        assert torch.equal(scales, torch.arange(4, dtype=torch.uint8))
+    snapshot.park()
+    snapshot.file.truncate(0)
+    with pytest.raises(OSError, match="truncated B200"):
+        snapshot.restore()
+    assert snapshot.parked
+
+
+def test_b200_transient_lifecycle_ignores_sleep_flags_and_reloads_adapter(monkeypatch):
+    events = []
+
+    def create(pool, **options):
+        assert not options.get("vllm_enable_sleep_mode")
+        assert pool._pool_kwargs["vllm_persistent_workers"] == 0
+        assert pool._pool_kwargs["vllm_engine_options"]["safetensors_load_strategy"] == "lazy"
+        events.append("load")
+        return SimpleNamespace(num_workers=2, sleep_supported=False,
+            sleep=lambda: pytest.fail("B200 must never create a sleep backup"),
+            shutdown=lambda: events.append("shutdown"),
+            generate_groups=lambda **kw: events.append(kw["adapter_path"]))
+
+    monkeypatch.setattr(PhasedVLLMGenerationPool, "_create_pool", create)
+    pool = PhasedVLLMGenerationPool(lambda: None, lambda: events.append("released"),
+        hardware_profile="B200", model_name="Qwen/Qwen3.8-27B", gpu_ids=[6, 7],
+        vllm_sleep_level=1, vllm_persistent_workers=2)
+    for step in range(2):
+        pool.generate_groups(adapter_path=f"adapter{step}")
+        pool.generate_groups(adapter_path=f"adapter{step}")
+        pool.release()
+        assert pool._pool is None and not pool.active
+    assert events == ["load", "adapter0", "adapter0", "shutdown", "released",
+                      "load", "adapter1", "adapter1", "shutdown", "released"]
+
+
+def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypatch):
+    monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1696*GIB, available=100*GIB))
+    context = multiprocessing.get_context("spawn")
+    assert HostMemoryAdmission(context).available_bytes() == 0
+    gate = HostMemoryAdmission(context, hardware_profile="B200")
+    assert gate.available_bytes() == 84*GIB
+    with gate.reservation(8*GIB, wait_for_external=False):
+        assert gate.available_bytes() == 76*GIB
+    activations = TokenWeightedActivationOffloadGate(
+        context, 80*GIB, 32768, full_context_bytes=64*GIB)
+    assert not activations.can_admit(32768)
+    activations.host_admission.hardware_profile = "B200"
+    assert activations.can_admit(32768)
+
+
+def test_b200_overflow_reuses_snapshot_and_parks_again_after_sharding(tmp_path, monkeypatch):
+    import torch
+    import training.fast_distributed as distributed
+    from runtime.disk_offload import FrozenWeightSnapshot
+
+    model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 1))
+    model[0].requires_grad_(False)
+    model.register_buffer("counter", torch.tensor(0))
+    identities = [id(parameter) for parameter in model.parameters()]
+    expected_base = model[0].weight.clone()
+    snapshot = FrozenWeightSnapshot(model, tmp_path)
+    snapshot.park()
+    backend = SimpleNamespace(model=model, _trainer_is_offloaded=True,
+                              _b200_frozen_weights=snapshot)
+    plans = []
+
+    def balanced(placement, **kwargs):
+        assert placement[0].weight.shape == (3, 3), "placement needs restored shapes"
+        plans.append(kwargs["max_memory"])
+        return kwargs["max_memory"]
+
+    monkeypatch.setitem(sys.modules, "accelerate", SimpleNamespace(
+        dispatch_model=lambda *a, **kw: None,
+        infer_auto_device_map=lambda *a, **kw: {"": 0}))
+    monkeypatch.setitem(sys.modules, "accelerate.hooks", SimpleNamespace(
+        remove_hook_from_submodules=lambda *a: None))
+    monkeypatch.setitem(sys.modules, "accelerate.utils", SimpleNamespace(get_balanced_memory=balanced))
+    monkeypatch.setattr(distributed, "set_long_rollout_memory_ceiling", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda *a: nullcontext())
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (100*GIB, 180*GIB))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(host_memory, "reclaim_unused_host_memory", lambda *a, **kw: None)
+    tensor_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, *a, **kw:
+                        tensor if a and isinstance(a[0], int) else tensor_to(tensor, *a, **kw))
+    with exact_overflow.temporary_gpu_shards(backend, [0, 1]):
+        assert torch.equal(model[0].weight, expected_base)
+        model(torch.ones(2, 3)).sum().backward()
+        expected_grad = model[1].weight.grad.clone()
+        model.counter.add_(1)
+    assert plans and model[0].weight.numel() == 0
+    assert snapshot.parked and backend._trainer_is_offloaded
+    snapshot.restore()
+    assert torch.equal(model[0].weight, expected_base)
+    assert torch.equal(model[1].weight.grad, expected_grad)
+    assert model.counter.item() == 1
+    assert [id(parameter) for parameter in model.parameters()] == identities
+
+
+def test_b200_overflow_parking_charges_only_mutable_state(monkeypatch):
+    import torch
+    model = torch.nn.Sequential(torch.nn.Linear(128, 128), torch.nn.Linear(128, 1))
+    model[0].requires_grad_(False)
+    monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1696*GIB, available=100*GIB))
+    exact_overflow.require_parking_capacity(model, 2, hardware_profile="B200")
+    with pytest.raises(RuntimeError, match="insufficient host RAM"):
+        exact_overflow.require_parking_capacity(model, 2)
 
 
 def test_transient_handoff_restores_every_trainer_without_sleep():
