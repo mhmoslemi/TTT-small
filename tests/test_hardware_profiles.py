@@ -34,6 +34,7 @@ class HardwareProfileTests(unittest.TestCase):
                 path = Path(folder) / leaf
                 path.mkdir()
                 self.assertEqual(hardware.local_checkpoint(name, "B200"), str(path))
+                self.assertEqual(hardware.local_checkpoint(name, "B200_full_ram"), str(path))
                 self.assertEqual(hardware.local_checkpoint(name, "RTX6000"), name)
                 self.assertEqual(hardware.checkpoint_identity(str(path)), name)
                 self.assertEqual(coders._coder_model_profile(str(path)), coders._coder_model_profile(name))
@@ -41,7 +42,7 @@ class HardwareProfileTests(unittest.TestCase):
             explicit = "/my/custom/Qwen3-8B"
             self.assertEqual(hardware.local_checkpoint(explicit, "B200"), explicit)
             name = str(Path(folder) / "Qwen3-8B")
-            for profile in ("RTX6000", "B200"):
+            for profile in ("RTX6000", "B200", "B200_full_ram"):
                 self.assertEqual(coders._dual_resident_qwen3_8b_strategy_coder_pools(dict(
                     hardware_profile=profile, model_name=name, coder_model_name=name,
                     strategy_model_name=name, strategies=True, generation_backend="vllm")), profile != "B200")
@@ -63,7 +64,7 @@ class HardwareProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_problem_config(dict(problem="erdos", hardware_profile="B20"), require_complete=False)
         for path in (ROOT / "configs").glob("*.yaml"):
-            self.assertRegex(path.read_text(), r"(?m)^hardware_profile: (RTX6000|B200)[ \t]*(?:#.*)?$")
+            self.assertRegex(path.read_text(), r"(?m)^hardware_profile: (RTX6000|B200|B200_full_ram)[ \t]*(?:#.*)?$")
         source = (ROOT / "runtime/configuration.py").read_text()
         self.assertLess(source.index("restore_hardware_settings(merged"), source.index("# 3) CLI overlay"))
 
@@ -132,7 +133,7 @@ class HardwareProfileTests(unittest.TestCase):
                 expected = strategists.strategist_memory_per_rank(name, tp, 262144)
                 self.assertEqual(expected[0], (profile["weights_gib"] - profile["ple_gib"]) / tp)
                 with patch.object(gpu, "_checkpoint_weight_gib", return_value=None):
-                    for hardware_profile in ("RTX6000", "B200"):
+                    for hardware_profile in ("RTX6000", "B200", "B200_full_ram"):
                         actual = gpu._vllm_memory_per_rank(dict(
                             model_name=name, max_seq_length=262144,
                             hardware_profile=hardware_profile, strategy_inference_profile=True), tp)
@@ -197,6 +198,51 @@ class HardwareProfileTests(unittest.TestCase):
         copy = (ROOT / "run_copy.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
         self.assertEqual(normal, copy)
         self.assertNotIn("TTT_HOST_MEMORY_RESERVE_GIB", (ROOT / "run_copy.sh").read_text())
+
+    def test_full_ram_resume_clears_low_ram_flags_and_uses_four_selected_gpus(self):
+        import json
+        import os
+        import sys
+        from runtime import configuration
+
+        self.assertEqual(hardware.hardware_profile("b200_FULL_ram"), "B200_full_ram")
+        preset = configuration.yaml.safe_load((ROOT / "configs/ac1.yaml").read_text())
+        saved = dict(preset, hardware_profile="B200", reload_coder_between_phases=True,
+                     strategy_vllm_persistent_workers=0, trainer_offload_dir="/old/.offload",
+                     training_gpu_ids="6,7", gpu_ids="6,7", num_training_gpus=2)
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.dict(os.environ, AVAILABLE_GPUS="2,3,4,5", HF_HUB_OFFLINE="1"), \
+             patch.object(gpu, "query_gpu_memory", return_value=self.cards()), \
+             patch.object(gpu, "detect_attention_heads", return_value=32), \
+             patch.object(configuration, "_isolated_evaluation_cpu_ids", return_value=[0, 1]), \
+             redirect_stdout(io.StringIO()):
+            config = Path(folder) / "ac1.yaml"
+            config.write_text(configuration.yaml.safe_dump(dict(preset, hardware_profile="B200_full_ram")))
+            (Path(folder) / "config.json").write_text(json.dumps(saved))
+            argv = ["train_multy_CVaR.py", "--config", str(config), "--resume", folder,
+                    "--parent-selection", "puct", "--advantage-mode", "spo-rs", "--fast", "--strategies", "--isolate-eval"]
+            with patch.object(sys, "argv", argv):
+                cfg, merged = configuration.load_config()
+            self.assertEqual(cfg.hardware_profile, "B200_full_ram")
+            self.assertEqual(cfg.training_gpu_ids, "2,3,4,5")
+            self.assertEqual(cfg.gpu_ids, "2,3,4,5")
+            self.assertEqual(cfg.num_training_gpus, 4)
+            self.assertEqual(cfg.parent_selection, "puct")
+            self.assertEqual((cfg.groups_per_step, cfg.group_size), (8, 64))
+            self.assertFalse(cfg.reload_coder_between_phases)
+            self.assertIsNone(cfg.strategy_vllm_persistent_workers)
+            self.assertIsNone(coders._coder_vllm_persistent_workers(cfg))
+            self.assertIsNone(cfg.trainer_offload_dir)
+            with patch.object(gpu, "query_gpu_memory", return_value={}), patch.object(sys, "argv", argv):
+                fallback, _ = configuration.load_config()
+            self.assertEqual(fallback.num_training_gpus, 4)
+            self.assertEqual(fallback.vllm_tensor_parallel_size, 1)
+            for name in strategists.STRATEGIST_ALIASES:
+                self.assertEqual(strategists.strategist_engine_options(name, "B200_full_ram"),
+                                 strategists.strategist_engine_options(name, "RTX6000"))
+            memory = dict(total=1696*host.GIB, available=1400*host.GIB)
+            self.assertEqual(host.host_memory_reserve_bytes(memory, "B200_full_ram"),
+                             host.host_memory_reserve_bytes(memory, "RTX6000"))
 
     def test_gpu_query_is_limited_to_launcher_devices(self):
         import os

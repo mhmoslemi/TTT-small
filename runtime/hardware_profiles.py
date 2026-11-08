@@ -1,4 +1,4 @@
-"""Launch-scoped hardware selection; never change the policy or task settings."""
+"""Launch-scoped hardware capacity, checkpoint locations and residency."""
 
 from pathlib import Path
 
@@ -17,7 +17,7 @@ B200_LOCAL_MODELS = {
 
 
 def local_checkpoint(model_name, profile):
-    if profile == "B200":
+    if profile in {"B200", "B200_full_ram"}:
         for model_id, folder in B200_LOCAL_MODELS.items():
             if str(model_name).lower() == model_id.lower():
                 path = B200_MODEL_DIR / folder
@@ -37,8 +37,10 @@ def checkpoint_identity(model_name):
 
 def hardware_profile(value):
     name = str(value).strip().upper()
+    if name == "B200_FULL_RAM":
+        return "B200_full_ram"
     if name not in {"RTX6000", "B200"}:
-        raise ValueError("hardware_profile must be RTX6000 or B200")
+        raise ValueError("hardware_profile must be RTX6000, B200 or B200_full_ram")
     return name
 
 
@@ -47,6 +49,10 @@ def restore_hardware_settings(merged, current_yaml, saved):
     selected = hardware_profile(current_yaml.get("hardware_profile", "RTX6000"))
     previous = hardware_profile(saved.get("hardware_profile", "RTX6000"))
     merged["hardware_profile"] = selected
+    if selected == "B200_full_ram" and previous != selected:
+        # Saved low-RAM launch flags must not defeat the requested RTX policy.
+        merged["reload_coder_between_phases"] = current_yaml.get("reload_coder_between_phases", False)
+        merged["strategy_vllm_persistent_workers"] = current_yaml.get("strategy_vllm_persistent_workers")
     if saved and previous != selected:
         for key, default in {
             "gen_micro_batch": "auto", "vllm_gpu_memory_utilization": "auto",

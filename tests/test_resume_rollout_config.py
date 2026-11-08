@@ -111,6 +111,53 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertTrue(self.step.is_dir())
         self.assertFalse((self.run / "_restarted_steps").exists())
 
+    def test_hardware_and_gpu_count_change_preserves_generated_step_recovery(self):
+        root = Path(__file__).resolve().parents[1]
+        source = ast.parse((root / "train_multy_CVaR.py").read_text())
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_recoverable_pending_spo_rs_artifacts")
+        scope = dict(Path=Path, json=json)
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "pending-recovery", "exec"), scope)
+        for group in range(2):
+            for rollout in range(2):
+                base = self.step / f"step03_group{group:02d}_rollout{rollout:03d}"
+                Path(str(base) + ".meta.json").write_text(json.dumps(dict(
+                    step=3, status="evaluation_pending", group=group, parent_group=group,
+                    rollout=rollout, n_response_tokens=12, counts_toward_allocation=True, retry_attempt=0)))
+                for suffix in ("txt", "prompt.txt", "tokens.zlib", "behavior_logprobs.zlib"):
+                    Path(str(base) + "." + suffix).touch()
+        cfg = SimpleNamespace(groups_per_step=2, group_size=2, hardware_profile="B200_full_ram",
+                              num_training_gpus=4, training_gpu_ids="2,3,4,5")
+        recovered = scope["_recoverable_pending_spo_rs_artifacts"](self.run, 3, cfg)
+        self.assertEqual(len(recovered), 4)
+        recovered[0]["token_path"].unlink()
+        self.assertIsNone(scope["_recoverable_pending_spo_rs_artifacts"](self.run, 3, cfg))
+
+    def test_full_ram_resume_launcher_is_portable_and_checks_sidecars(self):
+        import os
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        launcher = self.run / "resume_ac1_full_ram.sh"
+        launcher.write_text((root / launcher.name).read_text())
+        (self.run / "run_copy.sh").write_text('#!/bin/sh\nprintf "%s\\n" "$AVAILABLE_GPUS" "$TTT_CONFIG" "$@"\n')
+        target = self.run / "runs/ac1_Qwen3.8-27B_1107-0624"
+        step = target / "step03"
+        step.mkdir(parents=True)
+        (target / "training_state.pt").touch()
+        base = step / "step03_group00_rollout000"
+        Path(str(base) + ".meta.json").write_text('{}')
+        for suffix in ("txt", "prompt.txt", "tokens.zlib", "behavior_logprobs.zlib"):
+            Path(str(base) + "." + suffix).touch()
+        result = subprocess.run(["sh", str(launcher)], text=True, capture_output=True,
+                                env=dict(os.environ, AVAILABLE_GPUS="6,7"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["2,3,4,5", "configs/ac1.yaml",
+                         "--resume", str(target), "--parent-selection", "puct"])
+        Path(str(base) + ".tokens.zlib").unlink()
+        result = subprocess.run(["sh", str(launcher)], text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing recovery artifact", result.stderr)
+
     def test_yaml_counts_override_saved_but_cli_is_stronger(self):
         source = (Path(__file__).resolve().parents[1]
                   / "runtime/configuration.py").read_text()

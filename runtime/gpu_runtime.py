@@ -384,7 +384,7 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
     using_vllm = str(cfg.get("generation_backend", "hf")).lower() == "vllm"
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") == "B200" else 80.0)
+                    default=178.0 if cfg.get("hardware_profile") in {"B200", "B200_full_ram"} else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
 
     raw_util = cfg.get("vllm_gpu_memory_utilization", "auto")
@@ -629,7 +629,7 @@ def derive_vllm_parallel_layout(cfg: dict, roles: GPURoles,
 
     selected = [memory[g] for g in roles.generation if g in memory]
     min_total = min((item.total_gib for item in selected),
-                    default=178.0 if cfg.get("hardware_profile") == "B200" else 80.0)
+                    default=178.0 if cfg.get("hardware_profile") in {"B200", "B200_full_ram"} else 80.0)
     min_free = min((item.free_gib for item in selected), default=min_total)
     util = _resolved_vllm_utilization(
         cfg.get("vllm_gpu_memory_utilization", "auto"), min_total, min_free)

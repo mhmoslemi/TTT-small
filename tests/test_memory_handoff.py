@@ -601,6 +601,27 @@ def test_b200_transient_lifecycle_ignores_sleep_flags_and_reloads_adapter(monkey
                       "load", "adapter1", "adapter1", "shutdown", "released"]
 
 
+@pytest.mark.parametrize("profile", ["RTX6000", "B200_full_ram"])
+def test_full_ram_pools_keep_sleep_backups_and_load_only_once(monkeypatch, profile):
+    events = []
+    def create(pool, **options):
+        assert options["vllm_enable_sleep_mode"] is True
+        events.append("load")
+        return SimpleNamespace(num_workers=4, persistent_workers=4, sleep_supported=True,
+            sleep=lambda: events.append("sleep"), wake_up=lambda: events.append("wake"),
+            shutdown=lambda: events.append("shutdown"),
+            generate_groups=lambda **kw: events.append(kw["adapter_path"]))
+    monkeypatch.setattr(PhasedVLLMGenerationPool, "_create_pool", create)
+    pool = PhasedVLLMGenerationPool(lambda: None, lambda: None, hardware_profile=profile,
+        model_name="Qwen/Qwen3.8-27B", gpu_ids=[2, 3, 4, 5], num_workers=4, vllm_sleep_level=1)
+    for step in (3, 4):
+        pool.generate_groups(adapter_path=f"adapter{step}")
+        pool.release()
+    assert events == ["load", "adapter3", "sleep", "wake", "adapter4", "sleep"]
+    pool.shutdown()
+    assert events[-1] == "shutdown"
+
+
 def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypatch):
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1696*GIB, available=100*GIB))
