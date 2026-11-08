@@ -19,6 +19,7 @@ import shutil
 import threading
 import time
 from contextlib import nullcontext
+from runtime.host_memory import HostMemoryUnavailable, HostMemoryTimeout
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
@@ -559,7 +560,7 @@ def _configure_jev_sampler(sampler, cfg, backend, optimizer, parallel_trainer,
             parallel_trainer.offload_for_generation(
                 disk_directory=getattr(cfg, "trainer_offload_dir", None))
         else:
-            _move_optimizer_state(optimizer, "cpu")
+            _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
             backend.offload_for_generation(
                 disk_directory=getattr(cfg, "trainer_offload_dir", None))
         print(f"[puct-jev] loading GLiDE-9B on GPU {sampler.gpu_id}", flush=True)
@@ -3670,7 +3671,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                   "benchmark(s)")
             try:
                 torch.cuda.synchronize()
-                _move_optimizer_state(optimizer, "cpu")
+                _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
                 backend.offload_for_generation()
                 import gc
                 gc.collect()
@@ -5387,7 +5388,7 @@ def main():
             def _offload_trainer_for_generation(phase="coder"):
                 nonlocal trainer_offloaded
                 disk_directory = getattr(cfg, "trainer_offload_dir", None)
-                frozen_to_disk = bool(disk_directory or cfg.hardware_profile == "B200")
+                frozen_to_disk = bool(disk_directory)
                 if (parallel_trainer is not None and parallel_trainer.is_offloaded):
                     return
                 if parallel_trainer is None and trainer_offloaded:
@@ -5439,7 +5440,7 @@ def main():
                 # This trades one later checkpoint reload for survival instead
                 # of permanently choosing a slower level-2/transient policy.
                 if memory is not None:
-                    if frozen_to_disk:
+                    if frozen_to_disk or cfg.hardware_profile == "B200":
                         from runtime.host_memory import host_memory_reserve_bytes
                         reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:
@@ -5468,7 +5469,7 @@ def main():
                             "will reload on its next use",
                             flush=True,
                         )
-                    if memory["available"] < target_available:
+                    if memory["available"] < target_available and cfg.hardware_profile != "B200":
                         raise MemoryError(
                             "insufficient host RAM for exact trainer offload "
                             f"after cache reclamation: available="
@@ -5481,24 +5482,26 @@ def main():
                     else (f"all {parallel_trainer.world_size} trainer replicas"
                           if parallel_trainer is not None else "trainer")
                 )
-                destination = ("reusable disk snapshot; only adapters/optimizer stay in RAM"
-                               if cfg.hardware_profile == "B200" else
-                               f"disk ({disk_directory}); only adapters/optimizer stay in RAM"
+                destination = (f"disk ({disk_directory}); only adapters/optimizer stay in RAM"
                                if disk_directory else "CPU")
                 setting_log_only(
                     f"[gpu] offloading {replica_label} to {destination} before "
                     "shared-GPU vLLM generation", flush=True)
                 try:
-                    if parallel_trainer is not None:
-                        parallel_trainer.offload_for_generation(
-                            purge_host_cache=False, disk_directory=disk_directory)
-                    else:
-                        _move_optimizer_state(optimizer, "cpu")
-                        backend.offload_for_generation(disk_directory=disk_directory)
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        torch.cuda.ipc_collect()
+                    admission = (pool_options["host_memory_admission"].reservation(
+                        required_bytes, stage="trainer CPU offload")
+                        if cfg.hardware_profile == "B200" else nullcontext())
+                    with admission:
+                        if parallel_trainer is not None:
+                            parallel_trainer.offload_for_generation(
+                                purge_host_cache=False, disk_directory=disk_directory)
+                        else:
+                            _move_optimizer_state(optimizer, "cpu", hardware_profile=cfg.hardware_profile)
+                            backend.offload_for_generation(disk_directory=disk_directory)
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
                     trainer_offloaded = True
                 except Exception as exc:
                     try:
@@ -5509,6 +5512,9 @@ def main():
                             _restore_optimizer_state_to_parameters(optimizer)
                     except Exception:
                         pass
+                    if isinstance(exc, HostMemoryUnavailable):
+                        pool_options["host_memory_admission"].stop_waiting()
+                        raise
                     raise RuntimeError(
                         "the training model could not be offloaded for the "
                         "shared vLLM rollout phase; use generation_backend=hf "
@@ -6012,4 +6018,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except HostMemoryTimeout as error:
+        print(f"[stop] {error}\n[resume] Saved checkpoints and rollout artifacts are retained. "
+              "Restart with --resume and the run directory printed above.", flush=True)
+        raise SystemExit(75) from None

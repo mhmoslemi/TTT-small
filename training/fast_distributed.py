@@ -1356,11 +1356,13 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 break
             else:
                 raise RuntimeError(f"unknown fast-worker command: {kind!r}")
-    except BaseException:
+    except BaseException as error:
         try:
+            from runtime.host_memory import HostMemoryTimeout
             result_queue.put({
                 "event": "error", "rank": int(rank),
                 "traceback": traceback.format_exc(),
+                "host_memory_timeout": isinstance(error, HostMemoryTimeout),
             })
         except Exception:
             pass
@@ -1375,13 +1377,15 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
 
 
 
-def _move_optimizer_state(optimizer, device) -> None:
+def _move_optimizer_state(optimizer, device, *, hardware_profile="RTX6000") -> None:
     """Move Adam state recursively without replacing Parameter identities."""
     import torch
+    from runtime.host_memory import retry_host_allocation
 
     def move(value):
         if torch.is_tensor(value):
-            return value.to(device)
+            return retry_host_allocation(lambda: value.to(device), hardware_profile=hardware_profile,
+                                         stage="optimizer offload")
         if isinstance(value, dict):
             return {key: move(item) for key, item in value.items()}
         if isinstance(value, list):

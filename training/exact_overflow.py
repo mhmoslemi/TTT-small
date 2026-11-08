@@ -76,17 +76,20 @@ def plan_overflow_wave(examples, world_size, minimum_gpus=None):
 def require_parking_capacity(model, world_size, optimizer=None, *, generation_pools=(), hardware_profile="RTX6000"):
     """Reclaim sleeping inference backups before admitting CPU trainer copies."""
     from runtime.host_memory import (host_memory_info, GIB, estimated_module_bytes,
-                             estimated_optimizer_bytes, host_memory_reserve_bytes)
+                             estimated_optimizer_bytes)
 
-    weight_bytes = (estimated_module_bytes(model, frozen_to_disk=True)
-                    if hardware_profile == "B200" else estimated_module_bytes(model))
+    weight_bytes = estimated_module_bytes(model)
     optimizer_bytes = estimated_optimizer_bytes(optimizer)
     required = int(1.10 * (weight_bytes * int(world_size) + optimizer_bytes))
+    if hardware_profile == "B200":
+        from runtime.host_memory import wait_for_host_memory
+        wait_for_host_memory(required, hardware_profile=hardware_profile,
+                             stage="cooperative trainer CPU offload")
+        return
     info = host_memory_info()
     if info is None:
         raise RuntimeError("cannot safely park replicas: host RAM is unknown")
-    reserve = (host_memory_reserve_bytes(info, hardware_profile) if hardware_profile == "B200"
-               else max(128 * GIB, int(0.10 * info["total"])))
+    reserve = max(128 * GIB, int(0.10 * info["total"]))
     for pool in generation_pools:
         if required + reserve <= info["available"]:
             break
@@ -98,8 +101,7 @@ def require_parking_capacity(model, world_size, optimizer=None, *, generation_po
         info = host_memory_info()
         if info is None:
             raise RuntimeError("cannot safely park replicas: host RAM is unknown")
-        reserve = (host_memory_reserve_bytes(info, hardware_profile) if hardware_profile == "B200"
-                   else max(128 * GIB, int(0.10 * info["total"])))
+        reserve = max(128 * GIB, int(0.10 * info["total"]))
     if required + reserve > info["available"]:
         raise RuntimeError(
             "insufficient host RAM to park the trainer replicas safely: "
@@ -136,12 +138,9 @@ def temporary_gpu_shards(backend, gpu_ids):
     saved_methods = {name: placement.__dict__.get(name)
                      for name in ("to", "cuda")}
     original_profile = getattr(model, "_ttt_oom_execution_profile", None)
-    snapshot = getattr(backend, "_b200_frozen_weights", None)
     # A replica's failed memory profile is not the profile of this GPU group.
     model._ttt_oom_execution_profile = {}
     try:
-        if snapshot is not None:
-            snapshot.restore()
         budgets = {}
         for device in gpu_ids:
             set_long_rollout_memory_ceiling(device, 0.96)
@@ -149,9 +148,6 @@ def temporary_gpu_shards(backend, gpu_ids):
                 free, total = torch.cuda.mem_get_info()
             # This is a weight-placement ceiling, not a token/activation cap.
             budgets[device] = max(0, int(free - 0.08 * total))
-            if snapshot is not None:
-                budgets[device] += sum(p.numel() * p.element_size() for p in model.parameters()
-                                       if p.device == torch.device("cuda", device))
         no_split = list(getattr(placement, "_no_split_modules", None) or ())
         balanced = get_balanced_memory(
             placement, max_memory=budgets, no_split_module_classes=no_split)
@@ -192,8 +188,6 @@ def temporary_gpu_shards(backend, gpu_ids):
                 setattr(placement, name, original)
         # Do not call Module.to here: preserve optimizer-owned objects even
         # under runtimes configured to replace Parameters on device moves.
-        if snapshot is not None:
-            snapshot.park()
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.data = parameter.data.cpu()

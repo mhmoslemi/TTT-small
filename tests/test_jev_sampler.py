@@ -470,7 +470,7 @@ def test_hf_handoff_restores_the_live_coder_after_worker_exit(tmp_path, monkeypa
     backend, optimizer = Mock(), object()
     backend.offload_for_generation.side_effect = lambda **kw: events.append(("park", kw))
     backend.restore_after_generation.side_effect = lambda: events.append("restore")
-    monkeypatch.setattr(training, "_move_optimizer_state", lambda opt, device: events.append(device))
+    monkeypatch.setattr(training, "_move_optimizer_state", lambda opt, device, **kw: events.append(device))
     monkeypatch.setattr(training, "_restore_optimizer_state_to_parameters", lambda opt: events.append("optimizer"))
     cfg = SimpleNamespace(gpu_ids="2", generation_backend="hf", trainer_offload_dir="disk")
     training._configure_jev_sampler(actual, cfg, backend, optimizer, None, None, None, None)

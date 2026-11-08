@@ -1675,9 +1675,10 @@ class GenerationPool:
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None, vllm_engine_options=None,
-                 hardware_profile="RTX6000"):
+                 hardware_profile="RTX6000", host_memory_admission=None):
         self.model_name = model_name
         self.hardware_profile = hardware_profile
+        self.host_memory_admission = host_memory_admission
         requested_num_gpus = int(num_workers)
         self.gpu_ids = gpu_ids or list(range(num_workers))
         self.seed = seed
@@ -1982,7 +1983,7 @@ class GenerationPool:
                     f"while waiting for workers {sorted(pending)}; details: "
                     f"{self.vllm_log_path or 'console'}")
             try:
-                status, rank, detail = self._ready_queue.get(
+                status, rank, detail = self._get_worker_message(self._ready_queue,
                     timeout=min(1.0, remaining))
             except queue.Empty:
                 dead = [
@@ -2035,6 +2036,13 @@ class GenerationPool:
             for rank in worker_ids:
                 self._start_worker(rank)
             self._wait_workers(worker_ids)
+
+    def _get_worker_message(self, worker_queue, *, timeout):
+        admission = getattr(self, "host_memory_admission", None)
+        if admission is not None and admission._ram_wait_failed.value:
+            from runtime.host_memory import HostMemoryTimeout
+            raise HostMemoryTimeout("a shared RAM wait exceeded 2 hours; stopping generation")
+        return worker_queue.get(timeout=timeout)
 
     def _stop_workers(self, worker_ids):
         worker_ids = tuple(int(rank) for rank in worker_ids)
@@ -2347,7 +2355,7 @@ class GenerationPool:
                         "sequential generation has pending work but no "
                         "available worker")
                 try:
-                    rank, group_idx, job_results = self.result_queue.get(
+                    rank, group_idx, job_results = self._get_worker_message(self.result_queue,
                         timeout=1.0)
                 except queue.Empty:
                     dead = [
@@ -2466,7 +2474,7 @@ class GenerationPool:
         try:
             while collected < total_expected:
                 try:
-                    rank, group_idx, job_results = self.result_queue.get(timeout=1.0)
+                    rank, group_idx, job_results = self._get_worker_message(self.result_queue, timeout=1.0)
                 except queue.Empty:
                     dead = [
                         (idx, None if proc is None else proc.exitcode)
@@ -2575,7 +2583,7 @@ class GenerationPool:
                 if done and not pending and not any(inflight.values()):
                     break
                 try:
-                    rank, sample, results = self.result_queue.get(timeout=0.01 if continuous else 0.1)
+                    rank, sample, results = self._get_worker_message(self.result_queue, timeout=0.01 if continuous else 0.1)
                 except queue.Empty:
                     dead = [(rank, None if proc is None else proc.exitcode)
                             for rank, proc in enumerate(self.procs)
@@ -2679,7 +2687,7 @@ class GenerationPool:
 
             while waiting:
                 try:
-                    rank, group_idx, job_results = self.result_queue.get(
+                    rank, group_idx, job_results = self._get_worker_message(self.result_queue,
                         timeout=1.0)
                 except queue.Empty:
                     dead = {
@@ -3052,18 +3060,21 @@ class PhasedVLLMGenerationPool:
     def _create_pool(self, **options):
         startup_reservation = nullcontext()
         if (self.host_memory_admission is not None
-                and not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
-                    "enable_lora", True)):
+                and (getattr(self, "_b200_transient", False) or not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
+                    "enable_lora", True))):
             from models.strategist_models import strategist_profile
             profile = strategist_profile(self._pool_kwargs["model_name"])
             cards = int(self._pool_kwargs["num_workers"])
             # Lazy checkpoint pages are reclaimable; charge only CPU-resident tables and staging.
             cpu_tables = (self._pool_kwargs.get("vllm_engine_options") or {}).get(
                 "engram_config", {}).get("cpu_offload", True)
-            host_gib = ((profile["ple_gib"] if cpu_tables else 0.0) + 4.0) * cards
+            host_gib = ((profile["ple_gib"] if cpu_tables and profile else 0.0) + 4.0) * cards
             startup_reservation = self.host_memory_admission.reservation(
-                int(host_gib * 2**30 * 1.05), wait_for_external=False)
+                int(host_gib * 2**30 * 1.05), wait_for_external=False,
+                stage="generation worker initialization")
         with startup_reservation:
+            if getattr(self, "_b200_transient", False):
+                options["host_memory_admission"] = self.host_memory_admission
             return GenerationPool(**self._pool_kwargs, **options)
 
     def _ensure_started(self):

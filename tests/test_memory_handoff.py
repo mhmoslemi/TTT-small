@@ -525,13 +525,14 @@ def test_shutdown_does_not_allocate_sleep_backups():
     assert calls == ["shutdown"] and not pool.active
 
 
-def test_b200_snapshot_reuses_disk_and_preserves_optimizer_and_mutable_buffers(tmp_path, monkeypatch):
+def test_b200_cpu_parking_preserves_optimizer_and_mutable_buffers(monkeypatch):
     import copy
     import torch
     from models.model_backend import _ModelPlacementBackend
     from runtime import disk_offload
 
-    monkeypatch.setattr(disk_offload, "CHUNK_BYTES", 16)
+    monkeypatch.setattr(disk_offload, "DiskWeightOffload",
+                        lambda *a, **kw: pytest.fail("B200 must not create disk snapshots"))
     model = torch.nn.Sequential(torch.nn.Linear(5, 3), torch.nn.Linear(3, 2))
     model[0].requires_grad_(False)
     model.register_buffer("counter", torch.tensor(0))
@@ -542,18 +543,15 @@ def test_b200_snapshot_reuses_disk_and_preserves_optimizer_and_mutable_buffers(t
     backend = _ModelPlacementBackend()
     backend.model = model
     backend.cfg = SimpleNamespace(hardware_profile="B200")
+    backend._training_device_map = {"": 7}
     backend._trainer_is_offloaded = False
     identities = [id(p) for p in model.parameters()]
-    snapshot = None
-    writes = []
-    drop_cache = disk_offload.FrozenWeightSnapshot._drop_cache
-
-    def observe(self, offset, size, *, written=False):
-        if written:
-            writes.append(size)
-        drop_cache(self, offset, size, written=written)
-
-    monkeypatch.setattr(disk_offload.FrozenWeightSnapshot, "_drop_cache", observe)
+    moves = []
+    original_to = model.to
+    def move(target):
+        moves.append(target)
+        return original_to("cpu")  # Exercise GPU placement order without CUDA.
+    monkeypatch.setattr(model, "to", move)
     for step in range(3):
         x = torch.ones(2, 5) * (step + 1)
         for network, adam in ((model, optimizer), (baseline, reference)):
@@ -561,16 +559,11 @@ def test_b200_snapshot_reuses_disk_and_preserves_optimizer_and_mutable_buffers(t
             network(x).square().mean().backward()
             adam.step()
             network.counter.add_(1)
-        backend.offload_for_generation(disk_directory=tmp_path)
-        assert model[0].weight.numel() == 0 and model[1].weight.numel() == 6
-        if snapshot is None:
-            snapshot = backend._b200_frozen_weights
-            initial_writes = list(writes)
-        assert backend._b200_frozen_weights is snapshot
-        assert writes == initial_writes
+        backend.offload_for_generation()
+        assert model[0].weight.numel() == 15 and model[1].weight.numel() == 6
         backend.restore_after_generation()
         backend.restore_after_generation()
-        assert not snapshot.parked and not snapshot.file.closed
+        assert not getattr(backend, "_disk_weights", None)
         assert model.tied is model[0].weight
         assert [id(p) for p in model.parameters()] == identities
         assert next(iter(optimizer.state)) is model[1].weight
@@ -579,32 +572,7 @@ def test_b200_snapshot_reuses_disk_and_preserves_optimizer_and_mutable_buffers(t
         for p, q in zip(model[1].parameters(), baseline[1].parameters()):
             for name, value in optimizer.state[p].items():
                 assert torch.equal(value, reference.state[q][name])
-
-
-def test_b200_snapshot_preserves_packed_scale_storage_and_rejects_corruption(tmp_path, monkeypatch):
-    import torch
-    from runtime.disk_offload import FrozenWeightSnapshot
-
-    class Packed(torch.nn.Parameter):
-        pass
-
-    model = torch.nn.Module()
-    model.weight = torch.Tensor._make_subclass(Packed, torch.arange(16, dtype=torch.uint8), False)
-    model.weight.mxfp4_scales = torch.arange(4, dtype=torch.uint8)
-    scales = model.weight.mxfp4_scales
-    snapshot = FrozenWeightSnapshot(model, tmp_path)
-    for _ in range(2):
-        snapshot.park()
-        assert model.weight.numel() == scales.numel() == 0
-        snapshot.restore()
-        assert torch.equal(model.weight, torch.arange(16, dtype=torch.uint8))
-        assert model.weight.mxfp4_scales is scales
-        assert torch.equal(scales, torch.arange(4, dtype=torch.uint8))
-    snapshot.park()
-    snapshot.file.truncate(0)
-    with pytest.raises(OSError, match="truncated B200"):
-        snapshot.restore()
-    assert snapshot.parked
+    assert moves == ["cpu", "cuda:7"] * 3
 
 
 def test_b200_transient_lifecycle_ignores_sleep_flags_and_reloads_adapter(monkeypatch):
@@ -649,20 +617,137 @@ def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypa
     assert activations.can_admit(32768)
 
 
-def test_b200_overflow_reuses_snapshot_and_parks_again_after_sharding(tmp_path, monkeypatch):
+def test_b200_ram_wait_rechecks_each_minute_then_continues(monkeypatch):
+    clock, waits = [0.0], []
+    monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.setattr(host_memory, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda:
+                        None if not clock[0] else dict(total=200*GIB, available=(80 if clock[0] >= 120 else 16)*GIB))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200")
+    def retry(timeout):
+        waits.append(timeout)
+        clock[0] += timeout
+    monkeypatch.setattr(gate._condition, "wait", retry)
+    with gate.reservation(32*GIB, wait_for_external=False, stage="test startup"):
+        assert gate.reserved_bytes == 32*GIB
+    assert waits == [60, 60] and gate.reserved_bytes == 0
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_b200_ram_timeout_stops_queued_work_without_another_two_hour_wait(monkeypatch, unknown):
+    clock, waits = [0.0], []
+    monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.setattr(host_memory, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda:
+                        None if unknown else dict(total=200*GIB, available=16*GIB))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200")
+    def retry(timeout):
+        waits.append(timeout)
+        clock[0] += timeout
+    monkeypatch.setattr(gate._condition, "wait", retry)
+    with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
+        with gate.reservation(32*GIB):
+            pytest.fail("allocation must not start")
+    assert clock[0] == 7200 and waits == [60] * 120
+    with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
+        with gate.reservation(0):
+            pytest.fail("queued tasks must stop immediately after a peer's timeout")
+    assert len(waits) == 120 and gate.reserved_bytes == 0
+
+
+def test_ram_timeout_is_not_hidden_by_worker_errors_and_cli_exits_resumably(capsys):
+    from queue import Queue
+    from training.trainers import ProcessDistributedTrainer
+    trainer = object.__new__(ProcessDistributedTrainer)
+    trainer._result_queue = Queue()
+    trainer._result_queue.put(dict(event="error", rank=1, host_memory_timeout=True))
+    with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
+        trainer._collect_event("offloaded", [1])
+    def fail():
+        raise host_memory.HostMemoryTimeout("test RAM timeout")
+    root = Path(__file__).resolve().parents[1]
+    guard = ast.parse((root / "train_multy_CVaR.py").read_text()).body[-1]
+    with pytest.raises(SystemExit) as stopped:
+        exec(compile(ast.Module(body=[guard], type_ignores=[]), "ram-stop", "exec"),
+             dict(__name__="__main__", main=fail, HostMemoryTimeout=host_memory.HostMemoryTimeout))
+    assert stopped.value.code == 75
+    assert "--resume" in capsys.readouterr().out
+
+
+def test_b200_retries_cpu_allocation_errors_but_not_gpu_or_programming_errors(monkeypatch):
+    import errno
+    clock, waits = [0.0], []
+    def sleep(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+    monkeypatch.setattr(host_memory, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    failures = iter([MemoryError(), OSError(errno.ENOMEM, "Cannot allocate memory"),
+                     RuntimeError("DefaultCPUAllocator: not enough memory"), None])
+    expected = object()
+    def allocate():
+        error = next(failures)
+        if error is not None:
+            raise error
+        return expected
+    assert host_memory.retry_host_allocation(allocate, hardware_profile="B200", stage="test") is expected
+    assert waits == [60, 60, 60]
+    for error, profile in [(RuntimeError("CUDA out of memory"), "B200"),
+                           (RuntimeError("bad model config"), "B200"),
+                           (host_memory.HostMemoryUnavailable("already timed out"), "B200"),
+                           (MemoryError(), "RTX6000")]:
+        def fail():
+            raise error
+        with pytest.raises(type(error)):
+            host_memory.retry_host_allocation(fail, hardware_profile=profile, stage="test")
+    assert waits == [60, 60, 60]
+
+
+def test_b200_allocation_failure_stops_after_two_hours(monkeypatch):
+    clock, calls = [0.0], []
+    monkeypatch.setattr(host_memory, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+    monkeypatch.setattr(host_memory.gc, "collect", lambda: None)
+    def allocate():
+        calls.append(True)
+        raise MemoryError()
+    with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
+        host_memory.retry_host_allocation(allocate, hardware_profile="B200", stage="test")
+    assert clock[0] == 7200 and len(calls) == 120
+
+
+def test_auto_backend_preserves_ram_timeout_for_resumable_stop(monkeypatch):
+    import models.model_backend as backend
+    def fail():
+        raise host_memory.HostMemoryUnavailable("RAM timeout")
+    monkeypatch.setattr(backend, "UnslothBackend", lambda cfg: SimpleNamespace(load=fail))
+    with pytest.raises(host_memory.HostMemoryUnavailable):
+        backend._AutoFallbackBackend(SimpleNamespace()).load()
+
+
+def test_generation_queue_wait_stops_when_a_shared_ram_wait_times_out():
+    from queue import Queue
+    from generation.gen_workers import GenerationPool
+    admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200")
+    pool = object.__new__(GenerationPool)
+    pool.host_memory_admission = admission
+    messages = Queue()
+    messages.put("ready")
+    assert pool._get_worker_message(messages, timeout=.01) == "ready"
+    admission.stop_waiting()
+    with pytest.raises(host_memory.HostMemoryTimeout):
+        pool._get_worker_message(messages, timeout=.01)
+
+
+def test_cpu_parking_preserves_gradients_after_cooperative_sharding(monkeypatch):
     import torch
     import training.fast_distributed as distributed
-    from runtime.disk_offload import FrozenWeightSnapshot
 
     model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 1))
     model[0].requires_grad_(False)
     model.register_buffer("counter", torch.tensor(0))
     identities = [id(parameter) for parameter in model.parameters()]
     expected_base = model[0].weight.clone()
-    snapshot = FrozenWeightSnapshot(model, tmp_path)
-    snapshot.park()
-    backend = SimpleNamespace(model=model, _trainer_is_offloaded=True,
-                              _b200_frozen_weights=snapshot)
+    backend = SimpleNamespace(model=model, _trainer_is_offloaded=True)
     plans = []
 
     def balanced(placement, **kwargs):
@@ -689,22 +774,25 @@ def test_b200_overflow_reuses_snapshot_and_parks_again_after_sharding(tmp_path, 
         model(torch.ones(2, 3)).sum().backward()
         expected_grad = model[1].weight.grad.clone()
         model.counter.add_(1)
-    assert plans and model[0].weight.numel() == 0
-    assert snapshot.parked and backend._trainer_is_offloaded
-    snapshot.restore()
+    assert plans and backend._trainer_is_offloaded
+    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
     assert torch.equal(model[0].weight, expected_base)
     assert torch.equal(model[1].weight.grad, expected_grad)
     assert model.counter.item() == 1
     assert [id(parameter) for parameter in model.parameters()] == identities
 
 
-def test_b200_overflow_parking_charges_only_mutable_state(monkeypatch):
+def test_b200_overflow_parking_charges_full_weights_and_waits(monkeypatch):
     import torch
     model = torch.nn.Sequential(torch.nn.Linear(128, 128), torch.nn.Linear(128, 1))
     model[0].requires_grad_(False)
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=1696*GIB, available=100*GIB))
+    monkeypatch.setattr(host_memory, "estimated_module_bytes", lambda model: 51*GIB)
+    waits = []
+    monkeypatch.setattr(host_memory, "wait_for_host_memory", lambda size, **kw: waits.append((size, kw)))
     exact_overflow.require_parking_capacity(model, 2, hardware_profile="B200")
+    assert waits == [(int(1.1 * 102*GIB), dict(hardware_profile="B200", stage="cooperative trainer CPU offload"))]
     with pytest.raises(RuntimeError, match="insufficient host RAM"):
         exact_overflow.require_parking_capacity(model, 2)
 

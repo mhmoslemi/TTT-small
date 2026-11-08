@@ -2,7 +2,6 @@
 
 import importlib.util
 import os
-from pathlib import Path
 import torch
 import types
 import weakref
@@ -634,18 +633,15 @@ class _ModelPlacementBackend:
             except (ImportError, AttributeError):
                 pass
         try:
-            if getattr(getattr(self, "cfg", None), "hardware_profile", "RTX6000") == "B200":
-                from runtime.disk_offload import FrozenWeightSnapshot
-                if getattr(self, "_b200_frozen_weights", None) is None:
-                    directory = disk_directory or Path(__file__).resolve().parents[1] / ".offload"
-                    self._b200_frozen_weights = FrozenWeightSnapshot(self.model, directory)
-                self._b200_frozen_weights.park()
-            elif disk_directory:
+            if disk_directory:
                 from runtime.disk_offload import DiskWeightOffload
                 self._disk_weights = DiskWeightOffload(self.model, disk_directory)
                 self.model.to("cpu")
             else:
-                self.model.to("cpu")
+                from runtime.host_memory import retry_host_allocation
+                retry_host_allocation(lambda: self.model.to("cpu"),
+                    hardware_profile=getattr(getattr(self, "cfg", None), "hardware_profile", "RTX6000"),
+                    stage="trainer CPU offload")
             self._trainer_is_offloaded = True
         except Exception:
             # A quantized module can fail after earlier layers already moved.
@@ -661,10 +657,7 @@ class _ModelPlacementBackend:
     def restore_after_generation(self):
         if not getattr(self, "_trainer_is_offloaded", False):
             return
-        b200_snapshot = getattr(self, "_b200_frozen_weights", None)
-        if b200_snapshot is not None:
-            b200_snapshot.restore()
-        elif getattr(self, "_disk_weights", None) is not None:
+        if getattr(self, "_disk_weights", None) is not None:
             self._disk_weights.restore()
             self._disk_weights = None
         device_map = getattr(self, "_training_device_map", None) or {}
@@ -675,7 +668,7 @@ class _ModelPlacementBackend:
             from accelerate import dispatch_model
             dispatch_model(
                 placement_model, device_map=device_map, force_hooks=True)
-        elif b200_snapshot is None:
+        else:
             target = next(iter(devices), "0")
             target = target if str(target).startswith("cuda:") else f"cuda:{target}"
             self.model.to(target)
@@ -1193,6 +1186,9 @@ class UnslothBackend(_ModelPlacementBackend):
         self._FastLanguageModel = None
 
     def load(self):
+        from runtime.host_memory import wait_for_host_memory, retry_host_allocation, GIB
+        wait_for_host_memory(8 * GIB, hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
+                             stage="trainer initialization")
         _require_packed_mxfp4_training_runtime(self.cfg)
         # Unsloth must be imported BEFORE transformers/trl/peft
         from unsloth import FastLanguageModel
@@ -1211,7 +1207,7 @@ class UnslothBackend(_ModelPlacementBackend):
         print(f"[backend=unsloth] loading {training_name} across "
               f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
         offline = _offline_mode()
-        model, tokenizer = FastLanguageModel.from_pretrained(
+        model, tokenizer = retry_host_allocation(lambda: FastLanguageModel.from_pretrained(
             model_name=training_name,
             max_seq_length=self.cfg.max_seq_length,
             load_in_4bit=use_4bit,
@@ -1223,7 +1219,7 @@ class UnslothBackend(_ModelPlacementBackend):
             device_map=device_map,
             **({"max_memory": _training_max_memory(self.cfg)}
                if _training_max_memory(self.cfg) else {}),
-        )
+        ), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"), stage="trainer loading")
         self._remember_training_placement(model)
         if packed_mxfp4 and not _is_packed_mxfp4(model):
             raise RuntimeError(
@@ -1300,6 +1296,9 @@ class HFBackend(_ModelPlacementBackend):
         self.tokenizer = None
 
     def load(self):
+        from runtime.host_memory import wait_for_host_memory, retry_host_allocation, GIB
+        wait_for_host_memory(8 * GIB, hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
+                             stage="trainer initialization")
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -1387,8 +1386,9 @@ class HFBackend(_ModelPlacementBackend):
                 self.cfg.effective_load_in_4bit = False
                 print("[backend=hf] bitsandbytes not available; using default precision")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            training_name, **model_kwargs)
+        model = retry_host_allocation(lambda: AutoModelForCausalLM.from_pretrained(
+            training_name, **model_kwargs), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
+            stage="trainer loading")
         if qwen_training_kernels is not None:
             from models.qwen_training_kernels import install_training_kernels
             count = install_training_kernels(model, qwen_training_kernels)
@@ -1495,6 +1495,9 @@ class _AutoFallbackBackend:
             self._inner = inner
             return m, t
         except Exception as e:
+            from runtime.host_memory import HostMemoryUnavailable
+            if isinstance(e, HostMemoryUnavailable):
+                raise
             print(f"[backend=auto] Unsloth load failed: {e!r}")
             raise RuntimeError(
                 "Unsloth patched Transformers before its model load failed, so "

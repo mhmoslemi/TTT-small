@@ -2517,7 +2517,8 @@ class ReplicatedDataParallelTrainer:
         try:
             for logical_id in range(self.world_size):
                 torch.cuda.synchronize(logical_id)
-            _move_optimizer_state(self.optimizer, "cpu")
+            _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
+                getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
             for backend, _, _, _ in self.replicas:
                 if disk_directory:
                     backend.offload_for_generation(disk_directory=disk_directory)
@@ -2766,6 +2767,12 @@ class ProcessDistributedTrainer:
             rank = int(message.get("rank", -1))
             if message_event == "error":
                 traceback_text = message.get("traceback", "no traceback")
+                if message.get("host_memory_timeout"):
+                    from runtime.host_memory import HostMemoryTimeout
+                    admission = getattr(self, "host_memory_admission", None)
+                    if admission is not None:
+                        admission.stop_waiting()
+                    raise HostMemoryTimeout(f"trainer rank {rank}: RAM wait exceeded 2 hours")
                 if "ExactLongContextTrainingOOM" in traceback_text:
                     raise ExactLongContextTrainingOOM(
                         f"fast trainer rank {rank} exhausted exact "
@@ -4004,7 +4011,8 @@ class ProcessDistributedTrainer:
             for command_queue in self._command_queues.values():
                 command_queue.put({"kind": "offload", "disk_directory": disk_directory})
             torch.cuda.synchronize(0)
-            _move_optimizer_state(self.optimizer, "cpu")
+            _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
+                getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
             if disk_directory:
                 self.backend.offload_for_generation(disk_directory=disk_directory)
             else:
