@@ -143,7 +143,7 @@ class PUCTJevSampler(PUCTSampler):
                 self.reassign_seed_id(state, identity["id"])
 
         description = self._description() if step > 0 else ""
-        # Validate the saved signature before applying a new threshold to unfinished picks.
+        # Validate the old snapshot before applying the current config's gate.
         threshold = saved["threshold"] if saved is not None else self.same_core_threshold
         signature_data = {"archive": self.state_dict(), "step": step,
                           "count": count, "puct_c": self.puct_c, "description": description,
@@ -153,17 +153,16 @@ class PUCTJevSampler(PUCTSampler):
         if saved is not None:
             if saved.get("version") != 1 or saved.get("signature") != signature:
                 raise ValueError("saved puct-jev selection differs from this archive/configuration")
-            if saved["selected"] is None and threshold != self.same_core_threshold:
+            if threshold != self.same_core_threshold:
                 previous_threshold, threshold = threshold, self.same_core_threshold
                 signature_data["threshold"] = threshold
-                saved.update(threshold=threshold, signature=_digest(signature_data))
+                saved.update(threshold=threshold, signature=_digest(signature_data), selected=None)
+                saved.pop("picks_info", None)
+                saved.pop("decisions", None)
                 _write(path, saved)
                 print(f"[puct-jev] step {step}: threshold {previous_threshold:g} -> "
                       f"{threshold:g} from current config; reusing cached comparisons",
                       flush=True)
-            elif saved["selected"] is not None and threshold != self.same_core_threshold:
-                print(f"[puct-jev] step {step}: keeping committed parents; threshold "
-                      f"{self.same_core_threshold:g} applies to the next selection", flush=True)
         else:
             saved = {"version": 1, "signature": signature, "step": step,
                      "requested": count, "model": str(self.model_path),

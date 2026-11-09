@@ -163,6 +163,12 @@ const data = {
     { label: 'Recorded lineage', path: `${run}/search_tree.json` },
     { label: 'Earlier combined-system run', path: 'runs/erdos_Qwen3.8-27B_GRPO-Strategy1/step00..step06/*.summary.json' },
     { label: 'Adaptive follow-up on final-best ancestry', path: followupSource },
+    { label: 'FunSearch', url: 'https://doi.org/10.1038/s41586-023-06924-6' },
+    { label: 'AlphaEvolve', url: 'https://arxiv.org/abs/2506.13131' },
+    { label: 'TTT-Discover', url: 'https://arxiv.org/abs/2601.16175' },
+    { label: 'WIPO: claims and protection', url: 'https://www.wipo.int/en/web/patents/protection' },
+    { label: 'WIPO: infringement, United States', url: 'https://www.wipo.int/patent-judicial-guide/en/full-guide/united-states/10.5.2' },
+    { label: 'WIPO: licensing and patent FAQ', url: 'https://www.wipo.int/en/web/patents/faq_patents' },
     { label: 'Original Huawei logo', url: 'https://www.huawei.com/-/media/hcomponent-header/1.0.1.20260908162100/component/img/huawei_logo.png' },
   ],
 };
@@ -176,7 +182,7 @@ assert(!html.includes('__DATA_JSON__') && !html.includes('__LOGO_BASE64__'));
 assert(!/\bV[12]\b/.test(html), 'Remove version labels from the final presentation');
 const introductoryText = html.slice(html.indexOf('<section'), html.indexOf('<section class="slide animated')).replace(/<[^>]+>/g, ' ');
 assert(!/\b(?:coder|strategist|strateg(?:y|ies)|planner)\b/i.test(introductoryText), 'Introduce the specialist LLM roles only with the proposed hierarchy');
-assert.equal((html.match(/<math\b/g) || []).length, 6, 'All six display equations must use native math typesetting');
+assert.equal((html.match(/<math\b/g) || []).length, 5, 'All five allocation and training equations must use native math typesetting');
 fs.writeFileSync(path.join(out, 'patent-v2.html'), html);
 fs.writeFileSync(path.join(out, 'evidence.json'), JSON.stringify(data, null, 2) + '\n');
 const hero=html.match(/<section class="slide animated hero-framework"[\s\S]*?<\/section>/)[0];

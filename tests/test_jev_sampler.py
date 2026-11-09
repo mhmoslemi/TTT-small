@@ -10,7 +10,7 @@ import sys
 import pytest
 import yaml
 
-from experiment_io import save_parent_selections
+from experiment_io import restart_changed_rollout_step, save_parent_selections
 from search import jev_sampler as jev
 from search.jev_worker import GlideWorker
 from search.sampler import PUCTSampler, State, make_sampler
@@ -130,29 +130,42 @@ def test_configured_threshold_controls_gate(tmp_path, monkeypatch, threshold, ex
     assert saved["threshold"] == threshold
 
 
-@pytest.mark.parametrize("status", ["complete", "partial", "empty"])
-def test_resume_overrides_unfinished_threshold_but_keeps_committed_parents(tmp_path, monkeypatch, status):
+@pytest.mark.parametrize("status", ["complete", "partial", "empty", "generated"])
+def test_resume_threshold_overrides_cached_selection(tmp_path, monkeypatch, status):
     actual = sampler(tmp_path, same_core_threshold=.90)
     payload = copy.deepcopy(actual.state_dict())
     decide = lambda req: response(.70, .1) if "```python\nB\n```" in req["state"] else response()
     fake_judge(monkeypatch, decide)
     assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "B"]
     path = tmp_path / "step01/step01.jev.json"
-    if status != "complete":
+    if status in ("partial", "empty"):
         saved = json.loads(path.read_text())
         saved["selected"] = None
         if status == "empty":
             saved["comparisons"], saved["sources"] = [], {}
         path.write_text(json.dumps(saved))
+    if status == "generated":
+        cfg = SimpleNamespace(parent_selection="puct-jev", jev_same_core_threshold=.68,
+                              groups_per_step=2, group_size=8, pilot_programs_per_strategy=-1)
+        (tmp_path / "config.json").write_text(json.dumps(vars(cfg)))
+        save_parent_selections(tmp_path, 1, type(actual).__name__, actual._selected,
+                               actual.last_picks_info, rollout_config=cfg)
+        rollout = path.parent / "step01_group00_rollout000.meta.json"
+        rollout.write_text('{"reward": 1}')
+        backup = restart_changed_rollout_step(cfg, tmp_path, 1)
+        assert (backup / "step01" / rollout.name).is_file()
+        assert not rollout.exists()
+        assert not (path.parent / "step01.parents.json").exists()
+        assert restart_changed_rollout_step(cfg, tmp_path, 1) is None
     resumed = sampler(tmp_path, same_core_threshold=.68)
     resumed.load_state_dict(payload)
     requests, _ = fake_judge(monkeypatch, decide)
-    expected = ["A", "B"] if status == "complete" else ["A", "C"]
+    expected = ["A", "C"]
     assert [s.code for s in resumed.sample_states(2, selection_step=1)] == expected
-    assert len(requests) == {"complete": 0, "partial": 1, "empty": 2}[status]
-    if status == "partial":
+    assert len(requests) == (2 if status == "empty" else 1)
+    if status != "empty":
         assert "```python\nC\n```" in requests[0]["state"]  # B's judgment was reused.
-    assert json.loads(path.read_text())["threshold"] == (.90 if status == "complete" else .68)
+    assert json.loads(path.read_text())["threshold"] == .68
     resumed.load_state_dict(payload)
     monkeypatch.setattr(jev, "GlideWorker", lambda *a, **kw: pytest.fail("replayed GLiDE"))
     assert [s.code for s in resumed.sample_states(2, selection_step=1)] == expected

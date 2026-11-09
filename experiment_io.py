@@ -241,7 +241,7 @@ def make_experiment_dir(cfg, root: str = "runs", resume_dir=None,
 
 
 def restart_changed_rollout_step(cfg, exp_dir, step):
-    """Move an unfinished step aside before regenerating with a new budget."""
+    """Archive an unfinished step whose budget or committed JEV gate changed."""
     import tempfile
 
     run = Path(exp_dir)
@@ -264,9 +264,16 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if request_path.is_file():
         values["groups_per_step"] = int(
             json.loads(request_path.read_text())["num_parents"])
-    if jev_path.is_file():
-        values["groups_per_step"] = int(json.loads(jev_path.read_text())["requested"])
-    if all(getattr(cfg, key, None) == value for key, value in values.items()):
+    jev = json.loads(jev_path.read_text()) if jev_path.is_file() else None
+    if jev is not None:
+        values["groups_per_step"] = int(jev["requested"])
+    budget_changed = any(getattr(cfg, key, None) != value for key, value in values.items())
+    # Step zero uses ordinary PUCT, so its parents do not depend on this gate.
+    threshold_changed = (
+        step > 0 and getattr(cfg, "parent_selection", None) == "puct-jev"
+        and jev is not None and jev.get("selected") is not None
+        and jev["threshold"] != cfg.jev_same_core_threshold)
+    if not (budget_changed or threshold_changed):
         return None
 
     # Partial gradients and a prefetched next-step decision belong to the
@@ -300,7 +307,27 @@ def restart_changed_rollout_step(cfg, exp_dir, step):
     if move_prefetch:
         next_directory.rename(backup / next_directory.name)
     directory.rename(backup / directory.name)
-    print(f"[resume] rollout counts changed: restarting step {step} with "
+
+    if threshold_changed and not budget_changed:
+        # Probabilities do not depend on the gate. Retain only that cache;
+        # never carry old parents, rollouts, evaluations, or gradients forward.
+        # Leave the old threshold/signature intact for the sampler to validate
+        # against the restored archive before applying the current threshold.
+        jev["selected"] = None
+        jev.pop("picks_info", None)
+        jev.pop("decisions", None)
+        directory.mkdir()
+        tmp = jev_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(jev, indent=2, ensure_ascii=False,
+                                  allow_nan=False) + "\n", encoding="utf-8")
+        tmp.replace(jev_path)
+    reasons = []
+    if budget_changed:
+        reasons.append("rollout counts changed")
+    if threshold_changed:
+        reasons.append(f"JEV threshold changed {jev['threshold']:g} -> "
+                       f"{cfg.jev_same_core_threshold:g}")
+    print(f"[resume] {'; '.join(reasons)}: restarting step {step} with "
           f"{cfg.groups_per_step} parents x {cfg.group_size} rollouts; "
           f"previous step artifacts moved to {backup}", flush=True)
     return backup

@@ -3247,11 +3247,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "starts as each program arrives",
                         flush=True,
                     )
-                    pilot_records = _run_vllm_code_phase(
-                        [pilot_programs_per_strategy] * len(source_job_indices),
-                        phase="pilot", seed_offset=0, progress_desc="pilot rollouts",
-                        defer_format_retries=True)
-
                     def _run_ready_vllm_followups(
                             counts, dispatch_index, _batch_total,
                             dispatched_after, expected_total):
@@ -3316,12 +3311,25 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         _defer_coder_format_retries(
                             phase_records, seed_offset=0 if expected_pilots else 4_000_000)
 
-                    _run_adaptive_followups_as_ready(
-                        pilot_records, source_job_indices, _run_ready_vllm_followups)
+                    if cfg.generation_backend == "vllm" and hasattr(gen_pool, "iter_ready_jobs"):
+                        pilot_records = []
+                        print(f"[step {step_idx}] continuous coder queue: pilot and ready "
+                              "phase-2 work share engines; no generation-batch barriers", flush=True)
+                        _run_adaptive_followups_as_ready(
+                            pilot_records, source_job_indices,
+                            lambda poll, total: _run_streamed_vllm_followups(
+                                poll, total, pilot_records=pilot_records),
+                            pipelined=True, streaming_pilots=True)
+                    else:
+                        pilot_records = _run_vllm_code_phase(
+                            [pilot_programs_per_strategy] * len(source_job_indices),
+                            phase="pilot", seed_offset=0, progress_desc="pilot rollouts",
+                            defer_format_retries=True)
+                        _run_adaptive_followups_as_ready(
+                            pilot_records, source_job_indices, _run_ready_vllm_followups)
                     _drain_deferred_coder_format_retries()
                 else:
-                    # Keep the disabled path structurally identical to the
-                    # original one-pass rollout scheduler.
+                    # Non-adaptive runs keep one-pass generation and their original retry gate.
                     generation_options = {
                         "prompts_by_group": [job["prompt_text"] for job in prompt_jobs],
                         "group_size": cfg.group_size,

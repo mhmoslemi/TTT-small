@@ -8,7 +8,7 @@ const out = path.dirname(fileURLToPath(import.meta.url));
 const build = process.argv[2];
 if (!build || !fs.existsSync(path.join(build, 'editable-pptx.json'))) throw new Error('Run render.mjs with --editable-pptx-assets and pass its private build directory');
 const {slides} = JSON.parse(fs.readFileSync(path.join(build, 'editable-pptx.json'), 'utf8'));
-assert.equal(slides.length, 30);
+assert.equal(slides.length, 28);
 for (const [page,count] of [[7,6],[9,4],[10,4]]) assert.equal(slides.filter(s => s.page === page).length,count);
 const notesMasterId = `rId${slides.length + 2}`;
 
@@ -90,7 +90,10 @@ for (let i=1; i<=slides.length; i++) {
   const png=`background-${i}.png`;
   media(`ppt/media/${png}`,path.join(build,background));
   if(page===7)assert(geometry.length>5,'Framework geometry must remain editable');
-  const pics=picture(2,`${info.title} graphic elements`,'rId2',0,0,1280,720)+geometry.map((g,index)=>frameworkShape(index+3,g)).join('')+texts.map((t,index)=>textBox(index+3+geometry.length,t)).join('');
+  // Distinct IDs prevent native previewers from reusing a different slide's cached shapes.
+  const idBase=i*1000;
+  assert(geometry.length+texts.length<997);
+  const pics=picture(idBase+2,`${info.title} graphic elements`,'rId2',0,0,1280,720)+geometry.map((g,index)=>frameworkShape(idBase+index+3,g)).join('')+texts.map((t,index)=>textBox(idBase+index+3+geometry.length,t)).join('');
   const links=[{id:'rId1',type:'slideLayout',target:'../slideLayouts/slideLayout1.xml'},{id:'rId2',type:'image',target:`../media/${png}`},{id:'rId4',type:'notesSlide',target:`../notesSlides/notesSlide${i}.xml`}];
   write(`ppt/slides/slide${i}.xml`,`<p:sld ${header}><p:cSld name="${xml(info.title)}"><p:spTree>${group}${pics}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`);
   rels(`ppt/slides/_rels/slide${i}.xml.rels`,links);

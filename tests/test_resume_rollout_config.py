@@ -104,6 +104,62 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertEqual(saved["comparisons"], [{"done": True}])
         self.assertFalse(self.step.exists())
 
+    def test_changed_jev_threshold_restarts_generated_step_and_partial_training(self):
+        cfg = SimpleNamespace(**self.saved, parent_selection="puct-jev",
+                              jev_same_core_threshold=.68)
+        save_parent_selections(self.run, 3, "PUCTJevSampler", [], [], rollout_config=cfg)
+        cached = dict(requested=4, threshold=.9, selected=["old"], signature="old-signature",
+                      comparisons=[{"same_core_idea": .8}], picks_info=["old"], decisions=["old"])
+        path = self.step / "step03.jev.json"
+        path.write_text(json.dumps(cached))
+        (self.step / "step03_group00_rollout000.meta.json").write_text('{"reward": 1}')
+        gradient = self.run / ".exact_spo_rs_overflow_step0003.pt"
+        gradient.write_bytes(b'old partial gradients')
+        marker = self.run / ".exact_sharded_recovery.json"
+        marker.write_text(json.dumps(dict(step=3, overflow_gradient_file=gradient.name)))
+        checkpoint = self.run / "training_state.pt"
+        checkpoint.write_bytes(b'last completed training state')
+        adapter = self.run / "adapter_step002"
+        adapter.mkdir()
+        (adapter / "adapter_model.safetensors").write_bytes(b'last completed adapter')
+
+        backup = self.resume(cfg)
+        self.assertEqual(json.loads((backup / "step03/step03.jev.json").read_text()), cached)
+        self.assertTrue((backup / "step03/step03.parents.json").is_file())
+        self.assertTrue((backup / "step03/step03_group00_rollout000.meta.json").is_file())
+        self.assertTrue((backup / gradient.name).is_file())
+        self.assertTrue((backup / marker.name).is_file())
+        self.assertFalse(gradient.exists())
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(self.step.iterdir()), [path])
+        retained = json.loads(path.read_text())
+        self.assertIsNone(retained["selected"])
+        self.assertNotIn("picks_info", retained)
+        self.assertNotIn("decisions", retained)
+        for key in ("signature", "threshold", "comparisons"):
+            self.assertEqual(retained[key], cached[key])
+        self.assertEqual(checkpoint.read_bytes(), b'last completed training state')
+        self.assertEqual((adapter / "adapter_model.safetensors").read_bytes(), b'last completed adapter')
+        self.assertIsNone(self.resume(cfg))
+
+    def test_jev_override_does_not_restart_unchanged_uncommitted_or_completed_step(self):
+        path = self.step / "step03.jev.json"
+        summary = self.step / "step03.summary.json"
+        for threshold, selected, mode, completed in (
+                (.9, ["old"], "puct-jev", False),
+                (.68, None, "puct-jev", False),
+                (.68, ["old"], "puct", False),
+                (.68, ["old"], "puct-jev", True)):
+            with self.subTest(threshold=threshold, selected=selected, mode=mode, completed=completed):
+                path.write_text(json.dumps(dict(requested=4, threshold=.9, selected=selected)))
+                if completed:
+                    summary.write_text('{}')
+                cfg = SimpleNamespace(**self.saved, parent_selection=mode,
+                                      jev_same_core_threshold=threshold)
+                self.assertIsNone(self.resume(cfg))
+                self.assertTrue(path.is_file())
+                self.assertFalse((self.run / "_restarted_steps").exists())
+
     def test_unchanged_budget_or_effort_only_edits_keep_recovery(self):
         (self.step / "step03.parents.json").write_text('{"parents": []}')
         cfg = SimpleNamespace(**dict(self.saved, pilot_medium_programs_per_strategy=3))

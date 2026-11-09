@@ -67,7 +67,7 @@ try {
   await evaluate(`document.head.insertAdjacentHTML('beforeend','<style id="qa-style">*{transition:none!important;animation:none!important}</style>')`);
   const report = { slides: [], browserExceptions: exceptions };
   const count = await evaluate('deck.state.count');
-  if (count !== 19) throw new Error(`Expected 19 slides; received ${count}`);
+  if (count !== 17) throw new Error(`Expected 17 slides; received ${count}`);
   await evaluate('deck.show(6)');
   if (!await evaluate('deck.state.build === deck.state.maxBuild')) throw new Error('Reading a slide must show its complete content');
   await evaluate('deck.show(9,99)');

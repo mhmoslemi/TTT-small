@@ -2460,6 +2460,25 @@ class GenerationPool:
         worker_jobs = distribute_jobs(
             prompts_by_group, group_size, self.num_workers,
             counts_by_group=counts_by_group)
+        if (getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
+                and (getattr(self, "_worker_options", {}).get("engine_options") or {}).get("enable_lora", True)):
+            # Keep unstarted coder/retry requests shared instead of stranding them on a busy engine.
+            counts = ([int(group_size)] * len(prompts_by_group) if counts_by_group is None
+                      else [int(count) for count in counts_by_group])
+            jobs = [dict(key=index, prompt_text=prompt, count=count, step_idx=step_idx)
+                    for index, (prompt, count) in enumerate(zip(prompts_by_group, counts)) if count]
+
+            def poll():
+                nonlocal jobs
+                ready, jobs = jobs, []
+                return ready, True
+
+            yield from self.iter_ready_jobs(
+                poll, total_expected=sum(counts), adapter_path=adapter_path,
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                return_logprobs=return_logprobs, full_policy_sampling=full_policy_sampling,
+                top_k=top_k, min_p=min_p, progress_desc=progress_desc, show_progress=show_progress)
+            return
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,

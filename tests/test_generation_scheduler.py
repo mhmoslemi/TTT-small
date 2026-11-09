@@ -29,19 +29,75 @@ def load_nested(path, name, scope):
 
 
 class GenerationSchedulerTests(unittest.TestCase):
-    def test_b200_and_rtx_use_the_same_fixed_job_scheduler(self):
+    def test_coder_batches_use_shared_queue_on_all_hardware_profiles(self):
         pool = workers.GenerationPool.__new__(workers.GenerationPool)
         pool.num_workers, pool.gen_micro_batch = 2, 2
         pool._async_worker_ids, pool._worker_options = {0, 1}, {}
+
+        def ready(poll, **options):
+            jobs, done = poll()
+            self.assertTrue(done)
+            self.assertEqual([(job["key"], job["count"]) for job in jobs], [(0, 3), (2, 1)])
+            self.assertTrue(all(job["step_idx"] == 7 for job in jobs))
+            self.assertEqual(options["total_expected"], 4)
+            self.assertEqual(options["adapter_path"], "adapter7")
+            self.assertEqual(options["max_new_tokens"], 262144)
+            self.assertTrue(options["return_logprobs"] and options["full_policy_sampling"])
+            self.assertEqual((options["temperature"], options["top_p"], options["top_k"], options["min_p"]),
+                             (1., 1., 0, 0.))
+            self.assertEqual(poll(), ([], True))
+            yield 2, [("retry", [7], [-.1])]
+
+        pool.iter_ready_jobs = ready
+        for profile in ("RTX6000", "B200", "B200_full_ram"):
+            pool.hardware_profile = profile
+            result = list(pool.iter_group_jobs(["pilot", "empty", "retry"], 3, "adapter7", 262144,
+                1., 1., step_idx=7, counts_by_group=[3, 0, 1], top_k=0, min_p=0.,
+                return_logprobs=True, full_policy_sampling=True, show_progress=False))
+            self.assertEqual(result, [(2, [("retry", [7], [-.1])])])
+
+    def test_synchronous_and_frozen_strategy_batches_keep_legacy_dispatch(self):
+        pool = workers.GenerationPool.__new__(workers.GenerationPool)
+        pool.num_workers, pool.gen_micro_batch = 2, 2
         pool.iter_ready_jobs = Mock(side_effect=AssertionError("legacy path must keep its scheduler"))
         pool.task_queues = [SimpleNamespace(put=lambda task: None)] * 2
         pool.procs = [SimpleNamespace(exitcode=None)] * 2
         pool.result_queue = SimpleNamespace(get=lambda **kwargs: (0, 0, [("legacy", [7])]))
-        for profile in ("RTX6000", "B200"):
-            pool.hardware_profile = profile
+        for async_workers, engine_options in ((set(), None), ({0, 1}, {"enable_lora": False})):
+            pool._async_worker_ids = async_workers
+            pool._worker_options = dict(engine_options=engine_options)
             self.assertEqual(list(pool.iter_group_jobs(["prompt"], 1, None, 99, 1., 1., show_progress=False)),
                              [(0, [("legacy", [7])])])
         pool.iter_ready_jobs.assert_not_called()
+
+    def test_train_step_routes_vllm_to_streaming_but_preserves_legacy_fallback(self):
+        tree = ast.parse((ROOT / "train_multy_CVaR.py").read_text())
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If) and any(
+            isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "hasattr"
+            and any(isinstance(arg, ast.Constant) and arg.value == "iter_ready_jobs" for arg in call.args)
+            for call in ast.walk(node.test)))
+        for streaming in (True, False):
+            scope = dict(cfg=SimpleNamespace(generation_backend="vllm"), step_idx=7,
+                         gen_pool=SimpleNamespace(iter_ready_jobs=True) if streaming else SimpleNamespace(),
+                         pilot_programs_per_strategy=2, source_job_indices=[0, 1],
+                         _run_vllm_code_phase=Mock(return_value=["legacy pilots"]),
+                         _run_ready_vllm_followups=Mock(), _run_streamed_vllm_followups=Mock())
+            def plan(pilots, sources, run, **options):
+                self.assertEqual(sources, [0, 1])
+                if streaming:
+                    self.assertEqual(pilots, [])
+                    self.assertEqual(options, dict(pipelined=True, streaming_pilots=True))
+                    run("poll", 4)
+                    scope["_run_streamed_vllm_followups"].assert_called_once_with("poll", 4, pilot_records=pilots)
+                    scope["_run_vllm_code_phase"].assert_not_called()
+                else:
+                    self.assertEqual(pilots, ["legacy pilots"])
+                    self.assertIs(run, scope["_run_ready_vllm_followups"])
+                    self.assertEqual(options, {})
+            scope["_run_adaptive_followups_as_ready"] = Mock(side_effect=plan)
+            with redirect_stdout(io.StringIO()):
+                exec(compile(ast.Module(body=[branch], type_ignores=[]), "train_step_dispatch", "exec"), scope)
+            scope["_run_adaptive_followups_as_ready"].assert_called_once()
 
     def test_refill_before_slow_request_finishes_and_keep_exact_counts(self):
         pool = workers.GenerationPool.__new__(workers.GenerationPool)

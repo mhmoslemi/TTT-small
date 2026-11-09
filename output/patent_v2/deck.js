@@ -71,20 +71,6 @@ function chartAxes(w,h,domainX,domainY,xticks,yticks,formatter=(v)=>String(v),le
   body+=line(m.l,h-m.b,w-m.r,h-m.b,'stroke="#98a1ad"');
   return {x,y,body,m};
 }
-function ablationChart(field,id,max){
-  const w=550,h=250;
-  const a=chartAxes(w,h,[0,19],[0,max],[0,4,8,12,16,19],max===100?[0,25,50,75,100]:[0,10,20,30,40]);
-  let b=a.body;
-  DATA.ablation.forEach((run,index)=>{
-    const stroke=index===0?c.red:c.grey;
-    b+=`<polyline points="${run.rows.map(r=>`${a.x(r.step).toFixed(2)},${a.y(r[field]).toFixed(2)}`).join(' ')}" class="line" stroke="${stroke}" stroke-width="3.1"/>`;
-    const last=run.rows.at(-1);const dy=field==='copies'?(index===0?-12:22):(index===0?-12:-12);
-    b+=label(a.x(19)-3,a.y(last[field])+dy,`${last[field].toFixed(1)}%`,17,`text-anchor="end" style="fill:${stroke}"`);
-  });
-  b+=center((a.m.l+w-a.m.r)/2,h-4,'Training step',17,'class="axis"');
-  document.getElementById(id).innerHTML=svg(w,h,b,field==='copies'?'Parent copies as a percent of coder attempts. Without strategist rises to 92.2 percent; with strategist ends at 2.1 percent.':'Distinct valid non-parent outputs per 100 attempts. With strategist ends at 14.1 percent and without at 1.0 percent.');
-}
-
 function construction(h,w,height,mini=false){
   const m={l:60,r:15,t:mini?10:17,b:mini?39:43};
   const x=v=>m.l+v/2*(w-m.l-m.r), y=v=>height-m.b-v*(height-m.t-m.b);
@@ -98,10 +84,13 @@ function construction(h,w,height,mini=false){
   b+=center(12,mid,'h(x)',16,`class="axis" transform="rotate(-90 12 ${mid})"`);
   return svg(w,height,b,`Saved step function with ${h.length} equal-width pieces on the interval zero to two. Values lie between zero and one.`);
 }
-function snapshots(){
-  document.getElementById('snapshots').innerHTML=DATA.snapshots.map(r=>`<div class="snapshot"><h2>Step ${r.step}<span>n = ${r.n} &nbsp; C₅ = ${r.score.toFixed(9)}</span></h2><div class="chart">${construction(r.displayH,550,160,true)}</div></div>`).join('');
+function resultEvidence(){
   document.getElementById('best-construction').innerHTML=construction(DATA.best.displayH,650,285);
   document.getElementById('best-score').textContent=`C₅ ≤ ${DATA.best.score.toFixed(12)}`;
+  for(const [index,suffix] of [[0,'with'],[1,'without']]){
+    const row=DATA.ablation[index].rows.at(-1);
+    for(const metric of ['distinct','copies'])document.getElementById(`${metric}-${suffix}`).textContent=row[metric].toFixed(1)+'%';
+  }
 }
 function bestCurve(){
   const w=440,h=285;const scores=DATA.curve.map(r=>r.score).concat(DATA.benchmarkReference.value);
@@ -118,25 +107,7 @@ function bestCurve(){
   document.getElementById('best-curve').innerHTML=svg(w,h,b,'The best-so-far evaluated C5 bound decreases across completed steps zero through ten. The grey line marks the historical comparison reference, 0.380868.');
 }
 
-function experimentEvidence(){
-  for(const [id,key] of [['learning-results','coderLearning'],['direct-results','directCoder'],['planner-results','plannerCapacity'],['coder-results','coderCapacity']]){
-    document.getElementById(id).innerHTML=DATA.reportExperiments[key].map(r=>`<tr><td>${esc(r.label)}</td><td>${(r.programsApprox/1000).toFixed(1)}k</td><td>${r.positiveRewardPct.toFixed(2)}%</td><td>${r.bestScore.toFixed(6)}</td></tr>`).join('');
-  }
-  const w=720,h=320,a=chartAxes(w,h,[0,6],[.380853,.380998],[0,1,2,3,4,5,6],[.38086,.38090,.38094,.38098],v=>v.toFixed(5),105);
-  let b=a.body;
-  DATA.systemComparison.forEach((run,i)=>{
-    const stroke=i===0?c.grey:c.red;
-    b+=`<polyline points="${run.rows.map(r=>`${a.x(r.step).toFixed(2)},${a.y(r.score).toFixed(2)}`).join(' ')}" class="line" stroke="${stroke}" stroke-width="2.7"/>`;
-    run.rows.forEach(r=>{b+=`<circle cx="${a.x(r.step)}" cy="${a.y(r.score)}" r="3" fill="${stroke}"/>`;});
-  });
-  b+=center((a.m.l+w-a.m.r)/2,h-3,'Completed step',17,'class="axis"');
-  b+=label(a.m.l,12,'Best-so-far C₅ (lower is better)',16,'class="axis"');
-  document.getElementById('system-progression').innerHTML=svg(w,h,b,'Two saved best-so-far C5 trajectories over completed steps zero through six. The combined SPO squared run reaches a lower bound. Other run settings also differ.');
-  document.getElementById('earlier-system-score').textContent=DATA.systemComparison[0].rows.at(-1).score.toFixed(9);
-  document.getElementById('historical-system-score').textContent=DATA.systemComparison[1].rows.at(-1).score.toFixed(9);
-}
-
-background();const framework=pipeline();allocation();schedule();ablationChart('distinct','diversity',40);ablationChart('copies','copies',100);snapshots();bestCurve();experimentEvidence();
+background();const framework=pipeline();allocation();schedule();resultEvidence();bestCurve();
 const slides=[...document.querySelectorAll('.slide')];
 slides.forEach((slide,i)=>{
   const footer=document.createElement('footer');footer.className='footer';
