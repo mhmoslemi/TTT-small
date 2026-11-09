@@ -546,6 +546,9 @@ def _configure_jev_sampler(sampler, cfg, backend, optimizer, parallel_trainer,
     if sampler.selection_mode != "puct-jev":
         return
     sampler.gpu_id = _parse_gpu_ids(cfg.gpu_ids)[0]
+    sampler.host_memory_admission = (
+        getattr(parallel_trainer, "host_memory_admission", None)
+        or getattr(gen_pool, "host_memory_admission", None))
 
     def before():
         if cfg.generation_backend == "vllm":
@@ -5410,7 +5413,6 @@ def main():
                 from runtime.host_memory import (
                     GIB, estimated_module_bytes, estimated_optimizer_bytes,
                     host_memory_info, reclaim_unused_host_memory,
-                    wait_for_trainer_offload_memory,
                 )
 
                 # Reclaim cached activation-offload blocks on *every* trainer
@@ -5454,6 +5456,7 @@ def main():
                 # only sleeping level-1 backups, largest/unused peer first.
                 # This trades one later checkpoint reload for survival instead
                 # of permanently choosing a slower level-2/transient policy.
+                reserve_bytes = None
                 if memory is not None:
                     if frozen_to_disk or cfg.hardware_profile == "B200":
                         from runtime.host_memory import host_memory_reserve_bytes
@@ -5484,8 +5487,6 @@ def main():
                             "will reload on its next use",
                             flush=True,
                         )
-                    if memory["available"] < target_available and cfg.hardware_profile != "B200":
-                        memory = wait_for_trainer_offload_memory(required_bytes, reserve_bytes)
                 replica_label = (
                     "inactive training model"
                     if not runtime_training_active["value"]
@@ -5498,9 +5499,9 @@ def main():
                     f"[gpu] offloading {replica_label} to {destination} before "
                     "shared-GPU vLLM generation", flush=True)
                 try:
-                    admission = (pool_options["host_memory_admission"].reservation(
-                        required_bytes, stage="trainer CPU offload")
-                        if cfg.hardware_profile == "B200" else nullcontext())
+                    admission = pool_options["host_memory_admission"].reservation(
+                        required_bytes, stage="trainer CPU offload", priority=True,
+                        reserve_bytes=reserve_bytes)
                     with admission:
                         if parallel_trainer is not None:
                             parallel_trainer.offload_for_generation(

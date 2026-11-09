@@ -305,6 +305,140 @@ def test_activation_offload_shares_live_ram_gate_and_never_under_reserves(monkey
         too_small.reservation(32000)
 
 
+def test_waiting_model_transfer_has_priority_over_new_evaluations(monkeypatch):
+    memory = dict(total=100 * GIB, available=50 * GIB)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
+    waiting, admitted, finish = threading.Event(), threading.Event(), threading.Event()
+    order = []
+    original_wait = gate._condition.wait
+
+    def wait(timeout):
+        if threading.current_thread().name == "model-transfer":
+            waiting.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(gate._condition, "wait", wait)
+
+    def transfer():
+        with gate.reservation(60 * GIB, priority=True, stage="model transfer"):
+            order.append("model")
+            admitted.set()
+            finish.wait(2)
+
+    def evaluate():
+        with gate.reservation(5 * GIB):
+            order.append("evaluation")
+
+    model_thread = threading.Thread(target=transfer, name="model-transfer", daemon=True)
+    evaluator = threading.Thread(target=evaluate, daemon=True)
+    try:
+        model_thread.start()
+        assert waiting.wait(2)
+        evaluator.start()
+        evaluator.join(.05)
+        assert not order  # A small evaluation could fit, but must yield.
+        with gate._condition:
+            memory["available"] = 100 * GIB
+            gate._condition.notify_all()
+        assert admitted.wait(2)
+        evaluator.join(2)
+        assert order == ["model", "evaluation"]
+    finally:
+        finish.set()
+        gate.stop_waiting()
+        model_thread.join(2)
+        evaluator.join(2)
+    assert gate.reserved_bytes == gate._priority_waiters.value == 0
+
+
+def test_interrupted_ram_wait_releases_priority(monkeypatch):
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=200*GIB, available=0))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
+    def interrupt(timeout):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(gate._condition, "wait", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        with gate.reservation(32*GIB, priority=True):
+            pytest.fail("allocation must not start")
+    assert gate._priority_waiters.value == gate.reserved_bytes == 0
+
+
+def test_main_full_ram_offload_waits_and_holds_reservation_during_all_copies(monkeypatch):
+    memory = dict(total=200 * GIB, available=16 * GIB)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
+    waits, copies = [], []
+    def wait(timeout):
+        waits.append(timeout)
+        memory["available"] = 64 * GIB
+    monkeypatch.setattr(gate._condition, "wait", wait)
+    def offload(**kwargs):
+        assert gate.reserved_bytes == 32 * GIB
+        copies.append(kwargs)
+    trainer = SimpleNamespace(is_offloaded=False, world_size=2, reclaim_host_memory=lambda: [],
+                              estimated_host_offload_bytes=lambda **kw: 32 * GIB,
+                              offload_for_generation=offload)
+    source = ast.parse((Path(__file__).resolve().parents[1] / "train_multy_CVaR.py").read_text())
+    function = next(n for n in ast.walk(source) if isinstance(n, ast.FunctionDef)
+                    and n.name == "_offload_trainer_for_generation")
+    wrapper = ast.parse("def build():\n    trainer_offloaded = False\n    return None").body[0]
+    wrapper.body[1:] = [function, ast.Return(value=ast.Name(id=function.name, ctx=ast.Load()))]
+    scope = dict(cfg=SimpleNamespace(hardware_profile="B200_full_ram"),
+                 parallel_trainer=trainer, gen_pool=None, strategy_pool=None,
+                 pool_options={"host_memory_admission": gate}, runtime_training_active={"value": True},
+                 setting_log_only=lambda *a, **kw: None, HostMemoryUnavailable=host_memory.HostMemoryUnavailable)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
+                 "real-trainer-handoff", "exec"), scope)
+    scope["build"]()()
+    assert waits == [1] and copies == [{"purge_host_cache": False, "disk_directory": None}]
+    assert gate.reserved_bytes == 0
+
+
+def test_full_ram_model_initialization_holds_claim_until_loader_returns(monkeypatch):
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(total=200*GIB, available=100*GIB))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
+    monkeypatch.setattr(host_memory, "HostMemoryAdmission", lambda *a, **kw: gate)
+    def load():
+        assert gate.reserved_bytes == 8 * GIB
+        return "model"
+    assert host_memory.retry_host_allocation(load, hardware_profile="B200_full_ram",
+                                             stage="trainer loading", required_bytes=8*GIB) == "model"
+    assert gate.reserved_bytes == 0
+
+
+def test_full_ram_coder_startup_is_also_admitted(monkeypatch):
+    from generation import gen_workers as workers
+    memory = dict(total=200*GIB, available=0)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
+    waits = []
+    def wait(timeout):
+        waits.append(timeout)
+        memory["available"] = 100 * GIB
+    monkeypatch.setattr(gate._condition, "wait", wait)
+    def create(**kwargs):
+        assert gate.reserved_bytes == int(8 * GIB * 1.05)
+        return "pool"
+    monkeypatch.setattr(workers, "GenerationPool", create)
+    pool = PhasedVLLMGenerationPool(lambda: None, lambda: None,
+        hardware_profile="B200_full_ram", model_name="Qwen/Qwen3.8-27B",
+        gpu_ids=[6, 7], num_workers=2, host_memory_admission=gate)
+    assert pool._create_pool() == "pool"
+    assert waits == [1] and gate.reserved_bytes == 0
+
+
+def test_ram_timeout_during_sleep_is_not_swallowed_as_engine_failure():
+    pool = PhasedVLLMGenerationPool(lambda: None, lambda: None)
+    pool._awake = pool._persistent = True
+    def sleep():
+        raise host_memory.HostMemoryTimeout("test timeout")
+    pool._pool = SimpleNamespace(sleep=sleep)
+    with pytest.raises(host_memory.HostMemoryTimeout, match="test timeout"):
+        pool.release()
+    assert not pool.active
+
+
 def test_sleep_waves_restore_trainers_before_more_host_copies(monkeypatch):
     from generation.gen_workers import GenerationPool
 
@@ -629,6 +763,8 @@ def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypa
     assert HostMemoryAdmission(context).available_bytes() == 0
     gate = HostMemoryAdmission(context, hardware_profile="B200")
     assert gate.available_bytes() == 84*GIB
+    full_ram = HostMemoryAdmission(context, hardware_profile="B200_full_ram")
+    assert full_ram.available_bytes() == 95*GIB
     with gate.reservation(8*GIB, wait_for_external=False):
         assert gate.available_bytes() == 76*GIB
     activations = TokenWeightedActivationOffloadGate(
@@ -638,57 +774,32 @@ def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypa
     assert activations.can_admit(32768)
 
 
-@pytest.mark.parametrize("release_after", [0, 2, 30])
-def test_trainer_offload_wait_continues_when_ram_is_available(monkeypatch, release_after):
-    waits = []
-    monkeypatch.setattr(host_memory.time, "sleep", waits.append)
-    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(
-        total=200 * GIB, available=(80 if len(waits) >= release_after else 16) * GIB))
-    memory = host_memory.wait_for_trainer_offload_memory(64 * GIB, 16 * GIB)
-    assert memory["available"] == 80 * GIB
-    assert waits == [5] * release_after
-
-
-@pytest.mark.parametrize("unknown", [False, True])
-def test_trainer_offload_wait_stops_after_thirty_retries(monkeypatch, unknown):
-    waits, checks = [], []
-    monkeypatch.setattr(host_memory.time, "sleep", waits.append)
-
-    def memory():
-        checks.append(True)
-        return None if unknown else dict(total=200 * GIB, available=79 * GIB)
-
-    monkeypatch.setattr(host_memory, "host_memory_info", memory)
-    with pytest.raises(host_memory.HostMemoryTimeout, match="after 30 retries 5s apart"):
-        host_memory.wait_for_trainer_offload_memory(64 * GIB, 16 * GIB)
-    assert waits == [5] * 30
-    assert len(checks) == 31
-
-
-def test_b200_ram_wait_rechecks_each_minute_then_continues(monkeypatch):
+@pytest.mark.parametrize("profile", ["B200", "B200_full_ram"])
+def test_ram_wait_polls_each_second_then_reserves_and_continues(monkeypatch, profile):
     clock, waits = [0.0], []
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
     monkeypatch.setattr(host_memory, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(host_memory, "host_memory_info", lambda:
-                        None if not clock[0] else dict(total=200*GIB, available=(80 if clock[0] >= 120 else 16)*GIB))
-    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200")
+                        None if not clock[0] else dict(total=200*GIB, available=(80 if clock[0] >= 2 else 16)*GIB))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=profile)
     def retry(timeout):
         waits.append(timeout)
         clock[0] += timeout
     monkeypatch.setattr(gate._condition, "wait", retry)
     with gate.reservation(32*GIB, wait_for_external=False, stage="test startup"):
         assert gate.reserved_bytes == 32*GIB
-    assert waits == [60, 60] and gate.reserved_bytes == 0
+    assert waits == [1, 1] and gate.reserved_bytes == 0
 
 
 @pytest.mark.parametrize("unknown", [False, True])
-def test_b200_ram_timeout_stops_queued_work_without_another_two_hour_wait(monkeypatch, unknown):
+@pytest.mark.parametrize("profile", ["B200", "B200_full_ram"])
+def test_ram_timeout_stops_queued_work_without_another_two_hour_wait(monkeypatch, unknown, profile):
     clock, waits = [0.0], []
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
     monkeypatch.setattr(host_memory, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(host_memory, "host_memory_info", lambda:
                         None if unknown else dict(total=200*GIB, available=16*GIB))
-    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200")
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=profile)
     def retry(timeout):
         waits.append(timeout)
         clock[0] += timeout
@@ -696,11 +807,11 @@ def test_b200_ram_timeout_stops_queued_work_without_another_two_hour_wait(monkey
     with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
         with gate.reservation(32*GIB):
             pytest.fail("allocation must not start")
-    assert clock[0] == 7200 and waits == [60] * 120
+    assert clock[0] == 7200 and waits == [1] * 7200
     with pytest.raises(host_memory.HostMemoryUnavailable, match="2 hours"):
         with gate.reservation(0):
             pytest.fail("queued tasks must stop immediately after a peer's timeout")
-    assert len(waits) == 120 and gate.reserved_bytes == 0
+    assert len(waits) == 7200 and gate.reserved_bytes == 0
 
 
 def test_ram_timeout_is_not_hidden_by_worker_errors_and_cli_exits_resumably(capsys):
@@ -722,7 +833,8 @@ def test_ram_timeout_is_not_hidden_by_worker_errors_and_cli_exits_resumably(caps
     assert "--resume" in capsys.readouterr().out
 
 
-def test_b200_retries_cpu_allocation_errors_but_not_gpu_or_programming_errors(monkeypatch):
+@pytest.mark.parametrize("profile", ["B200", "B200_full_ram"])
+def test_b200_retries_cpu_allocation_errors_but_not_gpu_or_programming_errors(monkeypatch, profile):
     import errno
     clock, waits = [0.0], []
     def sleep(seconds):
@@ -737,7 +849,7 @@ def test_b200_retries_cpu_allocation_errors_but_not_gpu_or_programming_errors(mo
         if error is not None:
             raise error
         return expected
-    assert host_memory.retry_host_allocation(allocate, hardware_profile="B200", stage="test") is expected
+    assert host_memory.retry_host_allocation(allocate, hardware_profile=profile, stage="test") is expected
     assert waits == [60, 60, 60]
     for error, profile in [(RuntimeError("CUDA out of memory"), "B200"),
                            (RuntimeError("bad model config"), "B200"),

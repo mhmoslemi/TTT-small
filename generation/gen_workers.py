@@ -2196,7 +2196,7 @@ class GenerationPool:
         if not self._persistent_worker_ids:
             return
         from contextlib import nullcontext
-        from runtime.host_memory import (HostMemoryUnavailable, host_memory_info,
+        from runtime.host_memory import (HostMemoryUnavailable, HostMemoryTimeout, host_memory_info,
                                  host_transfer_wave, GIB)
 
         reports = self._vllm_control("host_memory", self._persistent_worker_ids)
@@ -2212,7 +2212,8 @@ class GenerationPool:
             # Margin covers small buffers/allocator rounding. Pageable backups
             # avoid the much larger power-of-two pinned-allocation overhead.
             reservation = (host_admission.reservation(
-                               int(transfer_bytes * 1.05), wait_for_external=False)
+                               int(transfer_bytes * 1.05), wait_for_external=False,
+                               stage="vLLM weight backup", priority=True)
                            if host_admission is not None else nullcontext())
             print(f"[pool] sleeping {len(wave)}/{self.num_workers} engine(s): "
                   f"{transfer_bytes / GIB:.1f} GiB pageable host backup", flush=True)
@@ -2223,6 +2224,8 @@ class GenerationPool:
                     if after_sleep:
                         after_sleep([gpu for rank in wave
                                      for gpu in self._gpu_groups[rank]])
+            except HostMemoryTimeout:
+                raise
             except HostMemoryUnavailable:
                 # No admitted CPU work can return RAM to unblock this copy.
                 # Keep all rollout GPUs; reload only the unretainable engines
@@ -3090,9 +3093,7 @@ class PhasedVLLMGenerationPool:
 
     def _create_pool(self, **options):
         startup_reservation = nullcontext()
-        if (self.host_memory_admission is not None
-                and (getattr(self, "_b200_transient", False) or not (self._pool_kwargs.get("vllm_engine_options") or {}).get(
-                    "enable_lora", True))):
+        if self.host_memory_admission is not None:
             from models.strategist_models import strategist_profile
             profile = strategist_profile(self._pool_kwargs["model_name"])
             cards = int(self._pool_kwargs["num_workers"])
@@ -3102,7 +3103,7 @@ class PhasedVLLMGenerationPool:
             host_gib = ((profile["ple_gib"] if cpu_tables and profile else 0.0) + 4.0) * cards
             startup_reservation = self.host_memory_admission.reservation(
                 int(host_gib * 2**30 * 1.05), wait_for_external=False,
-                stage="generation worker initialization")
+                stage="generation worker initialization", priority=True)
         with startup_reservation:
             if getattr(self, "_b200_transient", False):
                 options["host_memory_admission"] = self.host_memory_admission
@@ -3273,6 +3274,9 @@ class PhasedVLLMGenerationPool:
                         self._pool.sleep(after_sleep=after_sleep,
                                          host_admission=host_admission)
                 except Exception as exc:
+                    from runtime.host_memory import HostMemoryTimeout
+                    if isinstance(exc, HostMemoryTimeout):
+                        raise
                     # A vLLM EngineCore can die after an inference OOM.  It
                     # cannot acknowledge sleep, but shutting down the complete
                     # pool still releases its remaining processes and makes a

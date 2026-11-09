@@ -42,7 +42,8 @@ def fake_judge(monkeypatch, decide):
     requests, lifecycle = [], []
 
     class Judge:
-        def __init__(self, model_path, gpu_id, log_path, *, before_start, after_stop):
+        def __init__(self, model_path, gpu_id, log_path, *, before_start, after_stop,
+                     host_memory_admission=None):
             self.before, self.after = before_start, after_stop
 
         def __enter__(self):
@@ -408,12 +409,26 @@ def worker_checkpoint(tmp_path):
     return folder
 
 
-def test_real_worker_protocol_loads_once_and_exits_before_gpu_restore(tmp_path, worker_checkpoint):
+def test_real_worker_protocol_loads_once_and_exits_before_gpu_restore(tmp_path, worker_checkpoint, monkeypatch):
+    import multiprocessing
+    from runtime import host_memory
+    from search import jev_worker
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda:
+                        dict(total=200*host_memory.GIB, available=100*host_memory.GIB))
+    admission = host_memory.HostMemoryAdmission(multiprocessing.get_context("spawn"),
+                                                hardware_profile="B200_full_ram")
+    original_popen = jev_worker.subprocess.Popen
+    def start(*args, **kwargs):
+        assert admission.reserved_bytes == 8 * host_memory.GIB
+        return original_popen(*args, **kwargs)
+    monkeypatch.setattr(jev_worker.subprocess, "Popen", start)
     events = []
     log = tmp_path / "worker.log"
     with GlideWorker(worker_checkpoint, 3, log,
                      before_start=lambda: events.append("park"),
-                     after_stop=lambda: events.append("released")) as worker:
+                     after_stop=lambda: events.append("released"),
+                     host_memory_admission=admission) as worker:
+        assert admission.reserved_bytes == 0
         proc = worker.process
         for _ in range(2):
             result = worker.compare(jev.comparison_request("task", "A", "B"))

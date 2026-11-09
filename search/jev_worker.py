@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -16,11 +16,12 @@ MAX_CONTEXT = 40000
 
 class GlideWorker:
     def __init__(self, model_path, gpu_id, log_path, *, before_start=None,
-                 after_stop=None):
+                 after_stop=None, host_memory_admission=None):
         self.model_path = str(model_path)
         self.gpu_id = int(gpu_id)
         self.log_path = Path(log_path)
         self.before_start, self.after_stop = before_start, after_stop
+        self.host_memory_admission = host_memory_admission
         self.process = self.log = None
         self._prepared = False
 
@@ -40,12 +41,18 @@ class GlideWorker:
             self.log = self.log_path.open("a", encoding="utf-8")
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(self.gpu_id),
                        CUDA_DEVICE_ORDER="PCI_BUS_ID", TOKENIZERS_PARALLELISM="false")
-            self.process = subprocess.Popen(
-                [sys.executable, "-m", "search.jev_worker", str(path.resolve())],
-                cwd=str(Path(__file__).resolve().parents[1]), env=env,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
-                text=True, encoding="utf-8", bufsize=1)
-            ready = self._receive()
+            # Reserve after the trainer handoff, so nested reservations cannot
+            # hold judge staging RAM while waiting to park trainer weights.
+            admission = (self.host_memory_admission.reservation(
+                8 * 1024**3, stage="GLiDE worker initialization", priority=True)
+                if self.host_memory_admission is not None else nullcontext())
+            with admission:
+                self.process = subprocess.Popen(
+                    [sys.executable, "-m", "search.jev_worker", str(path.resolve())],
+                    cwd=str(Path(__file__).resolve().parents[1]), env=env,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
+                    text=True, encoding="utf-8", bufsize=1)
+                ready = self._receive()
             if ready != {"ready": True}:
                 raise RuntimeError(f"invalid GLiDE startup response: {ready!r}")
             return self

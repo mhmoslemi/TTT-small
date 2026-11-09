@@ -97,6 +97,7 @@ class PUCTJevSampler(PUCTSampler):
         self.same_core_threshold = same_core_threshold
         self.gpu_id = 0
         self.before_judge = self.after_judge = None
+        self.host_memory_admission = None
         self._selection_step, self._selected = None, []
 
     @property
@@ -244,7 +245,8 @@ class PUCTJevSampler(PUCTSampler):
                                 judge = stack.enter_context(GlideWorker(
                                     self.model_path, self.gpu_id,
                                     path.with_suffix(".worker.log"),
-                                    before_start=self.before_judge, after_stop=self.after_judge))
+                                    before_start=self.before_judge, after_stop=self.after_judge,
+                                    host_memory_admission=self.host_memory_admission))
                             response = judge.compare(comparison_request(
                                 description, parent.code, candidate.code))
                             row = {"candidate_id": candidate.id, "parent_id": parent.id,

@@ -1186,9 +1186,7 @@ class UnslothBackend(_ModelPlacementBackend):
         self._FastLanguageModel = None
 
     def load(self):
-        from runtime.host_memory import wait_for_host_memory, retry_host_allocation, GIB
-        wait_for_host_memory(8 * GIB, hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
-                             stage="trainer initialization")
+        from runtime.host_memory import retry_host_allocation, GIB
         _require_packed_mxfp4_training_runtime(self.cfg)
         # Unsloth must be imported BEFORE transformers/trl/peft
         from unsloth import FastLanguageModel
@@ -1219,7 +1217,8 @@ class UnslothBackend(_ModelPlacementBackend):
             device_map=device_map,
             **({"max_memory": _training_max_memory(self.cfg)}
                if _training_max_memory(self.cfg) else {}),
-        ), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"), stage="trainer loading")
+        ), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
+            stage="trainer loading", required_bytes=8 * GIB)
         self._remember_training_placement(model)
         if packed_mxfp4 and not _is_packed_mxfp4(model):
             raise RuntimeError(
@@ -1296,9 +1295,7 @@ class HFBackend(_ModelPlacementBackend):
         self.tokenizer = None
 
     def load(self):
-        from runtime.host_memory import wait_for_host_memory, retry_host_allocation, GIB
-        wait_for_host_memory(8 * GIB, hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
-                             stage="trainer initialization")
+        from runtime.host_memory import retry_host_allocation, GIB
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -1388,7 +1385,7 @@ class HFBackend(_ModelPlacementBackend):
 
         model = retry_host_allocation(lambda: AutoModelForCausalLM.from_pretrained(
             training_name, **model_kwargs), hardware_profile=getattr(self.cfg, "hardware_profile", "RTX6000"),
-            stage="trainer loading")
+            stage="trainer loading", required_bytes=8 * GIB)
         if qwen_training_kernels is not None:
             from models.qwen_training_kernels import install_training_kernels
             count = install_training_kernels(model, qwen_training_kernels)

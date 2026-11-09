@@ -7,7 +7,7 @@ never fewer tokens. Gradient reduction and the single optimizer update remain
 the coordinator's responsibility.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import gc
 import json
 import math
@@ -377,11 +377,20 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
             # Clear dead activation caches before checking the parking budget.
             trainer.reclaim_host_memory()
             if not trainer._offloaded:
-                require_parking_capacity(trainer.model, trainer.world_size,
-                                         trainer.optimizer,
-                                         generation_pools=getattr(trainer, "_generation_pools", ()),
-                                         hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
-                trainer.offload_for_generation(purge_host_cache=False)
+                if getattr(cfg, "hardware_profile", "RTX6000") in ("B200", "B200_full_ram"):
+                    # Hold the shared claim through all CPU copies. A preflight
+                    # alone lets evaluation consume the space before the move.
+                    parking = trainer.host_memory_admission.reservation(
+                        trainer.estimated_host_offload_bytes(), priority=True,
+                        stage="cooperative trainer CPU offload")
+                else:
+                    require_parking_capacity(trainer.model, trainer.world_size,
+                                             trainer.optimizer,
+                                             generation_pools=getattr(trainer, "_generation_pools", ()),
+                                             hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
+                    parking = nullcontext()
+                with parking:
+                    trainer.offload_for_generation(purge_host_cache=False)
             # Keep replicas parked between cooperative GPU waves.
             while pending:
                 wave = plan_overflow_wave(

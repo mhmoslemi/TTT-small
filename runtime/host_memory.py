@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 GIB = 1024 ** 3
 RAM_RETRY_INTERVAL_S = 60.0
+RAM_POLL_INTERVAL_S = 1.0
 RAM_WAIT_TIMEOUT_S = 2 * 60 * 60.0
 DEFAULT_PINNED_CACHE_LIMIT_BYTES = 16 * GIB
 DEFAULT_LOW_AVAILABLE_FRACTION = 0.18
@@ -162,6 +163,10 @@ def host_memory_reserve_bytes(info, hardware_profile="RTX6000"):
     if hardware_profile == "B200":
         # This job may own two GPUs on a busy multi-TiB host, not all its RAM.
         return min(total // 4, 16 * GIB)
+    if hardware_profile == "B200_full_ram":
+        # Use the same user-requested headroom as trainer handoff, including
+        # startup/evaluation gates; full machine RAM is not exclusive to us.
+        return min(total // 4, 5 * GIB)
     return min(total // 4, max(GIB, min(128 * GIB, total // 10)))
 
 
@@ -171,24 +176,6 @@ class HostMemoryUnavailable(MemoryError):
 
 class HostMemoryTimeout(HostMemoryUnavailable):
     """A bounded RAM wait expired; stop without a traceback."""
-
-
-def wait_for_trainer_offload_memory(required_bytes, reserve_bytes):
-    """Wait before moving any trainer weights, keeping the safety reserve intact."""
-    for retry in range(31):
-        memory = host_memory_info()
-        if memory is not None and memory["available"] >= required_bytes + reserve_bytes:
-            return memory
-        available = "unknown" if memory is None else f"{memory['available'] / GIB:.1f} GiB"
-        details = (f"available={available}, estimated offload={required_bytes / GIB:.1f} GiB, "
-                   f"safety reserve={reserve_bytes / GIB:.1f} GiB")
-        if retry == 30:
-            raise HostMemoryTimeout(
-                "insufficient host RAM for exact trainer offload after 30 retries "
-                f"5s apart: {details}")
-        print(f"[ram-wait] trainer CPU offload: {details}; "
-              f"retry {retry + 1}/30 in 5s", flush=True)
-        time.sleep(5)
 
 
 class HostMemoryAdmission:
@@ -203,6 +190,7 @@ class HostMemoryAdmission:
     def __init__(self, multiprocessing_context, *, hardware_profile="RTX6000"):
         self.hardware_profile = hardware_profile
         self._reserved = multiprocessing_context.Value("q", 0, lock=False)
+        self._priority_waiters = multiprocessing_context.Value("q", 0, lock=False)
         self._ram_wait_failed = multiprocessing_context.Value("b", False, lock=False)
         self._condition = multiprocessing_context.Condition(
             multiprocessing_context.RLock())
@@ -227,48 +215,61 @@ class HostMemoryAdmission:
             self._condition.notify_all()
 
     @contextmanager
-    def reservation(self, size_bytes, *, wait_for_external=True, stage="RAM allocation"):
+    def reservation(self, size_bytes, *, wait_for_external=True, stage="RAM allocation",
+                    priority=False, reserve_bytes=None):
         size_bytes = max(0, int(size_bytes))
-        bounded_wait = self.hardware_profile == "B200"
+        bounded_wait = self.hardware_profile in ("B200", "B200_full_ram")
         deadline = time.monotonic() + RAM_WAIT_TIMEOUT_S if bounded_wait else None
         next_report = 0.0
+        waited = False
         with self._condition:
-            while True:
-                if bounded_wait and self._ram_wait_failed.value:
-                    raise HostMemoryTimeout("a shared RAM wait exceeded 2 hours; stopping this run")
-                info = host_memory_info()
-                if info is None and not bounded_wait:
-                    break
-                reserve = host_memory_reserve_bytes(info, self.hardware_profile) if info else 0
-                available = (int(info["available"]) - reserve - int(self._reserved.value)
-                             if info else None)
-                if not bounded_wait and size_bytes > int(info["total"]) - reserve:
-                    raise HostMemoryUnavailable(
-                        "host-memory request exceeds node capacity")
-                if available is not None and available >= size_bytes:
-                    break
-                if bounded_wait:
-                    now = time.monotonic()
-                    if now >= deadline:
-                        self._ram_wait_failed.value = True
-                        self._condition.notify_all()
-                        raise HostMemoryTimeout(f"{stage}: RAM remained unavailable for 2 hours")
-                    if now >= next_report:
-                        free = "unknown" if available is None else f"{max(0, available) / GIB:.1f} GiB"
-                        print(f"[ram-wait] {stage}: need {size_bytes / GIB:.1f} GiB, "
-                              f"admissible={free}; retry in 60s, "
-                              f"{(deadline - now) / 60:.0f} min remaining", flush=True)
-                        next_report = now + RAM_RETRY_INTERVAL_S
-                    self._condition.wait(timeout=min(RAM_RETRY_INTERVAL_S, deadline - now))
-                    continue
-                if not wait_for_external and not self._reserved.value:
-                    raise HostMemoryUnavailable(
-                        "host RAM cannot retain another model backup")
-                # Also observe memory released outside this gate (model moves,
-                # page-cache reclamation and completed inference wake-ups).
-                self._condition.wait(timeout=0.25)
-            self._reserved.value += size_bytes
+            if priority:
+                self._priority_waiters.value += 1
+            try:
+                while True:
+                    if self._ram_wait_failed.value:
+                        raise HostMemoryTimeout("a shared RAM wait exceeded 2 hours; stopping this run")
+                    info = host_memory_info()
+                    if info is None and not bounded_wait:
+                        break
+                    reserve = (max(0, int(reserve_bytes)) if reserve_bytes is not None else
+                               host_memory_reserve_bytes(info, self.hardware_profile) if info else 0)
+                    available = (int(info["available"]) - reserve - int(self._reserved.value)
+                                 if info else None)
+                    if not bounded_wait and size_bytes > int(info["total"]) - reserve:
+                        raise HostMemoryUnavailable("host-memory request exceeds node capacity")
+                    # Let active evaluations finish, but do not let new ones
+                    # repeatedly spend the space needed by a model handoff.
+                    has_priority = priority or not self._priority_waiters.value
+                    if has_priority and available is not None and available >= size_bytes:
+                        break
+                    waited = True
+                    if bounded_wait:
+                        now = time.monotonic()
+                        if now >= deadline:
+                            self._ram_wait_failed.value = True
+                            self._condition.notify_all()
+                            raise HostMemoryTimeout(f"{stage}: RAM remained unavailable for 2 hours")
+                        if now >= next_report:
+                            free = "unknown" if available is None else f"{max(0, available) / GIB:.1f} GiB"
+                            print(f"[ram-wait] {stage}: need {size_bytes / GIB:.1f} GiB, "
+                                  f"admissible={free}; monitoring every {RAM_POLL_INTERVAL_S:g}s, "
+                                  f"{(deadline - now) / 60:.0f} min remaining", flush=True)
+                            next_report = now + RAM_RETRY_INTERVAL_S
+                        self._condition.wait(timeout=min(RAM_POLL_INTERVAL_S, deadline - now))
+                        continue
+                    if not wait_for_external and not self._reserved.value:
+                        raise HostMemoryUnavailable("host RAM cannot retain another model backup")
+                    self._condition.wait(timeout=0.25)
+                # Check and claim under the same lock, before any allocation.
+                self._reserved.value += size_bytes
+            finally:
+                if priority:
+                    self._priority_waiters.value -= 1
+                    self._condition.notify_all()
         try:
+            if waited:
+                print(f"[ram-ready] {stage}: reserved {size_bytes / GIB:.1f} GiB; continuing", flush=True)
             yield
         finally:
             with self._condition:
@@ -277,8 +278,8 @@ class HostMemoryAdmission:
 
 
 def wait_for_host_memory(size_bytes, *, hardware_profile="RTX6000", stage):
-    """B200 preflight for startup and cooperative CPU parking."""
-    if hardware_profile != "B200":
+    """Preflight for cooperative CPU parking on shared B200 hosts."""
+    if hardware_profile not in ("B200", "B200_full_ram"):
         return
     import multiprocessing
     admission = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=hardware_profile)
@@ -286,16 +287,23 @@ def wait_for_host_memory(size_bytes, *, hardware_profile="RTX6000", stage):
         pass
 
 
-def retry_host_allocation(allocation, *, hardware_profile="RTX6000", stage):
+def retry_host_allocation(allocation, *, hardware_profile="RTX6000", stage,
+                          required_bytes=0):
     """Retry CPU allocation failures only; never replay a training update."""
-    if hardware_profile != "B200":
+    if hardware_profile not in ("B200", "B200_full_ram"):
         return allocation()
+    from contextlib import nullcontext
+    import multiprocessing
+    admission = (HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=hardware_profile)
+                 if required_bytes else None)
     deadline = None
     while True:
         if deadline is not None and time.monotonic() >= deadline:
             raise HostMemoryTimeout(f"{stage}: CPU allocation failed for 2 hours")
         try:
-            return allocation()
+            with (admission.reservation(required_bytes, stage=stage, priority=True)
+                  if admission is not None else nullcontext()):
+                return allocation()
         except (MemoryError, OSError, RuntimeError) as error:
             message = str(error).lower()
             if isinstance(error, HostMemoryUnavailable) or not (
@@ -503,8 +511,7 @@ class TokenWeightedActivationOffloadGate:
                 if int(self._available_units.value) >= units:
                     self._available_units.value -= units
                     return units
-                self._condition.wait(timeout=RAM_RETRY_INTERVAL_S
-                                     if self.host_admission.hardware_profile == "B200" else None)
+                self._condition.wait(timeout=RAM_POLL_INTERVAL_S)
 
     def _release(self, units):
         units = int(units)
