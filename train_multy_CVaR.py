@@ -518,7 +518,7 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
         migrated = PUCTJevSampler(
             model_path=getattr(cfg, "jev_model_path", None),
             candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
-            same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.80), **options)
+            same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.68), **options)
         detail = "PUCT ordering with GLiDE-9B semantic comparisons"
     else:
         from search.llm_sampler import LLMSampler
@@ -5167,7 +5167,7 @@ def main():
         exp_dir=exp_dir, problem=problem,
         jev_model_path=getattr(cfg, "jev_model_path", None),
         jev_candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
-        jev_same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.80),
+        jev_same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.68),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,

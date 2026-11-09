@@ -665,7 +665,7 @@ def load_config():
         for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
-        # An unfinished PUCT-JEV selection retains its own saved window and threshold.
+        # Current YAML sets the JEV gate; unfinished selections retain only their saved window.
         for key in ("jev_candidate_multiplier", "jev_same_core_threshold"):
             if key in ydict:
                 merged[key] = ydict[key]
@@ -764,7 +764,7 @@ def load_config():
         merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
     if merged["parent_selection"] == "puct-jev":
         merged.setdefault("jev_candidate_multiplier", 3)
-        merged.setdefault("jev_same_core_threshold", 0.80)
+        merged.setdefault("jev_same_core_threshold", 0.68)
         jev_path = merged.get("jev_model_path")
         if not jev_path:
             sibling = Path(merged["model_name"]).expanduser().parent / "GLiDE-9B"

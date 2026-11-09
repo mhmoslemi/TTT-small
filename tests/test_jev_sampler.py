@@ -29,7 +29,7 @@ def response(same=.01, variant=.01):
 
 
 def sampler(tmp_path, codes=("A", "B", "C", "D", "E"), *, candidate_multiplier=3,
-            same_core_threshold=0.80):
+            same_core_threshold=0.68):
     result = make_sampler(parent_selection="puct-jev", num_seeds=0,
                           exp_dir=tmp_path, problem=problem(), puct_c=0.,
                           jev_candidate_multiplier=candidate_multiplier,
@@ -103,7 +103,7 @@ def test_skips_duplicates_checks_every_accepted_parent_and_preserves_puct(tmp_pa
             return response(.95, .03)
         if "```python\nC\n```" in text:
             return response(.02, .95)
-        return response(.79, .05)  # Uncertain same-core judgments remain eligible.
+        return response(.67, .05)  # Uncertain same-core judgments remain eligible.
 
     requests, lifecycle = fake_judge(monkeypatch, decide)
     picked = actual.sample_states(3, selection_step=1)
@@ -130,26 +130,35 @@ def test_configured_threshold_controls_gate(tmp_path, monkeypatch, threshold, ex
     assert saved["threshold"] == threshold
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_resume_keeps_saved_threshold_until_next_fresh_step(tmp_path, monkeypatch, partial):
+@pytest.mark.parametrize("status", ["complete", "partial", "empty"])
+def test_resume_overrides_unfinished_threshold_but_keeps_committed_parents(tmp_path, monkeypatch, status):
     actual = sampler(tmp_path, same_core_threshold=.90)
     payload = copy.deepcopy(actual.state_dict())
-    decide = lambda req: response(.80, .1) if "```python\nB\n```" in req["state"] else response()
+    decide = lambda req: response(.70, .1) if "```python\nB\n```" in req["state"] else response()
     fake_judge(monkeypatch, decide)
     assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "B"]
     path = tmp_path / "step01/step01.jev.json"
-    if partial:
+    if status != "complete":
         saved = json.loads(path.read_text())
         saved["selected"] = None
+        if status == "empty":
+            saved["comparisons"], saved["sources"] = [], {}
         path.write_text(json.dumps(saved))
-    resumed = sampler(tmp_path, same_core_threshold=.80)
+    resumed = sampler(tmp_path, same_core_threshold=.68)
+    resumed.load_state_dict(payload)
+    requests, _ = fake_judge(monkeypatch, decide)
+    expected = ["A", "B"] if status == "complete" else ["A", "C"]
+    assert [s.code for s in resumed.sample_states(2, selection_step=1)] == expected
+    assert len(requests) == {"complete": 0, "partial": 1, "empty": 2}[status]
+    if status == "partial":
+        assert "```python\nC\n```" in requests[0]["state"]  # B's judgment was reused.
+    assert json.loads(path.read_text())["threshold"] == (.90 if status == "complete" else .68)
     resumed.load_state_dict(payload)
     monkeypatch.setattr(jev, "GlideWorker", lambda *a, **kw: pytest.fail("replayed GLiDE"))
-    assert [s.code for s in resumed.sample_states(2, selection_step=1)] == ["A", "B"]
-    assert json.loads(path.read_text())["threshold"] == .90
+    assert [s.code for s in resumed.sample_states(2, selection_step=1)] == expected
     fake_judge(monkeypatch, decide)
     assert [s.code for s in resumed.sample_states(2, selection_step=2)] == ["A", "C"]
-    assert json.loads((tmp_path / "step02/step02.jev.json").read_text())["threshold"] == .80
+    assert json.loads((tmp_path / "step02/step02.jev.json").read_text())["threshold"] == .68
 
 
 @pytest.mark.parametrize("value", [-.1, 1.1, True, "0.8", None, float("nan"), float("inf")])

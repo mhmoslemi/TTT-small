@@ -80,7 +80,7 @@ def _probabilities(response):
 
 class PUCTJevSampler(PUCTSampler):
     def __init__(self, *args, exp_dir, problem, model_path=None,
-                 candidate_multiplier=3, same_core_threshold=0.80, **kwargs):
+                 candidate_multiplier=3, same_core_threshold=0.68, **kwargs):
         if exp_dir is None or problem is None:
             raise ValueError("puct-jev requires the run directory and problem")
         if (isinstance(candidate_multiplier, bool)
@@ -143,15 +143,27 @@ class PUCTJevSampler(PUCTSampler):
                 self.reassign_seed_id(state, identity["id"])
 
         description = self._description() if step > 0 else ""
-        # An interrupted selection keeps its original gate; only fresh steps use the new YAML.
+        # Validate the saved signature before applying a new threshold to unfinished picks.
         threshold = saved["threshold"] if saved is not None else self.same_core_threshold
-        signature = _digest({"archive": self.state_dict(), "step": step,
-                             "count": count, "puct_c": self.puct_c, "description": description,
-                             "model": str(self.model_path), "question": QUESTION,
-                             "threshold": threshold})
+        signature_data = {"archive": self.state_dict(), "step": step,
+                          "count": count, "puct_c": self.puct_c, "description": description,
+                          "model": str(self.model_path), "question": QUESTION,
+                          "threshold": threshold}
+        signature = _digest(signature_data)
         if saved is not None:
             if saved.get("version") != 1 or saved.get("signature") != signature:
                 raise ValueError("saved puct-jev selection differs from this archive/configuration")
+            if saved["selected"] is None and threshold != self.same_core_threshold:
+                previous_threshold, threshold = threshold, self.same_core_threshold
+                signature_data["threshold"] = threshold
+                saved.update(threshold=threshold, signature=_digest(signature_data))
+                _write(path, saved)
+                print(f"[puct-jev] step {step}: threshold {previous_threshold:g} -> "
+                      f"{threshold:g} from current config; reusing cached comparisons",
+                      flush=True)
+            elif saved["selected"] is not None and threshold != self.same_core_threshold:
+                print(f"[puct-jev] step {step}: keeping committed parents; threshold "
+                      f"{self.same_core_threshold:g} applies to the next selection", flush=True)
         else:
             saved = {"version": 1, "signature": signature, "step": step,
                      "requested": count, "model": str(self.model_path),

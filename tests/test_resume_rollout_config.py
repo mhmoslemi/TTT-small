@@ -183,7 +183,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                        strategy_max_new_tokens=65536, strategy_temperature=.6, strategy_top_p=.95,
                        strategy_top_k=50, strategy_min_p=.1),
             ydict=dict(self.current, num_seed_states=50, seed_min_points=40,
-                       jev_candidate_multiplier=3, jev_same_core_threshold=.80,
+                       jev_candidate_multiplier=3, jev_same_core_threshold=.68,
                        seed_max_points=500, learning_rate=0.02, strategy_max_seq_length="auto",
                        strategy_max_new_tokens="auto", strategy_temperature=1., strategy_top_p=1.,
                        strategy_top_k=0, strategy_min_p=0.),
@@ -200,7 +200,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             self.assertEqual(namespace["merged"]["programs_per_strategy"], 10)
             self.assertEqual(namespace["merged"]["pilot_programs_per_strategy"], 6)
             self.assertEqual(namespace["merged"]["jev_candidate_multiplier"], 3)
-            self.assertEqual(namespace["merged"]["jev_same_core_threshold"], .80)
+            self.assertEqual(namespace["merged"]["jev_same_core_threshold"], .68)
             self.assertEqual(namespace["merged"]["learning_rate"], 0.01)
             self.assertEqual(namespace["merged"]["strategy_vllm_persistent_workers"], 2)
             self.assertEqual(tuple(namespace["merged"][key] for key in (
