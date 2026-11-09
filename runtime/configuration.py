@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import yaml
-from runtime.hardware_profiles import local_checkpoint, restore_hardware_settings
+from runtime.hardware_profiles import generation_cpu_ids, local_checkpoint, restore_hardware_settings
 
 from models.strategist_models import (
     resolve_strategy_effort, resolve_strategy_model, resolve_strategy_token_limits, strategist_profile,
@@ -1390,11 +1390,15 @@ def load_config():
     return cfg, merged
 
 
-def _isolated_evaluation_cpu_ids():
-    """Return the exact Linux cpuset available to this training process."""
+def _isolated_evaluation_cpu_ids(cfg=None):
+    """Use the allowed cpuset, excluding B200's dedicated inference cores."""
     if not (hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity")):
         raise RuntimeError("--isolate-eval requires Linux CPU affinity support")
     cpu_ids = sorted(int(cpu_id) for cpu_id in os.sched_getaffinity(0))
     if not cpu_ids:
         raise RuntimeError("--isolate-eval found no CPUs in the allowed cpuset")
+    if cfg is not None and getattr(cfg, "generation_backend", None) == "vllm":
+        reserved = set(generation_cpu_ids(
+            getattr(cfg, "hardware_profile", "RTX6000"), len(_parse_gpu_ids(cfg.gpu_ids))))
+        cpu_ids = [cpu for cpu in cpu_ids if cpu not in reserved]
     return cpu_ids

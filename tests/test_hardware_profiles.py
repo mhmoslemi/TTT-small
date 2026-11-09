@@ -81,6 +81,8 @@ class HardwareProfileTests(unittest.TestCase):
                     expected.update(gen_micro_batch="auto", logprob_chunk="auto",
                                     vllm_gpu_memory_utilization="auto",
                                     vllm_max_num_batched_tokens="auto")
+                if profile == "B200":
+                    expected["gen_micro_batch"] = "auto"
                 self.assertEqual(cfg, expected)
 
     def test_all_profiled_models_fit_full_context_and_use_every_card(self):
@@ -191,7 +193,10 @@ class HardwareProfileTests(unittest.TestCase):
                     snapshots[profile, resume] = dict(vars(cfg))
                     snapshots[profile, resume].pop("hardware_profile")
             for resume in (False, True):
-                self.assertEqual(snapshots["RTX6000", resume], snapshots["B200", resume])
+                rtx, b200 = snapshots["RTX6000", resume], snapshots["B200", resume]
+                for key in ("gen_micro_batch", "strategy_gen_micro_batch"):
+                    self.assertGreaterEqual(b200.pop(key), rtx.pop(key))
+                self.assertEqual(rtx, b200)
 
     def test_run_copy_has_the_same_execution_flags_as_run2(self):
         normal = (ROOT / "run2.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
@@ -207,7 +212,7 @@ class HardwareProfileTests(unittest.TestCase):
 
         self.assertEqual(hardware.hardware_profile("b200_FULL_ram"), "B200_full_ram")
         preset = configuration.yaml.safe_load((ROOT / "configs/ac1.yaml").read_text())
-        saved = dict(preset, hardware_profile="B200", reload_coder_between_phases=True,
+        saved = dict(preset, parent_selection="puct", hardware_profile="B200", reload_coder_between_phases=True,
                      strategy_vllm_persistent_workers=0, trainer_offload_dir="/old/.offload",
                      training_gpu_ids="6,7", gpu_ids="6,7", num_training_gpus=2)
         with tempfile.TemporaryDirectory() as folder, \
@@ -253,7 +258,7 @@ class HardwareProfileTests(unittest.TestCase):
             self.assertEqual(set(gpu.query_gpu_memory()), {6, 7})
         self.assertIn("--id=6,7", query.call_args.args[0])
 
-    def test_b200_automatic_batches_follow_rtx_rules(self):
+    def test_b200_automatic_batches_are_wider_without_changing_limits_or_rtx(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")
         def resolve(profile, **overrides):
             cfg = dict(model_name="Qwen/Qwen3.8-27B", max_seq_length=262144,
@@ -264,13 +269,56 @@ class HardwareProfileTests(unittest.TestCase):
             gpu.resolve_memory_settings(cfg, roles, self.cards())
             return cfg
         for overrides in ({}, dict(groups_per_step=1, group_size=64), dict(frozen_strategy=True)):
-            b200, rtx = resolve("B200", **overrides), resolve("RTX6000", **overrides)
-            for key in ("gen_micro_batch", "vllm_max_num_batched_tokens", "logprob_chunk",
-                        "vllm_gpu_memory_utilization", "vllm_runtime_reserve_gib"):
-                self.assertEqual(b200[key], rtx[key], key)
+            rtx = resolve("RTX6000", **overrides)
+            for profile in ("B200", "B200_full_ram"):
+                b200 = resolve(profile, **overrides)
+                self.assertGreater(b200["gen_micro_batch"], rtx["gen_micro_batch"])
+                self.assertLessEqual(b200["gen_micro_batch"], 128)
+                for key in ("vllm_max_num_batched_tokens", "logprob_chunk",
+                            "vllm_gpu_memory_utilization", "vllm_runtime_reserve_gib", "max_seq_length"):
+                    self.assertEqual(b200[key], rtx[key], key)
         self.assertEqual(resolve("B200", gen_micro_batch=4)["gen_micro_batch"], 4)
         self.assertLessEqual(resolve("RTX6000")["gen_micro_batch"], 32)
         self.assertEqual(resolve("B200")["max_seq_length"], 262144)
+
+        saved = dict(hardware_profile="B200_full_ram", gen_micro_batch=26)
+        for requested in ("auto", 17):
+            cfg = dict(saved)
+            hardware.restore_hardware_settings(cfg, dict(hardware_profile="B200_full_ram",
+                                                       gen_micro_batch=requested), saved)
+            self.assertEqual(cfg["gen_micro_batch"], requested)
+
+    def test_inference_and_evaluation_have_disjoint_physical_cores_on_b200_only(self):
+        import os
+        from runtime import configuration
+
+        allowed = set(range(16)) | set(range(64, 80))
+        def topology(path, *args, **kwargs):
+            cpu = int(path.parent.parent.name.removeprefix("cpu")) % 64
+            return str(cpu // 8 if path.name == "physical_package_id" else cpu % 8)
+        with patch.object(os, "sched_getaffinity", return_value=allowed, create=True), \
+             patch.object(os, "sched_setaffinity", create=True), \
+             patch.object(Path, "read_text", topology):
+            for profile in ("B200", "B200_full_ram", "RTX6000"):
+                reserved = hardware.generation_cpu_ids(profile, 2)
+                cfg = SimpleNamespace(hardware_profile=profile, generation_backend="vllm", gpu_ids="6,7")
+                evaluation = configuration._isolated_evaluation_cpu_ids(cfg)
+                self.assertFalse(set(reserved) & set(evaluation))
+                self.assertEqual(set(reserved) | set(evaluation), allowed)
+                self.assertEqual(len(reserved), 0 if profile == "RTX6000" else 12)
+                for cpu in reserved:
+                    self.assertIn((cpu + 64) % 128, reserved)
+            with patch.object(Path, "read_text", side_effect=OSError("no topology")):
+                self.assertEqual(hardware.generation_cpu_ids("B200_full_ram", 2), [])
+            with patch.object(os, "sched_getaffinity", return_value={7}):
+                self.assertEqual(hardware.generation_cpu_ids("B200", 2), [])
+
+    def test_generation_stats_preserve_sampling_and_engine_memory_options(self):
+        quiet = workers._vllm_engine_kwargs("Qwen/Qwen3.8-27B", 262144, False, 32, .9)
+        stats = workers._vllm_engine_kwargs("Qwen/Qwen3.8-27B", 262144, False, 32, .9,
+                                          enable_log_stats=True)
+        self.assertTrue(quiet["disable_log_stats"])
+        self.assertEqual(stats, dict(quiet, disable_log_stats=False))
 
     def test_b200_starts_workers_concurrently_like_rtx(self):
         events = []

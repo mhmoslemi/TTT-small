@@ -1,5 +1,7 @@
 """Launch-scoped hardware capacity, checkpoint locations and residency."""
 
+from itertools import zip_longest
+import os
 from pathlib import Path
 
 
@@ -44,6 +46,32 @@ def hardware_profile(value):
     return name
 
 
+def generation_cpu_ids(profile, gpu_count):
+    """Keep evaluation off inference cores, including their SMT siblings."""
+    if profile not in {"B200", "B200_full_ram"} or not hasattr(os, "sched_getaffinity"):
+        return []
+    cores = {}
+    for cpu in sorted(os.sched_getaffinity(0)):
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            key = (int((topology / "physical_package_id").read_text()),
+                   int((topology / "core_id").read_text()))
+        except (OSError, ValueError):
+            # Without physical topology, do not accidentally reserve half a core.
+            return []
+        cores.setdefault(key, []).append(cpu)
+    reserve = min(2 + 2 * int(gpu_count), len(cores) // 2)
+    if len(cores) < 4 or int(gpu_count) < 1:
+        return []
+    sockets = {}
+    for (socket, _core), threads in cores.items():
+        sockets.setdefault(socket, []).append(threads)
+    # Spread inference across sockets rather than trapping all engines on one.
+    ordered = [threads for row in zip_longest(*sockets.values())
+               for threads in row if threads is not None]
+    return sorted(cpu for threads in ordered[:reserve] for cpu in threads)
+
+
 def restore_hardware_settings(merged, current_yaml, saved):
     """Do not reuse an old machine's resolved auto capacities on resume."""
     selected = hardware_profile(current_yaml.get("hardware_profile", "RTX6000"))
@@ -59,3 +87,6 @@ def restore_hardware_settings(merged, current_yaml, saved):
             "vllm_max_num_batched_tokens": "auto", "logprob_chunk": "auto",
         }.items():
             merged[key] = current_yaml.get(key, default)
+    if selected in {"B200", "B200_full_ram"}:
+        # A resolved checkpoint value must not freeze an automatic batch plan.
+        merged["gen_micro_batch"] = current_yaml.get("gen_micro_batch", "auto")

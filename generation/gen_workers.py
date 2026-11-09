@@ -70,6 +70,7 @@ from runtime.gpu_runtime import (
     uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
+from runtime.hardware_profiles import generation_cpu_ids
 import diagnostics.terminal_output as _terminal_output
 
 
@@ -668,7 +669,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         max_num_batched_tokens=0,
                         enable_expert_parallel=False,
                         enable_sleep_mode=False,
-                        disable_custom_all_reduce=False, engine_options=None):
+                        disable_custom_all_reduce=False, engine_options=None,
+                        enable_log_stats=False):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -697,7 +699,7 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         "gpu_memory_utilization": float(gpu_memory_utilization),
         "enforce_eager": bool(enforce_eager),
         "enable_prefix_caching": bool(enable_prefix_caching),
-        "disable_log_stats": True,
+        "disable_log_stats": not enable_log_stats,
         "tensor_parallel_size": int(tensor_parallel_size),
         "pipeline_parallel_size": int(pipeline_parallel_size),
     }
@@ -948,7 +950,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       max_num_batched_tokens=0,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
-                      disable_custom_all_reduce=False, engine_options=None):
+                      disable_custom_all_reduce=False, engine_options=None,
+                      cpu_ids=None, enable_log_stats=False):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
     # engine failure, killing only the multiprocessing.Process can leave those
@@ -962,6 +965,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # stdout/stderr and therefore append to the same run-local file.
     _worker_log_handle = _redirect_vllm_output(
         vllm_log_path, rank, gpu_group)
+    if cpu_ids:
+        os.sched_setaffinity(0, set(cpu_ids))
+        print(f"[vllm worker {rank}] inference CPU affinity={cpu_ids}; "
+              "reserved from isolated evaluation", flush=True)
     # Must happen before importing vLLM (and therefore torch). Spawned engine
     # core children inherit this worker-specific environment.
     if enable_sleep_mode:
@@ -1034,6 +1041,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             enable_sleep_mode=(enable_sleep_mode and sleep_api_available),
             disable_custom_all_reduce=disable_custom_all_reduce,
             engine_options=engine_options,
+            enable_log_stats=enable_log_stats,
         )
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
@@ -1883,6 +1891,10 @@ class GenerationPool:
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
+        if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
+            self._worker_options.update(
+                cpu_ids=generation_cpu_ids(hardware_profile, requested_num_gpus),
+                enable_log_stats=True)
         self._load_in_4bit = bool(load_in_4bit)
         self._startup_timeout = _positive_env_timeout(
             "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)

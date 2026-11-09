@@ -398,21 +398,28 @@ def test_migration_preserves_archive_and_defers_already_selected_step(tmp_path, 
     assert json.loads((tmp_path / "config.json").read_text())["parent_selection"] == "puct-jev"
 
 
-def test_vllm_handoff_drops_pools_before_parking_and_never_restores_early(tmp_path):
+@pytest.mark.parametrize("profile", ["RTX6000", "B200", "B200_full_ram"])
+def test_vllm_handoff_preserves_full_ram_pools_and_never_restores_early(tmp_path, profile):
     import train_multy_CVaR as training
     from generation.gen_workers import PhasedVLLMGenerationPool
     events = []
     pools = [Mock(spec=PhasedVLLMGenerationPool), Mock(spec=PhasedVLLMGenerationPool)]
     for name, pool in zip(("coder", "strategy"), pools):
         pool.shutdown.side_effect = lambda name=name: events.append(name)
+        pool.release.side_effect = lambda name=name: events.append(f"sleep {name}")
     actual = sampler(tmp_path)
-    cfg = SimpleNamespace(gpu_ids="6,7", generation_backend="vllm")
+    cfg = SimpleNamespace(gpu_ids="6,7", generation_backend="vllm", hardware_profile=profile)
     training._configure_jev_sampler(actual, cfg, Mock(), Mock(), Mock(),
                                    *pools, lambda phase: events.append(phase))
     actual.before_judge()
-    assert events == ["strategy", "coder", "jev"] and actual.gpu_id == 6
+    expected = (["sleep strategy", "sleep coder", "jev"] if profile == "B200_full_ram"
+                else ["strategy", "coder", "jev"])
+    assert events == expected and actual.gpu_id == 6
     actual.after_judge()
-    assert events == ["strategy", "coder", "jev"]
+    assert events == expected
+    if profile == "B200_full_ram":
+        for pool in pools:
+            pool.shutdown.assert_not_called()
 
 
 @pytest.mark.parametrize("name", ["ac1", "ac2", "erdos"])

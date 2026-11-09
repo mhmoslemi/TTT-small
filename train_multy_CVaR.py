@@ -549,10 +549,13 @@ def _configure_jev_sampler(sampler, cfg, backend, optimizer, parallel_trainer,
     def before():
         if cfg.generation_backend == "vllm":
             from generation.gen_workers import PhasedVLLMGenerationPool
-            # Also drop sleeping engines and their host weight backups.
+            # Full-RAM B200 can retain backups while the small judge runs.
             for pool in (strategy_pool, gen_pool):
                 if isinstance(pool, PhasedVLLMGenerationPool):
-                    pool.shutdown()
+                    if getattr(cfg, "hardware_profile", "RTX6000") == "B200_full_ram":
+                        pool.release()
+                    else:
+                        pool.shutdown()
             if prepare_trainer is None:
                 raise RuntimeError("puct-jev has no configured trainer/GPU handoff")
             prepare_trainer("jev")
@@ -1084,7 +1087,7 @@ def _finalize_pending_spo_rs_artifacts(
     isolated_slots = None
     isolated_memory_limit = None
     if isolated_eval:
-        cpu_ids = _isolated_evaluation_cpu_ids()
+        cpu_ids = _isolated_evaluation_cpu_ids(cfg)
         processes_per_cpu = int(cfg.reward_workers)
         isolated_slots = Queue()
         for _layer in range(processes_per_cpu):
@@ -2138,7 +2141,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     isolated_processes_per_cpu = 0
     isolated_memory_limit_bytes = None
     if isolated_eval:
-        isolated_cpu_ids = _isolated_evaluation_cpu_ids()
+        isolated_cpu_ids = _isolated_evaluation_cpu_ids(cfg)
         isolated_cpu_count = len(isolated_cpu_ids)
         isolated_processes_per_cpu = int(cfg.reward_workers)
         isolated_cpu_slots = Queue()
