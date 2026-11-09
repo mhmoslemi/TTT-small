@@ -58,6 +58,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "strategy_format_max_retries",
     "strict_strategy_validation",
     "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
+    "jev_same_core_threshold",
     "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
     "spo_rs_rho_max",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
@@ -248,6 +249,11 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: jev_model_path must be a nonempty path")
     if "jev_candidate_multiplier" in data:
         _positive_int(data, "jev_candidate_multiplier", source)
+    if "jev_same_core_threshold" in data:
+        threshold = data["jev_same_core_threshold"]
+        if (isinstance(threshold, bool) or not isinstance(threshold, Real)
+                or not 0 <= threshold <= 1):
+            raise ValueError(f"{_label(source)}: jev_same_core_threshold must be a number in [0, 1]")
     if "pilot_programs_per_strategy" in data:
         pilot_count = data["pilot_programs_per_strategy"]
         if (isinstance(pilot_count, bool)

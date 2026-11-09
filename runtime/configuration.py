@@ -665,9 +665,10 @@ def load_config():
         for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
-        # An unfinished PUCT-JEV selection retains its own saved window.
-        if "jev_candidate_multiplier" in ydict:
-            merged["jev_candidate_multiplier"] = ydict["jev_candidate_multiplier"]
+        # An unfinished PUCT-JEV selection retains its own saved window and threshold.
+        for key in ("jev_candidate_multiplier", "jev_same_core_threshold"):
+            if key in ydict:
+                merged[key] = ydict[key]
         # Current strategist controls must not inherit stale resolved limits
         # or sampling defaults from a previous checkpoint's config.json.
         for key in ("strategy_max_seq_length", "strategy_max_new_tokens",
@@ -763,6 +764,7 @@ def load_config():
         merged[key] = local_checkpoint(merged.get(key, ""), merged["hardware_profile"])
     if merged["parent_selection"] == "puct-jev":
         merged.setdefault("jev_candidate_multiplier", 3)
+        merged.setdefault("jev_same_core_threshold", 0.80)
         jev_path = merged.get("jev_model_path")
         if not jev_path:
             sibling = Path(merged["model_name"]).expanduser().parent / "GLiDE-9B"

@@ -13,7 +13,6 @@ from search.sampler import PUCTSampler
 from search.jev_worker import GlideWorker
 
 
-SAME_CORE_THRESHOLD = 0.90
 MODEL_ID = "fastino/GLiDE-9B"
 QUESTION = {
     "type": "choice",
@@ -81,16 +80,21 @@ def _probabilities(response):
 
 class PUCTJevSampler(PUCTSampler):
     def __init__(self, *args, exp_dir, problem, model_path=None,
-                 candidate_multiplier=3, **kwargs):
+                 candidate_multiplier=3, same_core_threshold=0.80, **kwargs):
         if exp_dir is None or problem is None:
             raise ValueError("puct-jev requires the run directory and problem")
         if (isinstance(candidate_multiplier, bool)
                 or not isinstance(candidate_multiplier, int) or candidate_multiplier < 1):
             raise ValueError("jev_candidate_multiplier must be a positive integer")
+        if (isinstance(same_core_threshold, bool)
+                or not isinstance(same_core_threshold, (int, float))
+                or not 0 <= same_core_threshold <= 1):
+            raise ValueError("jev_same_core_threshold must be a number in [0, 1]")
         super().__init__(*args, **kwargs)
         self.exp_dir, self.problem = Path(exp_dir), problem
         self.model_path = model_path or MODEL_ID
         self.candidate_multiplier = candidate_multiplier
+        self.same_core_threshold = same_core_threshold
         self.gpu_id = 0
         self.before_judge = self.after_judge = None
         self._selection_step, self._selected = None, []
@@ -139,10 +143,12 @@ class PUCTJevSampler(PUCTSampler):
                 self.reassign_seed_id(state, identity["id"])
 
         description = self._description() if step > 0 else ""
+        # An interrupted selection keeps its original gate; only fresh steps use the new YAML.
+        threshold = saved["threshold"] if saved is not None else self.same_core_threshold
         signature = _digest({"archive": self.state_dict(), "step": step,
                              "count": count, "puct_c": self.puct_c, "description": description,
                              "model": str(self.model_path), "question": QUESTION,
-                             "threshold": SAME_CORE_THRESHOLD})
+                             "threshold": threshold})
         if saved is not None:
             if saved.get("version") != 1 or saved.get("signature") != signature:
                 raise ValueError("saved puct-jev selection differs from this archive/configuration")
@@ -150,7 +156,7 @@ class PUCTJevSampler(PUCTSampler):
             saved = {"version": 1, "signature": signature, "step": step,
                      "requested": count, "model": str(self.model_path),
                      "candidate_multiplier": self.candidate_multiplier,
-                     "threshold": SAME_CORE_THRESHOLD, "seeds": self._seed_manifest(),
+                     "threshold": threshold, "seeds": self._seed_manifest(),
                      "problem_description": description, "question": QUESTION,
                      "sources": {}, "comparisons": [], "selected": None}
             _write(path, saved)
@@ -173,7 +179,8 @@ class PUCTJevSampler(PUCTSampler):
         _write(path, saved)
         self._requested, self._selection_step, self._selected = count, step, list(picks)
         print(f"[puct-jev] step {step}: {len(picks)}/{count} parents; "
-              f"{len(saved['comparisons'])} comparisons; decisions saved to {path}", flush=True)
+              f"{len(saved['comparisons'])} comparisons; threshold={threshold:g}; "
+              f"decisions saved to {path}", flush=True)
         return picks
 
     def _diverse_picks(self, count, path, saved, description):
@@ -238,7 +245,7 @@ class PUCTJevSampler(PUCTSampler):
                             _write(path, saved)
                         probabilities = _probabilities({"answers": {"relationship": row}})
                         comparisons.append(row)
-                        if probabilities["same_core_idea"] >= SAME_CORE_THRESHOLD:
+                        if probabilities["same_core_idea"] >= saved["threshold"]:
                             duplicate = row
                             break
                     if duplicate is not None:

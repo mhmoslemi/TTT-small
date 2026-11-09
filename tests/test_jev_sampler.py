@@ -28,10 +28,12 @@ def response(same=.01, variant=.01):
         "different_approach": 1 - same - variant}}}, "usage": {"input_tokens": 123}}
 
 
-def sampler(tmp_path, codes=("A", "B", "C", "D", "E"), *, candidate_multiplier=3):
+def sampler(tmp_path, codes=("A", "B", "C", "D", "E"), *, candidate_multiplier=3,
+            same_core_threshold=0.80):
     result = make_sampler(parent_selection="puct-jev", num_seeds=0,
                           exp_dir=tmp_path, problem=problem(), puct_c=0.,
-                          jev_candidate_multiplier=candidate_multiplier)
+                          jev_candidate_multiplier=candidate_multiplier,
+                          jev_same_core_threshold=same_core_threshold)
     result._states = [State.make(0, 20. - i, code) for i, code in enumerate(codes)]
     return result
 
@@ -101,7 +103,7 @@ def test_skips_duplicates_checks_every_accepted_parent_and_preserves_puct(tmp_pa
             return response(.95, .03)
         if "```python\nC\n```" in text:
             return response(.02, .95)
-        return response(.89, .05)  # Uncertain same-core judgments remain eligible.
+        return response(.79, .05)  # Uncertain same-core judgments remain eligible.
 
     requests, lifecycle = fake_judge(monkeypatch, decide)
     picked = actual.sample_states(3, selection_step=1)
@@ -114,6 +116,50 @@ def test_skips_duplicates_checks_every_accepted_parent_and_preserves_puct(tmp_pa
     assert [r["parent_id"] for r in d_matches] == [ids["A"], ids["C"]]
     path = save_parent_selections(tmp_path, 1, type(actual).__name__, picked, actual.last_picks_info)
     assert all("jev" in r for r in json.loads(path.read_text())["parents"])
+
+
+@pytest.mark.parametrize("threshold, expected", [
+    (.79, ["A", "C"]), (.80, ["A", "C"]), (.90, ["A", "B"]),
+])
+def test_configured_threshold_controls_gate(tmp_path, monkeypatch, threshold, expected):
+    actual = sampler(tmp_path, same_core_threshold=threshold)
+    fake_judge(monkeypatch, lambda req:
+        response(.80, .1) if "```python\nB\n```" in req["state"] else response())
+    assert [s.code for s in actual.sample_states(2, selection_step=1)] == expected
+    saved = json.loads((tmp_path / "step01/step01.jev.json").read_text())
+    assert saved["threshold"] == threshold
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_resume_keeps_saved_threshold_until_next_fresh_step(tmp_path, monkeypatch, partial):
+    actual = sampler(tmp_path, same_core_threshold=.90)
+    payload = copy.deepcopy(actual.state_dict())
+    decide = lambda req: response(.80, .1) if "```python\nB\n```" in req["state"] else response()
+    fake_judge(monkeypatch, decide)
+    assert [s.code for s in actual.sample_states(2, selection_step=1)] == ["A", "B"]
+    path = tmp_path / "step01/step01.jev.json"
+    if partial:
+        saved = json.loads(path.read_text())
+        saved["selected"] = None
+        path.write_text(json.dumps(saved))
+    resumed = sampler(tmp_path, same_core_threshold=.80)
+    resumed.load_state_dict(payload)
+    monkeypatch.setattr(jev, "GlideWorker", lambda *a, **kw: pytest.fail("replayed GLiDE"))
+    assert [s.code for s in resumed.sample_states(2, selection_step=1)] == ["A", "B"]
+    assert json.loads(path.read_text())["threshold"] == .90
+    fake_judge(monkeypatch, decide)
+    assert [s.code for s in resumed.sample_states(2, selection_step=2)] == ["A", "C"]
+    assert json.loads((tmp_path / "step02/step02.jev.json").read_text())["threshold"] == .80
+
+
+@pytest.mark.parametrize("value", [-.1, 1.1, True, "0.8", None, float("nan"), float("inf")])
+def test_threshold_requires_a_probability(tmp_path, value):
+    from config_validation import validate_problem_config
+    with pytest.raises(ValueError, match="jev_same_core_threshold"):
+        sampler(tmp_path, same_core_threshold=value)
+    with pytest.raises(ValueError, match="jev_same_core_threshold"):
+        validate_problem_config({"problem": "erdos", "jev_same_core_threshold": value},
+                                require_complete=False)
 
 
 def test_saved_selection_and_partial_comparisons_replay_without_model(tmp_path, monkeypatch):
@@ -380,7 +426,7 @@ def test_migration_preserves_archive_and_defers_already_selected_step(tmp_path, 
     old = PUCTSampler(2)
     old.record_expansion(old._states[0], 64)
     cfg = SimpleNamespace(parent_selection="puct-jev", jev_model_path="GLiDE-9B",
-                          jev_candidate_multiplier=5)
+                          jev_candidate_multiplier=5, jev_same_core_threshold=.83)
     (tmp_path / "config.json").write_text('{"parent_selection":"puct"}')
     checkpoint = Mock()
     monkeypatch.setattr(training, "_save_training_checkpoint", checkpoint)
@@ -394,6 +440,7 @@ def test_migration_preserves_archive_and_defers_already_selected_step(tmp_path, 
     migrated = training._migrate_parent_selection(*args, recovery_pending=False, problem=problem())
     assert migrated.state_dict() == dict(old.state_dict(), selection_mode="puct-jev")
     assert migrated.candidate_multiplier == 5
+    assert migrated.same_core_threshold == .83
     assert checkpoint.call_args.args[3] is migrated
     assert json.loads((tmp_path / "config.json").read_text())["parent_selection"] == "puct-jev"
 
@@ -451,6 +498,7 @@ def test_config_resolves_sibling_checkpoint_and_cli_override(tmp_path, monkeypat
     cfg = yaml.safe_load((root / "configs/erdos.yaml").read_text())
     cfg["hardware_profile"] = "RTX6000"
     cfg["jev_candidate_multiplier"] = 5
+    cfg["jev_same_core_threshold"] = .83
     cfg["model_name"] = cfg["coder_model_name"] = str(tmp_path / "Qwen3.8-27B")
     (tmp_path / "Qwen3.8-27B").mkdir()
     sibling = tmp_path / "GLiDE-9B"
@@ -465,6 +513,7 @@ def test_config_resolves_sibling_checkpoint_and_cli_override(tmp_path, monkeypat
     assert resolved.parent_selection == "puct-jev"
     assert resolved.jev_model_path == str(sibling)
     assert resolved.jev_candidate_multiplier == 5
+    assert resolved.jev_same_core_threshold == .83
     monkeypatch.setattr(sys, "argv", argv + ["--jev-model-path", str(tmp_path / "explicit")])
     resolved, _ = training.load_config()
     assert resolved.jev_model_path == str(tmp_path / "explicit")

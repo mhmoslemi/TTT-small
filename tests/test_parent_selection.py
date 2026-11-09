@@ -158,8 +158,9 @@ def test_all_yaml_presets_accept_supported_pickers():
     assert len(paths) == 8
     for path in paths:
         config = yaml.safe_load(path.read_text())
-        assert config["parent_selection"] in ("puct", "uct", "llm")
+        assert config["parent_selection"] in ("puct", "uct", "llm", "puct-jev")
         assert config["jev_candidate_multiplier"] == 3
+        assert config["jev_same_core_threshold"] == .80
         for mode in ("puct", "uct", "llm", "puct-jev"):
             config["parent_selection"] = mode
             validate_problem_config(config, source=path)

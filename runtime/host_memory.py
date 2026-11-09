@@ -170,7 +170,25 @@ class HostMemoryUnavailable(MemoryError):
 
 
 class HostMemoryTimeout(HostMemoryUnavailable):
-    """B200 exhausted its bounded RAM wait; stop without a traceback."""
+    """A bounded RAM wait expired; stop without a traceback."""
+
+
+def wait_for_trainer_offload_memory(required_bytes, reserve_bytes):
+    """Wait before moving any trainer weights, keeping the safety reserve intact."""
+    for retry in range(31):
+        memory = host_memory_info()
+        if memory is not None and memory["available"] >= required_bytes + reserve_bytes:
+            return memory
+        available = "unknown" if memory is None else f"{memory['available'] / GIB:.1f} GiB"
+        details = (f"available={available}, estimated offload={required_bytes / GIB:.1f} GiB, "
+                   f"safety reserve={reserve_bytes / GIB:.1f} GiB")
+        if retry == 30:
+            raise HostMemoryTimeout(
+                "insufficient host RAM for exact trainer offload after 30 retries "
+                f"5s apart: {details}")
+        print(f"[ram-wait] trainer CPU offload: {details}; "
+              f"retry {retry + 1}/30 in 5s", flush=True)
+        time.sleep(5)
 
 
 class HostMemoryAdmission:

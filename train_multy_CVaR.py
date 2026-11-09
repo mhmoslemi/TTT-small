@@ -517,7 +517,8 @@ def _migrate_parent_selection(sampler, cfg, exp_dir, next_step, adapter_path,
         from search.jev_sampler import PUCTJevSampler
         migrated = PUCTJevSampler(
             model_path=getattr(cfg, "jev_model_path", None),
-            candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3), **options)
+            candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
+            same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.80), **options)
         detail = "PUCT ordering with GLiDE-9B semantic comparisons"
     else:
         from search.llm_sampler import LLMSampler
@@ -4890,7 +4891,8 @@ def main():
     selection_detail = ("gpt-6-luna, reasoning=max; first pick=best raw score"
                         if selection == "llm" else f"c={cfg.puct_c}")
     if selection == "puct-jev":
-        selection_detail += (f"; GLiDE-9B={cfg.jev_model_path}; same-core threshold=0.90; "
+        selection_detail += (f"; GLiDE-9B={cfg.jev_model_path}; "
+                             f"same-core threshold={cfg.jev_same_core_threshold:g}; "
                              f"candidate window={cfg.jev_candidate_multiplier}x parents; step 0=PUCT")
     print(f"Search selection:   {selection.upper()} ({selection_detail})")
     configured_advantage_mode = getattr(cfg, "advantage_mode", "entropic")
@@ -5165,6 +5167,7 @@ def main():
         exp_dir=exp_dir, problem=problem,
         jev_model_path=getattr(cfg, "jev_model_path", None),
         jev_candidate_multiplier=getattr(cfg, "jev_candidate_multiplier", 3),
+        jev_same_core_threshold=getattr(cfg, "jev_same_core_threshold", 0.80),
         num_seeds=len(seeds) if seeds else cfg.num_seed_states,
         puct_c=cfg.puct_c,
         max_buffer_size=cfg.max_buffer_size,
@@ -5399,6 +5402,7 @@ def main():
                 from runtime.host_memory import (
                     GIB, estimated_module_bytes, estimated_optimizer_bytes,
                     host_memory_info, reclaim_unused_host_memory,
+                    wait_for_trainer_offload_memory,
                 )
 
                 # Reclaim cached activation-offload blocks on *every* trainer
@@ -5473,12 +5477,7 @@ def main():
                             flush=True,
                         )
                     if memory["available"] < target_available and cfg.hardware_profile != "B200":
-                        raise MemoryError(
-                            "insufficient host RAM for exact trainer offload "
-                            f"after cache reclamation: available="
-                            f"{memory['available'] / GIB:.1f} GiB, estimated "
-                            f"offload={required_bytes / GIB:.1f} GiB, safety "
-                            f"reserve={reserve_bytes / GIB:.1f} GiB")
+                        memory = wait_for_trainer_offload_memory(required_bytes, reserve_bytes)
                 replica_label = (
                     "inactive training model"
                     if not runtime_training_active["value"]

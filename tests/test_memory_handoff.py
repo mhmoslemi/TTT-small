@@ -638,6 +638,33 @@ def test_b200_ram_gate_reserves_job_headroom_without_global_env_changes(monkeypa
     assert activations.can_admit(32768)
 
 
+@pytest.mark.parametrize("release_after", [0, 2, 30])
+def test_trainer_offload_wait_continues_when_ram_is_available(monkeypatch, release_after):
+    waits = []
+    monkeypatch.setattr(host_memory.time, "sleep", waits.append)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(
+        total=200 * GIB, available=(80 if len(waits) >= release_after else 16) * GIB))
+    memory = host_memory.wait_for_trainer_offload_memory(64 * GIB, 16 * GIB)
+    assert memory["available"] == 80 * GIB
+    assert waits == [5] * release_after
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_trainer_offload_wait_stops_after_thirty_retries(monkeypatch, unknown):
+    waits, checks = [], []
+    monkeypatch.setattr(host_memory.time, "sleep", waits.append)
+
+    def memory():
+        checks.append(True)
+        return None if unknown else dict(total=200 * GIB, available=79 * GIB)
+
+    monkeypatch.setattr(host_memory, "host_memory_info", memory)
+    with pytest.raises(host_memory.HostMemoryTimeout, match="after 30 retries 5s apart"):
+        host_memory.wait_for_trainer_offload_memory(64 * GIB, 16 * GIB)
+    assert waits == [5] * 30
+    assert len(checks) == 31
+
+
 def test_b200_ram_wait_rechecks_each_minute_then_continues(monkeypatch):
     clock, waits = [0.0], []
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
