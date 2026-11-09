@@ -5451,7 +5451,7 @@ def main():
                         from runtime.host_memory import host_memory_reserve_bytes
                         reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:
-                        reserve_bytes = max(32 * GIB, int(0.05 * memory["total"]))
+                        reserve_bytes = 5 * GIB
                     target_available = required_bytes + reserve_bytes
                     if phase == "strategy":
                         pressure_candidates = (
