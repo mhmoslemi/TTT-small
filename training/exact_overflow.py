@@ -377,12 +377,20 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
             # Clear dead activation caches before checking the parking budget.
             trainer.reclaim_host_memory()
             if not trainer._offloaded:
+                from runtime.incremental_offload import can_incrementally_offload
+                from runtime.host_memory import RAM_WAIT_TIMEOUT_S
+                transfer_options = {}
                 if getattr(cfg, "hardware_profile", "RTX6000") in ("B200", "B200_full_ram"):
                     # Hold the shared claim through all CPU copies. A preflight
                     # alone lets evaluation consume the space before the move.
-                    parking = trainer.host_memory_admission.reservation(
-                        trainer.estimated_host_offload_bytes(), priority=True,
-                        stage="cooperative trainer CPU offload")
+                    if can_incrementally_offload(trainer.model, cfg):
+                        transfer_options = {"host_admission": trainer.host_memory_admission,
+                                            "deadline": time.monotonic() + RAM_WAIT_TIMEOUT_S}
+                        parking = trainer.host_memory_admission.prioritize_transfers()
+                    else:
+                        parking = trainer.host_memory_admission.reservation(
+                            trainer.estimated_host_offload_bytes(), priority=True,
+                            stage="cooperative trainer CPU offload")
                 else:
                     require_parking_capacity(trainer.model, trainer.world_size,
                                              trainer.optimizer,
@@ -390,7 +398,7 @@ def complete_warm_overflow(trainer, examples, cfg, step_idx, state):
                                              hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
                     parking = nullcontext()
                 with parking:
-                    trainer.offload_for_generation(purge_host_cache=False)
+                    trainer.offload_for_generation(purge_host_cache=False, **transfer_options)
             # Keep replicas parked between cooperative GPU waves.
             while pending:
                 wave = plan_overflow_wave(

@@ -1230,7 +1230,11 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
                 })
             elif kind == "offload":
                 if not offloaded:
-                    if command.get("disk_directory"):
+                    if command.get("incremental"):
+                        backend.offload_for_generation(
+                            host_admission=activation_offload_semaphore.host_admission,
+                            deadline=command.get("deadline"))
+                    elif command.get("disk_directory"):
                         backend.offload_for_generation(disk_directory=command["disk_directory"])
                     else:
                         backend.offload_for_generation()

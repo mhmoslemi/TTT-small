@@ -166,7 +166,7 @@ def host_memory_reserve_bytes(info, hardware_profile="RTX6000"):
     if hardware_profile == "B200_full_ram":
         # Use the same user-requested headroom as trainer handoff, including
         # startup/evaluation gates; full machine RAM is not exclusive to us.
-        return min(total // 4, 5 * GIB)
+        return min(total // 4, 2 * GIB)
     return min(total // 4, max(GIB, min(128 * GIB, total // 10)))
 
 
@@ -215,11 +215,27 @@ class HostMemoryAdmission:
             self._condition.notify_all()
 
     @contextmanager
+    def prioritize_transfers(self):
+        """Keep new evaluators from taking RAM between incremental chunks."""
+        with self._condition:
+            self._priority_waiters.value += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._priority_waiters.value -= 1
+                self._condition.notify_all()
+
+    @contextmanager
     def reservation(self, size_bytes, *, wait_for_external=True, stage="RAM allocation",
-                    priority=False, reserve_bytes=None):
+                    priority=False, reserve_bytes=None, minimum_bytes=None, deadline=None):
         size_bytes = max(0, int(size_bytes))
+        minimum_bytes = size_bytes if minimum_bytes is None else int(minimum_bytes)
+        if not 0 <= minimum_bytes <= size_bytes:
+            raise ValueError("minimum reservation must be between zero and the requested bytes")
         bounded_wait = self.hardware_profile in ("B200", "B200_full_ram")
-        deadline = time.monotonic() + RAM_WAIT_TIMEOUT_S if bounded_wait else None
+        if bounded_wait and deadline is None:
+            deadline = time.monotonic() + RAM_WAIT_TIMEOUT_S
         next_report = 0.0
         waited = False
         with self._condition:
@@ -241,7 +257,8 @@ class HostMemoryAdmission:
                     # Let active evaluations finish, but do not let new ones
                     # repeatedly spend the space needed by a model handoff.
                     has_priority = priority or not self._priority_waiters.value
-                    if has_priority and available is not None and available >= size_bytes:
+                    if has_priority and available is not None and available >= minimum_bytes:
+                        size_bytes = min(size_bytes, available)
                         break
                     waited = True
                     if bounded_wait:
@@ -252,7 +269,9 @@ class HostMemoryAdmission:
                             raise HostMemoryTimeout(f"{stage}: RAM remained unavailable for 2 hours")
                         if now >= next_report:
                             free = "unknown" if available is None else f"{max(0, available) / GIB:.1f} GiB"
-                            print(f"[ram-wait] {stage}: need {size_bytes / GIB:.1f} GiB, "
+                            needed = (f"{size_bytes / GIB:.1f}" if minimum_bytes == size_bytes else
+                                      f"{minimum_bytes / GIB:.3f}–{size_bytes / GIB:.3f}")
+                            print(f"[ram-wait] {stage}: need {needed} GiB, "
                                   f"admissible={free}; monitoring every {RAM_POLL_INTERVAL_S:g}s, "
                                   f"{(deadline - now) / 60:.0f} min remaining", flush=True)
                             next_report = now + RAM_RETRY_INTERVAL_S
@@ -270,7 +289,7 @@ class HostMemoryAdmission:
         try:
             if waited:
                 print(f"[ram-ready] {stage}: reserved {size_bytes / GIB:.1f} GiB; continuing", flush=True)
-            yield
+            yield size_bytes
         finally:
             with self._condition:
                 self._reserved.value -= size_bytes

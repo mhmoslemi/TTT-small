@@ -2503,7 +2503,8 @@ class ReplicatedDataParallelTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None):
+    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None,
+                               host_admission=None, deadline=None):
         """Release every replica before an all-GPU vLLM phase."""
         if self._offloaded:
             return
@@ -2517,10 +2518,16 @@ class ReplicatedDataParallelTrainer:
         try:
             for logical_id in range(self.world_size):
                 torch.cuda.synchronize(logical_id)
-            _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
-                getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
+            if host_admission is not None:
+                from runtime.incremental_offload import offload_optimizer
+                offload_optimizer(self.optimizer, host_admission, deadline=deadline)
+            else:
+                _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
+                    getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
             for backend, _, _, _ in self.replicas:
-                if disk_directory:
+                if host_admission is not None:
+                    backend.offload_for_generation(host_admission=host_admission, deadline=deadline)
+                elif disk_directory:
                     backend.offload_for_generation(disk_directory=disk_directory)
                 else:
                     backend.offload_for_generation()
@@ -3992,7 +3999,8 @@ class ProcessDistributedTrainer:
             "oom_quarantined_examples": quarantined_examples,
         }
 
-    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None):
+    def offload_for_generation(self, *, purge_host_cache=True, disk_directory=None,
+                               host_admission=None, deadline=None):
         if self._offloaded:
             return
         import gc
@@ -4009,14 +4017,22 @@ class ProcessDistributedTrainer:
         self._offloaded_ranks = set(range(self._world_size))
         try:
             for command_queue in self._command_queues.values():
-                command_queue.put({"kind": "offload", "disk_directory": disk_directory})
+                command = {"kind": "offload", "disk_directory": disk_directory}
+                if host_admission is not None:
+                    command.update(incremental=True, deadline=deadline)
+                command_queue.put(command)
             torch.cuda.synchronize(0)
-            _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
-                getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
-            if disk_directory:
-                self.backend.offload_for_generation(disk_directory=disk_directory)
+            if host_admission is not None:
+                from runtime.incremental_offload import offload_optimizer
+                offload_optimizer(self.optimizer, host_admission, deadline=deadline)
+                self.backend.offload_for_generation(host_admission=host_admission, deadline=deadline)
             else:
-                self.backend.offload_for_generation()
+                _move_optimizer_state(self.optimizer, "cpu", hardware_profile=getattr(
+                    getattr(self, "cfg", None), "hardware_profile", "RTX6000"))
+                if disk_directory:
+                    self.backend.offload_for_generation(disk_directory=disk_directory)
+                else:
+                    self.backend.offload_for_generation()
             gc.collect()
             with torch.cuda.device(0):
                 torch.cuda.empty_cache()

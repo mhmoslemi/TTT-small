@@ -173,6 +173,8 @@ def test_run_specific_ram_reserve_admits_small_strategy_without_changing_default
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: memory)
     monkeypatch.delenv("TTT_HOST_MEMORY_RESERVE_GIB", raising=False)
     assert host_memory.host_memory_reserve_bytes(memory) == 128 * GIB
+    assert host_memory.host_memory_reserve_bytes(memory, "B200") == 16 * GIB
+    assert host_memory.host_memory_reserve_bytes(memory, "B200_full_ram") == 2 * GIB
     gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
     with pytest.raises(host_memory.HostMemoryUnavailable):
         with gate.reservation(26 * GIB, wait_for_external=False):
@@ -364,7 +366,10 @@ def test_interrupted_ram_wait_releases_priority(monkeypatch):
     assert gate._priority_waiters.value == gate.reserved_bytes == 0
 
 
-def test_main_full_ram_offload_waits_and_holds_reservation_during_all_copies(monkeypatch):
+@pytest.mark.parametrize("incremental", [False, True])
+def test_main_offload_routes_plain_models_to_chunks_and_keeps_bulk_fallback(monkeypatch, incremental):
+    from runtime import incremental_offload
+    monkeypatch.setattr(incremental_offload, "can_incrementally_offload", lambda *a: incremental)
     memory = dict(total=200 * GIB, available=16 * GIB)
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
     gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
@@ -374,7 +379,8 @@ def test_main_full_ram_offload_waits_and_holds_reservation_during_all_copies(mon
         memory["available"] = 64 * GIB
     monkeypatch.setattr(gate._condition, "wait", wait)
     def offload(**kwargs):
-        assert gate.reserved_bytes == 32 * GIB
+        assert gate.reserved_bytes == (0 if incremental else 32 * GIB)
+        assert gate._priority_waiters.value == (1 if incremental else 0)
         copies.append(kwargs)
     trainer = SimpleNamespace(is_offloaded=False, world_size=2, reclaim_host_memory=lambda: [],
                               estimated_host_offload_bytes=lambda **kw: 32 * GIB,
@@ -387,12 +393,16 @@ def test_main_full_ram_offload_waits_and_holds_reservation_during_all_copies(mon
     scope = dict(cfg=SimpleNamespace(hardware_profile="B200_full_ram"),
                  parallel_trainer=trainer, gen_pool=None, strategy_pool=None,
                  pool_options={"host_memory_admission": gate}, runtime_training_active={"value": True},
-                 setting_log_only=lambda *a, **kw: None, HostMemoryUnavailable=host_memory.HostMemoryUnavailable)
+                 setting_log_only=lambda *a, **kw: None, HostMemoryUnavailable=host_memory.HostMemoryUnavailable,
+                 model=None, time=SimpleNamespace(monotonic=lambda: 123.), nullcontext=nullcontext)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
                  "real-trainer-handoff", "exec"), scope)
     scope["build"]()()
-    assert waits == [1] and copies == [{"purge_host_cache": False, "disk_directory": None}]
-    assert gate.reserved_bytes == 0
+    expected = {"purge_host_cache": False, "disk_directory": None}
+    if incremental:
+        expected.update(host_admission=gate, deadline=123. + host_memory.RAM_WAIT_TIMEOUT_S)
+    assert waits == ([] if incremental else [1]) and copies == [expected]
+    assert gate.reserved_bytes == gate._priority_waiters.value == 0
 
 
 def test_full_ram_model_initialization_holds_claim_until_loader_returns(monkeypatch):

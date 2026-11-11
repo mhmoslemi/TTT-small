@@ -620,7 +620,7 @@ class _ModelPlacementBackend:
                 "provide more training GPUs; silent spill would be unstable")
         self._trainer_is_offloaded = False
 
-    def offload_for_generation(self, *, disk_directory=None):
+    def offload_for_generation(self, *, disk_directory=None, host_admission=None, deadline=None):
         if getattr(self, "_trainer_is_offloaded", False):
             return
         placement_model = getattr(self, "_placement_model", self.model)
@@ -637,13 +637,16 @@ class _ModelPlacementBackend:
                 from runtime.disk_offload import DiskWeightOffload
                 self._disk_weights = DiskWeightOffload(self.model, disk_directory)
                 self.model.to("cpu")
+            elif host_admission is not None:
+                from runtime.incremental_offload import offload_model
+                offload_model(self.model, host_admission, deadline=deadline)
             else:
                 from runtime.host_memory import retry_host_allocation
                 retry_host_allocation(lambda: self.model.to("cpu"),
                     hardware_profile=getattr(getattr(self, "cfg", None), "hardware_profile", "RTX6000"),
                     stage="trainer CPU offload")
             self._trainer_is_offloaded = True
-        except Exception:
+        except BaseException:
             # A quantized module can fail after earlier layers already moved.
             # Mark it offloaded so the normal placement restore can repair the
             # partially moved model before the original exception propagates.
@@ -1265,13 +1268,16 @@ class UnslothBackend(_ModelPlacementBackend):
     def set_inference_mode(self):
         self._FastLanguageModel.for_inference(self.model)
 
-    def offload_for_generation(self, *, disk_directory=None):
+    def offload_for_generation(self, *, disk_directory=None, host_admission=None, deadline=None):
         if (not getattr(self, "_trainer_is_offloaded", False)
                 and str(getattr(self.cfg, "coder_model_profile", ""))
                 == "gpt-oss-120b"):
             from models.gpt_oss_training import release_checkpoint_workspaces
             release_checkpoint_workspaces()
-        if disk_directory:
+        if host_admission is not None:
+            super().offload_for_generation(disk_directory=disk_directory,
+                                          host_admission=host_admission, deadline=deadline)
+        elif disk_directory:
             super().offload_for_generation(disk_directory=disk_directory)
         else:
             super().offload_for_generation()
@@ -1511,8 +1517,9 @@ class _AutoFallbackBackend:
     def disable_adapter(self):
         return self._inner.disable_adapter()
 
-    def offload_for_generation(self, *, disk_directory=None):
-        return self._inner.offload_for_generation(disk_directory=disk_directory)
+    def offload_for_generation(self, *, disk_directory=None, host_admission=None, deadline=None):
+        return self._inner.offload_for_generation(disk_directory=disk_directory,
+                                                  host_admission=host_admission, deadline=deadline)
 
     def restore_after_generation(self):
         return self._inner.restore_after_generation()

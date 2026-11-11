@@ -5412,8 +5412,10 @@ def main():
                     return
                 from runtime.host_memory import (
                     GIB, estimated_module_bytes, estimated_optimizer_bytes,
-                    host_memory_info, reclaim_unused_host_memory,
+                    host_memory_info, reclaim_unused_host_memory, RAM_WAIT_TIMEOUT_S,
                 )
+                from runtime.incremental_offload import can_incrementally_offload, offload_optimizer
+                incremental = can_incrementally_offload(model, cfg, disk_directory)
 
                 # Reclaim cached activation-offload blocks on *every* trainer
                 # process before allocating complete CPU model replicas. This
@@ -5458,7 +5460,7 @@ def main():
                 # of permanently choosing a slower level-2/transient policy.
                 reserve_bytes = None
                 if memory is not None:
-                    if frozen_to_disk or cfg.hardware_profile == "B200":
+                    if frozen_to_disk or cfg.hardware_profile in ("B200", "B200_full_ram"):
                         from runtime.host_memory import host_memory_reserve_bytes
                         reserve_bytes = host_memory_reserve_bytes(memory, cfg.hardware_profile)
                     else:
@@ -5499,16 +5501,25 @@ def main():
                     f"[gpu] offloading {replica_label} to {destination} before "
                     "shared-GPU vLLM generation", flush=True)
                 try:
-                    admission = pool_options["host_memory_admission"].reservation(
+                    host_admission = pool_options["host_memory_admission"]
+                    transfer_options = ({"host_admission": host_admission,
+                                         "deadline": time.monotonic() + RAM_WAIT_TIMEOUT_S}
+                                        if incremental else {})
+                    admission = (host_admission.prioritize_transfers() if incremental else host_admission.reservation(
                         required_bytes, stage="trainer CPU offload", priority=True,
-                        reserve_bytes=reserve_bytes)
+                        reserve_bytes=reserve_bytes))
                     with admission:
                         if parallel_trainer is not None:
                             parallel_trainer.offload_for_generation(
-                                purge_host_cache=False, disk_directory=disk_directory)
+                                purge_host_cache=False, disk_directory=disk_directory,
+                                **transfer_options)
                         else:
-                            _move_optimizer_state(optimizer, "cpu", hardware_profile=cfg.hardware_profile)
-                            backend.offload_for_generation(disk_directory=disk_directory)
+                            if incremental:
+                                offload_optimizer(optimizer, host_admission,
+                                                  deadline=transfer_options["deadline"])
+                            else:
+                                _move_optimizer_state(optimizer, "cpu", hardware_profile=cfg.hardware_profile)
+                            backend.offload_for_generation(disk_directory=disk_directory, **transfer_options)
                             import gc
                             gc.collect()
                             torch.cuda.empty_cache()

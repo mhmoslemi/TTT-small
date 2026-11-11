@@ -247,7 +247,7 @@ class HardwareProfileTests(unittest.TestCase):
                                  strategists.strategist_engine_options(name, "RTX6000"))
             memory = dict(total=1696*host.GIB, available=1400*host.GIB)
             self.assertEqual(host.host_memory_reserve_bytes(memory, "B200_full_ram"),
-                             host.host_memory_reserve_bytes(memory, "RTX6000"))
+                             2 * host.GIB)
 
     def test_gpu_query_is_limited_to_launcher_devices(self):
         import os
