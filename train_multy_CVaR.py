@@ -1397,10 +1397,10 @@ def _finalize_pending_spo_rs_artifacts(
 def _resume_spo_rs_step_from_artifacts(
         backend, model, tokenizer, sampler, optimizer, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
-        artifacts):
+        artifacts, evaluation_complete=None):
     """Finish one interrupted SPO-RS step from its durable evaluations."""
     import torch
-    from experiment_io import save_rollout
+    from experiment_io import save_best_state_snapshot, save_rollout
     from evaluation.reward import extract_python_code
     from generation.gen_workers import native_final_answer_scope
     from search.sampler import State
@@ -1732,7 +1732,19 @@ def _resume_spo_rs_step_from_artifacts(
          min(raw_states, key=lambda state: float(state.raw_score)))
         if raw_states else None)
     best_seen = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
+    best_snapshot_path = save_best_state_snapshot(
+        exp_dir, step_idx, best_seen,
+        metric_name=str(problem.metric_name), maximize=bool(problem.maximize),
+        construction=(
+            _as_float_list(getattr(best_seen, "construction", None), cfg.max_saved_construction)
+            if (best_seen is not None and getattr(problem, "saves_construction", False))
+            else None),
+    )
+    if evaluation_complete is not None:
+        evaluation_complete(step_idx)
     stats = {
+        "best_seen_snapshot": (str(Path(best_snapshot_path).relative_to(exp_dir))
+                               if best_snapshot_path is not None else None),
         "planned_rollouts": sum(bool(item["meta"].get("counts_toward_allocation", True)) for item in artifacts),
         "coder_format_retries": sum(int(item['meta'].get('retry_attempt', 0) or 0) > 0 for item in artifacts),
         "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
@@ -1848,7 +1860,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from queue import Queue
 
     from search.sampler import State
-    from experiment_io import (save_parent_selections, save_rollout,
+    from experiment_io import (save_best_state_snapshot, save_parent_selections, save_rollout,
                                save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
@@ -4443,53 +4455,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             example["sample_weight"] = trajectory_weight
 
 
-    if entropic_overlap_state is not None:
-        actual_keys = {
-            example.get("_overlap_key") for example in all_examples
-            if example.get("_overlap_key") is not None
-        }
-        advantages_complete = all(math.isfinite(float(example["advantage"])) for example in all_examples)
-        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
-        expected_keys = entropic_overlap_state["scheduled_keys"]
-        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
-            parallel_trainer.finish_entropic_overlap(
-                cfg, step_idx,
-                entropic_overlap_state["queued_examples"],
-                apply_update=False)
-            print(
-                f"[warn] discarded streamed entropic gradients because the "
-                f"final training set changed ({len(actual_keys)}/"
-                f"{len(expected_keys)} records); using the unchanged "
-                "post-evaluation update",
-                flush=True,
-            )
-            entropic_overlap_state = None
-
-    if spo_rs_overlap_state is not None:
-        actual_keys = {
-            example.get("_overlap_key") for example in all_examples
-            if example.get("_overlap_key") is not None
-        }
-        advantages_complete = all(
-            example.get("advantage") is not None
-            and math.isfinite(float(example["advantage"]))
-            for example in all_examples)
-        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
-        expected_keys = spo_rs_overlap_state["scheduled_keys"]
-        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
-            parallel_trainer.finish_spo_rs_overlap(
-                cfg, step_idx,
-                spo_rs_overlap_state["queued_examples"],
-                apply_update=False)
-            print(
-                f"[warn] discarded streamed SPO-RS gradients because the "
-                f"final training set changed ({len(actual_keys)}/"
-                f"{len(expected_keys)} records); using the unchanged "
-                "post-evaluation update",
-                flush=True,
-            )
-            spo_rs_overlap_state = None
-
     rollout_time = time.time() - rollout_t0
     training_label = (str(len(all_examples)) if training_enabled else "disabled")
     rollout_phase_label = (
@@ -4555,7 +4520,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         step_best_result = None
         step_best_raw_score = None
 
-    # Report the problem-native metric before any gradient work. This
+    # Report the problem-native metric before waiting for streamed backward. This
     # is deliberately separate from reward: some problems maximize the raw
     # quantity, while others (Erdos bounds, runtime, MSE) minimize it.
     best_raw = sampler.best_raw_state(maximize=bool(problem.maximize))
@@ -4599,10 +4564,67 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         message = (f'[step {step_idx}] best-ever raw {problem.metric_name}: unavailable')
         print(f"\033[93m{message}\033[0m", flush=True)
 
+    best_snapshot_path = save_best_state_snapshot(
+        exp_dir, step_idx, best_seen_result,
+        metric_name=str(problem.metric_name), maximize=bool(problem.maximize),
+        construction=(
+            _as_float_list(getattr(best_seen_result, "construction", None), cfg.max_saved_construction)
+            if (best_seen_result is not None and getattr(problem, "saves_construction", False))
+            else None),
+    )
     if evaluation_complete is not None:
         evaluation_complete(step_idx)
 
+    if entropic_overlap_state is not None:
+        actual_keys = {
+            example.get("_overlap_key") for example in all_examples
+            if example.get("_overlap_key") is not None
+        }
+        advantages_complete = all(math.isfinite(float(example["advantage"])) for example in all_examples)
+        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
+        expected_keys = entropic_overlap_state["scheduled_keys"]
+        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
+            parallel_trainer.finish_entropic_overlap(
+                cfg, step_idx,
+                entropic_overlap_state["queued_examples"],
+                apply_update=False)
+            print(
+                f"[warn] discarded streamed entropic gradients because the "
+                f"final training set changed ({len(actual_keys)}/"
+                f"{len(expected_keys)} records); using the unchanged "
+                "post-evaluation update",
+                flush=True,
+            )
+            entropic_overlap_state = None
+
+    if spo_rs_overlap_state is not None:
+        actual_keys = {
+            example.get("_overlap_key") for example in all_examples
+            if example.get("_overlap_key") is not None
+        }
+        advantages_complete = all(
+            example.get("advantage") is not None
+            and math.isfinite(float(example["advantage"]))
+            for example in all_examples)
+        advantages_match = not any(example.get("_overlap_label_mismatch", False) for example in all_examples)
+        expected_keys = spo_rs_overlap_state["scheduled_keys"]
+        if (actual_keys != expected_keys or not advantages_complete or not advantages_match):
+            parallel_trainer.finish_spo_rs_overlap(
+                cfg, step_idx,
+                spo_rs_overlap_state["queued_examples"],
+                apply_update=False)
+            print(
+                f"[warn] discarded streamed SPO-RS gradients because the "
+                f"final training set changed ({len(actual_keys)}/"
+                f"{len(expected_keys)} records); using the unchanged "
+                "post-evaluation update",
+                flush=True,
+            )
+            spo_rs_overlap_state = None
+
     step_stats = {
+        "best_seen_snapshot": (str(Path(best_snapshot_path).relative_to(exp_dir))
+                               if best_snapshot_path is not None else None),
         "planned_rollouts": len(primary_rollout_records),
         "coder_format_retries": len(coder_retry_records),
         "coder_retry_enabled": bool(getattr(cfg, "coder_retry", False)),
@@ -4835,7 +4857,6 @@ def main():
         # Save the reusable base configuration before runtime-only adjustments.
         from experiment_io import (append_step_result, make_experiment_dir,
                                    restart_changed_rollout_step,
-                                   save_best_state_snapshot,
                                    save_final_summary, save_step_summary)
         resume_dir = merged.pop("_resume_dir", None)
         if resume_dir:
@@ -5931,7 +5952,8 @@ def main():
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
-                    interrupted_spo_rs_artifacts)
+                    interrupted_spo_rs_artifacts,
+                    evaluation_complete=step_plotter.submit)
             elif pending_spo_rs_artifacts is not None:
                 print(
                     f"[resume] found {len(pending_spo_rs_artifacts)} exact "
@@ -5945,12 +5967,12 @@ def main():
                         gen_pool, spo_rs_tracker,
                         current_policy_adapter_path,
                         pending_spo_rs_artifacts))
-                step_plotter.submit_explorer(step)
                 stats = _resume_spo_rs_step_from_artifacts(
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
                     spo_rs_tracker, current_policy_adapter_path,
-                    completed_spo_rs_artifacts)
+                    completed_spo_rs_artifacts,
+                    evaluation_complete=step_plotter.submit)
             else:
                 stats = train_step(
                     backend, model, tokenizer, sampler, optimizer, step,
@@ -5963,7 +5985,7 @@ def main():
                         current_policy_adapter_path
                         if _is_spo_rs_mode(configured_advantage_mode) else None),
                     ensure_trainer_ready=ensure_trainer_ready,
-                    evaluation_complete=step_plotter.submit_explorer)
+                    evaluation_complete=step_plotter.submit)
 
             stats = stats or {}
             entropy_observations = stats.pop("_entropy_observations", [])
@@ -6001,22 +6023,6 @@ def main():
                 "group_size": int(cfg.group_size),
                 **(stats or {}),
             }
-            # Snapshot the sampler's independent native-metric optimum before
-            # asynchronous plotting starts.  This includes unbeaten seeds and
-            # evaluated children that no longer survive archive pruning.
-            best_seen_state = (sampler.best_raw_state(maximize=bool(problem.maximize)) or sampler.best_state())
-            best_snapshot_path = save_best_state_snapshot(
-                exp_dir, step, best_seen_state,
-                metric_name=str(problem.metric_name),
-                maximize=bool(problem.maximize),
-                construction=(
-                    _as_float_list(getattr(best_seen_state, "construction", None), cfg.max_saved_construction)
-                    if (best_seen_state is not None and getattr(problem, "saves_construction", False))
-                    else None),
-            )
-            step_summary["best_seen_snapshot"] = (
-                str(Path(best_snapshot_path).relative_to(exp_dir))
-                if best_snapshot_path is not None else None)
             save_step_summary(exp_dir, step, step_summary)
             append_step_result(exp_dir, step, step_summary)
             if getattr(step_cfg, "measure_entropy", False):
@@ -6056,7 +6062,6 @@ def main():
                       f"superseded adapter snapshot(s); retained {retained}",
                       flush=True)
             print(f"[checkpoint] completed step {step}; resume at step {step + 1}")
-            step_plotter.submit(step)
             if (stats.get("exact_overflow_inprocess", False)
                     or getattr(cfg, "_exact_inprocess_recovery_step", None) == step):
                 # Keep partial gradients until the *full* optimizer/sampler

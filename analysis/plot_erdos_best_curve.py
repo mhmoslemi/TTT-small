@@ -200,6 +200,21 @@ def load_best_curve(run_dir, max_step=None):
         if cumulative_score is not None:
             summary_cumulative_by_step[step] = cumulative_score
 
+    # Evaluation snapshots are authoritative while the adapter update is still running.
+    for path in sorted(run_dir.glob("step*/step*.best.json")):
+        try:
+            snapshot = json.loads(path.read_text())
+            step = int(snapshot["completed_step"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if step < 0 or (max_step is not None and step > max_step):
+            continue
+        score = _finite_float(snapshot.get(
+            "reward" if metric_name == "reward" else "raw_score"))
+        if score is not None:
+            seen_steps.add(step)
+            summary_cumulative_by_step.setdefault(step, score)
+
     # Stop with a clear error when there is no usable completed-step data.
     if not seen_steps:
         raise ValueError(f"no completed step data found under {run_dir}/step*/")

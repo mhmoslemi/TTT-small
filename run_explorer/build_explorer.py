@@ -197,6 +197,10 @@ def main():
     a = ap.parse_args()
     if a.unified:
         runs = a.run_dir or default_unified_runs()
+        evaluated_run = os.environ.get("TTT_EVALUATED_RUN")
+        if (evaluated_run and os.path.isdir(evaluated_run)
+                and not any(os.path.realpath(r) == os.path.realpath(evaluated_run) for r in runs)):
+            runs.append(evaluated_run)
         if not runs:
             ap.error("--unified needs run directories (none given, none in unified_runs.txt, none found under ../runs)")
         print("unified build of: " + ", ".join(os.path.basename(os.path.abspath(r)) for r in runs))

@@ -555,11 +555,25 @@ def test_complete_step_with_cpu_generation_and_evaluation(
 
         coder_pool = CoderPool()
         monkeypatch.setattr(training, "_save_adapter", lambda *args, **kwargs: str(adapter))
+    evaluated = []
+
+    def evaluation_complete(step):
+        metadata = list((tmp_path / f"step{step:02d}").glob("*rollout*.meta.json"))
+        assert len(metadata) == expected_total
+        assert all("advantage" in json.loads(path.read_text()) for path in metadata)
+        snapshot = json.loads((tmp_path / f"step{step:02d}/step{step:02d}.best.json").read_text())
+        assert snapshot["raw_score"] == 3.
+        assert not (tmp_path / f"step{step:02d}/step{step:02d}.summary.json").exists()
+        assert not trainer.calls
+        evaluated.append(step)
+
     stats = training.train_step(
         backend, model, TinyTokenizer(), sampler, optimizer, 0, cfg, tmp_path,
         problem, parallel_trainer=trainer, spo_rs_tracker=tracker,
         strategy_pool=strategy_pool, gen_pool=coder_pool,
-        sampling_adapter_path=str(adapter) if tracker else None)
+        sampling_adapter_path=str(adapter) if tracker else None,
+        evaluation_complete=evaluation_complete)
+    assert evaluated == [0]
     assert len(generated) == expected_total
     assert len(trainer.calls) == 1
     if parent_selection == "llm":
@@ -614,7 +628,9 @@ def test_complete_step_with_cpu_generation_and_evaluation(
         cfg.strategies = allocation is not None
         training._resume_spo_rs_step_from_artifacts(
             backend, model, TinyTokenizer(), recovered, optimizer, 0, cfg, tmp_path,
-            problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts)
+            problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts,
+            evaluation_complete=lambda step: evaluated.append(step))
+        assert evaluated == [0, 0]
         assert recovered.state_dict() == sampler.state_dict()
 
 
@@ -760,6 +776,7 @@ def test_spo_rs_v2_overlap_preserves_gradients_after_roundoff(
 
         def finish_spo_rs_overlap(self, cfg, step, count, *, apply_update=True):
             assert count == len(self.queued)
+            assert (tmp_path / f"step{step:02d}/step{step:02d}.best.json").exists()
             self.finishes.append(apply_update)
             if apply_update:
                 self.calls.append(("spo-rs", self.queued))

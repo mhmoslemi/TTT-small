@@ -593,6 +593,8 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                 "seeds": [x.get("id") for x in (jev.get("seeds") or [])],
             }
         if best:
+            rec["result_metric_name"] = best.get("metric_name")
+            rec["result_maximize"] = bool(best.get("maximize"))
             rec["best"] = {
                 "state_id": best.get("state_id"),
                 "found_step": best.get("found_step"),
@@ -663,22 +665,27 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                 prev_best = (rec["best_seen_raw_score"], rec.get("best_seen_reward"), rec.get("best_seen_step"))
             continue
         lg = logged.get(rec["step"])
-        if not rec.get("partial") or lg is None:
+        snapshot = rec.get("best") or {}
+        has_snapshot = snapshot.get("raw") is not None
+        if not rec.get("partial") or (lg is None and not has_snapshot):
             continue
         rs = by_step_rollouts.get(rec["step"], [])
-        good = [r for r in rs if r["valid"] and r["raw"]]
-        if not good:
+        good = [r for r in rs if r["valid"] and r["raw"] is not None]
+        if not good and not has_snapshot:
             continue
-        top = max(good, key=lambda r: r["raw"]) if maximize_run else min(good, key=lambda r: r["raw"])
         rec["provisional"] = True
         rec["rollouts_done"] = True
-        rec["step_best_raw_score"] = _sig(top["raw"], 12)
-        rec["step_best_reward"] = _sig(top["reward"], 12)
+        if good:
+            top = max(good, key=lambda r: r["raw"]) if maximize_run else min(good, key=lambda r: r["raw"])
+            rec["step_best_raw_score"] = _sig(top["raw"], 12)
+            rec["step_best_reward"] = _sig(top["reward"], 12)
+            better = prev_best is None or (top["raw"] > prev_best[0] if maximize_run else top["raw"] < prev_best[0])
+            prev_best = (rec["step_best_raw_score"], rec["step_best_reward"], rec["step"]) if better else prev_best
+        if has_snapshot:
+            prev_best = (snapshot["raw"], snapshot.get("reward"), snapshot.get("found_step"))
         rec["valid_fraction"] = len(good) / max(1, len(rs))
-        better = prev_best is None or (top["raw"] > prev_best[0] if maximize_run else top["raw"] < prev_best[0])
-        prev_best = (rec["step_best_raw_score"], rec["step_best_reward"], rec["step"]) if better else prev_best
         rec["best_seen_raw_score"], rec["best_seen_reward"], rec["best_seen_step"] = prev_best
-        rec["log_best_ever"] = lg.get("best_ever")
+        rec["log_best_ever"] = (lg or {}).get("best_ever")
     for st, rs in by_step_rollouts.items():
         good = [r for r in rs if r["valid"] and r["raw"]]
         good.sort(key=lambda r: r["raw"])  # lower is better for AC1; harmless if maximise (we embed both ends)

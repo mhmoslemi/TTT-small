@@ -112,12 +112,12 @@ def load_rollout_logprobs(path):
 
 
 class StepPlotter:
-    """Refresh existing plots off the training thread, in step order.
+    """Refresh evaluated-step plots and HTML off the training thread, in order.
 
     Use the same Python environment, headless CPU-only subprocesses, and a
     bounded timeout per script. A single worker avoids competing plot writes;
     --max-step prevents a queued plot from including a later unfinished step.
-    Diagnostics go to plots.log, and failures never invalidate a checkpoint.
+    Diagnostics go to plots.log, and failures never invalidate training.
     """
 
     def __init__(self, run_dir, problem):
@@ -166,7 +166,7 @@ class StepPlotter:
                 for script, options in scripts:
                     if self.stopping.is_set():
                         break
-                    log.write(f"\n=== completed step {step}: {script} ===\n")
+                    log.write(f"\n=== evaluated step {step}: {script} ===\n")
                     log.flush()
                     try:
                         result = subprocess.run(
@@ -186,9 +186,13 @@ class StepPlotter:
                               flush=True)
         except OSError as error:
             print(f"[plots] step {step}: cannot write plots.log: {error}", flush=True)
+        if not self.stopping.is_set():
+            self._refresh_explorer(step)
 
     def _refresh_explorer(self, step):
+        import os
         import subprocess
+        import sys
 
         explorer_dir = Path(__file__).resolve().parent / "run_explorer"
         log_path = self.run_dir / "explorer.log"
@@ -199,6 +203,8 @@ class StepPlotter:
                 result = subprocess.run(
                     ["./make_explorer.sh", "--all-code", "--unified"],
                     cwd=explorer_dir, stdin=subprocess.DEVNULL,
+                    env={**os.environ, "PYTHON": sys.executable,
+                         "CUDA_VISIBLE_DEVICES": "", "TTT_EVALUATED_RUN": str(self.run_dir)},
                     stdout=log, stderr=subprocess.STDOUT,
                     timeout=600, check=False,
                 )
@@ -542,12 +548,12 @@ def save_step_summary(exp_dir: Path, step: int, summary: dict):
 def save_best_state_snapshot(exp_dir: Path, step: int, state, *,
                              metric_name: str, maximize: bool,
                              construction=None):
-    """Persist the sampler's authoritative best-ever state at a completed step.
+    """Persist the sampler's authoritative best-ever state after evaluation.
 
     Rollout metadata is not authoritative here: the best state may be an
     unbeaten seed or a valid child later removed by archive deduplication or
     pruning.  Keeping one small, step-scoped snapshot also lets asynchronous
-    plotting reproduce exactly the best state known at *that* completed step.
+    plotting reproduce exactly the best state known at that evaluated step.
     """
     if state is None:
         return None
