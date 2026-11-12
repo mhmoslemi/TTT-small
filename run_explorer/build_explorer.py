@@ -28,7 +28,7 @@ from collect import collect  # noqa: E402
 JS_ORDER = [
     "core.js", "charts.js", "problems.js", "knowledge.js",
     "tab_overview.js", "tab_pipeline.js", "tab_search.js", "tab_strategist.js",
-    "tab_rollouts.js", "tab_alloc.js", "tab_train.js", "tab_entropy.js",
+    "tab_rollouts.js", "tab_alloc.js", "tab_train.js", "jev_tree.js",
     "tab_solution.js", "tab_published.js", "tab_concepts.js", "tab_logs.js", "main.js",
 ]
 PROBLEM_TITLES = {"ac1": "First autocorrelation inequality (AC1)", "erdos": "Erdős minimum-overlap problem (C₅)"}
@@ -68,17 +68,13 @@ def summarize(main, pub):
     rows = main["rows"]
     n_valid = sum(1 for r in rows if r[iv])
     pid = str(cfg.get("problem") or "").lower()
-    ref = None
-    rank = None
-    firm = []
+    pub_results = []
     if pub and pub.get("results"):
-        by_id = {r["id"]: r for r in pub["results"]}
-        dr = by_id.get(pub.get("default_ref"))
-        if dr:
-            ref = {"label": dr["label"], "value": dr["reported"], "id": dr["id"]}
-        firm = [r["reported"] for r in pub["results"] if r.get("kind") != "claim" and r.get("reported") is not None]
-        if best is not None:
-            rank = 1 + sum(1 for v in firm if v < best)
+        for r in pub["results"]:
+            if r.get("reported") is None:
+                continue
+            tier = r.get("tier") or ("claim" if r.get("kind") == "claim" else "paper")
+            pub_results.append({"id": r["id"], "label": r["label"], "value": r["reported"], "tier": tier})
     el = main.get("elapsed") or {}
     hw = main.get("hardware") or {}
     metric = next((s.get("result_metric_name") for s in steps if s.get("result_metric_name")), "score")
@@ -89,7 +85,7 @@ def summarize(main, pub):
         "run_name": main["meta"]["run_name"], "generated_at": main["meta"]["generated_at"],
         "coder": nm(cfg.get("coder_model_name") or cfg.get("model_name")), "strategist": nm(cfg.get("strategy_model_name")),
         "steps_done": len(done), "steps_total": cfg.get("num_steps"), "rollouts": len(rows), "valid_fraction": (n_valid / len(rows)) if rows else None,
-        "best": best, "curve": curve, "pending": pending, "reference": ref, "rank": rank, "n_ranked": len(firm) + 1, "target": cfg.get("target"),
+        "best": best, "curve": curve, "pending": pending, "pub_results": pub_results, "ref_default": (pub or {}).get("default_ref"), "target": cfg.get("target"),
         "stopped": bool(el.get("stopped")), "elapsed_s": el.get("total"), "hardware": hw,
         "gpu_hours": (el.get("total") / 3600 * hw.get("n_gpus", 0)) if el.get("total") is not None and hw.get("n_gpus") else None,
         "selection": "PUCT + JEV" if any(s.get("jev") for s in steps) else "PUCT",

@@ -8,11 +8,12 @@ registerTab({
   id: "published", label: "Published SOTA", ico: "★",
   async render(root) {
     const pub = await lazy("pub");
-    root.append(pageHead(`Published ${PROB.short} results (state of the art)`, (pub && pub.lede) || "Published results for this problem."));
+    root.append(pageHead(`Published ${PROB.short} results (state of the art)`, (pub && pubText("lede")) || "Published results for this problem."));
     if (!pub || !pub.results || !pub.results.length) { root.append(h("div", { class: "hint" }, `No published reference data is embedded for the problem "${esc(CFG.problem)}" (data/published_${esc(String(CFG.problem).toLowerCase())}.json is missing).`)); return; }
 
     const done = BSTEPS, best = ST[done[done.length - 1]].best_seen_raw_score;
-    const rows = pub.results.map(r => Object.assign({}, r, { calc: r.values ? constructionScore(r.values) : null }));
+    const rows = pub.results.filter(pubVisible).map(r => Object.assign({}, r, { calc: r.values ? constructionScore(r.values) : null }));
+    if (hiddenNote()) root.append(h("div", { class: "hint", style: { marginBottom: "12px" }, html: `<b>Showing ${SHOW === "paper" ? "published works only" : SHOW === "board" ? "published works + Arena leaderboard" : "everything"}.</b> ${hiddenNote()}` }));
     const me = { label: "THIS RUN (best so far)", method: "this run", reported: best, calc: best, kind: "run", date: (D.main.meta.generated_at || "").slice(0, 10), n: heavyBestN(), me: true };
     const all = rows.concat([me]).sort((a, b) => a.reported - b.reported);
     const firm = all.filter(r => r.kind !== "claim");
@@ -31,7 +32,7 @@ registerTab({
     const hostT = h("div", { class: "chart" });
     const dated = rows.filter(r => r.date && monthIdx(r.date) >= 0), older = rows.filter(r => r.date && monthIdx(r.date) < 0);
     root.append(card("Record progression", `published ${PROB.short} ${PROB.metric} over time (lower is better) · y-axis = gap to the reference (symmetric log) · filled = construction available and recomputed · ring = reported only · diamond = unreviewed claim`,
-      h("div", null, hostT, legend([{ color: S_COL(0), label: "this run" }, { color: cssVar("--ink-2"), label: "verified construction" }, { color: cssVar("--s4"), label: "reported" }, { color: cssVar("--s2"), label: "unreviewed claim" }, { color: cssVar("--ink-3"), label: "record so far", line: true }]),
+      h("div", null, hostT, legend([{ color: S_COL(0), label: "this run" }, { color: cssVar("--ink-2"), label: "verified construction" }, rows.some(r => r.kind === "reported") ? { color: cssVar("--s4"), label: "reported" } : null, rows.some(r => r.kind === "claim") ? { color: cssVar("--s2"), label: "unreviewed claim" } : null, { color: cssVar("--ink-3"), label: "record so far", line: true }].filter(Boolean)),
         older.length ? h("div", { class: "sub", style: { marginTop: "4px" } }, "Older results not on this time axis: " + older.map(r => `${r.label} ${+r.reported.toFixed(PROB.dec + 2)} (${r.date.slice(0, 4)})`).join("; ") + ".") : null)));
     registerChart(hostT, () => {
       const F = frame(hostT, { height: 420, margin: { l: 70, b: 40, t: 18, r: 30 } }), { svg, m, iw, ih } = F;
@@ -98,7 +99,7 @@ registerTab({
       h("div", { class: "sub", style: { marginTop: "8px" } }, "'reported' is the figure as printed by the source; 'recomputed' is evaluated here from the public height sequence (stored to 10 significant digits). Where the community-curated list replayed the same construction with exact arithmetic, the recomputed values agree with it to ~1e-9 (see ", h("a", { href: "https://github.com/teorth/optimizationproblems/issues/348", target: "_blank", rel: "noopener" }, "teorth/optimizationproblems#348"), ").")))));
 
     /* ------------------------------------------------ source tables (paper table, curated list ...) */
-    (pub.tables || []).forEach(t => {
+    (pub.tables || []).filter(t => tierVisible(t.tier || "paper")).forEach(t => {
       const bestOf = (i, dir) => { const v = t.rows.map(r => r[i]).filter(x => typeof x === "number"); return v.length ? (dir === "max" ? Math.max(...v) : Math.min(...v)) : null; };
       const bests = t.columns.map((c, i) => c.best ? bestOf(i, c.best) : null);
       const cell = (v, ci) => {
@@ -112,10 +113,10 @@ registerTab({
     });
 
     /* ------------------------------------------------ history + sources */
-    const links = (pub.links || []).map(([t, u]) => h("div", null, h("a", { href: u, target: "_blank", rel: "noopener" }, t + " ↗")));
+    const links = (pub.links || []).filter(l => tierVisible(l[2] || "paper")).map(([t, u]) => h("div", null, h("a", { href: u, target: "_blank", rel: "noopener" }, t + " ↗")));
     root.append(h("div", { class: "grid g2", style: { marginTop: "14px" } },
-      card("What happened, in order", null, h("div", { class: "kv", style: { gridTemplateColumns: "92px 1fr", gap: "8px 12px" }, html: (pub.events || []).map(([d, t]) => `<div class="k"><b style="color:var(--ink)">${esc(d)}</b></div><div class="v">${esc(t)}</div>`).join("") })),
-      card("Sources and how to read them", null, h("div", null, h("div", null, links), h("div", { class: "warnbox", style: { marginTop: "10px" } }, (pub.caution ? pub.caution + " " : "") + "Reference data fetched " + esc(pub.fetched || "") + "; to refresh it run data/build_published.py."),
+      card("What happened, in order", null, h("div", { class: "kv", style: { gridTemplateColumns: "92px 1fr", gap: "8px 12px" }, html: (pub.events || []).filter(e => tierVisible(e[2] || "paper")).map(([d, t]) => `<div class="k"><b style="color:var(--ink)">${esc(d)}</b></div><div class="v">${esc(t)}</div>`).join("") })),
+      card("Sources and how to read them", null, h("div", null, h("div", null, links), h("div", { class: "warnbox", style: { marginTop: "10px" } }, (pubText("caution") ? pubText("caution") + " " : "") + "Reference data fetched " + esc(pub.fetched || "") + "; to refresh it run data/build_published.py."),
         h("p", { class: "sub", style: { marginTop: "8px" } }, pub.footnote || "")))));
   }
 });

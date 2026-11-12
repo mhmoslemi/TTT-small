@@ -210,15 +210,16 @@ function leagueSection(root, best) {
   const claims = items.filter(x => x.claim);
   const host = h("div", { class: "chart" });
   const txt = h("div", { html:
-    `<p style="margin:0 0 8px;color:var(--ink-2)">This run's best ${esc(PROB.metric)} is <b>${fmt.raw(best)}</b> - rank <b>${rank}</b> of ${firm.length} among the published ${esc(PROB.short)} results ${pub.league_note || ""}. ${claims.length ? `${claims.length} unreviewed claims (hollow dots) are drawn but not ranked. ` : ""}Details and sources: <b>Published SOTA</b> tab.</p>` +
+    `<p style="margin:0 0 8px;color:var(--ink-2)">This run's best ${esc(PROB.metric)} is <b>${fmt.raw(best)}</b> - rank <b>${rank}</b> of ${firm.length} among the published ${esc(PROB.short)} results ${pubText("league_note")}. ${claims.length ? `${claims.length} unreviewed claims (hollow dots) are drawn but not ranked. ` : ""}Details and sources: <b>Published SOTA</b> tab.</p>` +
     `<div class="kv" style="grid-template-columns:150px 1fr">` +
-    `<div class="k">Leading published</div><div class="v">${esc(lead.label)} · ${fmt.rep(lead.val)}</div>` +
+    `<div class="k">${SHOW === "paper" ? "Leading published" : "Leading result shown"}</div><div class="v">${esc(lead.label)} · ${fmt.rep(lead.val)}</div>` +
     `<div class="k">Gap to leading</div><div class="v"><b>${fmt.gap(best - lead.val)}</b> (${fmt.pctGap((best - lead.val) / lead.val)})</div>` +
     `<div class="k">Already beaten</div><div class="v">${beaten.length ? esc(beaten.join(", ")) : "none yet"}</div>` +
     (claims.length ? `<div class="k">Unreviewed claims</div><div class="v">${claims.map(c => esc(c.label) + " " + fmt.rep(c.val)).join("; ")}</div>` : "") +
     (pub.lower_bound ? `<div class="k">Known lower bound</div><div class="v">${pub.lower_bound.value} (${esc(pub.lower_bound.who)})</div>` : "") +
     (prompt ? `<div class="k">Run's prompt target</div><div class="v">${prompt.val} (shown to the coder; not part of the reward)</div>` : "") + `</div>` +
-    `<p class="sub" style="margin-top:10px">${pub.league_foot || "Values are quoted as printed (lower is better)."}</p>` });
+    (hiddenNote() ? `<p class="sub" style="margin-top:8px"><span class="pill warn">filtered</span> ${hiddenNote()}</p>` : "") +
+    `<p class="sub" style="margin-top:10px">${pubText("league_foot") || "Values are quoted as printed (lower is better)."}</p>` });
   root.append(h("div", { style: { marginTop: "14px" } }, card("How this run compares with published results", "reference lines and gaps everywhere follow the top-bar selector", h("div", { class: "grid g-main" }, h("div", null, host), txt))));
   registerChart(host, () => {
     const W = Math.max(380, host.clientWidth || 600), rowH = 27, H = 34 + items.length * rowH, lw = 226, rw = 96;

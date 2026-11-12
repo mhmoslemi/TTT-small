@@ -47,11 +47,10 @@ the HTML is a snapshot of the directory at build time. (`python3 build_explorer.
 |---|---|
 | **Overview** | **hardware used (GPU card, memory, vLLM layout, GPU-hours)**, best-so-far vs a reference, **league table against published AC1 results**, failure breakdown, score distribution, wall-clock per phase, per-step table |
 | **Pipeline (one step)** | the 8 stages with real counts; **animated flow diagram** (parents → plan → budget → result → training signal); click a stage for mechanism, formula, code references and live data; ▶ walkthrough |
-| **Search: PUCT + JEV** | PUCT components with a live *c* slider; JEV comparison matrix with threshold replay and an **animated scan**; **genealogy that grows step by step**; score landscape |
+| **Search: PUCT + JEV** | PUCT components with a live *c* slider; **JEV on the search tree** (the scanned candidates as tree nodes labelled with their upper bound, accept / reject recoloured live as you move the threshold, rejection arcs with the similarity, a zoomed upper-bound strip, and threshold sweeps); JEV comparison matrix with an **animated scan**; **genealogy that grows step by step**; score landscape |
 | **Strategist** | every strategy slot (attempts / fallbacks), the chain of any parent, plan text, reasoning, prompt anatomy, what the coder did with it |
 | **Allocation (hurdle)** | pilot outcomes vs the hurdle, the allocator's decision, a Monte-Carlo replica (agrees with the run on 96 % of parents) |
 | **SPO² & training** | advantage function with β / baseline sliders, SPO² vs entropic baseline, tracker simulation (reproduces the logged baseline to 1e-10), PPO-clip plot, loss / gradient / timing curves |
-| **Entropy & diversity** | token entropy, response length, code diversity, parent × strategy heat map |
 | **Rollouts explorer** | filter + scatter + sortable table; click any program for code, strategy, stdout, construction plot, **diff vs parent**, advantage derivation |
 | **Solution (AC1)** | step function and autoconvolution recomputed in the browser; compare any two constructions (this run's best after each step **or the published ones**: AlphaEvolve, ThetaEvolve, TTT-Discover, Together AI, SimpleTES, best human); ▶ morph through the steps; **step function and f*f after every step** (small multiples) plus an overlay of all steps; sequence lengths |
 | **Published SOTA** | record progression over time, every published AC1 result with the bound **recomputed from its public height sequence**, the verbatim Table 17 of arXiv:2604.19341 (AC1/AC2/AC3), what happened in order, source links, and clearly flagged unreviewed claims |
@@ -72,6 +71,17 @@ A `↺ reset what-ifs` button appears in the top bar while anything differs from
 ### Animation
 Charts draw in when a tab opens; the Pipeline flow reveals left → right and lights up the matching stage; the JEV scan can be animated candidate by candidate;
 **▶ play steps** (top bar, or the space bar) plays through the run - the genealogy grows and every tab follows the step. Honours `prefers-reduced-motion`.
+
+### Results key (published works only)
+The top-bar **Results** key decides which published results are visible *everywhere* (reference list, league table, Published SOTA tab, Solution tab, unified page):
+
+| level | shows |
+|---|---|
+| **published works only** (default) | papers / arXiv preprints with a public result (incl. the best human bound, AlphaEvolve, ThetaEvolve, TTT-Discover, Together AI, SimpleTES and the Einstein Arena paper) |
+| + Arena leaderboard | adds the replayed Einstein Arena / community-list entries (AgentDiscover, Atris, CodexProLong ...) - not papers |
+| + unreviewed claims | adds unreviewed claims (MILO, the Cumes preprint ...) - flagged, never ranked |
+
+Each result carries a `tier` (`paper` / `leaderboard` / `claim`) in `data/published_<problem>.json`; events, tables and links are tiered too. The setting is remembered, and in the unified page it is shared with every explorer (ranks and gaps on the cards follow it).
 
 ### Reference values
 The reference line / gap defaults to the record of the problem's reference table: for **AC1** the best bound in *arXiv:2604.19341v2, Supplementary Table 17* (Together AI, 1.502862), for **Erdős** the bound that paper presents as the new record (SimpleTES, 0.380868).
@@ -94,6 +104,7 @@ Without a profile the explorer still works (pipeline, search, strategist, traini
 * The allocation sandbox samples the allocator's model instead of integrating it, so expected-improvement numbers differ slightly.
 * The tracker simulation holds the measured policy shift D fixed when you change β.
 * The partially written step shows only the stages that already wrote files.
+* **JEV substitutes.** `jev.json` only stores the candidates GLiDE actually compared (the scan stops after the 8th acceptance), but lowering the threshold would push the scan further down the PUCT ranking. `archive_sim.py` therefore rebuilds the candidate window (top 24 states) of every step by replaying the rules of `search/sampler.py` on the saved rollouts (exact-code dedupe, top-2 per parent×strategy, top-8 per parent, rank prior, visit counts). It is checked against the run: the rebuilt archive size equals the logged `archive_size` at every step and the rebuilt scan reproduces the recorded one (programs with exactly equal reward may swap places, which never changes who is selected). In the JEV tree view the programs that would fill the vacated slots are shown as **substitutes** (blue, marked *): GLiDE never compared them, so they are assumed to pass. If a step's window cannot be validated the view falls back to the record-only replay.
 * A step writes `summary.json` / `best.json` / `result.txt` only after its adapter update, but `temirnal.log` already prints `[step N] best-ever raw …` when its rollouts are scored. Such a step is shown as **"rollouts done"**: its programs, best value and construction count for best-so-far (Overview, Solution, Published SOTA, unified page, cross-checked against the logged value), while training / archive numbers stay "pending" until the step finishes. Steps still generating rollouts are listed as in progress and do not move the best.
 * Baselines, advantages and the Throughput numbers use the logged values until you move a what-if control; a log that ends in a traceback / KeyboardInterrupt is reported as "stopped" and the finish estimate is replaced by "time left if resumed".
 
@@ -102,6 +113,7 @@ Without a profile the explorer still works (pipeline, search, strategist, traini
 make_explorer.sh    shell launcher (run directory in, html out)
 build_explorer.py   CLI: collect -> pack -> inline into the template
 collect.py          read-only reader of the run directory (parallel per step)
+archive_sim.py      rebuilds the PUCT candidate window of every JEV step (for the substitutes) by replaying search/sampler.py's rules
 data/               published_<problem>.json (reference constructions, tables, history) and the script that rebuilds them
 unified_runs.txt    runs used by --unified when none are given
 template/           index.html, style.css, js/*.js  (vanilla JS, SVG/canvas charts, no dependencies; problems.js = per-problem profiles)

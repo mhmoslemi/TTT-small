@@ -408,10 +408,34 @@ function paramSlider(label, min, max, step, fmtv, getVal, setVal) {
   return row;
 }
 
+/* ---- results key: which published results are visible EVERYWHERE (top bar "Results") ------------------------------
+   paper   = published works only (papers / arXiv preprints with a public result)       <- default
+   board   = + replayed Einstein Arena / community-list entries (not papers)
+   claims  = + unreviewed claims (never ranked)                                          */
+const SHOW_LEVELS = [
+  { id: "paper", label: "published works only", tip: "papers and preprints with a public result - no arena leaderboard entries, no claims" },
+  { id: "board", label: "+ Arena leaderboard", tip: "also the replayed Einstein Arena / community-list entries (not papers)" },
+  { id: "claims", label: "+ unreviewed claims", tip: "also unreviewed claims (flagged, never ranked)" },
+];
+const TIER_RANK = { paper: 0, leaderboard: 1, claim: 2 }, LEVEL_RANK = { paper: 0, board: 1, claims: 2 };
+let SHOW = "paper";
+try { const s0 = localStorage.getItem("rx-show"); if (SHOW_LEVELS.some(l => l.id === s0)) SHOW = s0; } catch (e) { /* ignore */ }
+function tierOf(r) { return r.tier || (r.kind === "claim" ? "claim" : (r.kind === "reported" && !/arxiv\.org/i.test(r.url || "")) ? "leaderboard" : "paper"); }
+function tierVisible(t) { return (TIER_RANK[t] != null ? TIER_RANK[t] : 0) <= LEVEL_RANK[SHOW]; }
+function pubVisible(r) { return tierVisible(tierOf(r)); }
+function hiddenCounts() { const c = { leaderboard: 0, claim: 0 }; ((D.pub && D.pub.results) || []).forEach(r => { const t = tierOf(r); if (!tierVisible(t) && c[t] != null) c[t]++; }); return c; }
+function hiddenNote() {
+  const c = hiddenCounts(), parts = [];
+  if (c.leaderboard) parts.push(`${c.leaderboard} Arena-leaderboard ${c.leaderboard > 1 ? "entries" : "entry"}`);
+  if (c.claim) parts.push(`${c.claim} unreviewed claim${c.claim > 1 ? "s" : ""}`);
+  return parts.length ? `${parts.join(" and ")} hidden - change <b>Results</b> in the top bar to show ${parts.length > 1 || c.leaderboard > 1 || c.claim > 1 ? "them" : "it"}.` : "";
+}
+function pubText(key) { const pub = D.pub || {}; return (SHOW === "paper" && pub[key + "_paper"]) || pub[key] || ""; }
+
 /* published reference values (from data/published_<problem>.json) + the run's own prompt target ------------ */
 function refList() {
   const pub = D.pub, l = [];
-  if (pub && pub.results) pub.results.filter(r => r.reported != null).forEach(r => l.push({ id: r.id, label: r.label, val: r.reported, kind: r.kind === "claim" ? "claim" : r.kind === "reported" ? "reported" : "record", note: r.note || "" }));
+  if (pub && pub.results) pub.results.filter(r => r.reported != null && pubVisible(r)).forEach(r => l.push({ id: r.id, label: r.label, val: r.reported, kind: r.kind === "claim" ? "claim" : r.kind === "reported" ? "reported" : "record", tier: tierOf(r), note: r.note || "" }));
   l.sort((a, b) => a.val - b.val);
   if (CFG.target) l.push({ id: "prompt", label: "this run's prompt target", val: CFG.target, kind: "record", note: "the target number shown to the coder in the prompt" });
   return l;

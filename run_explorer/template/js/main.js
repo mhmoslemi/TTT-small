@@ -3,7 +3,7 @@
 const TAB_GROUPS = [
   ["Understand", ["overview", "pipeline"]],
   ["Search & strategy", ["search", "strategist", "alloc"]],
-  ["Learning", ["train", "entropy"]],
+  ["Learning", ["train"]],
   ["Data", ["rollouts", "solution"]],
   ["Reference", ["published", "concepts", "logs"]],
 ];
@@ -42,6 +42,24 @@ async function renderTab() {
   window.scrollTo(0, sameTab ? prevY : 0);
 }
 
+function postParent(msg) { try { if (window.parent !== window) window.parent.postMessage(msg, "*"); } catch (e) { /* ignore */ } }
+function fillRefSelect() {
+  const rs = $("#gRef"), l = refList(); rs.innerHTML = "";
+  l.forEach(r => rs.append(h("option", { value: r.id }, `${r.label} · ${+r.val.toFixed(PROB.dec + 4)}${r.tier === "claim" ? " (claim)" : r.tier === "leaderboard" ? " (leaderboard)" : ""}`)));
+  if (!l.some(r => r.id === P.ref)) P.ref = (D.pub && l.some(r => r.id === D.pub.default_ref)) ? D.pub.default_ref : l[0].id;   // the chosen reference got hidden: back to the default
+  rs.value = P.ref;
+}
+/* the "Results" key: switch which published results are visible in every tab (and in the unified page) */
+function applyShow(level, fromParent) {
+  if (!SHOW_LEVELS.some(l => l.id === level) || level === SHOW) return;
+  SHOW = level;
+  try { localStorage.setItem("rx-show", level); } catch (e) { /* ignore */ }
+  const g = $("#gShow"); if (g) g.value = level;
+  fillRefSelect();
+  if (typeof updateResetBadge === "function") updateResetBadge();
+  if (!fromParent) postParent({ rxShowSet: level });
+  renderTab();
+}
 function initControls() {
   const sel = $("#gStep");
   sel.innerHTML = "";
@@ -49,10 +67,12 @@ function initControls() {
   sel.value = S.step;
   sel.addEventListener("change", () => setState({ step: +sel.value }));
   const move = d => { const i = ALL_STEPS.indexOf(S.step); const j = clamp(i + d, 0, ALL_STEPS.length - 1); setState({ step: ALL_STEPS[j] }); };
-  const rs = $("#gRef"); rs.innerHTML = "";
-  refList().forEach(r => rs.append(h("option", { value: r.id }, `${r.label} · ${+r.val.toFixed(PROB.dec + 4)}`)));
-  if (!refList().some(r => r.id === P.ref)) P.ref = "together";
-  rs.value = P.ref;
+  const rs = $("#gRef");
+  fillRefSelect();
+  const gs = $("#gShow"); gs.innerHTML = "";
+  SHOW_LEVELS.forEach(l => gs.append(h("option", { value: l.id, title: l.tip }, l.label)));
+  gs.value = SHOW;
+  gs.addEventListener("change", () => applyShow(gs.value));
   rs.addEventListener("change", () => { P.ref = rs.value; try { localStorage.setItem("rx-ref-" + PROB.id, P.ref); } catch (e) { /* ignore */ } renderTab(); });
   $("#btnPlay").addEventListener("click", playToggle);
   $("#btnReset").addEventListener("click", resetParams);
@@ -89,7 +109,11 @@ async function boot() {
       if (so) so.label = "Solution (" + PROB.short + ")";
       if (pb) pb.label = "Published SOTA"; }
     $("#runName").textContent = D.main.meta.run_name + "  ·  " + ((D.main.hardware || {}).label || "") + "  ·  generated " + D.main.meta.generated_at;
-    window.addEventListener("message", e => { if (e.data && e.data.rxTheme) { document.documentElement.setAttribute("data-theme", e.data.rxTheme); renderTab(); } });
+    window.addEventListener("message", e => {
+      if (!e.data) return;
+      if (e.data.rxTheme) { document.documentElement.setAttribute("data-theme", e.data.rxTheme); renderTab(); }
+      if (e.data.rxShow) applyShow(e.data.rxShow, true);
+    });
     S.step = STEPS.length ? STEPS[STEPS.length - 1] : (ALL_STEPS[0] || 0);
     readHash();
     if (!ST[S.step]) S.step = S.step in ST ? S.step : ALL_STEPS[ALL_STEPS.length - 1];
@@ -97,7 +121,7 @@ async function boot() {
     updateResetBadge();
     buildNav();
     await renderTab();
-    try { if (window.parent !== window) window.parent.postMessage({ rxReady: true, theme: document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") }, "*"); } catch (e) { /* ignore */ }
+    try { if (window.parent !== window) window.parent.postMessage({ rxReady: true, show: SHOW, theme: document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") }, "*"); } catch (e) { /* ignore */ }
   } catch (e) {
     console.error(e);
     $("#main").innerHTML = `<div class="warnbox" style="margin:30px">Failed to load run data: ${esc(e && e.message || e)}</div>`;

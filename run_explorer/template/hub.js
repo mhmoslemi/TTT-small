@@ -27,6 +27,28 @@ function svg(tag, attrs, ...kids) {
   return el;
 }
 
+/* ---------------------------------------------------------------- results key (same levels as the explorers) */
+const SHOW_LEVELS = [
+  { id: "paper", label: "published works only", tip: "papers and preprints with a public result - no arena leaderboard entries, no claims" },
+  { id: "board", label: "+ Arena leaderboard", tip: "also the replayed Einstein Arena / community-list entries (not papers)" },
+  { id: "claims", label: "+ unreviewed claims", tip: "also unreviewed claims (flagged, never ranked)" },
+];
+const TIER_RANK = { paper: 0, leaderboard: 1, claim: 2 }, LEVEL_RANK = { paper: 0, board: 1, claims: 2 };
+let SHOW = "paper";
+try { const s0 = localStorage.getItem("rx-show"); if (SHOW_LEVELS.some(l => l.id === s0)) SHOW = s0; } catch (e) { /* ignore */ }
+const tierVisible = t => (TIER_RANK[t] != null ? TIER_RANK[t] : 0) <= LEVEL_RANK[SHOW];
+/* reference value + rank of every run among the results visible at the current level */
+function recompute() {
+  RUNS.forEach(r => {
+    const vis = (r.pub_results || []).filter(x => tierVisible(x.tier)), firm = vis.filter(x => x.tier !== "claim");
+    const d = vis.find(x => x.id === r.ref_default) || firm[0] || null;
+    r.reference = d ? { label: d.label, value: d.value, id: d.id } : null;
+    r.rank = r.best != null ? 1 + firm.filter(x => (r.lower_is_better === false ? x.value > r.best : x.value < r.best)).length : null;
+    r.n_ranked = firm.length + 1;
+  });
+}
+recompute();
+
 /* ---------------------------------------------------------------- formatting */
 const fx = (v, d) => (v == null || !isFinite(v) ? "–" : (+v).toFixed(d));
 const int = n => (n == null ? "–" : Math.round(n).toLocaleString("en-US"));
@@ -318,6 +340,14 @@ function route() {
 const curTheme = () => document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 let explicitTheme = null;
 try { explicitTheme = localStorage.getItem("rx-theme"); if (explicitTheme) document.documentElement.setAttribute("data-theme", explicitTheme); } catch (e) { /* ignore */ }
+function pushShow(level, except) { Object.values(frames).forEach(f => { try { if (f.iframe && f.iframe.contentWindow !== except) f.iframe.contentWindow.postMessage({ rxShow: level }, "*"); } catch (e) { /* ignore */ } }); }
+function setShowLevel(level, except) {
+  if (!SHOW_LEVELS.some(l => l.id === level) || level === SHOW) return;
+  SHOW = level; try { localStorage.setItem("rx-show", level); } catch (e) { /* ignore */ }
+  $("#gShow").value = level; recompute(); renderLanding(); buildNav(); pushShow(level, except);
+  document.querySelectorAll(".hub-pill").forEach(p => p.classList.toggle("active", p.dataset.view === currentView()));
+}
+{ const g = $("#gShow"); SHOW_LEVELS.forEach(l => g.append(h("option", { value: l.id, title: l.tip }, l.label))); g.value = SHOW; g.addEventListener("change", () => setShowLevel(g.value)); }
 function pushTheme(t) { Object.values(frames).forEach(f => { try { if (f.iframe) f.iframe.contentWindow.postMessage({ rxTheme: t }, "*"); } catch (e) { /* ignore */ } }); }
 $("#btnTheme").addEventListener("click", () => {
   const nxt = curTheme() === "dark" ? "light" : "dark";
@@ -331,8 +361,11 @@ window.addEventListener("message", e => {
     explicitTheme = d.rxThemeSet; document.documentElement.setAttribute("data-theme", d.rxThemeSet);
     try { localStorage.setItem("rx-theme", d.rxThemeSet); } catch (err) { /* ignore */ }
     Object.values(frames).forEach(f => { try { if (f.iframe && f.iframe.contentWindow !== e.source) f.iframe.contentWindow.postMessage({ rxTheme: d.rxThemeSet }, "*"); } catch (err) { /* ignore */ } });
-  } else if (d.rxReady && explicitTheme && d.theme !== explicitTheme) {
-    try { e.source.postMessage({ rxTheme: explicitTheme }, "*"); } catch (err) { /* ignore */ }
+  } else if (d.rxShowSet) {                             // the explorer's own "Results" key was used: follow it everywhere
+    setShowLevel(d.rxShowSet, e.source);
+  } else if (d.rxReady) {
+    if (explicitTheme && d.theme !== explicitTheme) { try { e.source.postMessage({ rxTheme: explicitTheme }, "*"); } catch (err) { /* ignore */ } }
+    if (d.show !== SHOW) { try { e.source.postMessage({ rxShow: SHOW }, "*"); } catch (err) { /* ignore */ } }
   }
 });
 $("#btnNewTab").addEventListener("click", async () => {

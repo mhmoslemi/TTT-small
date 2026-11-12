@@ -44,8 +44,63 @@ def numbers_after(text, marker):
     return [float(x) for x in re.findall(r"-?\d+\.?\d*(?:[eE][-+]?\d+)?", text[j + 1:k])]
 
 
+
+# ----------------------------------------------------------------------------------------------------------------
+# Tiers: what counts as a "published work"?  (the explorer's top-bar key "Results" shows one tier or more)
+#   paper       peer-reviewed papers / arXiv preprints with a public result (incl. the human record)
+#   leaderboard Einstein Arena / community-curated list entries that are replayed but not a paper
+#   claim       unreviewed claims (preprint listings, quoted numbers) - never ranked
+PAPER_ONLY_TEXT = {
+    "ac1": dict(
+        lede_paper="Where this run stands against the <b>published</b> results on the same problem - the <b>first autocorrelation inequality</b> (lower is better). The reference table is Supplementary Table 17 of <a href=\"https://arxiv.org/abs/2604.19341\" target=\"_blank\" rel=\"noopener\">arXiv:2604.19341</a> (SimpleTES) plus the Einstein Arena paper (<a href=\"https://arxiv.org/abs/2606.10402\" target=\"_blank\" rel=\"noopener\">arXiv:2606.10402</a>). Community-leaderboard entries and unreviewed claims are hidden - use <b>Results</b> in the top bar to show them. For every method whose height sequence is public, the bound is <b>recomputed here</b> from the sequence itself.",
+        league_note_paper="(published works only: the table of <a href=\"https://arxiv.org/abs/2604.19341\" target=\"_blank\" rel=\"noopener\">arXiv:2604.19341</a> and the Einstein Arena paper)",
+        league_foot_paper="Values are quoted as printed (lower is better). The paper's own method (SimpleTES, gpt-oss-120b) reaches 1.503871 on AC1 and does not claim the AC1 record - the record in its table is the Together AI entry. Newer leaderboard entries and unreviewed claims are hidden (top bar: <b>Results</b>). Change the <b>Reference</b> selector to re-base every gap in this page.",
+        caution_paper="Only published works are shown (papers and preprints with a public result). Entries marked 'reported' are taken from the paper as printed.",
+    ),
+    "erdos": dict(
+        lede_paper="Where this run stands against the <b>published</b> results on <b>Erdős' minimum-overlap problem</b> - the constant <b>C₅</b> (lower is better). Published constructions come from Haugland, AlphaEvolve, TTT-Discover, Together AI and SimpleTES (<a href=\"https://arxiv.org/abs/2604.19341\" target=\"_blank\" rel=\"noopener\">arXiv:2604.19341</a>). Newer community-leaderboard entries are hidden - use <b>Results</b> in the top bar to show them. For every method whose step function is public, the bound is <b>recomputed here</b> from the function itself.",
+        league_note_paper="(published works only: Haugland, AlphaEvolve, TTT-Discover, Together AI and SimpleTES)",
+        league_foot_paper="Values are quoted as printed (lower is better). The SimpleTES paper presents its 0.380868 as the new record. Newer community-leaderboard entries are hidden (top bar: <b>Results</b>). Change the <b>Reference</b> selector to re-base every gap in this page.",
+        caution_paper="Only published works are shown (papers and preprints with a public result).",
+    ),
+}
+LEADERBOARD_IDS = {"agentdiscover", "atris", "codex"}
+LEADERBOARD_EVENTS = ("Oct 2026", "Aug 2026", "Autumn 2026")
+
+
+def tier_of_result(r):
+    if r.get("kind") == "claim":
+        return "claim"
+    if r["id"] in LEADERBOARD_IDS:
+        return "leaderboard"
+    return "paper"
+
+
+def annotate(d):
+    """Add tiers (results, tables, events, links) and the text variants shown when only published works are visible."""
+    for r in d["results"]:
+        r["tier"] = tier_of_result(r)
+    for t in d["tables"]:
+        t["tier"] = "leaderboard" if "teorth" in t["title"] else "paper"
+    ev = []
+    for e in d["events"]:
+        date, text = e[0], e[1]
+        tier = "claim" if ("Unreviewed" in text or "claim" in text.lower() and date.startswith("Nov")) else ("leaderboard" if date in LEADERBOARD_EVENTS else "paper")
+        ev.append([date, text, tier])
+    d["events"] = ev
+    ln = []
+    for l in d["links"]:
+        lab, url = l[0], l[1]
+        tier = "claim" if "unreviewed" in lab.lower() else ("leaderboard" if ("teorth" in url or "issues/348" in url or "issues" in url) else "paper")
+        ln.append([lab, url, tier])
+    d["links"] = ln
+    d.update(PAPER_ONLY_TEXT.get(d["problem"], {}))
+    return d
+
+
 def write(name, data):
     path = os.path.join(HERE, name)
+    annotate(data)
     with open(path, "w") as fh:
         json.dump(data, fh, separators=(",", ":"))
     n = sum(1 for r in data["results"] if r.get("values"))

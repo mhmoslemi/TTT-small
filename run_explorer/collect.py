@@ -112,6 +112,7 @@ def _scan_step(args):
             "parent": meta.get("parent_id"),
             "raw": _sig(meta.get("raw_score"), 9),
             "reward": _sig(meta.get("reward"), 9),
+            "reward_full": meta.get("reward"),
             "valid": bool(meta.get("valid")),
             "parsed": bool(meta.get("parsed")),
             "ran": bool(meta.get("ran")),
@@ -526,14 +527,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                 (res["step"], res["files"], len(res["rollouts"]), len(res["strategies"])))
 
     # ---- assemble step records ----------------------------------------------------------
-    entropy_rows = {}
-    for ln in _read(os.path.join(run_dir, "entropy.jsonl")).splitlines():
-        try:
-            e = json.loads(ln)
-            entropy_rows[e.get("step")] = e
-        except Exception:
-            pass
-
     steps = []
     rollouts = []
     strategies = {}
@@ -604,15 +597,6 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
                 "is_seed": best.get("is_seed"),
             }
             rec["_best_full"] = best
-        ent = entropy_rows.get(s)
-        if ent:
-            rec["entropy"] = {
-                "all": ent.get("all"),
-                "pilot": ent.get("pilot"),
-                "by_strategy": ent.get("by_strategy"),
-                "by_parent_strategy": ent.get("by_parent_strategy"),
-                "code_diversity": ent.get("code_diversity"),
-            }
         steps.append(rec)
         rollouts.extend(scans[s]["rollouts"])
         for k, v in scans[s]["strategies"].items():
@@ -686,6 +670,32 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
         rec["valid_fraction"] = len(good) / max(1, len(rs))
         rec["best_seen_raw_score"], rec["best_seen_reward"], rec["best_seen_step"] = prev_best
         rec["log_best_ever"] = (lg or {}).get("best_ever")
+    # the PUCT candidate window of every JEV step (the part the gate never compared), rebuilt by replaying the sampler's rules
+    try:
+        from archive_sim import reconstruct_windows
+        eligible = [r for r in rollouts if r.get("arch") and r.get("reward_full") is not None]
+        cache = {}
+
+        def _code_of(r):
+            sd = os.path.join(run_dir, "step%02d" % r["step"])
+            base = "step%02d_group%02d_rollout%03d.txt" % (r["step"], r["file_group"], r["file_rollout"])
+            th, ans = split_think(_read(os.path.join(sd, base)))
+            return extract_code(ans or _read(os.path.join(sd, base))) or ""
+        if any((s.get("jev") or {}).get("decisions") for s in steps):
+            with cf.ThreadPoolExecutor(max_workers=8) as ex:
+                for r, code in zip(eligible, ex.map(_code_of, eligible)):
+                    cache[(r["step"], r["file_group"], r["file_rollout"])] = code
+            wins = reconstruct_windows(run_dir, config, root_ids, steps, rollouts,
+                                       lambda r: cache.get((r["step"], r["file_group"], r["file_rollout"]), ""), log=log)
+            for s in steps:
+                w = wins.get(s["step"])
+                if w and s.get("jev"):
+                    s["jev"]["window"], s["jev"]["window_score"], s["jev"]["window_ok"] = w["window"], w["score"], w["ok"]
+                    for wid in w["window"]:               # make their code / construction available in the explorer
+                        if wid in node_to_rid:
+                            want.add(node_to_rid[wid])
+    except Exception as e:      # the window is a bonus: never break the build for it
+        log("window reconstruction failed: %r" % (e,))
     for st, rs in by_step_rollouts.items():
         good = [r for r in rs if r["valid"] and r["raw"]]
         good.sort(key=lambda r: r["raw"])  # lower is better for AC1; harmless if maximise (we embed both ends)

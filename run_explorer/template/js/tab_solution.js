@@ -43,7 +43,7 @@ registerTab({
     const heavy = await lazy("heavy");
     const pub = await lazy("pub");
     const snaps = heavy.best.filter(b => b.construction && b.construction.length);
-    const pubs = ((pub && pub.results) || []).filter(r => r.values && r.values.length);
+    const pubs = ((pub && pub.results) || []).filter(r => r.values && r.values.length && pubVisible(r));
     root.append(pageHead("The construction the search found",
       PROB.solIntro + ` Everything is recomputed in your browser from the saved sequences - for this run <b>and</b> for the published constructions (${pubs.length ? pubs.map(p => esc(p.method)).filter((x, i, a) => a.indexOf(x) === i).join(", ") : "none embedded"}) - so numbers are verified, not just read from a log.`));
     if (!PROB.prep) { root.append(h("div", { class: "hint" }, "No plot is defined for this problem.")); return; }

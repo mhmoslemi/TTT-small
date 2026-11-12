@@ -110,6 +110,11 @@ function lineChart(el, o) {
     axes(F, xs, ys, o);
     (o.bands || []).forEach(b => sv("rect", { x: xs(b.x0), width: Math.max(1, xs(b.x1) - xs(b.x0)), y: m.t, height: ih, fill: b.color || cssVar("--surface-2"), opacity: 0.6 }, svg));
     (o.hlines || []).forEach(l => hline(F, ys, l.y, l.label, l.color, l.dash, l.anchor, l.dy));
+    (o.vlines || []).forEach(l => {
+      const px = xs(l.x); if (px < m.l - 1 || px > m.l + iw + 1) return;
+      sv("line", { x1: px, x2: px, y1: m.t, y2: m.t + ih, stroke: l.color || cssVar("--ink-3"), "stroke-width": l.width || 1.4, "stroke-dasharray": l.dash || "" }, svg);
+      if (l.label) { const t = sv("text", { x: px + (l.anchor === "end" ? -5 : 5), y: m.t + 12 + (l.dy || 0), "text-anchor": l.anchor === "end" ? "end" : "start", style: "font-size:11px;font-weight:600;fill:" + (l.color || cssVar("--ink-2")) }, svg); t.textContent = l.label; }
+    });
     let G = svg;
     if (o.clip) {
       const cid = "cp" + Math.random().toString(36).slice(2, 8), cp = sv("clipPath", { id: cid }, svg);

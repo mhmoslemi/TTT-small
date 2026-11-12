@@ -19,6 +19,7 @@ registerTab({
         ? `<b>JEV</b> then acts as a gate: GLiDE-9B reads two programs and says whether they share the <i>same core idea</i>; a candidate that is too similar to an already-accepted parent is skipped, so the 8 parents cover different ideas.`
         : `The sampler then takes states in rank order but <b>blocks the lineage</b> of every pick (its ancestors and descendants), so the 8 parents sit on different branches of the tree. <i>This run has no JEV diversity gate.</i>`)));
     selectionSection(root, step);
+    jevTreeSection(root, step);
     await jevSection(root, step);
     treeSection(root);
     landscapeSection(root);
@@ -41,12 +42,69 @@ function pucRows(step) {
   const order = rows.slice().sort((a, b) => b.score2 - a.score2).map(r => r.group);
   return { rows, order, ctx, c };
 }
-/* replay the JEV scan of a step at a given threshold (null = the recorded one) */
+/* replay the JEV scan of a step at a given threshold (null = the recorded one).
+   With the rebuilt PUCT window (collect -> archive_sim.py, validated against every recorded scan) the replay is complete and follows
+   search/jev_sampler.py: pass 1 skips candidates whose lineage an accepted parent blocks, pass 2 relaxes that, and whatever is still
+   missing is filled from the rest of the window without comparisons.  Candidates the run never compared have no GLiDE judgment:
+   they are accepted provisionally and flagged `unjudged` (substitutes).  Without a window the old record-only replay is used. */
+let _lin = null;
+function lineageOf(id) {            // ancestors + descendants + itself, from the search tree
+  if (!_lin) _lin = {};
+  if (_lin[id]) return _lin[id];
+  const out = new Set([id]), i0 = TREE.idx[id];
+  if (i0 != null) {
+    let k = TREE.nodes[i0][0]; while (k != null && k >= 0) { out.add(TREE.ids[k]); k = TREE.nodes[k][0]; }
+    const st = [i0]; while (st.length) { const x = st.pop(); (TREE.kids[x] || []).forEach(c => { if (!out.has(TREE.ids[c])) { out.add(TREE.ids[c]); st.push(c); } }); }
+  }
+  return (_lin[id] = out);
+}
+function windowReplay(jev, t, cmp) {
+  const win = jev.window, REQ = jev.requested || 8, scanned = {};
+  jev.decisions.forEach(d => { scanned[d.candidate_id] = d; });
+  const picks = [], rejected = new Set(), blocked = new Set(), sim = [];
+  const compare = id => {
+    let verdict = "accept", match = null, unknown = false;
+    for (const a of picks) { const p = cmp[id + "|" + a]; if (!p) { unknown = true; continue; } if (p.same_core_idea >= t) { verdict = "reject"; match = a; break; } }
+    return { verdict, match, unknown };
+  };
+  for (const relax of [false, true]) {
+    for (const id of win) {
+      if (picks.length >= REQ) break;
+      if (picks.includes(id) || rejected.has(id) || (!relax && blocked.has(id))) continue;
+      const d = scanned[id], c = compare(id), unjudged = !d;
+      const e = { id, actual: d ? d.accepted : null, actualMatch: d ? d.matched_parent_id : null, verdict: c.verdict, match: c.match, unknown: c.verdict === "accept" && c.unknown && !unjudged, unjudged: unjudged && c.verdict === "accept", pass: relax ? 2 : 1 };
+      sim.push(e);
+      if (c.verdict === "accept") { picks.push(id); lineageOf(id).forEach(x => blocked.add(x)); } else rejected.add(id);
+    }
+  }
+  for (const id of win) {           // window exhausted: fill in PUCT order without any comparison
+    if (picks.length >= REQ) break;
+    if (picks.includes(id)) continue;
+    const d = scanned[id]; picks.push(id);
+    sim.push({ id, actual: d ? d.accepted : null, actualMatch: d ? d.matched_parent_id : null, verdict: "accept", match: null, unknown: false, unjudged: !d, fallback: true, pass: 3 });
+  }
+  return { sim, accepted: picks };
+}
+function windowTrusted(step) {      // the window must reproduce the recorded parents at the recorded threshold, otherwise ignore it
+  const jev = ST[step].jev; if (jev._wt !== undefined) return jev._wt;
+  let ok = false;
+  if (jev.window_ok && jev.window && jev.window.length) {
+    const cmp = {}; jev.comparisons.forEach(c => { cmp[c.candidate_id + "|" + c.parent_id] = c.probabilities; });
+    const r = windowReplay(jev, jev.threshold, cmp), sel = new Set(jev.selected || []);
+    ok = r.accepted.length === sel.size && r.accepted.every(x => sel.has(x));
+  }
+  return (jev._wt = ok);
+}
 function jevReplay(step, thr) {
   const jev = ST[step] && ST[step].jev;
   if (!jev || !jev.decisions || !jev.decisions.length) return null;
   const t = thr != null ? thr : jev.threshold, cmp = {};
   jev.comparisons.forEach(c => { cmp[c.candidate_id + "|" + c.parent_id] = c.probabilities; });
+  const meta = { thr: t, recorded: jev.threshold, recRej: jev.decisions.filter(d => !d.accepted).length, recAcc: jev.decisions.filter(d => d.accepted).length, cmp, decs: jev.decisions, jev };
+  if (windowTrusted(step)) {
+    const r = windowReplay(jev, t, cmp), nAcc = r.sim.filter(x => x.verdict === "accept").length;
+    return Object.assign(meta, { sim: r.sim, accepted: r.accepted, nAcc, nRej: r.sim.length - nAcc, hasWindow: true, nUnjudged: r.sim.filter(x => x.unjudged).length });
+  }
   const accepted = [], sim = [];
   for (const d of jev.decisions) {
     let verdict = "accept", match = null, unknown = false;
@@ -60,7 +118,7 @@ function jevReplay(step, thr) {
     if (verdict === "accept") accepted.push(d.candidate_id);
   }
   const nAcc = sim.filter(x => x.verdict === "accept").length;
-  return { sim, accepted, nAcc, nRej: sim.length - nAcc, thr: t, recorded: jev.threshold, recRej: jev.decisions.filter(d => !d.accepted).length, recAcc: jev.decisions.filter(d => d.accepted).length, cmp, decs: jev.decisions, jev };
+  return Object.assign(meta, { sim, accepted, nAcc, nRej: sim.length - nAcc, hasWindow: false, nUnjudged: 0 });
 }
 function thrNow(step) { return P.thr != null ? P.thr : (ST[step].jev ? ST[step].jev.threshold : 0.68); }
 
@@ -122,7 +180,7 @@ async function jevSection(root, step) {
     return;
   }
   const thr0 = jev.threshold;
-  wrap.append(h("div", { class: "card-head" }, h("h2", null, `JEV diversity gate — step ${step}`), h("span", { class: "sub" }, `GLiDE-9B · window = top ${jev.candidate_limit} PUCT states · recorded threshold ${thr0}`)));
+  wrap.append(h("div", { class: "card-head" }, h("h2", null, `JEV judgments in detail — step ${step}`), h("span", { class: "sub" }, `GLiDE-9B · window = top ${jev.candidate_limit} PUCT states · recorded threshold ${thr0}`)));
   wrap.append(paramSlider("same-core threshold", 0.3, 1, 0.01, v => v.toFixed(2), () => thrNow(step), (v, row) => setParam({ thr: v }, row)));
   const body = h("div"); wrap.append(body);
   let reveal = null, timer = null;
@@ -156,11 +214,11 @@ async function jevSection(root, step) {
       { label: "#", get: (r, i) => String(i + 1), num: true },
       { label: "candidate", get: r => h("a", { href: "javascript:void 0", class: "mono", onclick: () => openNode(r.id) }, fmt.id(r.id)) },
       { label: "raw", get: r => RN[r.id] ? fmt.raw(RN[r.id].raw) : (TREE.idx[r.id] != null ? fmt.raw(TREE.nodes[TREE.idx[r.id]][1]) : "–"), num: true },
-      { label: "recorded", get: r => pill(r.actual ? "accepted" : "rejected", r.actual ? "good" : "bad") },
+      { label: "recorded", get: r => r.actual == null ? pill("not scanned", "") : pill(r.actual ? "accepted" : "rejected", r.actual ? "good" : "bad") },
       { label: "matched parent", get: r => r.actualMatch ? fmt.id(r.actualMatch) : "" },
-      { label: `replay @ ${thr.toFixed(2)}`, get: r => pill(r.verdict === "accept" ? (r.unknown ? "accept (partly unknown)" : "accept") : "reject", r.verdict === "accept" ? (r.unknown ? "warn" : "good") : "bad") },
-      { label: "differs?", get: r => ((r.verdict === "accept") !== r.actual) ? pill("changes", "warn") : "" },
-    ], R0.sim.slice(0, nShow));
+      { label: `replay @ ${thr.toFixed(2)}`, get: r => r.unjudged ? pill(r.fallback ? "substitute (window fill)" : "substitute (never judged)", "acc") : pill(r.verdict === "accept" ? (r.unknown ? "accept (partly unknown)" : "accept") : "reject", r.verdict === "accept" ? (r.unknown ? "warn" : "good") : "bad") },
+      { label: "differs?", get: r => ((r.verdict === "accept") !== !!r.actual) ? pill("changes", "warn") : "" },
+    ], R0.sim.slice(0, reveal == null ? R0.sim.length : reveal));
     body.append(h("div", { class: "scroll", style: { maxHeight: "300px" } }, rt));
     body.append(h("p", { class: "sub", style: { marginTop: "6px" } }, "The replay walks candidates in the recorded scan order and rejects one when P(same core idea) ≥ threshold against any already-accepted parent. Pairs that the original run never computed (because it had already stopped on an earlier match) are skipped and flagged as 'partly unknown' - raising the threshold above the recorded one can therefore under-estimate rejections."));
   };
