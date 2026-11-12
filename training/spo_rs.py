@@ -591,6 +591,24 @@ class SPORSV2Tracker(SPORSTracker):
             "history_valid": self._history_valid.tolist(),
         }
 
+    def load_v1_history(self, state, *, rewards, weights, valid_flags) -> None:
+        """Upgrade an exact v1 baseline plus its reconstructed raw history."""
+        if (not isinstance(state, dict)
+                or state.get("version") != SPORSTracker.VERSION
+                or state.get("variant") is not None):
+            raise ValueError("SPO-RS-v2 migration requires a v1 SPO-RS tracker")
+        migrated = {
+            **state,
+            "version": self.VERSION,
+            "variant": self.VARIANT,
+            "win_alpha": self.win_alpha,
+            "win_scale": None,
+            "history_rewards": list(rewards),
+            "history_weights": list(weights),
+            "history_valid": list(valid_flags),
+        }
+        self.load_state_dict(migrated)
+
     def load_state_dict(self, state: dict) -> None:
         if (not isinstance(state, dict) or state.get("variant") != self.VARIANT
                 or not math.isclose(float(state.get("win_alpha", math.nan)),

@@ -724,8 +724,13 @@ def load_config():
             profile_explicit_keys.add(key)
     saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
     requested_mode = str(merged.get("advantage_mode") or "entropic").lower()
+    if (saved and saved_mode == "spo-rs-v2" and requested_mode == "spo-rs"):
+        # The launch scripts default fresh runs to v1. Once explicitly
+        # upgraded, a later plain resume must not silently downgrade the run.
+        merged["advantage_mode"] = requested_mode = saved_mode
     if (saved and saved_mode != requested_mode
-            and "spo-rs-v2" in {saved_mode, requested_mode}):
+            and "spo-rs-v2" in {saved_mode, requested_mode}
+            and not (saved_mode == "spo-rs" and requested_mode == "spo-rs-v2")):
         raise ValueError(
             "cannot switch to or from spo-rs-v2 while resuming; pass the "
             "saved advantage mode or start a fresh run")

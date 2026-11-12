@@ -836,6 +836,94 @@ def _literal_metadata_mapping(value):
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _migrate_spo_rs_v2_history(
+        tracker, tracker_state, sampler_state, exp_dir, start_step):
+    """Reconstruct exact v1 decay weights before enabling v2 on resume."""
+    seed_ids = set(sampler_state.get("seed_ids", ()))
+    states = {str(item.get("id")): item for item in sampler_state.get("states", ())}
+    try:
+        seed_rewards = [float(states[str(seed_id)]["value"]) for seed_id in seed_ids]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "SPO-RS-v2 migration cannot reconstruct the verified seed rewards") from error
+    if (not seed_rewards or not all(math.isfinite(value) for value in seed_rewards)):
+        raise ValueError(
+            "SPO-RS-v2 migration requires finite verified seed rewards")
+
+    rewards = np.asarray(seed_rewards, dtype=np.float64)
+    weights = np.full(
+        rewards.size, 1.0 / (1.0 - float(tracker_state["rho_min"])),
+        dtype=np.float64)
+    valid = np.ones(rewards.size, dtype=np.bool_)
+    migrated_rollouts = 0
+
+    for step_idx in range(int(start_step)):
+        step_dir = Path(exp_dir) / f"step{step_idx:02d}"
+        paths = sorted(step_dir.glob(
+            f"step{step_idx:02d}_group*_rollout*.meta.json"))
+        step_rows = []
+        for path in paths:
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"SPO-RS-v2 migration cannot read {path}") from error
+            info = _literal_metadata_mapping(meta.get("spo_rs"))
+            if not bool(info.get("used_for_policy_update", False)):
+                continue
+            if "valid" not in meta:
+                raise ValueError(
+                    f"SPO-RS-v2 migration found no validity flag in {path}")
+            try:
+                row = (float(meta["reward"]), bool(meta["valid"]), info)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"SPO-RS-v2 migration found invalid metadata in {path}") from error
+            if (str(meta.get("advantage_mode", "")).lower() != "spo-rs"
+                    or int(meta.get("step", -1)) != step_idx
+                    or not math.isfinite(row[0])):
+                raise ValueError(
+                    f"SPO-RS-v2 migration found incompatible metadata in {path}")
+            step_rows.append(row)
+
+        if not step_rows:
+            raise ValueError(
+                f"SPO-RS-v2 migration found no completed v1 rollouts for step {step_idx}")
+        info = step_rows[0][2]
+        if (int(info.get("group_size", -1)) != len(step_rows)
+                or int(info.get("step", -1)) != step_idx):
+            raise ValueError(
+                f"SPO-RS-v2 migration found incomplete history for step {step_idx}")
+        rho = float(info.get("rho", math.nan))
+        if not 0.0 < rho < 1.0:
+            raise ValueError(
+                f"SPO-RS-v2 migration found invalid decay for step {step_idx}")
+        count_before = float(weights.sum())
+        if not math.isclose(
+                count_before, float(info.get("effective_count_before", math.nan)),
+                rel_tol=2e-11, abs_tol=1e-10):
+            raise ValueError(
+                f"SPO-RS-v2 migration history disagrees before step {step_idx}")
+
+        step_rewards = np.asarray([row[0] for row in step_rows], dtype=np.float64)
+        step_valid = np.asarray([row[1] for row in step_rows], dtype=np.bool_)
+        weights *= rho
+        rewards = np.concatenate((rewards, step_rewards))
+        weights = np.concatenate((weights, np.ones(step_rewards.size, dtype=np.float64)))
+        valid = np.concatenate((valid, step_valid))
+        migrated_rollouts += step_rewards.size
+        if not math.isclose(
+                float(weights.sum()),
+                float(info.get("effective_count_after", math.nan)),
+                rel_tol=2e-11, abs_tol=1e-10):
+            raise ValueError(
+                f"SPO-RS-v2 migration history disagrees after step {step_idx}")
+
+    tracker.load_v1_history(
+        tracker_state, rewards=rewards, weights=weights, valid_flags=valid)
+    return {"seed_rewards": len(seed_rewards), "rollouts": migrated_rollouts}
+
+
 def _literal_float_list(value):
     if value is None:
         return None
@@ -5211,6 +5299,7 @@ def main():
     setting_log_only(f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
+    migrated_spo_rs_v2 = False
     if _is_spo_rs_mode(configured_advantage_mode):
         from training.spo_rs import BoundedSPORSTracker, SPORSTracker, SPORSV2Tracker
         bounded_shaping = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
@@ -5236,6 +5325,20 @@ def main():
         if compatible_tracker:
             spo_rs_tracker.load_state_dict(tracker_state)
             print("[resume] restored the run-wide SPO-RS tracker")
+        elif (configured_advantage_mode == "spo-rs-v2"
+                and tracker_state is not None
+                and tracker_state.get("version") == SPORSTracker.VERSION
+                and tracker_state.get("variant") is None
+                and resume_payload is not None):
+            migrated = _migrate_spo_rs_v2_history(
+                spo_rs_tracker, tracker_state, resume_payload["sampler"],
+                exp_dir, start_step)
+            migrated_spo_rs_v2 = True
+            print(
+                "[resume] upgraded SPO-RS -> SPO-RS-v2 from the exact "
+                f"completed history ({migrated['seed_rewards']} seeds, "
+                f"{migrated['rollouts']} rollouts); future updates use v2",
+                flush=True)
         elif start_step:
             if bounded_shaping or configured_advantage_mode == "spo-rs-v2":
                 raise ValueError(
@@ -5298,6 +5401,20 @@ def main():
                   f"v={initialization['value_after']:.9f}, "
                   f"N_eff={initialization['effective_count_after']:.2f}; "
                   "step 0 policy update enabled", flush=True)
+
+    if migrated_spo_rs_v2:
+        config_path = Path(exp_dir) / "config.json"
+        saved_config = json.loads(config_path.read_text(encoding="utf-8"))
+        saved_config.update(
+            advantage_mode="spo-rs-v2",
+            spo_rs_adaptive_beta=False,
+            spo_rs_win_alpha=float(cfg.spo_rs_win_alpha),
+        )
+        temporary_config = config_path.with_suffix(".json.tmp")
+        temporary_config.write_text(
+            json.dumps(saved_config, indent=2) + "\n", encoding="utf-8")
+        temporary_config.replace(config_path)
+        print("[resume] persisted SPO-RS-v2 for subsequent resumes", flush=True)
 
     del resume_payload
     from runtime.host_memory import reclaim_unused_host_memory

@@ -100,6 +100,18 @@ def test_help_and_new_policy_controls(load_config):
     assert cfg.spo_rs_clip_epsilon_low == cfg.spo_rs_clip_epsilon_high == .3
 
 
+def test_resume_can_upgrade_spo_rs_to_sticky_v2(load_config, tmp_path):
+    _, saved = load_config("spo-rs")
+    (tmp_path / "config.json").write_text(json.dumps(saved))
+    cfg, _ = load_config("spo-rs-v2", extra=("--resume", str(tmp_path)))
+    assert cfg.advantage_mode == "spo-rs-v2"
+
+    saved["advantage_mode"] = "spo-rs-v2"
+    (tmp_path / "config.json").write_text(json.dumps(saved))
+    cfg, _ = load_config("spo-rs", extra=("--resume", str(tmp_path)))
+    assert cfg.advantage_mode == "spo-rs-v2"
+
+
 @pytest.mark.parametrize("mode", ["puct", "uct", "llm"])
 def test_parent_picker_cli_and_resumed_config(load_config, tmp_path, mode):
     cfg, values = load_config(extra=("--parent-selection", mode))
@@ -748,3 +760,49 @@ def test_spo_rs_v2_adds_frozen_win_signal_and_round_trips():
     np.testing.assert_allclose(
         restored.rollout_advantages(rewards, valid), combined,
         rtol=1e-14, atol=1e-14)
+
+
+def test_spo_rs_v2_resume_reconstructs_exact_v1_history(tmp_path):
+    options = dict(entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
+    v1 = SPORSTracker(**options)
+    seeds = [.2, .8]
+    v1.update(
+        v1.transformed_rewards(seeds), divergence=0.,
+        policy_adapter="adapter_initial", step=-1)
+    steps = [
+        ([0., .4, 1.2], [False, True, True], .01),
+        ([0., .7, 1.8, 2.1], [False, True, True, True], .08),
+    ]
+    for step, (rewards, valid, divergence) in enumerate(steps):
+        info = v1.update(
+            v1.transformed_rewards(rewards), divergence=divergence,
+            policy_adapter=f"adapter_step{step:03d}", step=step)
+        step_dir = tmp_path / f"step{step:02d}"
+        step_dir.mkdir()
+        for rollout, (reward, is_valid) in enumerate(zip(rewards, valid)):
+            metadata = {
+                "step": step,
+                "reward": reward,
+                "valid": is_valid,
+                "advantage_mode": "spo-rs",
+                "spo_rs": repr({**info, "used_for_policy_update": True}),
+            }
+            (step_dir / (
+                f"step{step:02d}_group00_rollout{rollout:03d}.meta.json"
+            )).write_text(json.dumps(metadata))
+
+    sampler_state = {
+        "seed_ids": ["seed-a", "seed-b"],
+        "states": [
+            {"id": "seed-a", "value": seeds[0]},
+            {"id": "seed-b", "value": seeds[1]},
+        ],
+    }
+    v2 = SPORSV2Tracker(**options, win_alpha=.25)
+    migrated = training._migrate_spo_rs_v2_history(
+        v2, v1.state_dict(), sampler_state, tmp_path, len(steps))
+    assert migrated == {"seed_rewards": 2, "rollouts": 7}
+    assert v2.baseline() == pytest.approx(v1.baseline(), rel=1e-13)
+    assert v2.last_policy_adapter == v1.last_policy_adapter
+    v2.prepare_step()
+    assert v2.win_info()["win_lambda"] > 0.
