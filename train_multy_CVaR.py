@@ -4363,7 +4363,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             res = outs[r_idx]
             if prepared is not None:
                 prepared_advantage = prepared.get("advantage")
-                if (prepared_advantage is not None and float(prepared_advantage) != float(adv)):
+                # Streamed and full-batch reductions can differ by float64 roundoff.
+                if (prepared_advantage is not None and not math.isclose(
+                        float(prepared_advantage), float(adv),
+                        rel_tol=1e-12, abs_tol=1e-12)):
                     prepared["_overlap_label_mismatch"] = True
                 prepared.update({
                     "advantage": float(adv),

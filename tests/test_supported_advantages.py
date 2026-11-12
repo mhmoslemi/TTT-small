@@ -518,6 +518,9 @@ def test_complete_step_with_cpu_generation_and_evaluation(
                 yield from generate(model, TinyTokenizer(), prompts_by_group,
                                     counts_by_group, cfg)
 
+            def score_token_logprobs(self, pairs, **kwargs):
+                return [[-.7] * len(response_ids) for _, response_ids in pairs]
+
         if pooled_coder == "live":
             class LiveCoderPool(CoderPool):
                 def prepare(self):
@@ -722,6 +725,61 @@ def test_overlap_helpers_use_the_same_retained_advantages(v2):
     expected, _ = entropic_adaptive_advantages(np.asarray(rewards))
     np.testing.assert_allclose([ex["advantage"] for ex in entropic], expected)
     assert sum(ex["sample_weight"] for ex in entropic) == .5
+
+
+@pytest.mark.parametrize("rounding_delta,discard", [
+    (1e-15, False), (1e-4, True), (float("nan"), True),
+])
+def test_spo_rs_v2_overlap_preserves_gradients_after_roundoff(
+        monkeypatch, tmp_path, load_config, capsys, rounding_delta, discard):
+    trainers = []
+
+    class OverlappingTrainer(CapturingTrainer):
+        world_size = 2
+
+        def __init__(self):
+            super().__init__()
+            self.queued = []
+            self.finishes = []
+            trainers.append(self)
+
+        def begin_spo_rs_overlap(self, cfg, step):
+            self.state = dict(queued_examples=0, supplied_old=0, scheduled_keys=set())
+            return self.state
+
+        def queue_spo_rs_overlap(self, examples):
+            for example in examples:
+                example["advantage"] += rounding_delta
+                self.queued.append(dict(example))
+                self.state["scheduled_keys"].add(example["_overlap_key"])
+            self.state["queued_examples"] += len(examples)
+            self.state["supplied_old"] += len(examples)
+
+        def seal_spo_rs_overlap(self):
+            pass
+
+        def finish_spo_rs_overlap(self, cfg, step, count, *, apply_update=True):
+            assert count == len(self.queued)
+            self.finishes.append(apply_update)
+            if apply_update:
+                self.calls.append(("spo-rs", self.queued))
+            return {"training_seconds": 0.}
+
+    monkeypatch.setattr(sys.modules[__name__], "CapturingTrainer", OverlappingTrainer)
+
+    def vllm_config(*args, **kwargs):
+        cfg, values = load_config(*args, **kwargs)
+        cfg.generation_backend = "vllm"
+        return cfg, values
+
+    test_complete_step_with_cpu_generation_and_evaluation(
+        monkeypatch, tmp_path, vllm_config, "spo-rs-v2", None,
+        remote_strategy=False, pooled_coder=True, num_steps=1)
+    assert len(trainers) == 1
+    assert trainers[0].finishes == [not discard]
+    output = capsys.readouterr().out
+    assert ("discarded streamed SPO-RS gradients" in output) == discard
+    assert "[step 0] best-ever raw score:" in output
 
 
 def test_spo_rs_v2_adds_frozen_win_signal_and_round_trips():
