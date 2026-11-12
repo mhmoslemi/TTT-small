@@ -226,7 +226,8 @@ def prompt_anatomy(p):
     marks = [
         ("task", 0),
         ("sota_hint", p.find("A previous state of the art")),
-        ("parent_program", p.find("Your previous program achieved")),
+        # old wording first, then the TTT-Discover style block ("You are iteratively optimizing ...")
+        ("parent_program", max(p.find("Your previous program achieved"), p.find("You are iteratively optimizing"))),
         ("rules", p.find("Rules:\n- You must define")),
         ("prev_strategies", p.find("## Strategy-stage output")),
         ("contract", p.find("## Mandatory final-output contract")),
