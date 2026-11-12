@@ -61,7 +61,7 @@ def test_every_problem_refreshes_the_parent_tree(tmp_path):
                for call in plot_calls)
     assert all(call.kwargs["cwd"] == Path(__file__).resolve().parents[1]
                for call in plot_calls)
-    assert run.call_args.args[0] == ["./make_explorer.sh", "--all-code", "--unified"]
+    assert run.call_args.args[0] == ["./make_explorer.sh", "--code-per-step", "25", "--unified"]
     assert not (tmp_path / "step04/step04.summary.json").exists()
 
 
@@ -116,7 +116,7 @@ def test_evaluated_step_refreshes_unified_explorer(tmp_path):
         plotter.submit_explorer(4)
         plotter.close()
     assert run.call_args.args[0] == [
-        "./make_explorer.sh", "--all-code", "--unified"]
+        "./make_explorer.sh", "--code-per-step", "25", "--unified"]
     assert run.call_args.kwargs["cwd"].name == "run_explorer"
     assert run.call_args.kwargs["timeout"] == 600
     assert run.call_args.kwargs["env"]["TTT_EVALUATED_RUN"] == str(tmp_path.resolve())

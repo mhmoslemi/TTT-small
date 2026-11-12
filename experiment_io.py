@@ -201,7 +201,7 @@ class StepPlotter:
                 log.write(f"\n=== evaluated step {step}: unified explorer ===\n")
                 log.flush()
                 result = subprocess.run(
-                    ["./make_explorer.sh", "--all-code", "--unified"],
+                    ["./make_explorer.sh", "--code-per-step", "25", "--unified"],
                     cwd=explorer_dir, stdin=subprocess.DEVNULL,
                     env={**os.environ, "PYTHON": sys.executable,
                          "CUDA_VISIBLE_DEVICES": "", "TTT_EVALUATED_RUN": str(self.run_dir)},
