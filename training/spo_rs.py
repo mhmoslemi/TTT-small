@@ -81,6 +81,12 @@ class SPORSTracker:
             raise FloatingPointError("nonfinite SPO-RS normalized advantages")
         return advantages
 
+    def rollout_advantages(
+        self, rewards: Sequence[float], valid_flags: Sequence[bool] | None = None
+    ) -> np.ndarray | None:
+        """Return advantages against the immutable pre-step history."""
+        return self.normalized_advantages(self.transformed_rewards(rewards))
+
     @staticmethod
     def consecutive_policy_divergence(
         current_scores: Sequence[Sequence[float] | None],
@@ -135,7 +141,8 @@ class SPORSTracker:
 
     def update(self, transformed_rewards: Sequence[float], *,
                divergence: float, policy_adapter: str | Path,
-               step: int, raw_rewards: Sequence[float] | None = None) -> dict:
+               step: int, raw_rewards: Sequence[float] | None = None,
+               valid_flags: Sequence[bool] | None = None) -> dict:
         """Update once, after this step's advantages have been formed."""
         values = np.asarray(transformed_rewards, dtype=np.float64)
         if (values.ndim != 1 or values.size == 0
@@ -360,7 +367,7 @@ class BoundedSPORSTracker(SPORSTracker):
         }
 
     def update(self, transformed_rewards, *, divergence, policy_adapter,
-               step, raw_rewards=None) -> dict:
+               step, raw_rewards=None, valid_flags=None) -> dict:
         if raw_rewards is None:
             raise ValueError("bounded SPO-RS update requires raw reward history")
         rewards = self._rewards(raw_rewards)
@@ -419,3 +426,199 @@ class BoundedSPORSTracker(SPORSTracker):
                              / weights.sum())
             if not math.isclose(expected, self._value, rel_tol=1e-12, abs_tol=1e-12):
                 raise ValueError("bounded SPO-RS baseline/history mismatch")
+
+
+class SPORSV2Tracker(SPORSTracker):
+    """SPO-RS plus a frozen historical, validity-aware win advantage."""
+
+    VERSION = 4
+    VARIANT = "spo-rs-v2"
+    RMS_QUANTILES = 256
+
+    def __init__(self, *, win_alpha: float, **options):
+        super().__init__(**options)
+        self.win_alpha = float(win_alpha)
+        if not math.isfinite(self.win_alpha) or self.win_alpha < 0.0:
+            raise ValueError("SPO-RS-v2 win alpha must be finite and nonnegative")
+        self._history_rewards = np.empty(0, dtype=np.float64)
+        self._history_weights = np.empty(0, dtype=np.float64)
+        self._history_valid = np.empty(0, dtype=np.bool_)
+        self._win_scale: float | None = None
+        self._win_reference = np.empty(0, dtype=np.float64)
+        self._win_reference_weights = np.empty(0, dtype=np.float64)
+        self._win_valid_mass = 0.0
+        self._win_lambda = 0.0
+        self._prepared_updates = -1
+
+    @staticmethod
+    def _weighted_quantiles(values, weights, probabilities):
+        order = np.argsort(values, kind="stable")
+        values, weights = values[order], weights[order]
+        cumulative = np.cumsum(weights, dtype=np.float64)
+        indices = np.searchsorted(
+            cumulative, np.asarray(probabilities) * cumulative[-1], side="left")
+        return values[np.minimum(indices, values.size - 1)]
+
+    def _win_probabilities(self, rewards):
+        rewards = np.asarray(rewards, dtype=np.float64)
+        if not self._win_reference.size or self._win_scale is None:
+            return np.full(rewards.shape, 0.5, dtype=np.float64)
+        output = np.empty(rewards.size, dtype=np.float64)
+        total_weight = float(self._win_reference_weights.sum())
+        for start in range(0, rewards.size, 256):
+            stop = min(start + 256, rewards.size)
+            logits = np.clip(
+                (rewards[start:stop, None] - self._win_reference[None, :])
+                / self._win_scale, -60.0, 60.0)
+            output[start:stop] = (
+                (1.0 / (1.0 + np.exp(-logits)))
+                @ self._win_reference_weights / total_weight)
+        return output
+
+    def prepare_step(self) -> None:
+        if not self.initialized or not self._history_rewards.size:
+            raise RuntimeError("SPO-RS-v2 requires seed history first")
+        if self._prepared_updates == self._updates:
+            return
+        positive = self._history_weights > 0.0
+        valid = positive & self._history_valid
+        total_weight = float(self._history_weights[positive].sum())
+        valid_weight = float(self._history_weights[valid].sum())
+        self._win_valid_mass = valid_weight / total_weight
+        self._win_reference = self._history_rewards[valid]
+        self._win_reference_weights = self._history_weights[valid]
+        self._win_lambda = 0.0
+        if (self.win_alpha == 0.0 or self._win_reference.size < 2
+                or np.unique(self._win_reference).size < 2):
+            self._prepared_updates = self._updates
+            return
+
+        q25, q75, q90 = self._weighted_quantiles(
+            self._win_reference, self._win_reference_weights,
+            (0.25, 0.75, 0.90))
+        scale_floor = 64.0 * np.spacing(max(
+            1.0, float(np.max(np.abs(self._win_reference)))))
+        gaps = (float(q90 - q75), float(q75 - q25),
+                float(self._win_reference.max() - self._win_reference.min()))
+        gap = next((value for value in gaps if value > scale_floor), None)
+        if gap is None:
+            self._prepared_updates = self._updates
+            return
+        scale = gap / math.log(3.0)
+        if self._win_scale is not None:
+            scale = min(self._win_scale * 2.0,
+                        max(self._win_scale / 2.0, scale))
+        self._win_scale = scale
+
+        baseline = self.baseline()
+        base = ((np.exp(self.entropic_beta * self._history_rewards) / baseline - 1.0)
+                / self.entropic_beta)
+        base_rms = math.sqrt(float(np.dot(
+            self._history_weights, np.square(base)) / total_weight))
+
+        # shortcut: deterministic quantile quadrature avoids quadratic history calibration.
+        count = min(self.RMS_QUANTILES, self._win_reference.size)
+        probabilities = (np.arange(count, dtype=np.float64) + 0.5) / count
+        representatives = self._weighted_quantiles(
+            self._win_reference, self._win_reference_weights, probabilities)
+        centered_valid = self._win_probabilities(representatives) - self._win_valid_mass / 2.0
+        win_second_moment = (
+            self._win_valid_mass * float(np.mean(np.square(centered_valid)))
+            + (1.0 - self._win_valid_mass)
+            * (self._win_valid_mass / 2.0) ** 2)
+        win_rms = math.sqrt(max(0.0, win_second_moment))
+        if base_rms > 0.0 and win_rms > 0.0:
+            self._win_lambda = self.win_alpha * base_rms / win_rms
+        self._prepared_updates = self._updates
+
+    def rollout_advantages(self, rewards, valid_flags=None):
+        values = np.asarray(rewards, dtype=np.float64)
+        valid = np.asarray(valid_flags, dtype=np.bool_)
+        if valid.shape != values.shape:
+            raise ValueError("SPO-RS-v2 rewards and validity flags must align")
+        base = super().rollout_advantages(values, valid)
+        if base is None or self._win_lambda == 0.0:
+            return base
+        centered_win = (
+            valid.astype(np.float64) * self._win_probabilities(values)
+            - self._win_valid_mass / 2.0)
+        advantages = base + self._win_lambda * centered_win
+        if not np.isfinite(advantages).all():
+            raise FloatingPointError("nonfinite SPO-RS-v2 advantages")
+        return advantages
+
+    def win_info(self):
+        return {
+            "win_alpha": self.win_alpha,
+            "win_lambda": self._win_lambda,
+            "win_scale": self._win_scale,
+            "win_valid_mass": self._win_valid_mass,
+            "win_history_count": int(self._history_rewards.size),
+        }
+
+    def update(self, transformed_rewards, *, divergence, policy_adapter,
+               step, raw_rewards=None, valid_flags=None) -> dict:
+        rewards = np.asarray(raw_rewards, dtype=np.float64)
+        valid = np.asarray(valid_flags, dtype=np.bool_)
+        transformed = np.asarray(transformed_rewards, dtype=np.float64)
+        if (rewards.ndim != 1 or rewards.size == 0
+                or valid.shape != rewards.shape or transformed.shape != rewards.shape
+                or not np.isfinite(rewards).all()
+                or not np.array_equal(transformed, self.transformed_rewards(rewards))):
+            raise ValueError("invalid SPO-RS-v2 reward history update")
+        info = self.win_info()
+        result = super().update(
+            transformed, divergence=divergence,
+            policy_adapter=policy_adapter, step=step)
+        if result["initialized"]:
+            new_weights = np.full(rewards.size, 1.0 / (1.0 - self.rho_min))
+        else:
+            self._history_weights *= result["rho"]
+            new_weights = np.ones(rewards.size, dtype=np.float64)
+        self._history_rewards = np.concatenate((self._history_rewards, rewards))
+        self._history_weights = np.concatenate((self._history_weights, new_weights))
+        self._history_valid = np.concatenate((self._history_valid, valid))
+        return {**result, **info}
+
+    def state_dict(self) -> dict:
+        return {
+            **super().state_dict(),
+            "variant": self.VARIANT,
+            "win_alpha": self.win_alpha,
+            "win_scale": self._win_scale,
+            "history_rewards": self._history_rewards.tolist(),
+            "history_weights": self._history_weights.tolist(),
+            "history_valid": self._history_valid.tolist(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if (not isinstance(state, dict) or state.get("variant") != self.VARIANT
+                or not math.isclose(float(state.get("win_alpha", math.nan)),
+                                    self.win_alpha, rel_tol=0.0, abs_tol=1e-15)):
+            raise ValueError("incompatible SPO-RS-v2 checkpoint")
+        super().load_state_dict(state)
+        rewards = np.asarray(state.get("history_rewards"), dtype=np.float64)
+        weights = np.asarray(state.get("history_weights"), dtype=np.float64)
+        valid = np.asarray(state.get("history_valid"), dtype=np.bool_)
+        if (rewards.ndim != 1 or weights.shape != rewards.shape
+                or valid.shape != rewards.shape or not np.isfinite(rewards).all()
+                or not np.isfinite(weights).all() or np.any(weights < 0.0)
+                or bool(rewards.size) != self.initialized
+                or not math.isclose(float(weights.sum()), self._effective_count,
+                                    rel_tol=1e-12, abs_tol=1e-12)):
+            raise ValueError("invalid SPO-RS-v2 reward history")
+        if self.initialized:
+            expected = float(
+                np.dot(self.transformed_rewards(rewards), weights) / weights.sum())
+            if not math.isclose(
+                    expected, self._value, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("SPO-RS-v2 baseline/history mismatch")
+        self._history_rewards = rewards.copy()
+        self._history_weights = weights.copy()
+        self._history_valid = valid.copy()
+        self._prepared_updates = -1
+        scale = state.get("win_scale")
+        self._win_scale = None if scale is None else float(scale)
+        if self._win_scale is not None and (
+                not math.isfinite(self._win_scale) or self._win_scale <= 0.0):
+            raise ValueError("invalid saved SPO-RS-v2 win scale")

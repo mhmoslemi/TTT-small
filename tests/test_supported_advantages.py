@@ -21,7 +21,7 @@ from config_validation import validate_problem_config
 from problems.base import RewardResult, SeedState
 from evaluation.reward import extract_python_code
 from search.sampler import make_sampler
-from training.spo_rs import SPORSTracker
+from training.spo_rs import SPORSTracker, SPORSV2Tracker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,9 +55,9 @@ def load_config(monkeypatch):
     return load
 
 
-@pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
+@pytest.mark.parametrize("mode", ["entropic", "spo-rs", "spo-rs-v2"])
 @pytest.mark.parametrize("filename", sorted(p.name for p in (ROOT / "configs").glob("*.yaml")))
-def test_all_presets_support_both_objectives(load_config, mode, filename):
+def test_all_presets_support_supported_objectives(load_config, mode, filename):
     path = ROOT / "configs" / filename
     validate_problem_config(yaml.safe_load(path.read_text()), source=path)
     cfg, values = load_config(mode, filename)
@@ -65,8 +65,9 @@ def test_all_presets_support_both_objectives(load_config, mode, filename):
     assert cfg.training_model_name not in {None, "", "None"}
     assert not any(key.startswith(("rank_", "x_grpo_", "cvar_", "binary_coder_"))
                    for key in values)
-    if mode == "spo-rs":
+    if training._is_spo_rs_mode(mode):
         assert cfg.spo_rs_update_epochs == 1
+        assert cfg.spo_rs_win_alpha == .25
 
 
 @pytest.mark.parametrize("mode", ["grpo", "cvar", "rank", "x-grpo", "binary-coder"])
@@ -91,7 +92,7 @@ def test_removed_cli_options_are_not_accepted(option):
 
 def test_help_and_new_policy_controls(load_config):
     help_text = training._build_arg_parser().format_help()
-    assert "{entropic,spo-rs}" in help_text
+    assert "{entropic,spo-rs,spo-rs-v2}" in help_text
     assert "--rank-" not in help_text
     cfg, _ = load_config("spo-rs", extra=("--spo-rs-update-epochs", "2",
                          "--spo-rs-clip-epsilon", "0.3"))
@@ -128,7 +129,7 @@ def test_legacy_uct_config_and_flag_keep_their_meaning(load_config, tmp_path):
     assert cfg.parent_selection == "uct" and cfg.uct
 
 
-@pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
+@pytest.mark.parametrize("mode", ["entropic", "spo-rs", "spo-rs-v2"])
 def test_a3b_keeps_sequence_clipping_and_full_policy_sampling(load_config, mode):
     cfg, _ = load_config(mode, extra=(
         "--model-name", "Qwen/Qwen3-30B-A3B", "--temperature", ".7",
@@ -426,14 +427,20 @@ def test_complete_step_with_cpu_generation_and_evaluation(
                 pass
 
         strategy_pool = RemotePool()
+    seed_values = [2., 1.] if mode == "spo-rs-v2" else [1., 1.]
     sampler = make_sampler(
         parent_selection=parent_selection, num_seeds=2, group_size=cfg.group_size,
         exp_dir=tmp_path, problem=problem,
-        seed=cfg.seed, seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
+        seed=cfg.seed,
+        seed_states=[SeedState(value=value, raw_score=value) for value in seed_values])
     prefetched = []
     if parent_selection == "llm":
         def select(request_path, response_path, tree_path, record):
-            ids = list(sampler._seed_ids)
+            tree = json.loads(tree_path.read_text())
+            ids = sorted(
+                sampler._seed_ids,
+                key=lambda sid: tree["nodes"][sid]["raw_problem_score"],
+                reverse=True)
             result = {
                 "selected_parent_ids": ids,
                 "selections": [{"node_id": sid, "role": "exploit", "reason": "Seed anchor"}
@@ -459,10 +466,14 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     adapter = tmp_path / "adapter_initial"
     adapter.mkdir()
     tracker = None
-    if mode == "spo-rs":
-        tracker = SPORSTracker(entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
-        tracker.update(tracker.transformed_rewards([1., 1.]), divergence=0.,
-                       policy_adapter=str(adapter), step=-1)
+    if training._is_spo_rs_mode(mode):
+        tracker_type = SPORSV2Tracker if mode == "spo-rs-v2" else SPORSTracker
+        tracker = tracker_type(
+            entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96,
+            **({"win_alpha": .25} if mode == "spo-rs-v2" else {}))
+        tracker.update(tracker.transformed_rewards(seed_values), divergence=0.,
+                       policy_adapter=str(adapter), step=-1,
+                       raw_rewards=seed_values, valid_flags=[True, True])
     initial_tracker = tracker.state_dict() if tracker else None
 
     generated = []
@@ -538,7 +549,7 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     assert len(trainer.calls) == 1
     if parent_selection == "llm":
         assert prefetched == ([(2, 1)] if num_steps > 1 else [])
-    assert trainer.calls[0][0] == mode
+    assert trainer.calls[0][0] == ("spo-rs" if training._is_spo_rs_mode(mode) else mode)
     examples = trainer.calls[0][1]
     assert len(examples) == expected_total
     assert math.isclose(sum(ex["sample_weight"] for ex in examples), 1.)
@@ -548,11 +559,19 @@ def test_complete_step_with_cpu_generation_and_evaluation(
     assert len(metadata) == expected_total
     assert {row["advantage_mode"] for row in metadata} == {mode}
     assert stats["planned_rollouts"] == expected_total
-    if mode == "spo-rs":
+    if training._is_spo_rs_mode(mode):
         assert stats["spo_rs_policy_updated"]
+    if mode == "spo-rs":
         for row in metadata:
             expected = (math.exp(2 * row["reward"]) / math.exp(2) - 1) / 2
             assert row["advantage"] == pytest.approx(expected)
+    if mode == "spo-rs-v2":
+        spo_rs = [training._literal_metadata_mapping(row["spo_rs"])
+                  for row in metadata]
+        assert all(info["win_lambda"] > 0. for info in spo_rs)
+        assert any(row["advantage"] != pytest.approx(
+            (info["transformed_reward"] / info["value_before"] - 1.) / 2.)
+            for row, info in zip(metadata, spo_rs))
     if allocation:
         if allocation != "fixed":
             assert len(stats["strategy_pilot_allocation"]) == 4
@@ -564,13 +583,15 @@ def test_complete_step_with_cpu_generation_and_evaluation(
                        for prompt in remote_prompts[2:])
             if pooled_coder == "live":
                 assert worker_prepared.is_set() and coder_started.is_set()
-    if parent_selection == "llm" and mode == "spo-rs":
+    if parent_selection == "llm" and training._is_spo_rs_mode(mode):
         recovered = make_sampler(
             parent_selection="llm", num_seeds=2, exp_dir=tmp_path, problem=problem,
-            seed_states=[SeedState(value=1., raw_score=1.) for _ in range(2)])
+            seed_states=[SeedState(value=value, raw_score=value) for value in seed_values])
         monkeypatch.setattr(recovered, "_request", lambda *args: pytest.fail("repeated API call"))
-        recovered_tracker = SPORSTracker(
-            entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
+        tracker_type = SPORSV2Tracker if mode == "spo-rs-v2" else SPORSTracker
+        recovered_tracker = tracker_type(
+            entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96,
+            **({"win_alpha": .25} if mode == "spo-rs-v2" else {}))
         recovered_tracker.load_state_dict(initial_tracker)
         artifacts = training._recoverable_spo_rs_artifacts(tmp_path, 0, cfg)
         assert artifacts is not None
@@ -580,6 +601,13 @@ def test_complete_step_with_cpu_generation_and_evaluation(
             backend, model, TinyTokenizer(), recovered, optimizer, 0, cfg, tmp_path,
             problem, CapturingTrainer(), recovered_tracker, str(adapter), artifacts)
         assert recovered.state_dict() == sampler.state_dict()
+
+
+def test_spo_rs_v2_complete_step(monkeypatch, tmp_path, load_config):
+    test_complete_step_with_cpu_generation_and_evaluation(
+        monkeypatch, tmp_path, load_config, "spo-rs-v2", None,
+        remote_strategy=False, pooled_coder=False,
+        parent_selection="llm", num_steps=1)
 
 
 @pytest.mark.parametrize("mode", ["entropic", "spo-rs"])
@@ -649,7 +677,8 @@ def test_spo_rs_cpu_optimizer_preserves_frozen_behavior(monkeypatch, load_config
     assert all("old_policy_logprobs" not in ex for ex in examples)
 
 
-def test_overlap_helpers_use_the_same_retained_advantages():
+@pytest.mark.parametrize("v2", [False, True])
+def test_overlap_helpers_use_the_same_retained_advantages(v2):
     rewards = [0., 1., 2., 3.]
     futures = [Future() for _ in rewards]
     records = [dict(job_idx=0, token_ids=[3, 4], behavior_logprobs=[-.2, -.3])
@@ -657,15 +686,22 @@ def test_overlap_helpers_use_the_same_retained_advantages():
     jobs = [{"prompt_text": "CODE_REQUEST"}]
     staged = training._prepare_spo_rs_overlap_inputs(
         TinyTokenizer(), {0: records}, {0: futures}, jobs)
-    tracker = SPORSTracker(entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96)
-    tracker.update(tracker.transformed_rewards([1.]), divergence=0.,
-                   policy_adapter="unused-test-adapter", step=-1)
+    tracker_type = SPORSV2Tracker if v2 else SPORSTracker
+    tracker = tracker_type(
+        entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96,
+        **({"win_alpha": .25} if v2 else {}))
+    history = [.5, 1., 2.]
+    tracker.update(
+        tracker.transformed_rewards(history), divergence=0.,
+        policy_adapter="unused-test-adapter", step=-1,
+        raw_rewards=history, valid_flags=[True] * len(history))
+    tracker.prepare_step()
     with pytest.raises(RuntimeError, match="before its reward completed"):
         training._complete_spo_rs_overlap_examples(staged, tracker)
     for future, reward in zip(futures, rewards):
-        future.set_result(SimpleNamespace(reward=reward))
+        future.set_result(SimpleNamespace(reward=reward, valid=True))
     completed = training._complete_spo_rs_overlap_examples(staged, tracker)
-    expected = tracker.normalized_advantages(tracker.transformed_rewards(rewards))
+    expected = tracker.rollout_advantages(rewards, [True] * len(rewards))
     np.testing.assert_allclose([ex["advantage"] for ex in completed], expected)
     assert sum(ex["sample_weight"] for ex in completed) == 1.
     assert all("_overlap_reward_future" not in ex for ex in completed)
@@ -674,3 +710,41 @@ def test_overlap_helpers_use_the_same_retained_advantages():
     expected, _ = entropic_adaptive_advantages(np.asarray(rewards))
     np.testing.assert_allclose([ex["advantage"] for ex in entropic], expected)
     assert sum(ex["sample_weight"] for ex in entropic) == .5
+
+
+def test_spo_rs_v2_adds_frozen_win_signal_and_round_trips():
+    tracker = SPORSV2Tracker(
+        entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96,
+        win_alpha=.25)
+    seed_rewards = [1., 1.]
+    tracker.update(
+        tracker.transformed_rewards(seed_rewards), divergence=0.,
+        policy_adapter="adapter_initial", step=-1,
+        raw_rewards=seed_rewards, valid_flags=[True, True])
+    tracker.prepare_step()
+    np.testing.assert_allclose(
+        tracker.rollout_advantages([0., 1.], [False, True]),
+        tracker.normalized_advantages(tracker.transformed_rewards([0., 1.])))
+
+    rewards = [0., .5, 1., 2.]
+    valid = [False, True, True, True]
+    tracker.update(
+        tracker.transformed_rewards(rewards), divergence=.03,
+        policy_adapter="adapter_step000", step=0,
+        raw_rewards=rewards, valid_flags=valid)
+    tracker.prepare_step()
+    base = tracker.normalized_advantages(tracker.transformed_rewards(rewards))
+    combined = tracker.rollout_advantages(rewards, valid)
+    assert tracker.win_info()["win_lambda"] > 0.
+    assert tracker.win_info()["win_scale"] > 0.
+    assert not np.allclose(combined, base)
+    assert combined[-1] - combined[-2] > base[-1] - base[-2]
+
+    restored = SPORSV2Tracker(
+        entropic_beta=2., d_half=.06, rho_min=.875, rho_max=.96,
+        win_alpha=.25)
+    restored.load_state_dict(tracker.state_dict())
+    restored.prepare_step()
+    np.testing.assert_allclose(
+        restored.rollout_advantages(rewards, valid), combined,
+        rtol=1e-14, atol=1e-14)

@@ -60,7 +60,7 @@ COMMON_OPTIONAL_KEYS = frozenset({
     "uct", "parent_selection", "jev_model_path", "jev_candidate_multiplier",
     "jev_same_core_threshold",
     "spo_rs_adaptive_beta", "spo_rs_d_half", "spo_rs_rho_min",
-    "spo_rs_rho_max",
+    "spo_rs_rho_max", "spo_rs_win_alpha",
     "spo_rs_clip_epsilon", "spo_rs_clip_epsilon_low",
     "spo_rs_clip_epsilon_high", "spo_rs_update_epochs",
     "sequence_clip_epsilon_low", "sequence_clip_epsilon_high",
@@ -320,8 +320,10 @@ def validate_problem_config(
                     or not 0.0 <= float(value) <= 1.0):
                 raise ValueError(
                     f"{_label(source)}: {key} must be in [0, 1]")
-    if "advantage_mode" in data and data["advantage_mode"] not in {"entropic", "spo-rs"}:
-        raise ValueError(f"{_label(source)}: advantage_mode must be entropic or spo-rs")
+    if ("advantage_mode" in data
+            and data["advantage_mode"] not in {"entropic", "spo-rs", "spo-rs-v2"}):
+        raise ValueError(
+            f"{_label(source)}: advantage_mode must be entropic, spo-rs, or spo-rs-v2")
     for key in ("sequence_clip_epsilon_low", "sequence_clip_epsilon_high"):
         if key in data and not 0.0 < float(data[key]) < 1.0:
             raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
@@ -403,6 +405,12 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: weight_decay must be >= 0")
     if "spo_rs_beta" in data:
         _positive_number(data, "spo_rs_beta", source)
+    if "spo_rs_win_alpha" in data:
+        value = data["spo_rs_win_alpha"]
+        if (isinstance(value, bool) or not isinstance(value, Real)
+                or float(value) < 0.0):
+            raise ValueError(
+                f"{_label(source)}: spo_rs_win_alpha must be a nonnegative number")
     if ("spo_rs_adaptive_beta" in data
             and not isinstance(data["spo_rs_adaptive_beta"], bool)):
         raise ValueError(

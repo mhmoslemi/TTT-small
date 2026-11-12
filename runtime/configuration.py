@@ -25,7 +25,7 @@ from training.exact_overflow import (
 )
 
 
-ADVANTAGE_MODES = ("entropic", "spo-rs")
+ADVANTAGE_MODES = ("entropic", "spo-rs", "spo-rs-v2")
 SEQUENCE_CLIP_EPSILON_DEFAULT = 0.2
 SPO_RS_UPDATE_EPOCHS_DEFAULT = 1
 SPO_RS_BETA_DEFAULT = 2.0
@@ -35,10 +35,15 @@ SPO_RS_RHO_MAX_DEFAULT = 0.96
 SPO_RS_CLIP_EPSILON_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_LOW_DEFAULT = 0.2
 SPO_RS_CLIP_EPSILON_HIGH_DEFAULT = 0.35
+SPO_RS_WIN_ALPHA_DEFAULT = 0.25
+
+
+def _is_spo_rs_mode(mode):
+    return str(mode or "entropic").lower() in {"spo-rs", "spo-rs-v2"}
 
 
 def _uses_clipped_policy_loss(mode):
-    return str(mode or "entropic").lower() == "spo-rs"
+    return _is_spo_rs_mode(mode)
 
 
 def _normalize_saved_advantage_config(saved):
@@ -46,8 +51,10 @@ def _normalize_saved_advantage_config(saved):
     saved = dict(saved)
     mode = str(saved.get("advantage_mode") or "entropic").lower()
     if mode not in ADVANTAGE_MODES or saved.get("binary_coder_training", False):
-        raise ValueError('saved run uses an unsupported training objective; only entropic and spo-rs can be resumed')
-    if mode == "spo-rs" and "rank_update_epochs" in saved:
+        raise ValueError(
+            'saved run uses an unsupported training objective; only entropic, '
+            'spo-rs, and spo-rs-v2 can be resumed')
+    if _is_spo_rs_mode(mode) and "rank_update_epochs" in saved:
         saved.setdefault("spo_rs_update_epochs", saved["rank_update_epochs"])
     if mode == "entropic":
         for side in ("low", "high"):
@@ -89,7 +96,7 @@ def _resolve_policy_options(merged):
 
 
 def _resolve_spo_rs_options(merged):
-    if merged.get("advantage_mode") != "spo-rs":
+    if not _is_spo_rs_mode(merged.get("advantage_mode")):
         return
 
     epochs = merged.get("spo_rs_update_epochs")
@@ -104,6 +111,7 @@ def _resolve_spo_rs_options(merged):
         "spo_rs_rho_min": SPO_RS_RHO_MIN_DEFAULT,
         "spo_rs_rho_max": SPO_RS_RHO_MAX_DEFAULT,
         "spo_rs_clip_epsilon": SPO_RS_CLIP_EPSILON_DEFAULT,
+        "spo_rs_win_alpha": SPO_RS_WIN_ALPHA_DEFAULT,
     }
     for name, default in defaults.items():
         raw = merged.get(name)
@@ -117,11 +125,15 @@ def _resolve_spo_rs_options(merged):
     if not isinstance(adaptive_beta, bool):
         raise ValueError("spo_rs_adaptive_beta must be true or false")
     merged["spo_rs_adaptive_beta"] = bool(adaptive_beta)
+    if merged["advantage_mode"] == "spo-rs-v2" and adaptive_beta:
+        raise ValueError("spo-rs-v2 requires fixed exponential SPO-RS shaping")
     from training.spo_rs import BOUNDED_SHAPING_VERSION
     # The old adaptive-beta estimator did not have a historical baseline.
     merged["spo_rs_reward_shaping"] = (BOUNDED_SHAPING_VERSION if adaptive_beta else "exponential")
     if merged["spo_rs_d_half"] <= 0.0:
         raise ValueError("spo_rs_d_half must be positive")
+    if merged["spo_rs_win_alpha"] < 0.0:
+        raise ValueError("spo_rs_win_alpha must be nonnegative")
     if not (0.0 < merged["spo_rs_rho_min"] <= merged["spo_rs_rho_max"] < 1.0):
         raise ValueError("SPO-RS rho bounds must satisfy 0 < rho_min <= rho_max < 1")
     if not 0.0 < merged["spo_rs_clip_epsilon"] < 1.0:
@@ -318,8 +330,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--advantage-mode", type=str.lower,
                    choices=list(ADVANTAGE_MODES), default=None,
                    help="Objective: entropic (adaptive beta within each group, "
-                        "default) or spo-rs (historical entropic value tracking "
-                        "with asymmetric PPO clipping).")
+                        "default), spo-rs (historical entropic value tracking), "
+                        "or spo-rs-v2 (SPO-RS plus a historical win signal).")
     p.add_argument("--spo-rs-update-epochs", type=int, default=None,
                    help="SPO-RS updates per rollout batch with a frozen old "
                         "policy (default 1; --fast requires 1).")
@@ -344,6 +356,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spo-rs-beta", type=float, default=None,
                    help="SPO-RS: exponential coefficient and advantage divisor "
                         f"(default {SPO_RS_BETA_DEFAULT}).")
+    p.add_argument("--spo-rs-win-alpha", type=float, default=None,
+                   help="SPO-RS-v2: RMS-relative historical win-signal strength "
+                        f"(default {SPO_RS_WIN_ALPHA_DEFAULT}).")
     p.add_argument("--spo-rs-d-half", type=float, default=None,
                    help="SPO-RS: policy-KL half-life D_half "
                         f"(default {SPO_RS_D_HALF_DEFAULT}).")
@@ -707,6 +722,13 @@ def load_config():
         merged[key] = value
         if value != parser.get_default(arg_name):
             profile_explicit_keys.add(key)
+    saved_mode = str(saved.get("advantage_mode") or "entropic").lower()
+    requested_mode = str(merged.get("advantage_mode") or "entropic").lower()
+    if (saved and saved_mode != requested_mode
+            and "spo-rs-v2" in {saved_mode, requested_mode}):
+        raise ValueError(
+            "cannot switch to or from spo-rs-v2 while resuming; pass the "
+            "saved advantage mode or start a fresh run")
     # Disk parking is launch-local; do not inherit another machine's directory.
     merged["trainer_offload_dir"] = args.trainer_offload_dir
     from search.sampler import can_migrate_parent_selection, parent_selection_mode

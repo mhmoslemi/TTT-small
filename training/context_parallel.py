@@ -109,7 +109,7 @@ def initialize_groups(world_size):
 def availability(model, cfg, world_size):
     """Never substitute independent sequence chunks or a slow recurrent kernel."""
     if (getattr(cfg, "coder_model_profile", "") != "qwen3.8-27b"
-            or getattr(cfg, "advantage_mode", "") != "spo-rs"
+            or getattr(cfg, "advantage_mode", "") not in {"spo-rs", "spo-rs-v2"}
             or world_size < 2 or world_size & (world_size - 1)):
         return False, "not a supported hybrid Qwen replicated SPO-RS layout"
     try:

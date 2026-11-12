@@ -45,6 +45,7 @@ from models.coder_profiles import (
 )
 from runtime.configuration import (
     _build_arg_parser as _build_arg_parser, _isolated_evaluation_cpu_ids,
+    _is_spo_rs_mode,
     _normalize_saved_advantage_config as _normalize_saved_advantage_config, _parse_gpu_ids,
     _resolve_training_backend as _resolve_training_backend,
     _resolve_training_memory_budgets as _resolve_training_memory_budgets,
@@ -591,7 +592,8 @@ def _prefetch_resume_parents(sampler, cfg, exp_dir, next_step, adapter_path,
     """Start fresh-step selection before resumed trainer/generation startup."""
     if (cfg.parent_selection != "llm" or next_step >= cfg.num_steps or interrupted_artifacts is not None):
         return sampler, None
-    if (cfg.advantage_mode == "spo-rs" and _recoverable_pending_spo_rs_artifacts(exp_dir, next_step, cfg) is not None):
+    if (_is_spo_rs_mode(cfg.advantage_mode)
+            and _recoverable_pending_spo_rs_artifacts(exp_dir, next_step, cfg) is not None):
         return sampler, None
     sampler = _migrate_parent_selection(
         sampler, cfg, exp_dir, next_step, adapter_path,
@@ -703,7 +705,9 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
         )
         if any(name not in meta for name in required):
             return None
-        if (int(meta["step"]) != step_idx or str(meta["advantage_mode"]).lower() != "spo-rs"):
+        if (int(meta["step"]) != step_idx
+                or str(meta["advantage_mode"]).lower()
+                != str(cfg.advantage_mode).lower()):
             return None
         try:
             reward = float(meta["reward"])
@@ -1194,15 +1198,16 @@ def _finalize_pending_spo_rs_artifacts(
         prompt_text = item["prompt_path"].read_text(encoding="utf-8", errors="replace")
         if prompt_text not in prompt_indices:
             prompt_indices[prompt_text] = len(prompt_indices)
+    valid_flags = [bool(result.valid) for result in results]
     transformed = spo_rs_tracker.transformed_rewards(rewards)
-    advantages = spo_rs_tracker.normalized_advantages(transformed)
+    advantages = spo_rs_tracker.rollout_advantages(rewards, valid_flags)
     if advantages is None:
         raise RuntimeError("generated-step recovery lost the pre-step SPO-RS baseline")
     preview_tracker = deepcopy(spo_rs_tracker)
     update = preview_tracker.update(
         transformed, divergence=divergence,
         policy_adapter=sampling_adapter_path, step=step_idx,
-        raw_rewards=rewards)
+        raw_rewards=rewards, valid_flags=valid_flags)
     update.update({
         "groups": sorted({int(item["meta"]["group"]) for item in artifacts}),
         "prompt_jobs": list(range(len(prompt_indices))),
@@ -1261,7 +1266,7 @@ def _finalize_pending_spo_rs_artifacts(
             "failure_kind": result.failure_kind,
             "advantage": float(advantages[index]),
             "beta": float(beta_by_index[index]),
-            "advantage_mode": "spo-rs",
+            "advantage_mode": str(cfg.advantage_mode).lower(),
             "advantage_scale": float(beta_by_index[index]),
             "sandbox_stdout": (result.stdout or "")[:2000],
             "parent_value": (float(parent.value) if parent.value is not None else None),
@@ -1360,6 +1365,7 @@ def _resume_spo_rs_step_from_artifacts(
         sampler.record_expansion(parent, count=int(cfg.group_size))
 
     rewards = [float(item["meta"]["reward"]) for item in artifacts]
+    valid_flags = [bool(item["meta"]["valid"]) for item in artifacts]
     saved_advantages = np.asarray([float(item["meta"]["advantage"]) for item in artifacts], dtype=np.float64)
     spo_infos = [_literal_metadata_mapping(item["meta"].get("spo_rs")) for item in artifacts]
     if any(not info or not bool(info.get("used_for_policy_update", False)) for info in spo_infos):
@@ -1368,7 +1374,7 @@ def _resume_spo_rs_step_from_artifacts(
             "the saved SPO-RS policy update")
     recovery_updates = []
     transformed = spo_rs_tracker.transformed_rewards(rewards)
-    recovered_advantages = spo_rs_tracker.normalized_advantages(transformed)
+    recovered_advantages = spo_rs_tracker.rollout_advantages(rewards, valid_flags)
     spo_info = spo_infos[0]
     saved_value_before = spo_info.get("value_before")
     if (saved_value_before is None
@@ -1399,7 +1405,7 @@ def _resume_spo_rs_step_from_artifacts(
     tracker_update = spo_rs_tracker.update(
         transformed, divergence=divergence,
         policy_adapter=sampling_adapter_path, step=step_idx,
-        raw_rewards=rewards)
+        raw_rewards=rewards, valid_flags=valid_flags)
     recovery_updates = [tracker_update]
     saved_after = spo_info.get("value_after")
     if (saved_after is not None
@@ -1747,7 +1753,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                strategy_pool=None, strategy_tokenizer=None,
                parallel_trainer=None,
                spo_rs_tracker=None, sampling_adapter_path=None,
-               ensure_trainer_ready=None):
+               ensure_trainer_ready=None, evaluation_complete=None):
     import os
     import torch
     from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -1769,7 +1775,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         from analysis.entropy_tools import (begin_step, observation_descriptor, rollout_observation)
         entropy_directory = begin_step(exp_dir, step_idx)
     active_advantage_mode = str(getattr(cfg, "advantage_mode", "entropic")).lower()
-    spo_rs_mode = active_advantage_mode == "spo-rs"
+    spo_rs_mode = _is_spo_rs_mode(active_advantage_mode)
     adaptive_spo_beta = bool(spo_rs_mode and getattr(cfg, "spo_rs_adaptive_beta", False))
     if spo_rs_mode and spo_rs_tracker is None:
         raise ValueError("SPO-RS mode requires its persistent value tracker")
@@ -4042,16 +4048,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     f"but {len(futures)} reward results")
             for rollout_index, record in enumerate(responses):
                 job_idx = int(record["job_idx"])
+                result = futures[rollout_index].result()
                 samples.append({
                     "group": group_id,
                     "rollout": rollout_index,
                     "job": job_idx,
                     "record": record,
-                    "reward": float(futures[rollout_index].result().reward),
+                    "reward": float(result.reward),
+                    "valid": bool(result.valid),
                 })
         if samples:
             transformed = spo_rs_tracker.transformed_rewards([sample["reward"] for sample in samples])
-            normalized = spo_rs_tracker.normalized_advantages(transformed)
+            normalized = spo_rs_tracker.rollout_advantages(
+                [sample["reward"] for sample in samples],
+                [sample["valid"] for sample in samples])
             if normalized is None:
                 raise RuntimeError("SPO-RS lost its pre-step historical baseline")
             update = spo_rs_tracker.update(
@@ -4060,6 +4070,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 policy_adapter=adapter_path,
                 step=step_idx,
                 raw_rewards=[sample["reward"] for sample in samples],
+                valid_flags=[sample["valid"] for sample in samples],
             )
             update.update({
                 "groups": sorted({sample["group"] for sample in samples}),
@@ -4183,7 +4194,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "msg": res.msg,
                 "failure_kind": res.failure_kind,
                 "advantage": float(advantages[r_idx]) if hasattr(advantages, "__len__") else 0.0,
-                "beta": (float(adv_scale) if adv_mode in ("entropic", "spo-rs") else 0.0),
+                "beta": (float(adv_scale) if adv_mode == "entropic" or _is_spo_rs_mode(adv_mode) else 0.0),
                 "advantage_mode": adv_mode,
                 "advantage_scale": (float(adv_scale) if math.isfinite(adv_scale) else None),
                 "n_response_tokens": len(token_ids),
@@ -4496,6 +4507,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     else:
         message = (f'[step {step_idx}] best-ever raw {problem.metric_name}: unavailable')
         print(f"\033[93m{message}\033[0m", flush=True)
+
+    if evaluation_complete is not None:
+        evaluation_complete(step_idx)
 
     step_stats = {
         "planned_rollouts": len(primary_rollout_records),
@@ -4911,7 +4925,7 @@ def main():
     print(f"Group size:         {cfg.group_size}")
     print(f"Total rollouts/step: {cfg.groups_per_step * cfg.group_size}")
     print(f"LR:                 {cfg.learning_rate}")
-    if configured_advantage_mode == "spo-rs":
+    if _is_spo_rs_mode(configured_advantage_mode):
         print("Reference KL:        off (SPO-RS PPO objective)")
     else:
         print(f"KL coef:            {cfg.kl_penalty_coef}")
@@ -4919,7 +4933,7 @@ def main():
     if _uses_sequence_level_policy_ratio(cfg):
         print("MoE policy ratio:    sequence-level geometric mean "
               "(Qwen3-30B-A3B only; existing asymmetric low/high bounds)")
-    if configured_advantage_mode == "spo-rs":
+    if _is_spo_rs_mode(configured_advantage_mode):
         if bool(getattr(cfg, "spo_rs_adaptive_beta", False)):
             print(f'SPO-RS shaping:     historical arctan, width=1.25; beta={cfg.spo_rs_beta}; all rollouts train')
         else:
@@ -4932,6 +4946,8 @@ def main():
               f"(bounds {1.0 - cfg.spo_rs_clip_epsilon_low:.4f} / "
               f"{1.0 + cfg.spo_rs_clip_epsilon_high:.4f})")
         print(f"SPO-RS update epochs: {cfg.spo_rs_update_epochs}")
+        if configured_advantage_mode == "spo-rs-v2":
+            print(f"SPO-RS-v2 win alpha: {cfg.spo_rs_win_alpha}")
     elif _uses_sequence_level_policy_ratio(cfg):
         print(f"Sequence clip eps low/high: "
               f"{cfg.sequence_clip_epsilon_low} / {cfg.sequence_clip_epsilon_high} "
@@ -5093,7 +5109,7 @@ def main():
             print(f"[resume] training checkpoint found; next step is {start_step}")
             if resume_payload["version"] == 1:
                 print('[resume] legacy batch-growth state ignored; using fixed configured batch sizes')
-            if configured_advantage_mode == "spo-rs":
+            if _is_spo_rs_mode(configured_advantage_mode):
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, start_step, cfg))
                 if interrupted_spo_rs_artifacts is not None:
                     token_recovery = (
@@ -5112,7 +5128,7 @@ def main():
                         flush=True,
                     )
         else:
-            if configured_advantage_mode == "spo-rs":
+            if _is_spo_rs_mode(configured_advantage_mode):
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
             if (interrupted_spo_rs_artifacts is not None and initial_adapter.is_dir()):
@@ -5195,25 +5211,35 @@ def main():
     setting_log_only(f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None
-    if (configured_advantage_mode == 'spo-rs'):
-        from training.spo_rs import BoundedSPORSTracker, SPORSTracker
+    if _is_spo_rs_mode(configured_advantage_mode):
+        from training.spo_rs import BoundedSPORSTracker, SPORSTracker, SPORSV2Tracker
         bounded_shaping = bool(getattr(cfg, "spo_rs_adaptive_beta", False))
-        tracker_class = BoundedSPORSTracker if bounded_shaping else SPORSTracker
+        tracker_class = (SPORSV2Tracker if configured_advantage_mode == "spo-rs-v2"
+                         else BoundedSPORSTracker if bounded_shaping
+                         else SPORSTracker)
         spo_rs_tracker = tracker_class(
             entropic_beta=cfg.spo_rs_beta,
             d_half=cfg.spo_rs_d_half,
             rho_min=cfg.spo_rs_rho_min,
             rho_max=cfg.spo_rs_rho_max,
             **({"fail_score": cfg.fail_score} if bounded_shaping else {}),
+            **({"win_alpha": cfg.spo_rs_win_alpha}
+               if configured_advantage_mode == "spo-rs-v2" else {}),
         )
         tracker_state = (resume_payload.get("spo_rs_tracker") if resume_payload is not None else None)
-        if tracker_state is not None and (bounded_shaping or tracker_state.get("version") == 2):
+        compatible_tracker = bool(
+            tracker_state is not None and (
+                (configured_advantage_mode == "spo-rs-v2"
+                 and tracker_state.get("variant") == "spo-rs-v2")
+                or (configured_advantage_mode == "spo-rs"
+                    and (bounded_shaping or tracker_state.get("version") == 2))))
+        if compatible_tracker:
             spo_rs_tracker.load_state_dict(tracker_state)
             print("[resume] restored the run-wide SPO-RS tracker")
         elif start_step:
-            if bounded_shaping:
+            if bounded_shaping or configured_advantage_mode == "spo-rs-v2":
                 raise ValueError(
-                    "bounded SPO-RS requires its exact historical reward "
+                    f"{configured_advantage_mode} requires its exact historical reward "
                     "checkpoint; refusing to approximate or reset its baseline")
             # Version 1 attached history to rendered prompts. It cannot be
             # merged into the requested global statistic, so initialize the
@@ -5264,7 +5290,8 @@ def main():
             initialization = spo_rs_tracker.update(
                 transformed, divergence=0.0,
                 policy_adapter=initial_adapter, step=-1,
-                raw_rewards=seed_rewards)
+                raw_rewards=seed_rewards,
+                valid_flags=[True] * len(seed_rewards))
             current_policy_adapter_path = initial_adapter
             print("[init] SPO-RS global tracker initialized before step 0 "
                   f"from {len(seed_rewards)} verified seed rewards: "
@@ -5759,7 +5786,8 @@ def main():
                     f"({cfg.groups_per_step * cfg.group_size} rollouts)",
                     flush=True)
 
-            if (resume_dir and step == start_step and configured_advantage_mode == "spo-rs"):
+            if (resume_dir and step == start_step
+                    and _is_spo_rs_mode(configured_advantage_mode)):
                 pending_spo_rs_artifacts = None
                 if interrupted_spo_rs_artifacts is None:
                     interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, step, step_cfg))
@@ -5797,6 +5825,7 @@ def main():
                         gen_pool, spo_rs_tracker,
                         current_policy_adapter_path,
                         pending_spo_rs_artifacts))
+                step_plotter.submit_explorer(step)
                 stats = _resume_spo_rs_step_from_artifacts(
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, parallel_trainer,
@@ -5811,8 +5840,10 @@ def main():
                     parallel_trainer=parallel_trainer,
                     spo_rs_tracker=spo_rs_tracker,
                     sampling_adapter_path=(
-                        current_policy_adapter_path if configured_advantage_mode == 'spo-rs' else None),
-                    ensure_trainer_ready=ensure_trainer_ready)
+                        current_policy_adapter_path
+                        if _is_spo_rs_mode(configured_advantage_mode) else None),
+                    ensure_trainer_ready=ensure_trainer_ready,
+                    evaluation_complete=step_plotter.submit_explorer)
 
             stats = stats or {}
             entropy_observations = stats.pop("_entropy_observations", [])
@@ -5828,7 +5859,7 @@ def main():
             # Version the adapter first, then atomically advance the state
             # pointer. A crash during either write leaves the previous pair
             # valid.
-            if configured_advantage_mode == "spo-rs":
+            if _is_spo_rs_mode(configured_advantage_mode):
                 if stats.get("spo_rs_policy_updated", False):
                     adapter_path = _save_adapter(model, exp_dir, step, cfg.model_name)
                 else:
@@ -5962,7 +5993,7 @@ def main():
             raise RuntimeError(
                 "an exact trajectory still failed after distributing the "
                 "trainer across every selected GPU") from error
-        if (active_step is None or configured_advantage_mode != "spo-rs"):
+        if (active_step is None or not _is_spo_rs_mode(configured_advantage_mode)):
             raise
         recoverable = _recoverable_spo_rs_artifacts(exp_dir, active_step, cfg)
         if recoverable is None:

@@ -56,6 +56,18 @@ def test_every_problem_refreshes_the_parent_tree(tmp_path):
                for call in run.call_args_list)
 
 
+def test_evaluated_step_refreshes_unified_explorer(tmp_path):
+    plotter = StepPlotter(tmp_path, "ac1")
+    with patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+        plotter.submit_explorer(4)
+        plotter.close()
+    assert run.call_args.args[0] == [
+        "./make_explorer.sh", "--all-code", "--unified"]
+    assert run.call_args.kwargs["cwd"].name == "run_explorer"
+    assert run.call_args.kwargs["timeout"] == 600
+    assert "evaluated step 4" in (tmp_path / "explorer.log").read_text()
+
+
 def test_plot_keeps_completed_steps_when_selection_revisits_old_nodes(tmp_path):
     for step in range(3):
         _parents(tmp_path, step, [{

@@ -133,6 +133,9 @@ class StepPlotter:
     def submit(self, step):
         self.executor.submit(self._refresh, int(step))
 
+    def submit_explorer(self, step):
+        self.executor.submit(self._refresh_explorer, int(step))
+
     def close(self, *, wait=True):
         # On interruption, cancel queued plots; an already-running plot is
         # still bounded by the per-script timeout.
@@ -183,6 +186,27 @@ class StepPlotter:
                               flush=True)
         except OSError as error:
             print(f"[plots] step {step}: cannot write plots.log: {error}", flush=True)
+
+    def _refresh_explorer(self, step):
+        import subprocess
+
+        explorer_dir = Path(__file__).resolve().parent / "run_explorer"
+        log_path = self.run_dir / "explorer.log"
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(f"\n=== evaluated step {step}: unified explorer ===\n")
+                log.flush()
+                result = subprocess.run(
+                    ["./make_explorer.sh", "--all-code", "--unified"],
+                    cwd=explorer_dir, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT,
+                    timeout=600, check=False,
+                )
+                if result.returncode:
+                    raise RuntimeError(f"exit status {result.returncode}")
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+            print(f"[explorer] step {step}: not updated ({error}); "
+                  f"see {log_path}", flush=True)
 
 
 def _slugify(s: str) -> str:

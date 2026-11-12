@@ -14,7 +14,8 @@ from diagnostics.console import _LOG_TIME_OFFSET_SECONDS, setting_log_only
 from models.coder_profiles import _uses_sequence_level_policy_ratio
 from runtime.configuration import (
     SEQUENCE_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
-    SPO_RS_CLIP_EPSILON_LOW_DEFAULT, SPO_RS_UPDATE_EPOCHS_DEFAULT, _parse_gpu_ids,
+    SPO_RS_CLIP_EPSILON_LOW_DEFAULT, SPO_RS_UPDATE_EPOCHS_DEFAULT,
+    _is_spo_rs_mode, _parse_gpu_ids,
 )
 from training.exact_overflow import (
     ExactLongContextTrainingOOM, _EXACT_OVERFLOW_GRADIENT_FILE, _clip_sharded_grad_norm_,
@@ -1103,7 +1104,7 @@ def _policy_dropout_disabled(model):
 
 def _clipped_policy_options(cfg):
     """Return PPO epsilon, lower epsilon, upper epsilon, and reference-KL coef."""
-    if getattr(cfg, "advantage_mode", "entropic") == "spo-rs":
+    if _is_spo_rs_mode(getattr(cfg, "advantage_mode", "entropic")):
         epsilon = float(getattr(cfg, "spo_rs_clip_epsilon", SPO_RS_CLIP_EPSILON_DEFAULT))
         epsilon_low = float(getattr(cfg, "spo_rs_clip_epsilon_low", SPO_RS_CLIP_EPSILON_LOW_DEFAULT))
         epsilon_high = float(getattr(cfg, "spo_rs_clip_epsilon_high", SPO_RS_CLIP_EPSILON_HIGH_DEFAULT))
@@ -1295,9 +1296,10 @@ def _complete_spo_rs_overlap_examples(examples, spo_rs_tracker=None):
         raise RuntimeError("SPO-RS overlap received an example before its reward completed")
     if spo_rs_tracker is None:
         raise RuntimeError("SPO-RS overlap requires its historical tracker")
-    rewards = [float(future.result().reward) for future in futures]
-    transformed = spo_rs_tracker.transformed_rewards(rewards)
-    advantages = spo_rs_tracker.normalized_advantages(transformed)
+    results = [future.result() for future in futures]
+    rewards = [float(result.reward) for result in results]
+    advantages = spo_rs_tracker.rollout_advantages(
+        rewards, [bool(result.valid) for result in results])
     if advantages is None:
         raise RuntimeError("SPO-RS overlap lost its frozen pre-step tracker baseline")
     for example, advantage in zip(examples, advantages):
@@ -2695,7 +2697,7 @@ class ProcessDistributedTrainer:
             self._abort_workers()
             raise
 
-        if str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs":
+        if _is_spo_rs_mode(getattr(cfg, "advantage_mode", "")):
             fallback_description = (
                 "oversized exact trajectories use token-weighted replica "
                 "activation offload from a "
@@ -2969,7 +2971,7 @@ class ProcessDistributedTrainer:
               f"initial padded-token budgets/GPU={self._token_budgets}",
               flush=True)
 
-        defer_exact_oom = (str(getattr(cfg, "advantage_mode", "")).lower() == "spo-rs")
+        defer_exact_oom = _is_spo_rs_mode(getattr(cfg, "advantage_mode", ""))
         self._workers_idle = False
         for rank in range(1, self._world_size):
             self._command_queues[rank].put({
@@ -3135,7 +3137,7 @@ class ProcessDistributedTrainer:
             reduce_trainable_gradients,
         )
 
-        if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
+        if not _is_spo_rs_mode(getattr(cfg, "advantage_mode", "")):
             raise ValueError("exact overflow recovery is SPO-RS-only")
         if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("exact overflow recovery requires one update epoch")
@@ -3610,7 +3612,7 @@ class ProcessDistributedTrainer:
         from concurrent.futures import ThreadPoolExecutor
         from training.fast_distributed import local_spo_rs_update
 
-        if str(getattr(cfg, "advantage_mode", "")).lower() != "spo-rs":
+        if not _is_spo_rs_mode(getattr(cfg, "advantage_mode", "")):
             raise ValueError("streaming clipped overlap is SPO-RS-only")
         if int(getattr(cfg, "spo_rs_update_epochs", 1)) != 1:
             raise ValueError("streaming SPO-RS requires one update epoch")
