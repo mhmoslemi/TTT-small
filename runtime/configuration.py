@@ -680,6 +680,10 @@ def load_config():
         for key in ROLLOUT_CONFIG_KEYS:
             if key in ydict:
                 merged[key] = ydict[key]
+        # Evaluation resources follow the current launch, including on resume.
+        for key in ("budget_s", "sandbox_timeout_s", "eval_cpus"):
+            if key in ydict:
+                merged[key] = ydict[key]
         # Current YAML sets the JEV gate; unfinished selections retain only their saved window.
         for key in ("jev_candidate_multiplier", "jev_same_core_threshold"):
             if key in ydict:
@@ -708,8 +712,8 @@ def load_config():
         # run to a paid service. An explicit CLI selector can still opt in.
         merged["api_strategy"] = saved.get("api_strategy", "")
         print(f"[config] resuming saved configuration from "
-              f"{resume_dir / 'config.json'}; current YAML rollout counts "
-              "and strategy limits/sampling override saved values")
+              f"{resume_dir / 'config.json'}; current YAML rollout counts, "
+              "evaluation resources, and strategy limits/sampling override saved values")
 
     restore_hardware_settings(merged, ydict, saved)
 

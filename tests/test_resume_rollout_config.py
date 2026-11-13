@@ -233,12 +233,14 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         sampler.parent_selection_mode = lambda config: config.get("parent_selection", "puct")
         namespace = dict(
             saved=dict(self.saved, problem="erdos", num_seed_states=10,
+                       budget_s=1800, sandbox_timeout_s=1900, eval_cpus=1,
                        jev_candidate_multiplier=5, jev_same_core_threshold=.90,
                        strategy_vllm_persistent_workers=2,
                        learning_rate=0.01, strategy_max_seq_length=131072,
                        strategy_max_new_tokens=65536, strategy_temperature=.6, strategy_top_p=.95,
                        strategy_top_k=50, strategy_min_p=.1),
             ydict=dict(self.current, num_seed_states=50, seed_min_points=40,
+                       budget_s=2400, sandbox_timeout_s=2500, eval_cpus=100,
                        jev_candidate_multiplier=3, jev_same_core_threshold=.68,
                        seed_max_points=500, learning_rate=0.02, strategy_max_seq_length="auto",
                        strategy_max_new_tokens="auto", strategy_temperature=1., strategy_top_p=1.,
@@ -246,7 +248,8 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             merged=dict(self.current, problem="erdos"), profile_explicit_keys=set(),
             RETIRED_BATCH_GROWTH_KEYS=set(), resume_dir=self.run,
             args=SimpleNamespace(groups_per_step=12, reload_coder_between_phases=True,
-                                 strategy_vllm_persistent_workers=0), skip=set(),
+                                 strategy_vllm_persistent_workers=0,
+                                 sandbox_timeout_s=2600, eval_cpus=2), skip=set(),
             _CLI_TO_CFG={}, parser=SimpleNamespace(get_default=lambda key: None),
         )
         with patch.dict(sys.modules, {'search.sampler': sampler}), redirect_stdout(io.StringIO()):
@@ -255,6 +258,8 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             self.assertEqual(namespace["merged"]["groups_per_step"], 10)
             self.assertEqual(namespace["merged"]["programs_per_strategy"], 10)
             self.assertEqual(namespace["merged"]["pilot_programs_per_strategy"], 6)
+            self.assertEqual(tuple(namespace["merged"][key] for key in (
+                "budget_s", "sandbox_timeout_s", "eval_cpus")), (2400, 2500, 100))
             self.assertEqual(namespace["merged"]["jev_candidate_multiplier"], 3)
             self.assertEqual(namespace["merged"]["jev_same_core_threshold"], .68)
             self.assertEqual(namespace["merged"]["learning_rate"], 0.01)
@@ -275,6 +280,8 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertEqual(namespace["merged"]["groups_per_step"], 12)
         self.assertTrue(namespace["merged"]["reload_coder_between_phases"])
         self.assertEqual(namespace["merged"]["strategy_vllm_persistent_workers"], 0)
+        self.assertEqual(tuple(namespace["merged"][key] for key in (
+            "budget_s", "sandbox_timeout_s", "eval_cpus")), (2400, 2600, 2))
 
 
 if __name__ == "__main__":
