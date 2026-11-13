@@ -82,7 +82,8 @@ class HardwareProfileTests(unittest.TestCase):
                                     vllm_gpu_memory_utilization="auto",
                                     vllm_max_num_batched_tokens="auto")
                 if profile == "B200":
-                    expected["gen_micro_batch"] = "auto"
+                    expected.update(gen_micro_batch="auto",
+                                    vllm_max_num_batched_tokens="auto")
                 self.assertEqual(cfg, expected)
 
     def test_all_profiled_models_fit_full_context_and_use_every_card(self):
@@ -114,9 +115,8 @@ class HardwareProfileTests(unittest.TestCase):
                 cfg.update(vllm_tensor_parallel_size=layout.tensor_parallel_size, vllm_pipeline_parallel_size=1)
                 gpu.resolve_memory_settings(cfg, roles, self.cards())
                 self.assertEqual(cfg["max_seq_length"], context)
-                self.assertGreaterEqual(cfg["gen_micro_batch"], 1)
-                self.assertLessEqual(cfg["gen_micro_batch"], 256)
-                self.assertEqual(cfg["vllm_max_num_batched_tokens"], 8192)
+                self.assertEqual(cfg["gen_micro_batch"], 0)
+                self.assertEqual(cfg["vllm_max_num_batched_tokens"], 0)
                 if frozen:
                     for parents in (1, 3, 4, 8):
                         folded = gpu.align_vllm_layout_to_concurrency(cfg, layout, 8, heads, parents)
@@ -194,8 +194,16 @@ class HardwareProfileTests(unittest.TestCase):
                     snapshots[profile, resume].pop("hardware_profile")
             for resume in (False, True):
                 rtx, b200 = snapshots["RTX6000", resume], snapshots["B200", resume]
-                for key in ("gen_micro_batch", "strategy_gen_micro_batch"):
-                    self.assertGreaterEqual(b200.pop(key), rtx.pop(key))
+                self.assertEqual(b200.pop("gen_micro_batch"), 0)
+                self.assertGreater(rtx.pop("gen_micro_batch"), 0)
+                self.assertEqual(b200.pop("vllm_max_num_batched_tokens"), 0)
+                self.assertGreater(rtx.pop("vllm_max_num_batched_tokens"), 0)
+                self.assertEqual(b200.pop("strategy_gen_micro_batch"), 0)
+                self.assertGreater(rtx.pop("strategy_gen_micro_batch"), 0)
+                self.assertEqual(
+                    b200.pop("strategy_vllm_max_num_batched_tokens"), 0)
+                self.assertGreater(
+                    rtx.pop("strategy_vllm_max_num_batched_tokens"), 0)
                 self.assertEqual(rtx, b200)
 
     def test_run_copy_has_the_same_execution_flags_as_run2(self):
@@ -258,7 +266,7 @@ class HardwareProfileTests(unittest.TestCase):
             self.assertEqual(set(gpu.query_gpu_memory()), {6, 7})
         self.assertIn("--id=6,7", query.call_args.args[0])
 
-    def test_b200_automatic_batches_are_wider_without_changing_limits_or_rtx(self):
+    def test_b200_auto_delegates_scheduler_limits_to_vllm(self):
         roles = gpu.allocate_gpu_roles(range(8), "erdos")
         def resolve(profile, **overrides):
             cfg = dict(model_name="Qwen/Qwen3.8-27B", max_seq_length=262144,
@@ -272,21 +280,27 @@ class HardwareProfileTests(unittest.TestCase):
             rtx = resolve("RTX6000", **overrides)
             for profile in ("B200", "B200_full_ram"):
                 b200 = resolve(profile, **overrides)
-                self.assertGreater(b200["gen_micro_batch"], rtx["gen_micro_batch"])
-                self.assertLessEqual(b200["gen_micro_batch"], 128)
-                for key in ("vllm_max_num_batched_tokens", "logprob_chunk",
-                            "vllm_gpu_memory_utilization", "vllm_runtime_reserve_gib", "max_seq_length"):
+                self.assertEqual(b200["gen_micro_batch"], 0)
+                self.assertEqual(b200["vllm_max_num_batched_tokens"], 0)
+                for key in ("logprob_chunk", "vllm_gpu_memory_utilization",
+                            "vllm_runtime_reserve_gib", "max_seq_length"):
                     self.assertEqual(b200[key], rtx[key], key)
         self.assertEqual(resolve("B200", gen_micro_batch=4)["gen_micro_batch"], 4)
+        self.assertEqual(resolve(
+            "B200", vllm_max_num_batched_tokens=16384
+        )["vllm_max_num_batched_tokens"], 16384)
         self.assertLessEqual(resolve("RTX6000")["gen_micro_batch"], 32)
         self.assertEqual(resolve("B200")["max_seq_length"], 262144)
 
-        saved = dict(hardware_profile="B200_full_ram", gen_micro_batch=26)
+        saved = dict(hardware_profile="B200_full_ram", gen_micro_batch=26,
+                     vllm_max_num_batched_tokens=8192)
         for requested in ("auto", 17):
             cfg = dict(saved)
             hardware.restore_hardware_settings(cfg, dict(hardware_profile="B200_full_ram",
-                                                       gen_micro_batch=requested), saved)
+                                                       gen_micro_batch=requested,
+                                                       vllm_max_num_batched_tokens=requested), saved)
             self.assertEqual(cfg["gen_micro_batch"], requested)
+            self.assertEqual(cfg["vllm_max_num_batched_tokens"], requested)
 
     def test_evaluation_leaves_inference_cores_free_on_b200_only(self):
         import os
@@ -319,6 +333,12 @@ class HardwareProfileTests(unittest.TestCase):
                                           enable_log_stats=True)
         self.assertTrue(quiet["disable_log_stats"])
         self.assertEqual(stats, dict(quiet, disable_log_stats=False))
+        automatic = workers._vllm_engine_kwargs(
+            "Qwen/Qwen3.8-27B", 262144, False, 32, .9,
+            performance_mode="throughput")
+        self.assertEqual(automatic["performance_mode"], "throughput")
+        self.assertNotIn("max_num_seqs", automatic)
+        self.assertNotIn("max_num_batched_tokens", automatic)
 
     def test_b200_starts_workers_concurrently_like_rtx(self):
         events = []

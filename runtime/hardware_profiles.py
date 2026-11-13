@@ -88,5 +88,8 @@ def restore_hardware_settings(merged, current_yaml, saved):
         }.items():
             merged[key] = current_yaml.get(key, default)
     if selected in {"B200", "B200_full_ram"}:
-        # A resolved checkpoint value must not freeze an automatic batch plan.
+        # Resolved checkpoint values must not freeze vLLM's automatic B200
+        # scheduler when the current launch still requests auto.
         merged["gen_micro_batch"] = current_yaml.get("gen_micro_batch", "auto")
+        merged["vllm_max_num_batched_tokens"] = current_yaml.get(
+            "vllm_max_num_batched_tokens", "auto")

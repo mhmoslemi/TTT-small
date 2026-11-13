@@ -667,6 +667,7 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         max_num_seqs=0, seed=None, quantization=None,
                         tensor_parallel_size=1, pipeline_parallel_size=1,
                         max_num_batched_tokens=0,
+                        performance_mode=None,
                         enable_expert_parallel=False,
                         enable_sleep_mode=False,
                         disable_custom_all_reduce=False, engine_options=None,
@@ -741,6 +742,8 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
         kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
         if int(max_num_batched_tokens) < int(max_seq_length):
             kwargs["enable_chunked_prefill"] = True
+    if performance_mode:
+        kwargs["performance_mode"] = str(performance_mode)
     if seed is not None:
         kwargs["seed"] = int(seed)
     # Rollout quantization is independent of the training copy's QLoRA format.
@@ -833,10 +836,13 @@ def _prepare_vllm_sleep_allocator_env():
               "requires vLLM's CuMemAllocator", flush=True)
 
 
-def _prepare_vllm_thinking_budget_env(thinking_budget):
-    """Select the vLLM runner that implements native thinking budgets."""
-    if thinking_budget:
-        # vLLM reads this at import time; Model Runner V2 rejects the budget.
+def _prepare_vllm_thinking_budget_env(thinking_budget, use_v2=False):
+    """Select the requested runner before vLLM is imported."""
+    if use_v2:
+        # vLLM 0.30 implements thinking budgets and chunked prompt logprobs in
+        # Model Runner V2; it is also the standard high-throughput runner.
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    elif thinking_budget:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
 
@@ -955,6 +961,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       gen_micro_batch=0, quantization=None,
                       tensor_parallel_size=1, pipeline_parallel_size=1,
                       max_num_batched_tokens=0,
+                      performance_mode=None, use_v2_model_runner=False,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
@@ -976,7 +983,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # core children inherit this worker-specific environment.
     if enable_sleep_mode:
         _prepare_vllm_sleep_allocator_env()
-    _prepare_vllm_thinking_budget_env(thinking_budget)
+    _prepare_vllm_thinking_budget_env(
+        thinking_budget, use_v2=use_v2_model_runner)
     # FlashInfer sampling defaults on in recent vLLM releases and may try to
     # compile at runtime with nvcc. Keep the dependency-free native sampler as
     # the default while preserving an explicit operator override.
@@ -1038,6 +1046,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
+            performance_mode=performance_mode,
             enable_expert_parallel=enable_expert_parallel,
             # Older vLLM builds do not accept this constructor option. They
             # start normally and report no sleep capability so the parent can
@@ -1050,8 +1059,10 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         if thinking_budget:
             from vllm import envs
             from vllm.config import ReasoningConfig
-            if getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False):
-                raise RuntimeError("coder thinking budgets require vLLM Model Runner V1")
+            if (use_v2_model_runner
+                    and not getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)):
+                raise RuntimeError(
+                    "B200 rollout generation requires vLLM Model Runner V2")
             # Use the native boundary alone; no injected transition phrase.
             SamplingParams(thinking_token_budget=int(thinking_budget))
             engine_kwargs["reasoning_config"] = ReasoningConfig(
@@ -1072,8 +1083,11 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     AsyncEngineArgs(**engine_kwargs))
 
             llm = async_loop.run_until_complete(_start_async_engine())
+            scheduler_label = (
+                "vLLM automatic" if not int(gen_micro_batch or 0)
+                else str(int(gen_micro_batch)))
             print(f"[vllm worker {rank}] asynchronous completion streaming "
-                  f"enabled (max_num_seqs={int(gen_micro_batch or 0)})",
+                  f"enabled (max_num_seqs={scheduler_label})",
                   flush=True)
         else:
             llm = LLM(**engine_kwargs)
@@ -1787,6 +1801,7 @@ class GenerationPool:
         effective_max_batched_tokens = int(
             vllm_max_num_batched_tokens or 0)
         if (self.backend == "vllm" and self.vllm_token_scoring
+                and hardware_profile not in {"B200", "B200_full_ram"}
                 and (effective_max_batched_tokens <= 0
                      or effective_max_batched_tokens
                      > VLLM_TOKEN_SCORING_MAX_BATCHED_TOKENS)):
@@ -1900,6 +1915,14 @@ class GenerationPool:
             "tensor_parallel_size": tp,
             "pipeline_parallel_size": pp,
             "max_num_batched_tokens": effective_max_batched_tokens,
+            "performance_mode": (
+                "throughput"
+                if self.backend == "vllm"
+                and hardware_profile in {"B200", "B200_full_ram"}
+                else None),
+            "use_v2_model_runner": bool(
+                self.backend == "vllm"
+                and hardware_profile in {"B200", "B200_full_ram"}),
             "enable_expert_parallel": bool(vllm_enable_expert_parallel),
             "engine_options": vllm_engine_options,
             # Separate TP engines remap different physical GPU pairs to the

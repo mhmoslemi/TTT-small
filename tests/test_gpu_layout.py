@@ -83,7 +83,8 @@ def test_erdos_gpt_oss_config_uses_eight_coders(monkeypatch, tmp_path, resume):
     assert cfg.coder_reasoning_effort == "low"
     assert cfg.strategy_backend == "local" and not cfg.api_strategy
     assert cfg.training_layout == "replicated"
-    assert cfg.gen_micro_batch >= 8
+    assert cfg.gen_micro_batch == 0
+    assert cfg.vllm_max_num_batched_tokens == 0
 
 
 def test_qwen_keeps_original_worker_and_parallel_layout():

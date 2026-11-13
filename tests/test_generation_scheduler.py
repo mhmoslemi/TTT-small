@@ -103,7 +103,7 @@ class GenerationSchedulerTests(unittest.TestCase):
 
     def test_refill_before_slow_request_finishes_and_keep_exact_counts(self):
         pool = workers.GenerationPool.__new__(workers.GenerationPool)
-        pool.num_workers, pool.gen_micro_batch = 2, 2
+        pool.num_workers, pool.gen_micro_batch = 2, 0
         pool._async_worker_ids = {0, 1}
         pool.procs = [SimpleNamespace(exitcode=None)] * 2
         pool.shutdown = Mock()
@@ -306,11 +306,13 @@ class GenerationSchedulerTests(unittest.TestCase):
         self.assertAlmostEqual(result[0][2][0], -.1)
         self.assertAlmostEqual(result[0][2][1], -.2)
 
-    def test_thinking_budget_selects_vllm_runner_v1_before_import(self):
+    def test_b200_thinking_budget_selects_vllm_runner_v2_before_import(self):
         previous = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
         try:
-            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
-            workers._prepare_vllm_thinking_budget_env(131072)
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+            workers._prepare_vllm_thinking_budget_env(131072, use_v2=True)
+            self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "1")
+            workers._prepare_vllm_thinking_budget_env(131072, use_v2=False)
             self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "0")
         finally:
             if previous is None:

@@ -1388,9 +1388,9 @@ def load_config():
 
     if (merged.get("problem") in {"ac1", "ac2"}
             and merged.get("coder_model_profile") == "gpt-oss-120b"
-            and merged.get("generation_backend") == "vllm"):
-        # AC responses can exceed 64K tokens; bound vLLM's exact FP32
-        # prompt-logprob projection without shortening or approximating them.
+            and merged.get("generation_backend") == "vllm"
+            and merged.get("hardware_profile") not in {"B200", "B200_full_ram"}):
+        # Legacy runners project exact prompt logprobs in one large chunk.
         merged["vllm_max_num_batched_tokens"] = min(int(merged["vllm_max_num_batched_tokens"]), 2048)
         print('[memory] AC GPT-OSS exact scoring: vLLM max batched tokens=2048')
 

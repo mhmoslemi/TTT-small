@@ -395,9 +395,9 @@ def test_yaml_local_strategy_and_aligned_gpt_oss_coder(config, filename):
 
 
 @pytest.mark.parametrize(("filename", "expected"), [
-    ("ac1.yaml", 2048), ("ac2.yaml", 2048), ("erdos.yaml", 8192),
+    ("ac1.yaml", 0), ("ac2.yaml", 2048), ("erdos.yaml", 0),
 ])
-def test_only_ac_gpt_oss_bounds_exact_scoring_projection(
+def test_only_legacy_gpu_profiles_bound_exact_scoring_projection(
         config, filename, expected):
     cfg, _ = config(
         "--strategies", "--generation-backend", "vllm",
@@ -405,7 +405,7 @@ def test_only_ac_gpt_oss_bounds_exact_scoring_projection(
     assert cfg.vllm_max_num_batched_tokens == expected
 
 
-def test_resumed_ac_run_reapplies_exact_scoring_bound(config, tmp_path):
+def test_resumed_b200_ac_run_restores_vllm_auto_scoring(config, tmp_path):
     _, saved = config(
         "--strategies", "--generation-backend", "vllm",
         filename="ac1.yaml")
@@ -414,7 +414,7 @@ def test_resumed_ac_run_reapplies_exact_scoring_bound(config, tmp_path):
     cfg, _ = config(
         "--strategies", "--generation-backend", "vllm",
         "--resume", str(tmp_path), filename="ac1.yaml")
-    assert cfg.vllm_max_num_batched_tokens == 2048
+    assert cfg.vllm_max_num_batched_tokens == 0
 
 
 def test_empty_selector_disables_api_and_cli_overrides_effort(config, monkeypatch):

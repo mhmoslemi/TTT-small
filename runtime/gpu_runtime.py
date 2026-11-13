@@ -436,7 +436,14 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
             "max_seq_length, choose generation_backend=hf, or provide a "
             "larger compatible TP*PP group.")
 
-    if _auto(cfg.get("gen_micro_batch", "auto")):
+    b200 = (using_vllm
+            and cfg.get("hardware_profile") in {"B200", "B200_full_ram"})
+    if _auto(cfg.get("gen_micro_batch", "auto")) and b200:
+        # Zero means do not pass max_num_seqs. vLLM 0.30 then selects its
+        # hardware-aware B200 throughput ceiling and admits against profiled KV.
+        cfg["gen_micro_batch"] = 0
+        notes.append("generation max sequences=vLLM automatic throughput")
+    elif _auto(cfg.get("gen_micro_batch", "auto")):
         # ``max_num_seqs`` is an active scheduler ceiling, not a reservation of
         # max_model_len for every request.  Basing it on full-context requests
         # serialized long-thinking jobs (for example, two active Qwen3.8
@@ -447,7 +454,6 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         # shortening or approximating any rollout.
         # B200 needs wider decode batches; use a 32K active target there
         # (16K for GPT-OSS). This changes admission, never the output limit.
-        b200 = using_vllm and cfg.get("hardware_profile") in {"B200", "B200_full_ram"}
         active_target = (16_384 if using_vllm and uses_bounded_gpt_oss_repack(
             cfg.get("model_name"), cfg.get("vllm_quantization"))
             else (32_768 if b200 else 65_536))
@@ -479,7 +485,12 @@ def resolve_memory_settings(cfg: dict, roles: GPURoles,
         if cfg["gen_micro_batch"] < 0:
             raise ValueError("gen_micro_batch must be auto or >= 0")
 
-    if _auto(cfg.get("vllm_max_num_batched_tokens", "auto")):
+    if _auto(cfg.get("vllm_max_num_batched_tokens", "auto")) and b200:
+        # Zero omits the constructor argument. Throughput mode lets vLLM pick
+        # chunked-prefill and token scheduling limits for the detected B200.
+        cfg["vllm_max_num_batched_tokens"] = 0
+        notes.append("vLLM batched tokens=vLLM automatic throughput")
+    elif _auto(cfg.get("vllm_max_num_batched_tokens", "auto")):
         # Chunked prefill keeps a long prompt from monopolizing a giant
         # temporary batch.  This is scheduling work per iteration, not the KV
         # capacity or maximum request length.
