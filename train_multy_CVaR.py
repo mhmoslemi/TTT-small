@@ -1941,25 +1941,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
     training_enabled = not bool(getattr(cfg, "no_train", False))
-    unfiltered_sampling = bool(
-        math.isclose(float(cfg.temperature), 1.0)
-        and math.isclose(float(cfg.top_p), 1.0)
-        and getattr(cfg, "sampling_top_k", None) in (None, 0, -1)
-        and float(getattr(cfg, "sampling_min_p", 0.0) or 0.0) == 0.0
-    )
-    # B200 decode stays on the fast token-only path when exact teacher-forced
-    # scoring represents the same unfiltered policy used for sampling.
-    capture_rollout_logprobs = bool(
-        training_enabled
-        and not (
-            spo_rs_mode
-            and unfiltered_sampling
-            and cfg.generation_backend == "vllm"
-            and getattr(cfg, "hardware_profile", "RTX6000")
-            in {"B200", "B200_full_ram"}
-        )
-    )
-
     all_examples = []
     spo_rs_updates = []
     entropic_overlap_state = None
@@ -2566,7 +2547,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 progress_desc="coder format retries",
                 full_policy_sampling=_uses_sequence_level_policy_ratio(cfg))
             if cfg.generation_backend == "vllm":
-                options["return_logprobs"] = capture_rollout_logprobs
+                options["return_logprobs"] = training_enabled
             stream = gen_pool.iter_group_jobs(**options)
         else:
             _seed_local_generation(retry_step)
@@ -3384,7 +3365,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                         }
                         if cfg.generation_backend == "vllm":
-                            options["return_logprobs"] = capture_rollout_logprobs
+                            options["return_logprobs"] = training_enabled
                         phase_records = []
                         for local_idx, job_results in (gen_pool.iter_group_jobs(**options)):
                             source_idx = active_indices[int(local_idx)]
@@ -3464,7 +3445,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature,
                                 top_p=cfg.top_p, top_k=getattr(cfg, "sampling_top_k", None),
                                 min_p=getattr(cfg, "sampling_min_p", None),
-                                return_logprobs=capture_rollout_logprobs,
+                                return_logprobs=training_enabled,
                                 full_policy_sampling=_uses_sequence_level_policy_ratio(cfg),
                                 progress_desc="coder rollouts" if expected_pilots else "adaptive rollouts"):
                             source_idx, prompt_idx, phase = jobs_by_key[key]
@@ -3514,7 +3495,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                     }
                     if cfg.generation_backend == "vllm":
-                        generation_options["return_logprobs"] = capture_rollout_logprobs
+                        generation_options["return_logprobs"] = training_enabled
                     for job_idx, job_results in gen_pool.iter_group_jobs(**generation_options):
                         for result in job_results:
                             text, token_ids = result[:2]
