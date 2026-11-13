@@ -18,7 +18,6 @@ import numpy as np
 
 from problems.base import (
     Problem, ParentContext, RewardResult, SeedState, render_state_context,
-    render_ttt_state_context,
 )
 
 from examples.ac_inequalities.prompt import (
@@ -170,13 +169,8 @@ class ACInequalities(Problem):
 
     # ------------------------------------------------------------------
     def _state_ctx(self, parent: ParentContext) -> str:
-        # Parent block as in TTT-Discover. With no parent program the old text
-        # is kept: the JEV gate hashes the parentless prompt as the problem
-        # description, so changing it would invalidate saved selections.
-        render = (render_ttt_state_context
-                  if parent.code and parent.code.strip() else render_state_context)
-        ctx = render(self.metric_name, self.target, parent,
-                     maximize=self.maximize)
+        ctx = render_state_context(self.metric_name, self.target, parent,
+                                   maximize=self.maximize)
         if parent.construction is not None and len(parent.construction) > 0:
             ctx += f"\nLength of the construction: {len(parent.construction)}"
         return ctx

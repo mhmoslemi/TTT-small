@@ -473,23 +473,6 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimiz
     return target
 
 
-def _backfill_legacy_observations(sampler, snapshot, exp_dir):
-    """Checkpoints from before State.observation existed: restore each archived
-    program's printed output from its saved rollout (one-time, then persisted)."""
-    fill = getattr(sampler, "fill_observations", None)
-    wanted = {}
-    for item in snapshot.get("states", ()):
-        if fill is not None and "observation" not in item and not item.get("is_seed"):
-            wanted.setdefault(int(item.get("timestep", -1)), set()).add(str(item["id"]))
-    if not wanted:
-        return
-    from search.prompt_context import observations_from_rollout_metas
-    filled = fill(observations_from_rollout_metas(exp_dir, wanted))
-    print(f"[resume] restored the previous-program output of {filled}/"
-          f"{sum(len(ids) for ids in wanted.values())} archived programs from saved "
-          "rollouts (the checkpoint predates that field)", flush=True)
-
-
 def _load_training_checkpoint(exp_dir, *, mmap=False):
     import torch
 
@@ -671,11 +654,7 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             construction = meta.get("construction")
         except (TypeError, ValueError):
             continue
-        state = State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,
-                           observation=meta.get("observation") or "")
-        parent_raw = meta.get("parent_raw_score")
-        state.parent_raw_score = float(parent_raw) if isinstance(parent_raw, (int, float)) else None
-        states.append(state)
+        states.append(State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
 
@@ -1196,8 +1175,6 @@ def _finalize_pending_spo_rs_artifacts(
             value=(parent.value if parent.value is not None else 0.0),
             raw_score=parent.raw_score,
             construction=parent.construction,
-            parent_raw_score=parent.parent_raw_score,
-            observation=parent.observation,
         )
         for parent in parents
     ]
@@ -1239,7 +1216,7 @@ def _finalize_pending_spo_rs_artifacts(
         parent_context = parent_contexts[int(meta["parent_group"])]
         if not isolated_eval:
             return problem.compute_reward(response_text, parent_context, cfg.sandbox_timeout_s, **answer_options)
-        with host_admission.reservation(isolated_memory_limit):
+        with host_admission.reservation(min(1024**3, isolated_memory_limit)):
             cpu_id = isolated_slots.get()
             try:
                 return problem.compute_reward(
@@ -1346,8 +1323,7 @@ def _finalize_pending_spo_rs_artifacts(
         child = State.make(
             timestep=step_idx, value=float(result.reward),
             code=result.code or "", raw_score=result.raw_score,
-            construction=result.construction,
-            observation=getattr(result, "observation", ""))
+            construction=result.construction)
         archive_eligible = bool(result.valid and result.code)
         strategy_source = pending.get("strategy_source_job_idx")
         strategy_index = (
@@ -1381,8 +1357,6 @@ def _finalize_pending_spo_rs_artifacts(
             "advantage_mode": str(cfg.advantage_mode).lower(),
             "advantage_scale": float(beta_by_index[index]),
             "sandbox_stdout": (result.stdout or "")[:2000],
-            # Only a rollout that can become a parent needs its full output.
-            "observation": (getattr(result, "observation", "") if archive_eligible else ""),
             "parent_value": (float(parent.value) if parent.value is not None else None),
             "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
             "parent_is_seed": parent.id in sampler._seed_ids,
@@ -1636,11 +1610,6 @@ def _resume_spo_rs_step_from_artifacts(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
                 construction=_literal_float_list(meta.get("construction")),
-                # Older metas lack "observation"; their sandbox_stdout is only
-                # a usable stand-in while it is complete (not cut at 2000).
-                observation=(meta.get("observation")
-                             or (meta.get("sandbox_stdout", "")
-                                 if len(meta.get("sandbox_stdout") or "") < 2000 else "")),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
@@ -1861,7 +1830,7 @@ def _resolve_reward_workers(cfg, problem, cpu_count=None) -> int:
 
 
 def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
-    """Return a conservative automatic per-process sandbox address-space cap.
+    """Return an automatic sandbox address-space cap of at most 1 GiB.
 
     This sets a per-program ceiling, not a promise that the whole evaluator
     pool fits beside resident models. HostMemoryAdmission separately reserves
@@ -1876,7 +1845,7 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
         total_bytes = 8 * 1024**3
     shared_budget = max(1, int(total_bytes * 0.40))
     per_process = shared_budget // concurrent_sandboxes
-    return max(512 * 1024**2, min(4 * 1024**3, per_process))
+    return max(512 * 1024**2, min(1024**3, per_process))
 
 
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
@@ -1965,8 +1934,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             value=parent.value if parent.value is not None else 0.0,
             raw_score=parent.raw_score,
             construction=parent.construction,
-            parent_raw_score=parent.parent_raw_score,
-            observation=parent.observation,
         )
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
@@ -2303,7 +2270,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             f"{isolated_processes_per_cpu}/CPU from reward_workers; each "
             "process tree is pinned to one CPU and excess candidates remain "
             "queued; live RAM admission is shared with model transfers and "
-            f"activation offload; automatic memory ceiling="
+            f"activation offload; RAM reservation="
+            f"{min(1024**3, isolated_memory_limit_bytes) / 1024**3:.2f} GiB/process; "
+            f"automatic address-space ceiling="
             f"{isolated_memory_limit_bytes / 1024**3:.2f} GiB/process, "
             "stdout+stderr capture is bounded")
     else:
@@ -2363,7 +2332,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "shared-GPU evaluator")
 
     def _run_isolated_reward(response_text, parent_ctx, **answer_options):
-        with host_admission.reservation(isolated_memory_limit_bytes):
+        with host_admission.reservation(min(1024**3, isolated_memory_limit_bytes)):
             cpu_id = isolated_cpu_slots.get()
             try:
                 return problem.compute_reward(
@@ -4303,7 +4272,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 code=res.code or "",
                 raw_score=res.raw_score,
                 construction=res.construction,
-                observation=getattr(res, "observation", ""),
             )
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
@@ -4334,7 +4302,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": (res.stdout or '')[:2000],
-                "observation": (getattr(res, "observation", "") if archive_eligible else ""),
                 "parent_value": float(parent.value) if parent.value is not None else None,
                 "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
@@ -5352,7 +5319,6 @@ def main():
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
         print(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
-        _backfill_legacy_observations(sampler, resume_payload["sampler"], exp_dir)
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
         print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')

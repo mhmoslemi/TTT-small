@@ -8,10 +8,11 @@ from concurrent.futures import Future, wait, FIRST_COMPLETED
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
+import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import generation.gen_workers as workers
 from models.coder_profiles import _coder_effort_entries, _phase_coder_prompt_job
@@ -106,6 +107,7 @@ class GenerationSchedulerTests(unittest.TestCase):
         pool.procs = [SimpleNamespace(exitcode=None)] * 2
         pool.shutdown = Mock()
         queued, markers, submitted, outputs = [], [], [], []
+        phase_queued = threading.Event()
 
         class Tasks:
             def __init__(self, rank):
@@ -124,10 +126,19 @@ class GenerationSchedulerTests(unittest.TestCase):
                     self_case.assertEqual(count, 1)
                     submitted.append((self.rank, sample, prompt, step))
                     queued.append((self.rank, sample, [(prompt, [7, 8], [-.1, -.2])]))
+                    if sample == 12:
+                        phase_queued.set()
 
         class Results:
+            first = True
+
             def get(self, timeout):
-                if not outputs:
+                if not self.first and not phase_queued.wait(timeout):
+                    raise Empty
+                if not queued:
+                    raise Empty
+                if self.first:
+                    self.first = False
                     self_case.assertEqual(Counter(rank for rank, *_ in submitted), {0: 2, 1: 2})
                     self_case.assertEqual(Counter((rank, prompt) for rank, _sample, prompt, _step in submitted),
                         {(0, "pilot xhigh"): 1, (1, "pilot xhigh"): 1,
@@ -168,6 +179,65 @@ class GenerationSchedulerTests(unittest.TestCase):
                          ["__rollouts__", "__rollouts__", "__rollouts_done__", "__rollouts_done__"])
         self.assertTrue(all(result[0][2] == [-.1, -.2] for _, result in outputs))
         pool.shutdown.assert_not_called()
+
+    def test_dispatch_continues_during_slow_consumer_and_progress_writes(self):
+        for pause in ("consumer", "progress"):
+            with self.subTest(pause=pause):
+                pool = workers.GenerationPool.__new__(workers.GenerationPool)
+                pool.num_workers, pool.gen_micro_batch = 2, 1
+                pool.hardware_profile = "B200_full_ram"
+                pool._async_worker_ids = {0, 1}
+                pool.procs = [SimpleNamespace(exitcode=None)] * 2
+                pool.shutdown = Mock()
+                pool.result_queue = Queue()
+                submitted, outputs, poll_threads = [], [], set()
+                refilled = threading.Event()
+
+                def submit(rank, task):
+                    if len(task) == 1:
+                        return
+                    step, adapter, jobs, options = task
+                    for sample, prompt, count in jobs:
+                        submitted.append((rank, sample))
+                        pool.result_queue.put((rank, sample, [(prompt, [7], [-.1])]))
+                    if len(submitted) >= 6:
+                        refilled.set()
+
+                pool.task_queues = [SimpleNamespace(put=lambda task, rank=rank: submit(rank, task))
+                                    for rank in range(2)]
+                first = True
+
+                def poll():
+                    nonlocal first
+                    poll_threads.add(threading.get_ident())
+                    if first:
+                        first = False
+                        return [dict(key=0, count=8, prompt_text="pilot", step_idx=7)], False
+                    if len(outputs) == 8:
+                        return [dict(key=1, count=2, prompt_text="phase2", step_idx=4000007)], True
+                    return [], False
+
+                def slow_progress(_count):
+                    self.assertTrue(refilled.wait(2), "progress I/O blocked GPU refill")
+
+                bar = SimpleNamespace(update=slow_progress, close=Mock())
+                with patch.object(workers, "make_progress_bar", return_value=bar):
+                    stream = pool.iter_ready_jobs(
+                        poll, total_expected=10, adapter_path="adapter_step7",
+                        max_new_tokens=262144, temperature=1., top_p=1.,
+                        show_progress=pause == "progress")
+                    try:
+                        for key, result in stream:
+                            if not outputs and pause == "consumer":
+                                self.assertTrue(refilled.wait(2), "result processing blocked GPU refill")
+                            outputs.append(key)
+                    finally:
+                        stream.close()
+                self.assertEqual(Counter(outputs), {0: 8, 1: 2})
+                self.assertEqual(len({sample for _, sample in submitted}), 10)
+                self.assertEqual({rank for rank, _ in submitted}, {0, 1})
+                self.assertEqual(poll_threads, {threading.get_ident()})
+                pool.shutdown.assert_not_called()
 
     def test_worker_accepts_new_requests_and_preserves_next_control_message(self):
         async def run():
@@ -361,7 +431,7 @@ class GenerationSchedulerTests(unittest.TestCase):
         self.assertEqual(deferred, [(records, dict(seed_offset=0))])
 
     def test_worker_failure_and_generator_close_cancel_session(self):
-        for fault in ("worker_error", "over_budget", "close"):
+        for fault in ("worker_error", "over_budget", "producer_error", "close"):
             with self.subTest(fault=fault):
                 pool = workers.GenerationPool.__new__(workers.GenerationPool)
                 pool.num_workers, pool.gen_micro_batch = 1, 2
@@ -370,9 +440,19 @@ class GenerationSchedulerTests(unittest.TestCase):
                 pool.procs = [SimpleNamespace(exitcode=None)]
                 pool.shutdown = Mock()
                 result = (0, None, dict(error="failure")) if fault == "worker_error" else (0, 0, [("ok", [1])])
-                pool.result_queue = SimpleNamespace(get=lambda **kwargs: result)
-                stream = pool.iter_ready_jobs(lambda: ([dict(key=0, count=3 if fault == "over_budget" else 2,
-                    prompt_text="prompt", step_idx=0)], True), total_expected=2,
+                pool.result_queue = Queue()
+                pool.result_queue.put(result)
+                first = True
+
+                def poll():
+                    nonlocal first
+                    if not first:
+                        raise RuntimeError("producer failure")
+                    first = False
+                    return [dict(key=0, count=3 if fault == "over_budget" else 2,
+                                 prompt_text="prompt", step_idx=0)], fault != "producer_error"
+
+                stream = pool.iter_ready_jobs(poll, total_expected=2,
                     adapter_path=None, max_new_tokens=99, temperature=1., top_p=1., show_progress=False)
                 if fault == "close":
                     next(stream)

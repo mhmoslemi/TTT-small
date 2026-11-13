@@ -82,14 +82,10 @@ class State:
     is_seed: bool = False  # True for initial seed states
     raw_score: float = None      # true metric for prompt display (may equal value)
     construction: list = None    # injected global threaded parent -> child
-    # Prompt-only context for the next attempt (TTT-Discover's parent_values /
-    # observation). Neither takes part in selection or in the JEV signatures.
-    parent_raw_score: float = None  # raw_score of the parent this state came from
-    observation: str = ""           # what the program that made this state printed
 
     @staticmethod
     def make(timestep, value, code, parents=None, is_seed=False,
-             raw_score=None, construction=None, observation=""):
+             raw_score=None, construction=None):
         return State(
             id=str(uuid.uuid4()),
             timestep=timestep,
@@ -99,7 +95,6 @@ class State:
             is_seed=is_seed,
             raw_score=raw_score,
             construction=construction,
-            observation=observation or "",
         )
 
 
@@ -378,7 +373,6 @@ class PUCTSampler:
                     [{"id": parent.id, "timestep": parent.timestep}]
                     + (parent.parents or [])
                 )
-                child.parent_raw_score = parent.raw_score
                 new_entries.append((child, parent, strategy_key))
                 if key is not None:
                     existing_keys.add(key)
@@ -516,17 +510,6 @@ class PUCTSampler:
             raise ValueError("sampler checkpoint contains no states")
 
         restored = [State(**item) for item in states]
-        # Checkpoints written before State.parent_raw_score existed: it is the
-        # raw_score of the state's parent, which is still in the archive.
-        legacy = {item.get("id") for item in states if "parent_raw_score" not in item}
-        if legacy:
-            by_id = {s.id: s for s in restored}
-            for s in restored:
-                if s.id in legacy and s.parent_raw_score is None and s.parents:
-                    first = s.parents[0]
-                    parent = by_id.get(first.get("id") if isinstance(first, dict) else first)
-                    if parent is not None:
-                        s.parent_raw_score = parent.raw_score
         restored_ids = {s.id for s in restored}
         seed_ids = set(payload.get("seed_ids", ()))
         if not seed_ids.issubset(restored_ids):
@@ -547,18 +530,6 @@ class PUCTSampler:
             if self._best_raw_min is None or self._best_raw_max is None:
                 self._record_raw_states(self._states)
             self.last_picks_info = []
-
-    def fill_observations(self, observations):
-        """Give archived states that have no recorded output the text in
-        `observations` ({state id: text}). Returns how many were filled."""
-        filled = 0
-        with self._lock:
-            for state in self._states:
-                text = observations.get(state.id)
-                if text and not state.observation:
-                    state.observation = text
-                    filled += 1
-        return filled
 
     def import_legacy_states(self, states, total_expansions: int = 0):
         """Best-effort archive import for runs created before checkpoints."""

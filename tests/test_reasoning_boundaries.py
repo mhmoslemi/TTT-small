@@ -122,11 +122,11 @@ class NativeBoundaryTests(unittest.TestCase):
         def result(**kwargs):
             return SimpleNamespace(**kwargs)
 
-        load_functions("problems/base.py", {"compute_reward", "observation_text"}, scope)
+        load_functions("problems/base.py", {"compute_reward"}, scope)
         scope.update(RewardResult=result, run_code=lambda code, **kwargs: (
             evaluated.append((code, kwargs)) or {"ok": False, "error": "synthetic stop"}))
         problem = SimpleNamespace(require_final_code_marker=True, fail_score=0., entrypoint="run", eval_cpus=1,
-                                  parent_output_max_chars=0, preprocess=lambda code, parent: code)
+                                  preprocess=lambda code, parent: code)
         problem.compute_reward = scope["compute_reward"].__get__(problem)
         slots = Queue()
         slots.put(3)
@@ -177,6 +177,33 @@ class NativeBoundaryTests(unittest.TestCase):
         scope["evaluate"](item)
         self.assertIsNone(item["meta"]["output_format_issue"])
         self.assertEqual(evaluated[0][0], 'value = "</think>"')
+
+    def test_fresh_and_recovery_eval_use_one_gib_reservation_and_limit(self):
+        scope, evaluated, _ = self.pipeline_scope(True)
+        reservations = []
+        scope["os"] = SimpleNamespace(sysconf=lambda key: {
+            "SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 2 * 1024**4 // 4096}[key])
+        load_functions("train_multy_CVaR.py", {"_automatic_sandbox_memory_limit_bytes"}, scope)
+        limit = scope["_automatic_sandbox_memory_limit_bytes"](264)
+        self.assertEqual(limit, 1024**3)
+        scope.update(
+            isolated_memory_limit_bytes=limit, isolated_memory_limit=limit,
+            parent_contexts=[object()], isolated_slots=scope["isolated_cpu_slots"],
+            host_admission=SimpleNamespace(
+                reservation=lambda size: reservations.append(size) or nullcontext()))
+        scope["_run_isolated_reward"](
+            "response", object(), final_answer_text="```python\nrun()\n```")
+        parent = next(node for node in ast.parse((ROOT / "train_multy_CVaR.py").read_text()).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "_finalize_pending_spo_rs_artifacts")
+        evaluate = next(node for node in parent.body if isinstance(node, ast.FunctionDef) and node.name == "evaluate")
+        exec(compile(ast.Module(body=[evaluate], type_ignores=[]), "pending recovery", "exec"), scope)
+        scope["evaluate"]({
+            "meta": {"parent_group": 0}, "response_token_ids": [1, 907, 2],
+            "response_path": SimpleNamespace(read_text=lambda **kwargs: "raw response"),
+            "prompt_path": SimpleNamespace(read_text=lambda **kwargs: "original prompt")})
+        self.assertEqual(reservations, [1024**3, 1024**3])
+        self.assertEqual([kwargs["memory_limit_bytes"] for _, kwargs in evaluated], [limit, limit])
+        self.assertEqual(scope["isolated_cpu_slots"].qsize(), 1)
 
 
 if __name__ == "__main__":

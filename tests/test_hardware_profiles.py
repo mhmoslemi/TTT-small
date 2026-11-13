@@ -288,7 +288,7 @@ class HardwareProfileTests(unittest.TestCase):
                                                        gen_micro_batch=requested), saved)
             self.assertEqual(cfg["gen_micro_batch"], requested)
 
-    def test_inference_and_evaluation_have_disjoint_physical_cores_on_b200_only(self):
+    def test_evaluation_leaves_inference_cores_free_on_b200_only(self):
         import os
         from runtime import configuration
 

@@ -57,7 +57,7 @@ import os
 import signal
 from array import array
 from collections import deque
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import queue
 import re
 import sys
@@ -70,7 +70,6 @@ from runtime.gpu_runtime import (
     uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
-from runtime.hardware_profiles import generation_cpu_ids
 import diagnostics.terminal_output as _terminal_output
 
 
@@ -951,7 +950,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
-                      cpu_ids=None, enable_log_stats=False):
+                      enable_log_stats=False):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
     # engine failure, killing only the multiprocessing.Process can leave those
@@ -965,10 +964,6 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # stdout/stderr and therefore append to the same run-local file.
     _worker_log_handle = _redirect_vllm_output(
         vllm_log_path, rank, gpu_group)
-    if cpu_ids:
-        os.sched_setaffinity(0, set(cpu_ids))
-        print(f"[vllm worker {rank}] inference CPU affinity={cpu_ids}; "
-              "reserved from isolated evaluation", flush=True)
     # Must happen before importing vLLM (and therefore torch). Spawned engine
     # core children inherit this worker-specific environment.
     if enable_sleep_mode:
@@ -1893,9 +1888,8 @@ class GenerationPool:
             "vllm_log_path": self.vllm_log_path,
         }
         if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
-            self._worker_options.update(
-                cpu_ids=generation_cpu_ids(hardware_profile, requested_num_gpus),
-                enable_log_stats=True)
+            # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
+            self._worker_options["enable_log_stats"] = True
         self._load_in_4bit = bool(load_in_4bit)
         self._startup_timeout = _positive_env_timeout(
             "TTT_VLLM_STARTUP_TIMEOUT_S", 900.0)
@@ -2543,6 +2537,94 @@ class GenerationPool:
                         return_logprobs=False, full_policy_sampling=False,
                         top_k=None, min_p=None, progress_desc="coder rollouts",
                         show_progress=True):
+        """Keep GPU dispatch independent of result processing and progress I/O.
+
+        Adaptive job creation stays on the caller's thread with its evaluation
+        records. Only the dispatcher thread touches worker queues.
+        """
+        options = dict(
+            total_expected=total_expected, adapter_path=adapter_path,
+            max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+            return_logprobs=return_logprobs, full_policy_sampling=full_policy_sampling,
+            top_k=top_k, min_p=min_p)
+        if getattr(self, "_async_worker_ids", set()) != set(range(self.num_workers)):
+            yield from self._dispatch_ready_jobs(
+                poll_jobs, progress_desc=progress_desc, show_progress=show_progress, **options)
+            return
+
+        submissions = queue.Queue()
+        # Bound completed long-response buffering when the consumer is slow.
+        outputs = queue.Queue(maxsize=max(2, 2 * self.num_workers))
+        stopped, finished = threading.Event(), threading.Event()
+        errors = []
+        producer_done = False
+
+        def receive_jobs():
+            nonlocal producer_done
+            if stopped.is_set():
+                raise GeneratorExit
+            jobs = []
+            while True:
+                try:
+                    new_jobs, producer_done = submissions.get_nowait()
+                except queue.Empty:
+                    return jobs, producer_done
+                jobs.extend(new_jobs)
+
+        def dispatch():
+            try:
+                with closing(self._dispatch_ready_jobs(
+                        receive_jobs, show_progress=False, **options)) as stream:
+                    for item in stream:
+                        while not stopped.is_set():
+                            try:
+                                outputs.put(item, timeout=0.1)
+                                break
+                            except queue.Full:
+                                pass
+                        if stopped.is_set():
+                            return
+            except GeneratorExit:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        jobs, done = poll_jobs()
+        submissions.put((jobs, done))
+        worker = threading.Thread(target=dispatch, name="coder-dispatch", daemon=True)
+        worker.start()
+        bar = None
+        try:
+            bar = make_progress_bar(total_expected, desc=progress_desc) if show_progress else None
+            while True:
+                if not done:
+                    jobs, done = poll_jobs()
+                    if jobs or done:
+                        submissions.put((jobs, done))
+                try:
+                    item = outputs.get(timeout=0.1)
+                except queue.Empty:
+                    if finished.is_set() and outputs.empty():
+                        if errors:
+                            raise errors[0]
+                        break
+                    continue
+                if bar is not None:
+                    bar.update(len(item[1]))
+                yield item
+        finally:
+            stopped.set()
+            worker.join()
+            if bar is not None:
+                bar.close()
+
+    def _dispatch_ready_jobs(self, poll_jobs, *, total_expected, adapter_path,
+                             max_new_tokens, temperature, top_p,
+                             return_logprobs=False, full_policy_sampling=False,
+                             top_k=None, min_p=None, progress_desc="coder rollouts",
+                             show_progress=True):
         """Feed newly ready jobs into each available decoding slot.
 
         ``poll_jobs`` returns (new jobs, producer finished). Each job has a
@@ -2570,6 +2652,12 @@ class GenerationPool:
         bar = make_progress_bar(total_expected, desc=progress_desc) if show_progress else None
         continuous = getattr(self, "_async_worker_ids", set()) == set(range(self.num_workers))
         capacity = self.gen_micro_batch or max(1, (int(total_expected) + self.num_workers - 1) // self.num_workers)
+        # Keep replacements waiting inside vLLM on B200. They consume no KV
+        # until admitted, while avoiding an idle decode slot during IPC refill.
+        queue_capacity = capacity + (
+            8 if continuous and getattr(self, "hardware_profile", "RTX6000")
+            in {"B200", "B200_full_ram"}
+            else 0)
         try:
             if continuous:
                 for tasks in self.task_queues:
@@ -2595,7 +2683,7 @@ class GenerationPool:
                         next_sample += 1
 
                 available_ranks = [rank for rank in range(self.num_workers)
-                                   if len(inflight[rank]) < capacity and (continuous or not inflight[rank])]
+                                   if len(inflight[rank]) < queue_capacity and (continuous or not inflight[rank])]
                 if continuous:
                     # Effort variants arrive grouped; round robin keeps long
                     # xhigh requests from collecting on the first engine.
@@ -2605,7 +2693,7 @@ class GenerationPool:
                         sample, prompt, task_step = pending.popleft()
                         inflight[rank].add(sample)
                         self.task_queues[rank].put((task_step, adapter_path, [(sample, prompt, 1)], dict(options)))
-                        if len(inflight[rank]) < capacity:
+                        if len(inflight[rank]) < queue_capacity:
                             available.append(rank)
                 else:
                     for position, rank in enumerate(available_ranks):
