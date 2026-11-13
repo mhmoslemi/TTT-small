@@ -16,7 +16,7 @@ fi
 # Do not silently regenerate step 3 if the server's exact sidecars are missing.
 for ttt_meta in "$ttt_resume_dir"/step03/step03_group*_rollout*.meta.json; do
     ttt_base=${ttt_meta%.meta.json}
-    for ttt_suffix in txt prompt.txt tokens.zlib behavior_logprobs.zlib; do
+    for ttt_suffix in txt prompt.txt tokens.zlib; do
         if [ ! -f "$ttt_base.$ttt_suffix" ]; then
             printf '%s\n' "Missing recovery artifact: $ttt_base.$ttt_suffix" >&2
             exit 1

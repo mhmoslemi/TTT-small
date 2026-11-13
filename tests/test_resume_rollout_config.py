@@ -180,7 +180,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                 Path(str(base) + ".meta.json").write_text(json.dumps(dict(
                     step=3, status="evaluation_pending", group=group, parent_group=group,
                     rollout=rollout, n_response_tokens=12, counts_toward_allocation=True, retry_attempt=0)))
-                for suffix in ("txt", "prompt.txt", "tokens.zlib", "behavior_logprobs.zlib"):
+                for suffix in ("txt", "prompt.txt", "tokens.zlib"):
                     Path(str(base) + "." + suffix).touch()
         cfg = SimpleNamespace(groups_per_step=2, group_size=2, hardware_profile="B200_full_ram",
                               num_training_gpus=4, training_gpu_ids="2,3,4,5")
@@ -188,6 +188,39 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertEqual(len(recovered), 4)
         recovered[0]["token_path"].unlink()
         self.assertIsNone(scope["_recoverable_pending_spo_rs_artifacts"](self.run, 3, cfg))
+
+    def test_pending_recovery_rebuilds_missing_behavior_logprobs(self):
+        root = Path(__file__).resolve().parents[1]
+        source = ast.parse((root / "train_multy_CVaR.py").read_text())
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_finalize_pending_spo_rs_artifacts")
+        branch = next(node for node in ast.walk(function) if isinstance(node, ast.If)
+                      and isinstance(node.test, ast.Call)
+                      and isinstance(node.test.func, ast.Name)
+                      and node.test.func.id == "any"
+                      and "current_scores" in ast.unparse(node.test))
+        artifact = dict(
+            meta_path=self.step / "step03_group00_rollout000.meta.json",
+            response_token_ids=[7, 8], behavior_logprobs=None)
+        saved = []
+        class Pool:
+            def score_token_logprobs(self, pairs, **options):
+                self_case.assertEqual(pairs, [([1], [7, 8])])
+                self_case.assertEqual(options["adapter_path"], "adapter_step2")
+                self_case.assertTrue(options["require_complete"])
+                return [[-.1, -.2]]
+        self_case = self
+        scope = dict(
+            current_scores=[None], score_pairs=[([1], [7, 8])],
+            gen_pool=Pool(), sampling_adapter_path="adapter_step2",
+            artifacts=[artifact],
+            save_rollout_logprobs=lambda path, values: saved.append((path, values)))
+        exec(compile(ast.Module(body=[branch], type_ignores=[]),
+                     "pending-logprob-recovery", "exec"), scope)
+        self.assertEqual(artifact["behavior_logprobs"], [-.1, -.2])
+        self.assertEqual(scope["current_scores"], [[-.1, -.2]])
+        self.assertEqual(saved[0][0].name,
+                         "step03_group00_rollout000.behavior_logprobs.zlib")
 
     def test_full_ram_resume_launcher_is_portable_and_checks_sidecars(self):
         import os
@@ -202,7 +235,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         (target / "training_state.pt").touch()
         base = step / "step03_group00_rollout000"
         Path(str(base) + ".meta.json").write_text('{}')
-        for suffix in ("txt", "prompt.txt", "tokens.zlib", "behavior_logprobs.zlib"):
+        for suffix in ("txt", "prompt.txt", "tokens.zlib"):
             Path(str(base) + "." + suffix).touch()
         result = subprocess.run(["sh", str(launcher)], text=True, capture_output=True,
                                 env=dict(os.environ, AVAILABLE_GPUS="6,7"))

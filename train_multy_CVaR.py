@@ -758,10 +758,10 @@ def _recoverable_spo_rs_artifacts(exp_dir, step_idx, cfg):
 def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
     """Return a completely generated SPO-RS step awaiting final evaluation.
 
-    Generation writes response text, exact token IDs, rollout-policy
-    logprobs, prompts, and provisional metadata atomically as each rollout
-    arrives.  If exact consecutive-policy scoring later fails, those durable
-    artifacts are sufficient to resume without sampling the policy again.
+    Generation writes response text, exact token IDs, prompts, and provisional
+    metadata atomically as each rollout arrives. Rollout-policy logprobs may be
+    added by the batched scorer after generation; exact token IDs let recovery
+    reproduce them without sampling the policy again.
     Rewards are deliberately recomputed because provisional metadata never
     claims that an in-memory evaluation survived a process crash.
     """
@@ -795,14 +795,15 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
         token_path = meta_path.with_name(base + ".tokens.zlib")
         behavior_path = meta_path.with_name(base + ".behavior_logprobs.zlib")
         if not all(path.is_file() for path in (
-                response_path, prompt_path, token_path, behavior_path)):
+                response_path, prompt_path, token_path)):
             return None
         artifacts.append({
             "meta_path": meta_path,
             "response_path": response_path,
             "prompt_path": prompt_path,
             "token_path": token_path,
-            "behavior_logprobs_path": behavior_path,
+            "behavior_logprobs_path": (
+                behavior_path if behavior_path.is_file() else None),
             "meta": meta,
         })
 
@@ -1115,17 +1116,17 @@ def _finalize_pending_spo_rs_artifacts(
         spo_rs_tracker, sampling_adapter_path, artifacts):
     """Evaluate and score a generated interrupted step, then seal its metadata.
 
-    No policy sampling occurs here.  The exact generated token IDs and their
-    rollout-policy logprobs come from the durable sidecars.  CPU rewards are
-    recomputed while vLLM scores those same trajectories under the preceding
-    policy, after which the ordinary evaluated-step recovery performs the
-    unchanged fast distributed adapter update.
+    No policy sampling occurs here. Exact generated token IDs come from the
+    durable sidecars; missing rollout-policy logprobs are reconstructed by
+    exact teacher-forced scoring. CPU rewards are recomputed while vLLM scores
+    those trajectories, after which the ordinary evaluated-step recovery
+    performs the unchanged fast distributed adapter update.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from copy import deepcopy
     from queue import Queue
 
-    from experiment_io import save_rollout
+    from experiment_io import save_rollout, save_rollout_logprobs
     from generation.gen_workers import make_progress_bar, native_final_answer_scope
     from problems.base import ParentContext, RewardResult
     from search.sampler import State
@@ -1147,8 +1148,6 @@ def _finalize_pending_spo_rs_artifacts(
     token_summary = _prepare_recoverable_response_tokens(None, tokenizer, artifacts)
     if token_summary["exact_sidecars"] != len(artifacts):
         raise RuntimeError("generated-step recovery refuses non-exact response token IDs")
-    if token_summary["behavior_logprob_sidecars"] != len(artifacts):
-        raise RuntimeError('generated-step recovery requires every rollout-policy logprob sidecar')
 
     parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
     if len(parents) != int(cfg.groups_per_step):
@@ -1246,6 +1245,27 @@ def _finalize_pending_spo_rs_artifacts(
                 prompt_cache[prompt_text], item["response_token_ids"]))
             current_scores.append(item["behavior_logprobs"])
             context_ids.append(int(item["meta"]["parent_group"]))
+
+        if any(values is None for values in current_scores):
+            rescored = gen_pool.score_token_logprobs(
+                score_pairs, show_progress=True,
+                adapter_path=str(sampling_adapter_path),
+                require_complete=True)
+            for item, existing, values in zip(
+                    artifacts, current_scores, rescored):
+                if existing is not None:
+                    continue
+                if values is None or len(values) != len(item["response_token_ids"]):
+                    raise RuntimeError(
+                        "generated-step recovery could not reconstruct every "
+                        "rollout-policy logprob")
+                item["behavior_logprobs"] = values
+                behavior_path = item["meta_path"].with_name(
+                    item["meta_path"].name.removesuffix(".meta.json")
+                    + ".behavior_logprobs.zlib")
+                save_rollout_logprobs(behavior_path, values)
+                item["behavior_logprobs_path"] = behavior_path
+            current_scores = [item["behavior_logprobs"] for item in artifacts]
 
         previous_name = spo_rs_tracker.last_policy_adapter
         if previous_name is None:
@@ -1921,6 +1941,24 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                  and int(getattr(cfg, "max_saved_construction", 0)) != 0)
 
     training_enabled = not bool(getattr(cfg, "no_train", False))
+    unfiltered_sampling = bool(
+        math.isclose(float(cfg.temperature), 1.0)
+        and math.isclose(float(cfg.top_p), 1.0)
+        and getattr(cfg, "sampling_top_k", None) in (None, 0, -1)
+        and float(getattr(cfg, "sampling_min_p", 0.0) or 0.0) == 0.0
+    )
+    # B200 decode stays on the fast token-only path when exact teacher-forced
+    # scoring represents the same unfiltered policy used for sampling.
+    capture_rollout_logprobs = bool(
+        training_enabled
+        and not (
+            spo_rs_mode
+            and unfiltered_sampling
+            and cfg.generation_backend == "vllm"
+            and getattr(cfg, "hardware_profile", "RTX6000")
+            in {"B200", "B200_full_ram"}
+        )
+    )
 
     all_examples = []
     spo_rs_updates = []
@@ -2528,7 +2566,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 progress_desc="coder format retries",
                 full_policy_sampling=_uses_sequence_level_policy_ratio(cfg))
             if cfg.generation_backend == "vllm":
-                options["return_logprobs"] = training_enabled
+                options["return_logprobs"] = capture_rollout_logprobs
             stream = gen_pool.iter_group_jobs(**options)
         else:
             _seed_local_generation(retry_step)
@@ -3346,7 +3384,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                         }
                         if cfg.generation_backend == "vllm":
-                            options["return_logprobs"] = training_enabled
+                            options["return_logprobs"] = capture_rollout_logprobs
                         phase_records = []
                         for local_idx, job_results in (gen_pool.iter_group_jobs(**options)):
                             source_idx = active_indices[int(local_idx)]
@@ -3426,7 +3464,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 max_new_tokens=cfg.max_new_tokens, temperature=cfg.temperature,
                                 top_p=cfg.top_p, top_k=getattr(cfg, "sampling_top_k", None),
                                 min_p=getattr(cfg, "sampling_min_p", None),
-                                return_logprobs=training_enabled,
+                                return_logprobs=capture_rollout_logprobs,
                                 full_policy_sampling=_uses_sequence_level_policy_ratio(cfg),
                                 progress_desc="coder rollouts" if expected_pilots else "adaptive rollouts"):
                             source_idx, prompt_idx, phase = jobs_by_key[key]
@@ -3476,7 +3514,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         "full_policy_sampling": (_uses_sequence_level_policy_ratio(cfg)),
                     }
                     if cfg.generation_backend == "vllm":
-                        generation_options["return_logprobs"] = training_enabled
+                        generation_options["return_logprobs"] = capture_rollout_logprobs
                     for job_idx, job_results in gen_pool.iter_group_jobs(**generation_options):
                         for result in job_results:
                             text, token_ids = result[:2]
