@@ -152,6 +152,37 @@ assert "torch" not in sys.modules
         assert "import train_multy_CVaR" not in path.read_text(), path
 
 
+def test_entropy_export_records_real_measurements_and_preserves_policy_gradients(tmp_path):
+    import json
+    import torch
+    from analysis.entropy_tools import measure_policy_entropy
+    from training.trainers import measure_policy_entropy as trainer_decorator
+
+    assert trainer_decorator is measure_policy_entropy
+    module = ast.parse((ROOT / "analysis/entropy_tools.py").read_text())
+    assert any(isinstance(node, ast.FunctionDef) and node.name == "measure_policy_entropy"
+               for node in module.body)
+    scores = [torch.tensor([-.3, -.7, -.2], requires_grad=True)]
+    calls = []
+
+    def forward(model, examples, with_grad, chunk, **options):
+        calls.append(options["return_entropy"])
+        return (scores, [torch.tensor([.2, .8, 1.])]) if options["return_entropy"] else scores
+
+    path = tmp_path / "measurement.json"
+    examples = [{"_entropy_measurement": {"path": str(path), "forced_token_indices": [1]}}]
+    wrapped = measure_policy_entropy(forward)
+    assert wrapped(None, examples, True) is scores
+    measured = json.loads(path.read_text())
+    assert measured["measured"] and measured["token_count"] == 2
+    assert measured["entropy_sum_nats"] == pytest.approx(1.2)
+    scores[0].sum().backward()
+    assert torch.equal(scores[0].grad, torch.ones(3))
+    assert wrapped(None, examples, True) is scores
+    assert wrapped(None, examples, False) is scores
+    assert calls == ["measure", False, False]
+
+
 def test_extracted_config_and_restart_keep_project_root_paths(monkeypatch, tmp_path):
     path = ROOT / "runtime/configuration.py"
     tree = ast.parse(path.read_text())

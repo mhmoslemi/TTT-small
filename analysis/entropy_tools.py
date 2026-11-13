@@ -128,34 +128,29 @@ def _record_tensor(descriptor, values):
 
 
 def measure_policy_entropy(function):
-    """Instrument successful policy forwards without changing their API result.
+    """Record pre-update policy entropy using the existing differentiable forward.
 
-    Descriptors travel with examples through existing queues and device moves.
-    Only with_grad policy calls participate; reference scoring cannot
-    contaminate the metric. Multi-epoch callers disable this after epoch zero.
-    The first completed forward is counted once, even if backward subsequently
-    OOMs. Such a forward is still a valid pre-update policy observation.
-    Checkpoint recomputation happens below this wrapper and cannot double count.
+    Reference forwards never record measurements. Completed descriptors are
+    reused after retries, and forced boundary tokens are excluded by the
+    recorder. The policy scores and their gradient graph pass through intact.
     """
     @functools.wraps(function)
     def wrapped(model, examples, with_grad, chunk=0, *, pad_token_id=0,
                 return_entropy=False, measure_entropy=True):
         examples = list(examples)
-        pending = []
-        if with_grad and measure_entropy:
-            for index, example in enumerate(examples):
-                descriptor = example.get("_entropy_measurement")
-                if descriptor and not Path(descriptor["path"]).exists():
-                    pending.append((index, descriptor))
-        if not pending:
-            return function(model, examples, with_grad, chunk,
-                            pad_token_id=pad_token_id,
-                            return_entropy=return_entropy)
-        # True preserves a requested entropy regularizer's existing graph.
-        # 'measure' returns entropy detached without changing policy logprobs.
+        pending = [
+            (index, example["_entropy_measurement"])
+            for index, example in enumerate(examples)
+            if (with_grad and measure_entropy
+                and example.get("_entropy_measurement")
+                and not Path(example["_entropy_measurement"]["path"]).exists())
+        ]
+        requested_entropy = (True if return_entropy else "measure") if pending else return_entropy
         result = function(model, examples, with_grad, chunk,
                           pad_token_id=pad_token_id,
-                          return_entropy=True if return_entropy else "measure")
+                          return_entropy=requested_entropy)
+        if not pending:
+            return result
         logprobs, entropies = result
         for index, descriptor in pending:
             try:
