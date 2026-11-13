@@ -7,6 +7,7 @@ from collections import Counter
 from concurrent.futures import Future, wait, FIRST_COMPLETED
 from contextlib import redirect_stdout
 import io
+import os
 from pathlib import Path
 from queue import Empty, Queue
 import threading
@@ -304,6 +305,18 @@ class GenerationSchedulerTests(unittest.TestCase):
         self.assertEqual((rank, sample, result[0][:2]), (4, 29, ("program", [7, 8])))
         self.assertAlmostEqual(result[0][2][0], -.1)
         self.assertAlmostEqual(result[0][2][1], -.2)
+
+    def test_thinking_budget_selects_vllm_runner_v1_before_import(self):
+        previous = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+        try:
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+            workers._prepare_vllm_thinking_budget_env(131072)
+            self.assertEqual(os.environ["VLLM_USE_V2_MODEL_RUNNER"], "0")
+        finally:
+            if previous is None:
+                os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+            else:
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"] = previous
 
     def test_phase2_polls_new_parent_during_first_parents_generation(self):
         records, prompt_jobs = [], []

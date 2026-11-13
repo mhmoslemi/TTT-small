@@ -833,6 +833,13 @@ def _prepare_vllm_sleep_allocator_env():
               "requires vLLM's CuMemAllocator", flush=True)
 
 
+def _prepare_vllm_thinking_budget_env(thinking_budget):
+    """Select the vLLM runner that implements native thinking budgets."""
+    if thinking_budget:
+        # vLLM reads this at import time; Model Runner V2 rejects the budget.
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
+
 def _flashinfer_comm_guard_required(package_version, python_version=None):
     """Return whether FlashInfer's comm package has the annotation bug."""
     python_version = (sys.version_info[:2] if python_version is None
@@ -969,6 +976,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # core children inherit this worker-specific environment.
     if enable_sleep_mode:
         _prepare_vllm_sleep_allocator_env()
+    _prepare_vllm_thinking_budget_env(thinking_budget)
     # FlashInfer sampling defaults on in recent vLLM releases and may try to
     # compile at runtime with nvcc. Keep the dependency-free native sampler as
     # the default while preserving an explicit operator override.
@@ -1042,8 +1050,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
         if thinking_budget:
             from vllm import envs
             from vllm.config import ReasoningConfig
-            if not getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False):
-                raise RuntimeError("coder thinking budgets require vLLM Model Runner V2")
+            if getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False):
+                raise RuntimeError("coder thinking budgets require vLLM Model Runner V1")
             # Use the native boundary alone; no injected transition phrase.
             SamplingParams(thinking_token_budget=int(thinking_budget))
             engine_kwargs["reasoning_config"] = ReasoningConfig(
