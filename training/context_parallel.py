@@ -370,6 +370,7 @@ def compute_context_work(backend, tokenizer, example, cfg, group, ranks, *, vali
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
             loss, metrics = training.clipped_policy_loss(
                 cfg, current, old.to(device), None, example["advantage"],
+                forced_token_indices=example.get("forced_token_indices", ()),
                 clip_epsilon=epsilon, clip_epsilon_low=low,
                 clip_epsilon_high=high, kl_coef=kl)
             if not torch.isfinite(loss).all():
@@ -432,6 +433,7 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
                 advantage=1.0, sample_weight=1.0)
     mini.pop("_entropy_measurement", None)
     size = mini["response_ids"].shape[1]
+    mini["forced_token_indices"] = [index for index in mini.get("forced_token_indices", ()) if index < size]
     old = torch.empty(size, dtype=torch.float32, device=device)
     reference_gradients = None
     if leader:
@@ -451,6 +453,7 @@ def _validate_context_group(backend, tokenizer, example, cfg, group, ranks):
             epsilon, low, high, kl = training._clipped_policy_options(cfg)
             loss, _ = training.clipped_policy_loss(
                 cfg, scores, old, None, 1.0, clip_epsilon=epsilon,
+                forced_token_indices=mini.get("forced_token_indices", ()),
                 clip_epsilon_low=low, clip_epsilon_high=high, kl_coef=kl)
             loss.backward()
         reference_gradients = {name: parameter.grad.detach().cpu().clone()

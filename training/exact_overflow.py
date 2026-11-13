@@ -240,6 +240,7 @@ def backward_overflow_example(backend, tokenizer, example, cfg, gpu_ids):
                     loss, metrics = training.clipped_policy_loss(
                         cfg, current, item["old_policy_logprobs"],
                         None, item["advantage"],
+                        forced_token_indices=item.get("forced_token_indices", ()),
                         clip_epsilon=epsilon, clip_epsilon_low=low,
                         clip_epsilon_high=high, kl_coef=kl)
                     if not torch.isfinite(loss).all():

@@ -93,6 +93,7 @@ class SPORSTracker:
         previous_scores: Sequence[Sequence[float] | None],
         context_ids: Sequence[int],
         *, required_context_ids: Sequence[int] | None = None,
+        forced_token_indices: Sequence[Sequence[int]] | None = None,
     ) -> tuple[float, int, dict[int, float]]:
         """Estimate mean KL(pi_t || pi_{t-1}) on current-step contexts.
 
@@ -103,6 +104,10 @@ class SPORSTracker:
         """
         if not (len(current_scores) == len(previous_scores) == len(context_ids)):
             raise ValueError("SPO-RS policy scores and contexts must align")
+        if forced_token_indices is None:
+            forced_token_indices = [()] * len(current_scores)
+        if len(forced_token_indices) != len(current_scores):
+            raise ValueError("forced-token masks must align with SPO-RS policy scores")
         required_contexts = tuple(dict.fromkeys(
             int(x) for x in (
                 context_ids if required_context_ids is None
@@ -111,8 +116,8 @@ class SPORSTracker:
             context_id: [] for context_id in required_contexts
         }
         missing = 0
-        for current_values, previous_values, context_id in zip(
-                current_scores, previous_scores, context_ids):
+        for current_values, previous_values, context_id, forced in zip(
+                current_scores, previous_scores, context_ids, forced_token_indices):
             if current_values is None or previous_values is None:
                 missing += 1
                 continue
@@ -124,8 +129,12 @@ class SPORSTracker:
                     or not np.isfinite(previous).all()):
                 missing += 1
                 continue
-            by_context[int(context_id)].append(float(np.sum(
-                current - previous, dtype=np.float64)))
+            difference = current - previous
+            if forced:
+                if any(type(index) is not int or not 0 <= index < current.size for index in forced):
+                    raise ValueError("invalid forced-token index in SPO-RS divergence")
+                difference[list(forced)] = 0.0
+            by_context[int(context_id)].append(float(np.sum(difference, dtype=np.float64)))
 
         if any(not values for values in by_context.values()):
             return math.inf, missing, {}

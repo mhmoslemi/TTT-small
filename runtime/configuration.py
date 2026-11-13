@@ -1072,6 +1072,8 @@ def load_config():
     # resolvers below remain authoritative when they require full-policy
     # sampling for an exact likelihood ratio.
     _apply_qwen3_8b_thinking_sampling(merged, profile_explicit_keys)
+    from generation.thinking_budget import validate_thinking_budget
+    validate_thinking_budget(merged)
     _resolve_policy_options(merged)
     _resolve_spo_rs_options(merged)
     train_microbatch = int(merged["train_examples_per_microbatch"])

@@ -536,6 +536,7 @@ def local_spo_rs_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 example["old_policy_logprobs"],
                                 None,
                                 example["advantage"],
+                                forced_token_indices=example.get("forced_token_indices", ()),
                                 clip_epsilon=epsilon,
                                 clip_epsilon_low=epsilon_low,
                                 clip_epsilon_high=epsilon_high,
@@ -964,6 +965,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                         for example, current_lp, base_lp in zip(
                                 batch, current_logprobs, base_logprobs):
                             base_lp = base_lp.to(current_lp.device)
+                            forced = example.get("forced_token_indices", ())
+                            current_lp, base_lp = training.policy_token_values(
+                                current_lp, base_lp, forced_token_indices=forced)
                             advantage = example["advantage"]
                             logp_difference = (
                                 current_lp - base_lp).detach()
@@ -980,6 +984,9 @@ def local_policy_update(backend, model, tokenizer, examples, cfg, logical_id,
                                 example["behavior_logprobs"].to(
                                     current_lp.device)
                                 if has_behavior else None)
+                            if has_behavior and forced:
+                                behavior_lp, = training.policy_token_values(
+                                    behavior_lp, forced_token_indices=forced)
                             if sequence_policy:
                                 loss, policy_metrics = (
                                     training.

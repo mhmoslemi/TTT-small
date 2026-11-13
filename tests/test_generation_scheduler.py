@@ -283,6 +283,7 @@ class GenerationSchedulerTests(unittest.TestCase):
             return kwargs
         scope = dict(engine_options=None, llm=SimpleNamespace(
             get_tokenizer=lambda: SimpleNamespace(encode=encode)), max_seq_length=262144,
+            thinking_budget=0, check_answer_space=workers.check_answer_space,
             result_queue=results, rank=4, seed=42, array=array,
             _vllm_rollout_seed=workers._vllm_rollout_seed, SamplingParams=params,
             RequestOutputKind=SimpleNamespace(FINAL_ONLY="final"),

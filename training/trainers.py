@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+from generation.thinking_budget import policy_token_values
 
 from analysis.entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
 from diagnostics.console import setting_log_only
@@ -989,7 +990,8 @@ def clipped_surrogate_loss(
         current_logprobs, old_logprobs, reference_logprob,
         advantage, *, clip_epsilon=SEQUENCE_CLIP_EPSILON_DEFAULT,
         clip_epsilon_low=None, clip_epsilon_high=None, kl_coef=0.0,
-        sequence_level_ratio=False, return_tensor_metrics=False):
+        sequence_level_ratio=False, return_tensor_metrics=False,
+        forced_token_indices=()):
     """One trajectory's loss; callers average equally within each parent.
 
     Normally, per-token rho = exp(current_lp - old_lp) is differentiable. For
@@ -1023,6 +1025,9 @@ def clipped_surrogate_loss(
     old = torch.as_tensor(old_logprobs, dtype=cur.dtype, device=cur.device).detach()
     if cur.ndim != 1 or old.shape != cur.shape or cur.numel() == 0:
         raise ValueError("current and old logprobs must be matching nonempty vectors")
+    ref = (None if reference_logprob is None else
+           torch.as_tensor(reference_logprob, dtype=cur.dtype, device=cur.device).detach())
+    cur, old, ref = policy_token_values(cur, old, ref, forced_token_indices=forced_token_indices)
     adv = torch.as_tensor(advantage, dtype=cur.dtype, device=cur.device).detach()
     if adv.numel() != 1 or not torch.isfinite(adv).all():
         raise ValueError("policy advantage must be a finite scalar")
@@ -1043,7 +1048,6 @@ def clipped_surrogate_loss(
     if kl_coef:
         if reference_logprob is None:
             raise ValueError("reference logprobs are required for nonzero KL coefficient")
-        ref = torch.as_tensor(reference_logprob, dtype=cur.dtype, device=cur.device).detach()
         if ref.shape != cur.shape or not torch.isfinite(ref).all():
             raise ValueError("reference logprobs must be a finite vector matching current logprobs")
         logp_difference = (cur - ref).detach()
@@ -1118,7 +1122,7 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
                        reference_logprob, advantage, *,
                        clip_epsilon, clip_epsilon_low,
                        clip_epsilon_high, kl_coef=0.0,
-                       return_tensor_metrics=False):
+                       return_tensor_metrics=False, forced_token_indices=()):
     """Dispatch the shared fast trainer to the active clipped objective."""
     return clipped_surrogate_loss(
         current_logprobs, old_logprobs, reference_logprob, advantage,
@@ -1127,6 +1131,7 @@ def clipped_policy_loss(cfg, current_logprobs, old_logprobs,
         clip_epsilon_high=clip_epsilon_high,
         kl_coef=kl_coef,
         sequence_level_ratio=_uses_sequence_level_policy_ratio(cfg),
+        forced_token_indices=forced_token_indices,
         return_tensor_metrics=return_tensor_metrics)
 
 
@@ -1205,6 +1210,7 @@ def _prepare_entropic_overlap_group(
         example = {
             "prompt_ids": prompt_ids_by_job[job_idx],
             "response_ids": torch.tensor([token_ids], dtype=torch.long, device="cpu"),
+            "forced_token_indices": record.get("forced_token_indices", []),
             "_entropy_measurement": record.get("_entropy_measurement"),
             "advantage": float(advantage),
             "behavior_logprobs": behavior_logprobs,
@@ -1264,6 +1270,7 @@ def _prepare_spo_rs_overlap_inputs(tokenizer, group_responses, reward_futures, p
             example = {
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": torch.tensor([token_ids], dtype=torch.long, device="cpu"),
+                "forced_token_indices": record.get("forced_token_indices", []),
                 "_entropy_measurement": record.get("_entropy_measurement"),
                 "advantage": None,
                 "behavior_logprobs": torch.as_tensor(behavior_array, dtype=torch.float32).cpu(),
@@ -1436,6 +1443,7 @@ def _train_durable_exact_spo_rs_overflow(
                         loss, metrics = clipped_policy_loss(
                             cfg, current_lp, item["old_policy_logprobs"],
                             None, item["advantage"],
+                            forced_token_indices=item.get("forced_token_indices", ()),
                             clip_epsilon=epsilon,
                             clip_epsilon_low=epsilon_low,
                             clip_epsilon_high=epsilon_high,
@@ -1629,6 +1637,7 @@ def _train_spo_rs_examples(backend, model, tokenizer, optimizer, examples,
                         loss, metrics = clipped_policy_loss(
                             cfg, cur_lp, ex["old_policy_logprobs"],
                             None, ex["advantage"],
+                            forced_token_indices=ex.get("forced_token_indices", ()),
                             clip_epsilon=epsilon,
                             clip_epsilon_low=epsilon_low,
                             clip_epsilon_high=epsilon_high,
@@ -2085,6 +2094,7 @@ class ReplicatedDataParallelTrainer:
                                         example["old_policy_logprobs"],
                                         None,
                                         example["advantage"],
+                                        forced_token_indices=example.get("forced_token_indices", ()),
                                         clip_epsilon=epsilon,
                                         clip_epsilon_low=epsilon_low,
                                         clip_epsilon_high=epsilon_high,
@@ -2318,6 +2328,7 @@ class ReplicatedDataParallelTrainer:
                                     example["old_policy_logprobs"],
                                     None,
                                     example["advantage"],
+                                    forced_token_indices=example.get("forced_token_indices", ()),
                                     clip_epsilon=epsilon,
                                     clip_epsilon_low=epsilon_low,
                                     clip_epsilon_high=epsilon_high,
@@ -2436,6 +2447,9 @@ class ReplicatedDataParallelTrainer:
                     batch_losses = []
                     for example, current_lp, base_lp in zip(batch, current_logprobs, base_logprobs):
                         base_lp = base_lp.to(current_lp.device)
+                        forced = example.get("forced_token_indices", ())
+                        current_lp, base_lp = policy_token_values(
+                            current_lp, base_lp, forced_token_indices=forced)
                         advantage = example["advantage"]
                         logp_difference = (current_lp - base_lp).detach()
                         average_difference = logp_difference.mean()
@@ -2443,6 +2457,8 @@ class ReplicatedDataParallelTrainer:
                         effective_advantage = advantage + kl_advantage
                         behavior_lp = example.get("behavior_logprobs")
                         has_behavior = _valid_example_token_logprobs(example, "behavior_logprobs")
+                        if has_behavior and forced:
+                            behavior_lp, = policy_token_values(behavior_lp, forced_token_indices=forced)
                         if sequence_policy:
                             loss, policy_metrics = (
                                 _a3b_sequence_clipped_standard_loss(

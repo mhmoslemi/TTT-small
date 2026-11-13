@@ -282,6 +282,8 @@ def _resolve_coder_token_limits(merged):
 
 def _coder_effort_for_rollout_phase(cfg, phase=None):
     """Keep the legacy phase-2 fallback; explicit splits use prompt variants."""
+    if getattr(cfg, "coder_thinking_budget", 0):
+        return "xhigh"
     if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8" and phase == "adaptive"):
         return "medium"
     return getattr(cfg, "coder_reasoning_effort", None)
@@ -301,6 +303,8 @@ def _coder_effort_entries(prompt_jobs, source_job_indices, counts, cfg, step_idx
         for source_idx, count in zip(source_job_indices, counts)
         if int(count) > 0
     ]
+    if getattr(cfg, "coder_thinking_budget", 0):
+        return entries
     if (phase == "adaptive" and getattr(cfg, "coder_template_kind", "generic") == "qwen3.8"):
         requested = {
             effort: int(getattr(cfg, f"phase2_{effort}_programs_per_strategy", default))

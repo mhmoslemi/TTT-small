@@ -70,6 +70,7 @@ from runtime.gpu_runtime import (
     uses_bounded_gpt_oss_repack,
     vllm_runtime_reserve_gib as _default_vllm_runtime_reserve_gib,
 )
+from generation.thinking_budget import check_answer_space
 import diagnostics.terminal_output as _terminal_output
 
 
@@ -950,7 +951,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
-                      enable_log_stats=False):
+                      enable_log_stats=False, thinking_budget=0):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
     # engine failure, killing only the multiprocessing.Process can leave those
@@ -1038,6 +1039,15 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             engine_options=engine_options,
             enable_log_stats=enable_log_stats,
         )
+        if thinking_budget:
+            from vllm import envs
+            from vllm.config import ReasoningConfig
+            if not getattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False):
+                raise RuntimeError("coder thinking budgets require vLLM Model Runner V2")
+            # Use the native boundary alone; no injected transition phrase.
+            SamplingParams(thinking_token_budget=int(thinking_budget))
+            engine_kwargs["reasoning_config"] = ReasoningConfig(
+                reasoning_start_str="<think>", reasoning_end_str="</think>")
         print(f"[vllm worker {rank}] loading {model_name} on physical GPU "
               f"group {gpu_group} (TP={tensor_parallel_size}, "
               f"PP={pipeline_parallel_size}, collectives="
@@ -1127,6 +1137,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             prompt_ids = tokenizer.encode(prompt)
         max_tokens = min(int(options["max_new_tokens"]),
                          int(max_seq_length) - len(prompt_ids))
+        check_answer_space(prompt_ids, max_tokens, thinking_budget, tokenizer)
         if max_tokens < 1:
             print(f"[vllm worker {rank}] group {chain} prompt is {len(prompt_ids)} tokens, "
                   f"at/over max_model_len={max_seq_length}; dropping 1 rollout(s)", flush=True)
@@ -1137,6 +1148,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             top_p=float(options["top_p"]), skip_special_tokens=True,
             seed=_vllm_rollout_seed(seed, step, int(options.get("seed_rank", rank)), chain, 0),
             output_kind=RequestOutputKind.FINAL_ONLY)
+        if thinking_budget:
+            sampling["thinking_token_budget"] = int(thinking_budget)
         if options.get("top_k") is not None:
             sampling["top_k"] = -1 if int(options["top_k"]) == 0 else int(options["top_k"])
         if options.get("min_p") is not None:
@@ -1409,11 +1422,13 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                     prompt_len = len(prompt_ids)
                     prompt = {"prompt_token_ids": prompt_ids}
                 else:
-                    prompt_len = len(tokenizer.encode(prompt))
+                    prompt_ids = tokenizer.encode(prompt)
+                    prompt_len = len(prompt_ids)
                 max_tokens = min(
                     int(gen_kwargs["max_new_tokens"]),
                     int(max_seq_length) - int(prompt_len),
                 )
+                check_answer_space(prompt_ids, max_tokens, thinking_budget, tokenizer)
                 if max_tokens < 1:
                     print(f"[vllm worker {rank}] group {group_idx} prompt is "
                           f"{prompt_len} tokens, at/over max_model_len="
@@ -1461,6 +1476,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                             skip_special_tokens=True,
                             output_kind=RequestOutputKind.FINAL_ONLY,
                         )
+                        if thinking_budget:
+                            sampling_kwargs["thinking_token_budget"] = int(thinking_budget)
                         if gen_kwargs.get("top_k") is not None:
                             top_k = int(gen_kwargs["top_k"])
                             sampling_kwargs["top_k"] = (
@@ -1528,6 +1545,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                             seed, step, seed_rank, group_idx),
                         skip_special_tokens=True,
                     )
+                    if thinking_budget:
+                        sampling_kwargs["thinking_token_budget"] = int(thinking_budget)
                     if gen_kwargs.get("top_k") is not None:
                         top_k = int(gen_kwargs["top_k"])
                         sampling_kwargs["top_k"] = (
@@ -1678,7 +1697,8 @@ class GenerationPool:
                  vllm_runtime_reserve_gib=None,
                  vllm_staged_loading=False,
                  vllm_log_path=None, vllm_engine_options=None,
-                 hardware_profile="RTX6000", host_memory_admission=None):
+                 hardware_profile="RTX6000", host_memory_admission=None,
+                 thinking_budget=0):
         self.model_name = model_name
         self.hardware_profile = hardware_profile
         self.host_memory_admission = host_memory_admission
@@ -1887,6 +1907,10 @@ class GenerationPool:
             "control_queue": self.control_queue,
             "vllm_log_path": self.vllm_log_path,
         }
+        if thinking_budget:
+            if self.backend != "vllm":
+                raise ValueError("thinking budgets require vLLM")
+            self._worker_options["thinking_budget"] = int(thinking_budget)
         if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True

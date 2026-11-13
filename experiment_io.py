@@ -40,6 +40,7 @@ ROLLOUT_CONFIG_KEYS = (
     "pilot_medium_programs_per_strategy", "pilot_xhigh_programs_per_strategy",
     "phase2_low_programs_per_strategy", "phase2_medium_programs_per_strategy",
     "phase2_xhigh_programs_per_strategy",
+    "coder_thinking_budget",
 )
 ROLLOUT_BUDGET_KEYS = ROLLOUT_CONFIG_KEYS[:5]
 

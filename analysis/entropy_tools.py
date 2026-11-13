@@ -109,6 +109,9 @@ def _record_tensor(descriptor, values):
 
     with torch.no_grad():
         flat = values.detach().reshape(-1)
+        if descriptor.get("forced_token_indices"):
+            from generation.thinking_budget import policy_token_values
+            flat, = policy_token_values(flat, forced_token_indices=descriptor["forced_token_indices"])
         # One small CPU transfer per response, not a sync per vocabulary chunk.
         valid = torch.isfinite(flat) & (flat >= -1e-5)
         count, total = torch.stack((
@@ -201,7 +204,7 @@ def rollout_observation(descriptor, meta, code):
         "retry_attempt": int(meta.get("retry_attempt") or 0),
         "valid": bool(meta["valid"]), "reward": float(meta["reward"]),
         "raw_score": meta.get("raw_score"),
-        "response_tokens": int(meta["n_response_tokens"]),
+        "response_tokens": int(meta["n_response_tokens"]) - len(meta.get("forced_token_indices", ())),
         "failure_kind": meta.get("failure_kind"),
         "_measurement": descriptor,
         "_code": _code_signature(code) if meta["valid"] else None,

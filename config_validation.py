@@ -42,6 +42,7 @@ sandbox_timeout_s reward_workers print_responses max_saved_construction
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "hardware_profile",
+    "coder_thinking_budget",
     "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
     "advantage_mode", "fast", "isolate_eval",
     "fused_long_attention",
@@ -329,6 +330,10 @@ def validate_problem_config(
             raise ValueError(f"{_label(source)}: {key} must be in (0, 1)")
     if "eval_cpus" in data:
         _positive_int(data, "eval_cpus", source)
+    if "coder_thinking_budget" in data:
+        value = data["coder_thinking_budget"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{_label(source)}: coder_thinking_budget must be an integer >= 0")
     if "num_circles" in data:
         _positive_int(data, "num_circles", source)
     if "max_coeff_count" in data:

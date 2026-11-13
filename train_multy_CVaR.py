@@ -27,6 +27,9 @@ from generation.output_retries import (
     coder_output_issue, coder_retry_gate, coder_retry_prompt_job, output_retry_messages,
     retry_metadata, strategy_retry_needed,
 )
+from generation.thinking_budget import (
+    budget_messages, thinking_budget_metadata, saved_budget_metadata, policy_token_values,
+)
 from models.strategist_models import (
     render_strategy_prompt, strategist_engine_options, strategist_profile, validate_strategist_runtime,
 )
@@ -1075,6 +1078,7 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
             summary["canonical_text"] += 1
         item["response_token_ids"] = token_ids
         item["response_token_recovery"] = recovery
+        saved_budget_metadata(item["meta"], token_ids, exact=bool(recovery.get("exact", False)))
         behavior_path = item.get("behavior_logprobs_path")
         if behavior_path is not None:
             if not bool(recovery.get("exact", False)):
@@ -1266,6 +1270,7 @@ def _finalize_pending_spo_rs_artifacts(
         divergence, missing_scores, context_divergences = (
             spo_rs_tracker.consecutive_policy_divergence(
                 current_scores, previous_scores, context_ids,
+                forced_token_indices=[item["meta"].get("forced_token_indices", ()) for item in artifacts],
                 required_context_ids=range(int(cfg.groups_per_step))))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
@@ -1567,6 +1572,7 @@ def _resume_spo_rs_step_from_artifacts(
         entropy_descriptor = None
         if entropy_directory is not None:
             entropy_descriptor = observation_descriptor(entropy_directory, group, int(meta["rollout"]))
+            entropy_descriptor["forced_token_indices"] = meta.get("forced_token_indices", [])
         if response_tokens:
             behavior_values = item.get("behavior_logprobs")
             behavior_logprobs = (
@@ -1577,6 +1583,7 @@ def _resume_spo_rs_step_from_artifacts(
             all_examples.append({
                 "prompt_ids": prompt_cache[prompt_text],
                 "response_ids": torch.tensor([response_tokens], dtype=torch.long),
+                **saved_budget_metadata(meta, response_tokens, exact=bool(recovery.get("exact", False))),
                 "_entropy_measurement": entropy_descriptor,
                 "advantage": float(meta["advantage"]),
                 "behavior_logprobs": behavior_logprobs,
@@ -1966,6 +1973,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if reasoning_effort is None else reasoning_effort),
                 "preserve_thinking": bool(cfg.coder_preserve_thinking),
             })
+            budget = int(getattr(cfg, "coder_thinking_budget", 0))
+            if budget:
+                template_options.pop("reasoning_effort")
+                messages = budget_messages(messages, budget)
         elif template_kind == "qwen-thinking":
             # Thinking-2507 is a thinking-only checkpoint. Its native template
             # always opens the reasoning channel and deliberately exposes no
@@ -2385,6 +2396,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 and all(math.isfinite(float(value)) for value in behavior_values)
                 else None)
         job = prompt_jobs[int(job_idx)]
+        budget = int(getattr(cfg, "coder_thinking_budget", 0))
+        if budget and "_thinking_prompt_ids" not in job:
+            job["_thinking_prompt_ids"] = tokenizer.encode(job["prompt_text"])
+        budget_meta = (thinking_budget_metadata(
+            tokenizer, job["_thinking_prompt_ids"], token_ids, budget)
+            if budget else {})
         final_text = native_final_answer_scope(
             tokenizer, token_ids,
             require_final_marker=bool(getattr(problem, "require_final_code_marker", False)),
@@ -2401,6 +2418,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             planned_by_group[group_id] += 1
         queued_by_group[group_id] = rollout_index + 1
         record = {
+            **budget_meta,
             "job_idx": int(job_idx),
             "parent_group": parent_group,
             "group_id": int(group_id),
@@ -2422,6 +2440,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         (primary_rollout_records if retry_of is None else coder_retry_records).append(record)
         if entropy_directory is not None:
             record["_entropy_measurement"] = observation_descriptor(entropy_directory, int(group_id), rollout_index)
+            if budget_meta:
+                record["_entropy_measurement"]["forced_token_indices"] = budget_meta["forced_token_indices"]
         if rollout_phase is not None:
             record["strategy_rollout_phase"] = str(rollout_phase)
         if strategy_source_job_idx is not None:
@@ -2434,6 +2454,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             response_token_ids=token_ids,
             behavior_logprobs=behavior_logprobs,
             pending_meta={
+                **budget_meta,
                 **retry_metadata(record),
                 "status": "evaluation_pending",
                 "step": int(step_idx),
@@ -3723,6 +3744,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                     current_policy_scores,
                                     previous_policy_scores,
                                     [record["context_id"] for record in vllm_logprob_records],
+                                    forced_token_indices=[record.get("forced_token_indices", ()) for record in vllm_logprob_records],
                                     required_context_ids=[spec["context_id"] for spec in group_specs]))
                             if (spo_rs_missing_policy_scores or not math.isfinite(spo_rs_divergence)):
                                 raise RuntimeError(
@@ -4107,6 +4129,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                                 [record.get("_spo_rs_current_score") for record in current_records],
                                 [record.get("_spo_rs_previous_score") for record in current_records],
                                 [record["context_id"] for record in current_records],
+                                forced_token_indices=[record.get("forced_token_indices", ()) for record in current_records],
                                 required_context_ids=[spec["context_id"] for spec in group_specs]))
             except Exception as error:
                 spo_rs_divergence = math.inf
@@ -4279,6 +4302,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 all_child_strategy_keys.append(int(job["strategy_index"]) if two_stage_rollouts else None)
             pick_info = (sampler.last_picks_info[parent_group] if parent_group < len(sampler.last_picks_info) else {})
             meta = {
+                **{key: record[key] for key in (
+                    "coder_thinking_budget", "n_reasoning_tokens", "forced_token_indices") if key in record},
                 **retry_metadata(record),
                 "step": step_idx,
                 "group": g,
@@ -4407,6 +4432,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             all_examples.append({
                 "prompt_ids": prompt_ids_by_job[job_idx],
                 "response_ids": response_ids,
+                "forced_token_indices": record.get("forced_token_indices", []),
                 "_entropy_measurement": record.get("_entropy_measurement"),
                 "advantage": float(adv),
                 "behavior_logprobs": behavior_logprobs,
@@ -4762,6 +4788,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             batch_losses = []
             for ex, cur_lp, base_lp in zip(batch, current_logprobs, base_logprobs):
                 base_lp = base_lp.to(cur_lp.device)
+                forced = ex.get("forced_token_indices", ())
+                cur_lp, base_lp = policy_token_values(cur_lp, base_lp, forced_token_indices=forced)
                 adv = ex["advantage"]
                 logp_diff = (cur_lp - base_lp).detach()
                 avg_logp_diff = logp_diff.mean()
@@ -4771,6 +4799,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
 
                 behavior_lp = ex.get("behavior_logprobs")
                 has_behavior = _valid_example_token_logprobs(ex, "behavior_logprobs")
+                if has_behavior and forced:
+                    behavior_lp, = policy_token_values(behavior_lp, forced_token_indices=forced)
                 if sequence_policy:
                     loss, policy_metrics = (
                         _a3b_sequence_clipped_standard_loss(
@@ -5068,7 +5098,10 @@ def main():
               f"(bounds {1.0 - cfg.sequence_clip_epsilon_low:.4f} / "
               f"{1.0 + cfg.sequence_clip_epsilon_high:.4f})")
     print(f"Max new tokens:     {cfg.max_new_tokens}")
-    if getattr(problem, "two_stage_rollouts", False):
+    if getattr(cfg, "coder_thinking_budget", 0):
+        print(f"Coder reasoning:    thinking budget={cfg.coder_thinking_budget}; "
+              "native default effort; all phases/retries; answer uses remaining context")
+    elif getattr(problem, "two_stage_rollouts", False):
         base_effort = _coder_effort_for_rollout_phase(cfg)
         pilot_count = int(getattr(cfg, "pilot_programs_per_strategy", -1))
         if (getattr(cfg, "coder_template_kind", "generic") == "qwen3.8" and pilot_count > 0):
@@ -5563,6 +5596,7 @@ def main():
             vllm_staged_loading=cfg.vllm_staged_loading,
             vllm_log_path=vllm_log_path,
             hardware_profile=cfg.hardware_profile,
+            thinking_budget=int(getattr(cfg, "coder_thinking_budget", 0)),
         )
         if cfg.generation_backend == "vllm":
             from runtime.host_memory import HostMemoryAdmission
@@ -5794,6 +5828,7 @@ def main():
                         flush=True,
                     )
                 strategy_pool_options.update({
+                    "thinking_budget": 0,
                     "model_name": cfg.strategy_model_name,
                     "vllm_engine_options": strategist_engine_options(cfg.strategy_model_name, cfg.hardware_profile),
                     "max_seq_length": cfg.strategy_max_seq_length,
