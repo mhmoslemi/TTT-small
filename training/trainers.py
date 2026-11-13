@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from analysis.entropy_tools import measure_policy_entropy, token_entropy as _token_entropy
-from diagnostics.console import _LOG_TIME_OFFSET_SECONDS, setting_log_only
+from diagnostics.console import setting_log_only
 from models.coder_profiles import _uses_sequence_level_policy_ratio
 from runtime.configuration import (
     SEQUENCE_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_DEFAULT, SPO_RS_CLIP_EPSILON_HIGH_DEFAULT,
@@ -114,10 +114,9 @@ def _score_hidden_token_chunks(hidden_states, targets, output_head, *, chunk, wi
 
     chosen_parts = []
     entropy_parts = []
-    for start in range(0, length, step):
-        end = min(start + step, length)
-        hidden_chunk = hidden_states[start:end]
-        target_chunk = targets[start:end]
+    # Split backward assembles gradients once; slicing scatters a full sequence per tile.
+    for hidden_chunk, target_chunk in zip(
+            hidden_states.split(step, dim=0), targets.split(step, dim=0)):
         if with_grad and hidden_chunk.requires_grad:
             from torch.utils.checkpoint import checkpoint
             result = checkpoint(project, hidden_chunk, target_chunk, use_reentrant=False)
@@ -2653,7 +2652,6 @@ class ProcessDistributedTrainer:
         cfg_dict = dict(vars(cfg))
         cfg_dict["_terminal_log_path"] = str(Path(exp_dir).resolve() / "temirnal.log")
         cfg_dict["_setting_log_path"] = str(Path(exp_dir).resolve() / "setting.log")
-        cfg_dict["_log_time_offset_seconds"] = _LOG_TIME_OFFSET_SECONDS
 
         setting_log_only(
             f"[{self._process_label}] starting "

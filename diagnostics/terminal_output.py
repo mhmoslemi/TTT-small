@@ -1,30 +1,35 @@
 """Small output helpers that do not depend on model or GPU libraries."""
 
 import builtins
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 
 _SETTING_LOG_LOCK = threading.RLock()
 _SETTING_LOG_PATH = None
-_SETTING_LOG_TIME_OFFSET = 0
+_LOG_TIMEZONE = ZoneInfo("America/Toronto")
 
 
-def bind_setting_log(path, *, time_offset=0):
+def log_timestamp():
+    return datetime.fromtimestamp(time.time(), _LOG_TIMEZONE).strftime("[%H:%M:%S] ")
+
+
+def bind_setting_log(path):
     """Bind hidden configuration/runtime notices directly to setting.log.
 
     The direct append path works even while stdout is temporarily redirected
     by model-loading capture, and O_APPEND keeps independent trainer processes
     from overwriting one another's records.
     """
-    global _SETTING_LOG_PATH, _SETTING_LOG_TIME_OFFSET
+    global _SETTING_LOG_PATH
     with _SETTING_LOG_LOCK:
         _SETTING_LOG_PATH = (
             None if path is None else str(Path(path).expanduser().resolve()))
-        _SETTING_LOG_TIME_OFFSET = float(time_offset)
 
 
 def setting_log_only(*values, sep=" ", end="\n", flush=False, file=None):
@@ -36,14 +41,12 @@ def setting_log_only(*values, sep=" ", end="\n", flush=False, file=None):
     value = sep.join(str(item) for item in values) + end
     with _SETTING_LOG_LOCK:
         path = _SETTING_LOG_PATH
-        offset = _SETTING_LOG_TIME_OFFSET
     if path is None:
         # Preserve diagnostics in standalone utilities and early failures.
         terminal_log_only(
             *values, sep=sep, end=end, flush=flush)
         return
-    timestamp = time.strftime(
-        "[%H:%M:%S] ", time.localtime(time.time() + offset))
+    timestamp = log_timestamp()
     rendered = "".join(
         (timestamp + line if line else line)
         for line in value.splitlines(keepends=True)

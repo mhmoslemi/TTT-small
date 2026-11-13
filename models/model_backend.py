@@ -847,8 +847,8 @@ def _exact_chunked_qwen35_mlp_forward(module, hidden_states):
     outputs = []
     use_checkpoint = bool(
         torch.is_grad_enabled() and hidden_states.requires_grad)
-    for start in range(0, sequence, chunk):
-        token_slice = hidden_states[..., start:start + chunk, :]
+    # One split avoids a full-sequence gradient scatter for every tile.
+    for token_slice in hidden_states.split(chunk, dim=-2):
         if use_checkpoint:
             from torch.utils.checkpoint import checkpoint
             output = checkpoint(project, token_slice, use_reentrant=False)
@@ -936,9 +936,8 @@ def _exact_chunked_qwen35_gated_norm_forward(module, hidden_states, gate):
     use_checkpoint = bool(
         torch.is_grad_enabled()
         and (hidden_states.requires_grad or gate.requires_grad))
-    for start in range(0, rows, chunk):
-        hidden_slice = hidden_states[..., start:start + chunk, :]
-        gate_slice = gate[..., start:start + chunk, :]
+    for hidden_slice, gate_slice in zip(
+            hidden_states.split(chunk, dim=-2), gate.split(chunk, dim=-2)):
         if use_checkpoint:
             from torch.utils.checkpoint import checkpoint
             output = checkpoint(

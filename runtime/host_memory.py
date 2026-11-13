@@ -228,7 +228,8 @@ class HostMemoryAdmission:
 
     @contextmanager
     def reservation(self, size_bytes, *, wait_for_external=True, stage="RAM allocation",
-                    priority=False, reserve_bytes=None, minimum_bytes=None, deadline=None):
+                    priority=False, reserve_bytes=None, minimum_bytes=None, deadline=None,
+                    blocking=True):
         size_bytes = max(0, int(size_bytes))
         minimum_bytes = size_bytes if minimum_bytes is None else int(minimum_bytes)
         if not 0 <= minimum_bytes <= size_bytes:
@@ -260,6 +261,8 @@ class HostMemoryAdmission:
                     if has_priority and available is not None and available >= minimum_bytes:
                         size_bytes = min(size_bytes, available)
                         break
+                    if not blocking:
+                        raise HostMemoryUnavailable(f"{stage}: host RAM is not available now")
                     waited = True
                     if bounded_wait:
                         now = time.monotonic()

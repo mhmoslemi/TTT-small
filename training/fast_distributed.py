@@ -1169,10 +1169,7 @@ def worker_main(rank, world_size, cfg_dict, init_method, work_queue,
             # Use the compatibility binding exported by the console module.
             # Logging-version skew must not abort a distributed update after
             # rollout generation and evaluation have completed.
-            console.bind_setting_log(
-                setting_log_path,
-                time_offset=cfg_dict.get("_log_time_offset_seconds", 0),
-            )
+            console.bind_setting_log(setting_log_path)
 
         from diagnostics.loading_logs import quiet_replica_load
 

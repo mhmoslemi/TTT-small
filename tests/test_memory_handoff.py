@@ -449,12 +449,13 @@ def test_ram_timeout_during_sleep_is_not_swallowed_as_engine_failure():
     assert not pool.active
 
 
-def test_sleep_waves_restore_trainers_before_more_host_copies(monkeypatch):
+@pytest.mark.parametrize("hardware_profile", ["RTX6000", "B200_full_ram"])
+def test_sleep_waves_restore_trainers_before_more_host_copies(monkeypatch, hardware_profile):
     from generation.gen_workers import GenerationPool
 
     memory = {"total": 1700 * GIB, "available": 1100 * GIB}
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
-    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=hardware_profile)
     pool = object.__new__(GenerationPool)
     pool._persistent_worker_ids = tuple(range(8))
     pool._transient_worker_ids = ()
@@ -516,14 +517,18 @@ def test_sleep_extension_uses_pageable_backups_and_reclaims_only_unused_cache(mo
     assert len(allocations) == 2
 
 
-def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
+@pytest.mark.parametrize("hardware_profile", ["RTX6000", "B200_full_ram"])
+def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch, hardware_profile):
     from generation.gen_workers import GenerationPool
 
     memory = {"total": 200 * GIB, "available": 30 * GIB}
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
-    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"))
+    gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile=hardware_profile)
+    monkeypatch.setattr(gate._condition, "wait", lambda **kwargs: pytest.fail(
+        "optional inference backup must not wait for RAM while trainers are offloaded"))
     pool = object.__new__(GenerationPool)
     pool._persistent_worker_ids = (0, 1)
+    pool._configured_persistent_worker_ids = (0, 1)
     pool._transient_worker_ids = ()
     pool._gpu_groups = [[0], [1]]
     pool.num_workers = pool.persistent_workers = 2
@@ -536,10 +541,33 @@ def test_unaffordable_backup_releases_engine_instead_of_hanging(monkeypatch):
         return {rank: {"backup_bytes": 70 * GIB} for rank in ranks}
 
     pool._vllm_control = control
-    pool.sleep(after_sleep=lambda ids: restored.extend(ids), host_admission=gate)
+    # An evaluator still owns RAM, but the next phase can reload these engines.
+    with gate.reservation(5 * GIB):
+        pool.sleep(after_sleep=lambda ids: restored.extend(ids), host_admission=gate)
+        assert gate.reserved_bytes == 5 * GIB
+    with gate.reservation(GIB):
+        assert gate.reserved_bytes == GIB  # Cache eviction must not poison RAM admission.
     assert stopped == restored == [0, 1]
     assert pool._transient_worker_ids == (0, 1)
     assert pool.persistent_workers == 0 and pool.num_workers == 2
+
+    # Reloaded engines keep sleep support and can be cached when RAM returns.
+    pool.vllm_co_resident_sleep = True
+    events = []
+    def start(ranks):
+        assert pool._persistent_worker_ids == (0, 1)
+        events.append(("load", tuple(ranks)))
+    pool._start_workers = start
+    pool._vllm_control = lambda command, ranks: (
+        {rank: {"backup_bytes": 70 * GIB} for rank in ranks}
+        if command == "host_memory" else events.append((command, tuple(ranks))))
+    pool.wake_up()
+    assert events == [("wake_up", ()), ("load", (0, 1))]
+    memory["available"] = 190 * GIB
+    pool.sleep(after_sleep=lambda ids: restored.extend(ids), host_admission=gate)
+    assert [rank for command, ranks in events if command == "sleep" for rank in ranks] == [0, 1]
+    assert stopped == [0, 1] and restored == [0, 1, 0, 1]
+    assert pool._transient_worker_ids == () and pool.persistent_workers == 2
 
 
 def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):

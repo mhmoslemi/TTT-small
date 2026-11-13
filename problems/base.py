@@ -52,6 +52,29 @@ class ParentContext:
     value: float = 0.0
     raw_score: Optional[float] = None
     construction: Optional[list] = None
+    # The parent's own parent's true metric ("before"; raw_score is "after").
+    parent_raw_score: Optional[float] = None
+    # What the run that produced the parent printed (see observation_text).
+    observation: str = ""
+
+
+# The previous program's stdout is shown to the model whole. The only bound is
+# a safety cap against a runaway print loop (the sandbox itself stops at 256
+# KiB); beyond it the start and the end are kept. 0 disables the cap. Problem
+# config key: parent_output_max_chars.
+PARENT_OUTPUT_MAX_CHARS = 20000
+
+
+def observation_text(stdout, max_chars: int) -> str:
+    """The program's own stdout (no traceback/stderr), kept for the next prompt."""
+    text = str(stdout or "").strip()
+    if max_chars and len(text) > max_chars:
+        head = max_chars // 2
+        tail = max_chars - head
+        text = (text[:head].rstrip()
+                + f"\n[... {len(text) - max_chars} characters omitted ...]\n"
+                + text[-tail:].lstrip())
+    return text
 
 
 @dataclass
@@ -70,6 +93,8 @@ class RewardResult:
     # program rejected by the scientific verifier; timeout/infrastructure are
     # distinct from code failures.
     failure_kind: str = ""
+    # stdout the program itself printed, for the next prompt (observation_text).
+    observation: str = ""
 
 
 def is_code_failure(res) -> bool:
@@ -109,6 +134,40 @@ def render_state_context(metric_name: str, target, parent: ParentContext,
     )
 
 
+def render_ttt_state_context(metric_name: str, target, parent: ParentContext,
+                             maximize: bool = True) -> str:
+    """Parent block of the TTT-Discover prompt (tinker_utils/state.py::State.to_prompt).
+
+    Same wording and layout, with three deliberate differences:
+      * the previous program's stdout is shown whole (no 500-character tail);
+      * a parent without a "before" score says "(lower|higher is better)"
+        according to the metric, where the reference hard-codes "higher";
+      * `before`/`after` are the problem's true metric (raw_score), because
+        `value` here is a reward (1/raw for AC1), not the metric itself.
+    Callers keep the old render_state_context text for the no-parent case.
+    """
+    better = "higher" if maximize else "lower"
+    ctx = (f"You are iteratively optimizing {metric_name}.\n"
+           f"Here is the last code we ran:\n{parent.code}")
+    after = parent.raw_score
+    before = parent.parent_raw_score
+    if after is not None:
+        gap = (target - after) if maximize else (after - target)
+        if before is not None and parent.construction:
+            ctx += (f"\nHere is the {metric_name} before and after running the "
+                    f"code above ({better} is better): {before:.6f} -> {after:.6f}")
+        else:
+            ctx += f"\nCurrent {metric_name} ({better} is better): {after:.6f}"
+        ctx += (f"\nTarget: {target}. Current gap: {gap:.6f}. "
+                "Further improvements will also be generously rewarded.")
+    else:
+        ctx += f"\nTarget {metric_name}: {target}"
+    output = str(parent.observation or "").strip()
+    if output:
+        ctx += f"\n\n--- Previous Program Output ---\n{output}\n--- End Output ---"
+    return ctx
+
+
 # ----------------------------------------------------------------------
 # Problem ABC
 # ----------------------------------------------------------------------
@@ -134,6 +193,10 @@ class Problem(ABC):
         self.num_seed_states = int(self.cfg.get("num_seed_states", 8))
         self.seed = int(self.cfg.get("seed", 42))
         self.eval_cpus = int(self.cfg.get("eval_cpus", 1))
+        self.parent_output_max_chars = int(
+            self.cfg.get("parent_output_max_chars", PARENT_OUTPUT_MAX_CHARS))
+        if self.parent_output_max_chars < 0:
+            raise ValueError("parent_output_max_chars must be >= 0")
         self.require_final_code_marker = bool(
             self.cfg.get("coder_model_profile") == "qwen3.8-27b"
             and self.cfg.get("coder_preserve_thinking", False)
@@ -260,6 +323,8 @@ usage. Return only exactly one fenced Python code block, beginning with
         diagnostics = [out.get("stdout", ""), out.get("traceback", ""),
                        out.get("stderr", "")]
         res.stdout = "\n".join(str(x).strip() for x in diagnostics if x).strip()
+        res.observation = observation_text(
+            out.get("stdout", ""), self.parent_output_max_chars)
         if not out.get("ok"):
             error = str(out.get("error", "unknown"))
             res.msg = f"run_failed: {error}"
@@ -275,6 +340,7 @@ usage. Return only exactly one fenced Python code block, beginning with
         scored.code = code
         if not scored.stdout:
             scored.stdout = res.stdout
+        scored.observation = res.observation
         if not scored.valid and not scored.msg:
             scored.msg = "invalid"
         if not scored.valid and not scored.failure_kind:

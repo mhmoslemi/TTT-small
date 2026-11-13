@@ -50,6 +50,26 @@ def comparison_request(description, program_a, program_b):
     }
 
 
+# State fields that only feed the next prompt. They neither change the PUCT
+# ranking nor what the judge compares (programs only), so they stay out of the
+# signatures: a selection saved before they existed remains valid on resume.
+_PROMPT_ONLY_FIELDS = ("parent_raw_score", "observation")
+
+
+def _identity(state):
+    return {key: value for key, value in state.items()
+            if key not in _PROMPT_ONLY_FIELDS}
+
+
+def _archive_identity(snapshot):
+    snapshot = dict(snapshot)
+    snapshot["states"] = [_identity(state) for state in snapshot["states"]]
+    for key in ("best_raw_min", "best_raw_max"):
+        if snapshot.get(key):
+            snapshot[key] = _identity(snapshot[key])
+    return snapshot
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
@@ -110,7 +130,8 @@ class PUCTJevSampler(PUCTSampler):
 
     def _seed_manifest(self):
         return [{"id": s.id, "digest": _digest({
-            key: value for key, value in asdict(s).items() if key != "id"})}
+            key: value for key, value in _identity(asdict(s)).items()
+            if key != "id"})}
                 for s in self._states if s.id in self._seed_ids]
 
     def _description(self):
@@ -146,7 +167,7 @@ class PUCTJevSampler(PUCTSampler):
         description = self._description() if step > 0 else ""
         # Validate the old snapshot before applying the current config's gate.
         threshold = saved["threshold"] if saved is not None else self.same_core_threshold
-        signature_data = {"archive": self.state_dict(), "step": step,
+        signature_data = {"archive": _archive_identity(self.state_dict()), "step": step,
                           "count": count, "puct_c": self.puct_c, "description": description,
                           "model": str(self.model_path), "question": QUESTION,
                           "threshold": threshold}

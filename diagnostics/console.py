@@ -6,9 +6,9 @@ import os
 import re
 import sys
 import threading
-import time
 
 import diagnostics.terminal_output as _terminal_output
+from diagnostics.terminal_output import log_timestamp
 
 # Logging is diagnostic and must never make an otherwise valid trainer update
 # fail.  Accept the pre-setting.log helper module during a rolling/mixed
@@ -17,9 +17,9 @@ setting_log_only = getattr(_terminal_output, "setting_log_only", _terminal_outpu
 _native_bind_setting_log = getattr(_terminal_output, "bind_setting_log", None)
 
 
-def bind_setting_log(path, *, time_offset=0):
+def bind_setting_log(path):
     if callable(_native_bind_setting_log):
-        return _native_bind_setting_log(path, time_offset=time_offset)
+        return _native_bind_setting_log(path)
     return None
 
 
@@ -30,9 +30,6 @@ if not hasattr(_terminal_output, "setting_log_only"):
     _terminal_output.setting_log_only = setting_log_only
 if not hasattr(_terminal_output, "bind_setting_log"):
     _terminal_output.bind_setting_log = bind_setting_log
-
-
-_LOG_TIME_OFFSET_SECONDS = -4 * 60 * 60
 
 
 class _TimestampedLineStream:
@@ -63,7 +60,7 @@ class _TimestampedLineStream:
         with self._lock:
             for index, part in enumerate(parts):
                 if part and self._line_start:
-                    timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
+                    timestamp = log_timestamp()
                     self.stream.write(timestamp)
                 if part:
                     self.stream.write(part)
@@ -88,7 +85,7 @@ class _TimestampedLineStream:
         rendered = []
         for index, part in enumerate(parts):
             if part:
-                timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
+                timestamp = log_timestamp()
                 rendered.extend((timestamp, part))
             if index + 1 < len(parts):
                 rendered.append("\n")
@@ -211,7 +208,7 @@ class _TerminalLogSink:
         self._remove_visible_progress()
         self.log_file.seek(0, os.SEEK_END)
         self._progress_offset = self.log_file.tell()
-        timestamp = time.strftime("[%H:%M:%S] ", time.localtime(time.time() + _LOG_TIME_OFFSET_SECONDS))
+        timestamp = log_timestamp()
         self.log_file.write(timestamp + self._progress_text)
         self.log_file.truncate()
         self.log_file.seek(0, os.SEEK_END)

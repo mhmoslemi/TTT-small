@@ -122,11 +122,11 @@ class NativeBoundaryTests(unittest.TestCase):
         def result(**kwargs):
             return SimpleNamespace(**kwargs)
 
-        load_functions("problems/base.py", {"compute_reward"}, scope)
+        load_functions("problems/base.py", {"compute_reward", "observation_text"}, scope)
         scope.update(RewardResult=result, run_code=lambda code, **kwargs: (
             evaluated.append((code, kwargs)) or {"ok": False, "error": "synthetic stop"}))
         problem = SimpleNamespace(require_final_code_marker=True, fail_score=0., entrypoint="run", eval_cpus=1,
-                                  preprocess=lambda code, parent: code)
+                                  parent_output_max_chars=0, preprocess=lambda code, parent: code)
         problem.compute_reward = scope["compute_reward"].__get__(problem)
         slots = Queue()
         slots.put(3)

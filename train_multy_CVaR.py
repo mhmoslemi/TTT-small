@@ -32,7 +32,7 @@ from models.strategist_models import (
 )
 # Same-name aliases retain entrypoint exports used by existing tools/tests.
 from diagnostics.console import (
-    _LOG_TIME_OFFSET_SECONDS, _NoticeRoutingStream as _NoticeRoutingStream,
+    _NoticeRoutingStream as _NoticeRoutingStream,
     _TerminalLogSink as _TerminalLogSink, _TerminalTeeStream as _TerminalTeeStream,
     _TimestampedLineStream as _TimestampedLineStream, _install_console_timestamps, _install_terminal_log,
     _route_dependency_notices, bind_setting_log, setting_log_only,
@@ -473,6 +473,23 @@ def _save_training_checkpoint(exp_dir, next_step, adapter_path, sampler, optimiz
     return target
 
 
+def _backfill_legacy_observations(sampler, snapshot, exp_dir):
+    """Checkpoints from before State.observation existed: restore each archived
+    program's printed output from its saved rollout (one-time, then persisted)."""
+    fill = getattr(sampler, "fill_observations", None)
+    wanted = {}
+    for item in snapshot.get("states", ()):
+        if fill is not None and "observation" not in item and not item.get("is_seed"):
+            wanted.setdefault(int(item.get("timestep", -1)), set()).add(str(item["id"]))
+    if not wanted:
+        return
+    from search.prompt_context import observations_from_rollout_metas
+    filled = fill(observations_from_rollout_metas(exp_dir, wanted))
+    print(f"[resume] restored the previous-program output of {filled}/"
+          f"{sum(len(ids) for ids in wanted.values())} archived programs from saved "
+          "rollouts (the checkpoint predates that field)", flush=True)
+
+
 def _load_training_checkpoint(exp_dir, *, mmap=False):
     import torch
 
@@ -654,7 +671,11 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             construction = meta.get("construction")
         except (TypeError, ValueError):
             continue
-        states.append(State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,))
+        state = State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,
+                           observation=meta.get("observation") or "")
+        parent_raw = meta.get("parent_raw_score")
+        state.parent_raw_score = float(parent_raw) if isinstance(parent_raw, (int, float)) else None
+        states.append(state)
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
 
@@ -1175,6 +1196,8 @@ def _finalize_pending_spo_rs_artifacts(
             value=(parent.value if parent.value is not None else 0.0),
             raw_score=parent.raw_score,
             construction=parent.construction,
+            parent_raw_score=parent.parent_raw_score,
+            observation=parent.observation,
         )
         for parent in parents
     ]
@@ -1323,7 +1346,8 @@ def _finalize_pending_spo_rs_artifacts(
         child = State.make(
             timestep=step_idx, value=float(result.reward),
             code=result.code or "", raw_score=result.raw_score,
-            construction=result.construction)
+            construction=result.construction,
+            observation=getattr(result, "observation", ""))
         archive_eligible = bool(result.valid and result.code)
         strategy_source = pending.get("strategy_source_job_idx")
         strategy_index = (
@@ -1357,6 +1381,8 @@ def _finalize_pending_spo_rs_artifacts(
             "advantage_mode": str(cfg.advantage_mode).lower(),
             "advantage_scale": float(beta_by_index[index]),
             "sandbox_stdout": (result.stdout or "")[:2000],
+            # Only a rollout that can become a parent needs its full output.
+            "observation": (getattr(result, "observation", "") if archive_eligible else ""),
             "parent_value": (float(parent.value) if parent.value is not None else None),
             "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
             "parent_is_seed": parent.id in sampler._seed_ids,
@@ -1610,6 +1636,11 @@ def _resume_spo_rs_step_from_artifacts(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
                 construction=_literal_float_list(meta.get("construction")),
+                # Older metas lack "observation"; their sandbox_stdout is only
+                # a usable stand-in while it is complete (not cut at 2000).
+                observation=(meta.get("observation")
+                             or (meta.get("sandbox_stdout", "")
+                                 if len(meta.get("sandbox_stdout") or "") < 2000 else "")),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
@@ -1934,6 +1965,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             value=parent.value if parent.value is not None else 0.0,
             raw_score=parent.raw_score,
             construction=parent.construction,
+            parent_raw_score=parent.parent_raw_score,
+            observation=parent.observation,
         )
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
@@ -4270,6 +4303,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 code=res.code or "",
                 raw_score=res.raw_score,
                 construction=res.construction,
+                observation=getattr(res, "observation", ""),
             )
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
@@ -4300,6 +4334,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "n_response_tokens": len(token_ids),
                 "coder_reasoning_effort": job.get("coder_reasoning_effort"),
                 "sandbox_stdout": (res.stdout or '')[:2000],
+                "observation": (getattr(res, "observation", "") if archive_eligible else ""),
                 "parent_value": float(parent.value) if parent.value is not None else None,
                 "parent_raw_score": (float(parent.raw_score) if parent.raw_score is not None else None),
                 "parent_is_seed": parent.id in sampler._seed_ids,
@@ -4843,7 +4878,7 @@ def main():
     terminal_log = _install_terminal_log()
     from builtins import print as console_print
     from diagnostics.startup_logs import StartupLog, print_dashboard
-    startup_log = StartupLog(time_offset=_LOG_TIME_OFFSET_SECONDS)
+    startup_log = StartupLog()
     with startup_log.capture():
         cfg, merged = load_config()
         if cfg.strategies and cfg.strategy_backend == "local":
@@ -4879,7 +4914,7 @@ def main():
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
         startup_log.title = ("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
         startup_log.bind(setting_log_path)
-        bind_setting_log(setting_log_path, time_offset=_LOG_TIME_OFFSET_SECONDS)
+        bind_setting_log(setting_log_path)
     # Keep the full resolved settings in the file; show their grouped dashboard
     # once below. Restore normal print before loading/training begins.
     print = startup_log.print
@@ -5317,6 +5352,7 @@ def main():
     if resume_payload is not None:
         sampler.load_state_dict(resume_payload["sampler"])
         print(f'[resume] restored exact {sampler.selection_mode.upper()} archive and search statistics')
+        _backfill_legacy_observations(sampler, resume_payload["sampler"], exp_dir)
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
         print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')

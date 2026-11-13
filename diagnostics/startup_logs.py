@@ -9,7 +9,7 @@ import re
 import shutil
 import sys
 import textwrap
-import time
+from diagnostics.terminal_output import log_timestamp
 
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -52,10 +52,9 @@ class StartupLog:
     on scope exit, so later training and progress output cannot be captured.
     """
 
-    def __init__(self, *, time_offset=0, console=None,
+    def __init__(self, *, console=None,
                  title="Strategist Bandit"):
         self.console = sys.stdout if console is None else console
-        self.time_offset = time_offset
         self.title = str(title)
         self.path = None
         self.pending = io.StringIO()
@@ -73,8 +72,7 @@ class StartupLog:
 
     def _record(self, line, *, loading=False):
         line = _ANSI.sub("", line)
-        timestamp = time.strftime(
-            "[%H:%M:%S] ", time.localtime(time.time() + self.time_offset))
+        timestamp = log_timestamp()
         record = timestamp + line + "\n"
         if self.path is None:
             self.pending.write(record)

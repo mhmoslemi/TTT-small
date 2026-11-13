@@ -64,6 +64,65 @@ def test_group_size_uses_available_memory():
     assert checkpoint_group_size(64, 100, 100) == 8
 
 
+@pytest.mark.parametrize("kind", ["head", "mlp", "gated_norm"])
+def test_token_tiles_preserve_gradients_without_full_sequence_scatter(kind, monkeypatch):
+    import models.model_backend as backend
+    from training.trainers import _score_hidden_token_chunks
+
+    torch.manual_seed(15)
+    if kind == "head":
+        module = nn.Linear(4, 11)
+        inputs = [torch.randn(13, 4, requires_grad=True)]
+        targets = torch.arange(13) % 11
+
+        def reference(hidden):
+            return module(hidden).float().log_softmax(-1).gather(
+                1, targets[:, None]).squeeze(1)
+
+        def tiled(hidden):
+            return _score_hidden_token_chunks(
+                hidden, targets, module, chunk=3, with_grad=True,
+                return_entropy="measure")[0]
+    elif kind == "mlp":
+        module = nn.Module()
+        module.gate_proj = nn.Linear(4, 9)
+        module.up_proj = nn.Linear(4, 9)
+        module.down_proj = nn.Linear(9, 4)
+        module.act_fn = nn.SiLU()
+        inputs = [torch.randn(2, 13, 4, requires_grad=True)]
+        reference = lambda hidden: module.down_proj(
+            module.act_fn(module.gate_proj(hidden)) * module.up_proj(hidden))
+        module._ttt_exact_mlp_original_forward = reference
+        monkeypatch.setattr(backend, "_EXACT_MLP_PROJECTION_TILE_BYTES", 216)
+        tiled = lambda hidden: backend._exact_chunked_qwen35_mlp_forward(module, hidden)
+    else:
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.randn(4))
+        inputs = [torch.randn(13, 4, requires_grad=True) for _ in range(2)]
+        reference = lambda hidden, gate: (
+            hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
+            * module.weight * torch.nn.functional.silu(gate))
+        module._ttt_exact_gated_norm_original_forward = reference
+        monkeypatch.setattr(backend, "_EXACT_GATED_NORM_TILE_BYTES", 48)
+        tiled = lambda hidden, gate: backend._exact_chunked_qwen35_gated_norm_forward(
+            module, hidden, gate)
+
+    expected = reference(*inputs)
+    weights = torch.randn_like(expected)
+    (expected * weights).sum().backward()
+    expected_grads = [x.grad.clone() for x in [*inputs, *module.parameters()]]
+    for x in [*inputs, *module.parameters()]:
+        x.grad = None
+    actual = tiled(*inputs)
+    with torch.autograd.profiler.profile() as profile:
+        (actual * weights).sum().backward()
+    torch.testing.assert_close(actual, expected)
+    for x, grad in zip([*inputs, *module.parameters()], expected_grads):
+        torch.testing.assert_close(x.grad, grad)
+    # Each slice backward zero-fills the entire trajectory, once per tile.
+    assert not any(event.name == "aten::slice_backward" for event in profile.function_events)
+
+
 def test_unsupported_decoder_keeps_existing_forward():
     assert grouped_qwen_hidden(SimpleNamespace(), torch.ones(1, 2), None) is None
 

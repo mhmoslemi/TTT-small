@@ -2,12 +2,14 @@
 
 import ast
 from contextlib import redirect_stdout
+from datetime import datetime
 import io
 from pathlib import Path
 import pickle
 import subprocess
 import sys
 from types import ModuleType
+import pytest
 
 from generation import gen_workers
 from runtime.host_memory import validate_memory_handoff_runtime
@@ -168,11 +170,21 @@ def test_extracted_config_and_restart_keep_project_root_paths(monkeypatch, tmp_p
         "--config", "configs/ac1.yaml", "--resume", str(tmp_path.resolve())]
 
 
-def test_extracted_terminal_routing_preserves_visible_and_hidden_logs(monkeypatch, tmp_path):
+@pytest.mark.parametrize("instant, expected", [
+    ("2026-11-12T23:08:00+00:00", "[18:08:00] "),
+    ("2026-07-12T23:08:00+00:00", "[19:08:00] "),
+])
+def test_extracted_terminal_routing_preserves_visible_and_hidden_logs(monkeypatch, tmp_path, instant, expected):
     from diagnostics import console, terminal_output
+    from diagnostics.startup_logs import StartupLog
 
-    for name in ("_SETTING_LOG_PATH", "_SETTING_LOG_TIME_OFFSET"):
-        monkeypatch.setattr(terminal_output, name, getattr(terminal_output, name))
+    monkeypatch.setattr(terminal_output, "_SETTING_LOG_PATH", None)
+    monkeypatch.setattr(terminal_output.time, "time", lambda: datetime.fromisoformat(instant).timestamp())
+    monkeypatch.setattr(terminal_output.time, "localtime", lambda *args: pytest.fail(
+        "log timestamps must not depend on the server timezone"))
+    startup = StartupLog(console=io.StringIO())
+    startup._record("startup status")
+    assert startup.pending.getvalue() == expected + "startup status\n"
     visible = io.StringIO()
     sink = console._TerminalLogSink()
     log = tmp_path / "temirnal.log"
@@ -189,6 +201,11 @@ def test_extracted_terminal_routing_preserves_visible_and_hidden_logs(monkeypatc
         assert log.read_text() == visible.getvalue()
         assert "hidden status" in setting.read_text()
         assert "hidden status" not in log.read_text()
+        assert visible.getvalue() == expected + "visible status\n"
+        assert setting.read_text() == expected + "hidden status\n"
+        sink.write_progress("\rprogress 1/2")
+        sink.flush()
+        assert log.read_text().endswith(expected + "progress 1/2")
     finally:
         sink.log_file.close()
 

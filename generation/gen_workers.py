@@ -1825,6 +1825,7 @@ class GenerationPool:
                 "vllm_persistent_workers is valid only for backend='vllm'")
         self.persistent_workers = persistent_workers
         self._persistent_worker_ids = tuple(range(persistent_workers))
+        self._configured_persistent_worker_ids = self._persistent_worker_ids
         self._transient_worker_ids = tuple(
             range(persistent_workers, self.num_workers))
 
@@ -2213,7 +2214,8 @@ class GenerationPool:
             # avoid the much larger power-of-two pinned-allocation overhead.
             reservation = (host_admission.reservation(
                                int(transfer_bytes * 1.05), wait_for_external=False,
-                               stage="vLLM weight backup", priority=True)
+                               stage="vLLM weight backup", priority=True,
+                               blocking=after_sleep is None)
                            if host_admission is not None else nullcontext())
             print(f"[pool] sleeping {len(wave)}/{self.num_workers} engine(s): "
                   f"{transfer_bytes / GIB:.1f} GiB pageable host backup", flush=True)
@@ -2227,9 +2229,7 @@ class GenerationPool:
             except HostMemoryTimeout:
                 raise
             except HostMemoryUnavailable:
-                # No admitted CPU work can return RAM to unblock this copy.
-                # Keep all rollout GPUs; reload only the unretainable engines
-                # next phase instead of hanging or overcommitting the host.
+                # A reloadable inference cache must not delay restoring trainers.
                 print(f"[pool] host RAM cannot retain engines {list(wave)}; "
                       "releasing them for training and reloading next phase",
                       flush=True)
@@ -2263,7 +2263,14 @@ class GenerationPool:
         # Wake the RAM-resident engine before loading transient checkpoints so
         # its offloaded weights leave host memory as early as vLLM permits.
         self._vllm_control("wake_up", self._persistent_worker_ids)
-        self._start_workers(self._transient_worker_ids)
+        reload_ids = self._transient_worker_ids
+        # Temporary RAM pressure must not permanently disable sleep backups.
+        self._persistent_worker_ids = self._configured_persistent_worker_ids
+        self._transient_worker_ids = tuple(
+            rank for rank in range(self.num_workers)
+            if rank not in self._persistent_worker_ids)
+        self.persistent_workers = len(self._persistent_worker_ids)
+        self._start_workers(reload_ids)
 
     def run_sequential_chains(
             self, *, num_chains, num_stages, prompt_builder, result_handler,
