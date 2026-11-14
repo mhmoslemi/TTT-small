@@ -660,6 +660,64 @@ def test_vllm_shutdown_reaps_children_outside_wrapper_process_group():
         wrapper.stdout.close()
 
 
+def test_vllm_parent_watchdog_reaps_group_after_parent_disappears(monkeypatch):
+    from generation import gen_workers as workers
+
+    parents = iter((1234, 1234, 1))
+    killed = []
+    monkeypatch.setattr(workers.os, "getppid", lambda: next(parents))
+    monkeypatch.setattr(workers.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        workers, "_kill_current_vllm_process_group",
+        lambda: killed.append(True),
+    )
+
+    workers._watch_vllm_parent(1234, poll_seconds=0)
+
+    assert killed == [True]
+
+
+def test_sigkill_supervisor_replaces_resume_argument():
+    from runtime.run_supervisor import _resume_command
+
+    command = [
+        "python3", "train_multy_CVaR.py", "--fast",
+        "--resume", "runs/old", "--strategies",
+    ]
+    assert _resume_command(command, "runs/current") == [
+        "python3", "train_multy_CVaR.py", "--fast", "--strategies",
+        "--resume", "runs/current",
+    ]
+
+
+def test_sigkill_supervisor_resumes_same_run(tmp_path):
+    from runtime.run_supervisor import supervise
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "config.json").write_text("{}")
+    script = r'''
+import os
+from pathlib import Path
+import signal
+import sys
+
+run_dir = Path(sys.argv[1]).resolve()
+Path(os.environ["TTT_SUPERVISOR_RUN_FILE"]).write_text(str(run_dir))
+attempt = run_dir / "attempt"
+if not attempt.exists():
+    attempt.write_text("1")
+    os.kill(os.getpid(), signal.SIGKILL)
+if sys.argv[-2:] != ["--resume", str(run_dir)]:
+    raise SystemExit(f"wrong recovery arguments: {sys.argv!r}")
+'''
+    assert supervise(
+        [sys.executable, "-c", script, str(run_dir)],
+        initial_delay=0.01,
+        maximum_delay=0.01,
+    ) == 0
+
+
 def test_strategy_startup_charges_resident_tables_not_the_whole_checkpoint(monkeypatch):
     from generation import gen_workers as workers
     from models.strategist_models import strategist_engine_options

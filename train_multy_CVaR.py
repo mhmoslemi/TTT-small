@@ -4927,6 +4927,12 @@ def main():
                 cfg, merged = load_config()
                 merged.pop("_resume_dir", None)
         exp_dir = make_experiment_dir(cfg, resume_dir=resume_dir, config_dict=merged)
+        supervisor_run_file = os.environ.get("TTT_SUPERVISOR_RUN_FILE")
+        if supervisor_run_file:
+            run_file = Path(supervisor_run_file)
+            run_file_tmp = run_file.with_suffix(".tmp")
+            run_file_tmp.write_text(str(Path(exp_dir).resolve()), encoding="utf-8")
+            run_file_tmp.replace(run_file)
         setting_log_path = Path(exp_dir).resolve() / "setting.log"
         startup_log.title = ("Strategist Bandit" if cfg.strategies else "Single-Model Discovery")
         startup_log.bind(setting_log_path)

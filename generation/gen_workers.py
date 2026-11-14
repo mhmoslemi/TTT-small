@@ -55,6 +55,7 @@ import asyncio
 import importlib.metadata
 import os
 import signal
+import subprocess
 from array import array
 from collections import deque
 from contextlib import closing, nullcontext
@@ -131,6 +132,65 @@ def _isolate_vllm_worker_process_group():
     except OSError:
         return False
     return True
+
+
+def _kill_current_vllm_process_group():
+    """Hard-stop this wrapper and its EngineCore children together."""
+    try:
+        import psutil
+    except ImportError:
+        try:
+            rows = subprocess.check_output(
+                ("ps", "-eo", "pid=,ppid="), text=True).splitlines()
+            children = {}
+            for row in rows:
+                pid, parent = (int(value) for value in row.split())
+                children.setdefault(parent, []).append(pid)
+            descendants = []
+            pending = [os.getpid()]
+            while pending:
+                direct = children.get(pending.pop(), ())
+                descendants.extend(direct)
+                pending.extend(direct)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            descendants = ()
+    else:
+        try:
+            descendants = [
+                child.pid
+                for child in psutil.Process(os.getpid()).children(recursive=True)
+            ]
+        except psutil.Error:
+            descendants = ()
+    for child_pid in descendants:
+        try:
+            os.kill(int(child_pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if os.name == "posix" and hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    os._exit(128 + int(signal.SIGKILL))
+
+
+def _watch_vllm_parent(parent_pid, poll_seconds=0.5):
+    """Reap the private vLLM group when an uncatchable parent death occurs."""
+    while os.getppid() == int(parent_pid):
+        time.sleep(float(poll_seconds))
+    _kill_current_vllm_process_group()
+
+
+def _start_vllm_parent_watchdog(parent_pid):
+    thread = threading.Thread(
+        target=_watch_vllm_parent,
+        args=(int(parent_pid),),
+        name="vllm-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _vllm_process_group_exists(process_group_id):
@@ -971,7 +1031,12 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
     # engine failure, killing only the multiprocessing.Process can leave those
     # grandchildren orphaned on the GPU. A private session lets the parent
     # reap the complete worker tree by process group during shutdown.
-    _isolate_vllm_worker_process_group()
+    parent_pid = os.getppid()
+    if _isolate_vllm_worker_process_group():
+        # The trainer can be SIGKILLed by the host OOM killer, bypassing every
+        # finally/atexit handler. The surviving wrapper must then reap itself
+        # and all EngineCore grandchildren instead of leaving idle GPU owners.
+        _start_vllm_parent_watchdog(parent_pid)
     gpu_group = ([int(x) for x in gpu_id]
                  if isinstance(gpu_id, (list, tuple)) else [int(gpu_id)])
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_group)

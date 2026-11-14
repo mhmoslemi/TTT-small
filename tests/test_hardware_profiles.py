@@ -206,11 +206,17 @@ class HardwareProfileTests(unittest.TestCase):
                     rtx.pop("strategy_vllm_max_num_batched_tokens"), 0)
                 self.assertEqual(rtx, b200)
 
-    def test_run_copy_has_the_same_execution_flags_as_run2(self):
-        normal = (ROOT / "run2.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
-        copy = (ROOT / "run_copy.sh").read_text().split("exec python3 ", 1)[1].split('"$@"', 1)[0]
-        self.assertEqual(normal, copy)
-        self.assertNotIn("TTT_HOST_MEMORY_RESERVE_GIB", (ROOT / "run_copy.sh").read_text())
+    def test_run_copy_supervises_the_training_entrypoint(self):
+        launcher = (ROOT / "run_copy.sh").read_text()
+        self.assertIn(
+            "exec python3 runtime/run_supervisor.py -- python3 train_multy_CVaR.py",
+            launcher,
+        )
+        for flag in ("--fast", "--measure-entropy", "--strategies",
+                     "--coder-retry", "--isolate-eval",
+                     "--fused-long-attention"):
+            self.assertIn(flag, launcher)
+        self.assertNotIn("TTT_HOST_MEMORY_RESERVE_GIB", launcher)
 
     def test_full_ram_resume_clears_low_ram_flags_and_uses_four_selected_gpus(self):
         import json
