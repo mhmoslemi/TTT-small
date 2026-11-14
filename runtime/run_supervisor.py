@@ -11,6 +11,12 @@ import tempfile
 import time
 
 
+def request_restart(reason):
+    path = os.environ.get("TTT_SUPERVISOR_RESTART_FILE")
+    if path:
+        Path(path).write_text(str(reason), encoding="utf-8")
+
+
 def _resume_command(command, run_dir):
     cleaned = []
     skip = False
@@ -33,7 +39,12 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
 
     with tempfile.TemporaryDirectory(prefix="ttt-supervisor-") as temporary:
         run_file = Path(temporary) / "run_dir"
-        environment = dict(os.environ, TTT_SUPERVISOR_RUN_FILE=str(run_file))
+        restart_file = Path(temporary) / "restart"
+        environment = dict(
+            os.environ,
+            TTT_SUPERVISOR_RUN_FILE=str(run_file),
+            TTT_SUPERVISOR_RESTART_FILE=str(restart_file),
+        )
         child = None
         stopping = False
 
@@ -54,13 +65,16 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
         try:
             active_command = list(command)
             while True:
+                restart_file.unlink(missing_ok=True)
                 child = subprocess.Popen(
                     active_command,
                     env=environment,
                     start_new_session=True,
                 )
                 returncode = child.wait()
-                if stopping or returncode not in (-signal.SIGKILL, 128 + signal.SIGKILL):
+                restart_requested = restart_file.is_file()
+                killed = returncode in (-signal.SIGKILL, 128 + signal.SIGKILL)
+                if stopping or not (killed or restart_requested):
                     return returncode
                 try:
                     run_dir = Path(run_file.read_text(encoding="utf-8").strip()).resolve()
@@ -80,11 +94,13 @@ def supervise(command, *, initial_delay=2.0, maximum_delay=60.0):
                         flush=True,
                     )
                     return returncode
-                print(
-                    f"[supervisor] trainer was SIGKILLed; vLLM workers are "
-                    f"being reaped. Resuming {run_dir} in {delay:g}s ...",
-                    flush=True,
+                reason = (
+                    restart_file.read_text(encoding="utf-8").strip()
+                    if restart_requested else
+                    "trainer was SIGKILLed; vLLM workers are being reaped"
                 )
+                print(f"[supervisor] {reason}. Resuming {run_dir} in "
+                      f"{delay:g}s ...", flush=True)
                 time.sleep(delay)
                 if stopping:
                     return 128 + signal.SIGINT

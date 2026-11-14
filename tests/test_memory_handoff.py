@@ -370,7 +370,7 @@ def test_interrupted_ram_wait_releases_priority(monkeypatch):
 def test_main_offload_routes_plain_models_to_chunks_and_keeps_bulk_fallback(monkeypatch, incremental):
     from runtime import incremental_offload
     monkeypatch.setattr(incremental_offload, "can_incrementally_offload", lambda *a: incremental)
-    memory = dict(total=200 * GIB, available=16 * GIB)
+    memory = dict(total=200 * GIB, available=(64 if incremental else 16) * GIB)
     monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
     gate = HostMemoryAdmission(multiprocessing.get_context("spawn"), hardware_profile="B200_full_ram")
     waits, copies = [], []
@@ -402,6 +402,81 @@ def test_main_offload_routes_plain_models_to_chunks_and_keeps_bulk_fallback(monk
     if incremental:
         expected.update(host_admission=gate, deadline=123. + host_memory.RAM_WAIT_TIMEOUT_S)
     assert waits == ([] if incremental else [1]) and copies == [expected]
+    assert gate.reserved_bytes == gate._priority_waiters.value == 0
+
+
+def test_main_offload_uses_disk_when_complete_replicas_do_not_fit(
+        tmp_path, monkeypatch):
+    import shutil
+    from runtime import incremental_offload
+
+    monkeypatch.setattr(
+        incremental_offload, "can_incrementally_offload", lambda *a: True)
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _: SimpleNamespace(free=64 * GIB))
+    memory = dict(total=200 * GIB, available=16 * GIB)
+    monkeypatch.setattr(host_memory, "host_memory_info", lambda: dict(memory))
+    gate = HostMemoryAdmission(
+        multiprocessing.get_context("spawn"),
+        hardware_profile="B200_full_ram",
+    )
+    copies = []
+
+    def estimate(*, frozen_to_disk=False):
+        return (4 if frozen_to_disk else 32) * GIB
+
+    def offload(**kwargs):
+        assert gate.reserved_bytes == 4 * GIB
+        copies.append(kwargs)
+
+    trainer = SimpleNamespace(
+        is_offloaded=False,
+        world_size=2,
+        reclaim_host_memory=lambda: [],
+        estimated_host_offload_bytes=estimate,
+        offload_for_generation=offload,
+    )
+    source = ast.parse(
+        (Path(__file__).resolve().parents[1] / "train_multy_CVaR.py").read_text())
+    function = next(
+        node for node in ast.walk(source)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_offload_trainer_for_generation"
+    )
+    wrapper = ast.parse(
+        "def build():\n    trainer_offloaded = False\n    return None").body[0]
+    wrapper.body[1:] = [
+        function,
+        ast.Return(value=ast.Name(id=function.name, ctx=ast.Load())),
+    ]
+    scope = dict(
+        cfg=SimpleNamespace(
+            hardware_profile="B200_full_ram", trainer_offload_dir=None),
+        parallel_trainer=trainer,
+        gen_pool=None,
+        strategy_pool=None,
+        pool_options={"host_memory_admission": gate},
+        runtime_training_active={"value": True},
+        setting_log_only=lambda *a, **kw: None,
+        HostMemoryUnavailable=host_memory.HostMemoryUnavailable,
+        model=None,
+        time=SimpleNamespace(monotonic=lambda: 123.),
+        nullcontext=nullcontext,
+        Path=Path,
+        exp_dir=tmp_path,
+    )
+    exec(compile(
+        ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
+        "real-trainer-handoff", "exec"), scope)
+
+    scope["build"]()()
+
+    offload_dir = str(tmp_path / ".trainer_offload")
+    assert copies == [{
+        "purge_host_cache": False,
+        "disk_directory": offload_dir,
+    }]
+    assert Path(offload_dir).is_dir()
     assert gate.reserved_bytes == gate._priority_waiters.value == 0
 
 
@@ -708,6 +783,34 @@ attempt = run_dir / "attempt"
 if not attempt.exists():
     attempt.write_text("1")
     os.kill(os.getpid(), signal.SIGKILL)
+if sys.argv[-2:] != ["--resume", str(run_dir)]:
+    raise SystemExit(f"wrong recovery arguments: {sys.argv!r}")
+'''
+    assert supervise(
+        [sys.executable, "-c", script, str(run_dir)],
+        initial_delay=0.01,
+        maximum_delay=0.01,
+    ) == 0
+
+
+def test_supervisor_resumes_when_worker_requests_recovery(tmp_path):
+    from runtime.run_supervisor import supervise
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "config.json").write_text("{}")
+    script = r'''
+import os
+from pathlib import Path
+import sys
+
+run_dir = Path(sys.argv[1]).resolve()
+Path(os.environ["TTT_SUPERVISOR_RUN_FILE"]).write_text(str(run_dir))
+attempt = run_dir / "worker-attempt"
+if not attempt.exists():
+    attempt.write_text("1")
+    Path(os.environ["TTT_SUPERVISOR_RESTART_FILE"]).write_text("worker died")
+    raise SystemExit(1)
 if sys.argv[-2:] != ["--resume", str(run_dir)]:
     raise SystemExit(f"wrong recovery arguments: {sys.argv!r}")
 '''

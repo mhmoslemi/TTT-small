@@ -5718,6 +5718,53 @@ def main():
                             "will reload on its next use",
                             flush=True,
                         )
+                    # Incremental anonymous mappings remain resident after
+                    # each chunk. If the complete replicas do not fit, do not
+                    # begin a transfer that the host will later SIGKILL.
+                    if (incremental and not disk_directory
+                            and memory["available"] < target_available):
+                        import shutil
+                        automatic_disk_directory = (
+                            Path(exp_dir) / ".trainer_offload"
+                        )
+                        disk_free = shutil.disk_usage(
+                            automatic_disk_directory.parent).free
+                        if disk_free >= required_bytes:
+                            automatic_disk_directory.mkdir(
+                                parents=True, exist_ok=True)
+                            disk_directory = str(automatic_disk_directory)
+                            frozen_to_disk = True
+                            incremental = False
+                            if parallel_trainer is not None:
+                                required_bytes = (
+                                    parallel_trainer.estimated_host_offload_bytes(
+                                        frozen_to_disk=True)
+                                )
+                            else:
+                                required_bytes = int(
+                                    1.05 * (
+                                        estimated_module_bytes(
+                                            model, frozen_to_disk=True)
+                                        + estimated_optimizer_bytes(optimizer)
+                                    ) + GIB
+                                )
+                            print(
+                                "[host-memory] complete trainer replicas do "
+                                "not fit safely in RAM; streaming frozen "
+                                "weights to the run-local offload directory "
+                                "for this phase",
+                                flush=True,
+                            )
+                        else:
+                            # Full admission waits before allocating anything;
+                            # it is slower than chunks but cannot overcommit.
+                            incremental = False
+                            print(
+                                "[host-memory] insufficient RAM and disk for "
+                                "safe trainer parking; waiting for the full "
+                                "CPU allocation before starting the transfer",
+                                flush=True,
+                            )
                 replica_label = (
                     "inactive training model"
                     if not runtime_training_active["value"]

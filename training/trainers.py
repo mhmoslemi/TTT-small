@@ -4,6 +4,7 @@ from contextlib import contextmanager, nullcontext
 import math
 import os
 from pathlib import Path
+import signal
 import time
 from types import SimpleNamespace
 
@@ -2784,6 +2785,12 @@ class ProcessDistributedTrainer:
                 dead = self._dead_workers(pending)
                 if dead:
                     codes = {rank: self._processes[rank].exitcode for rank in dead}
+                    if any(code == -signal.SIGKILL for code in codes.values()):
+                        from runtime.run_supervisor import request_restart
+                        request_restart(
+                            "trainer worker was SIGKILLed during "
+                            f"{event}; restarting from durable artifacts"
+                        )
                     raise RuntimeError(f'fast trainer worker(s) exited while waiting for {event}: {codes}')
                 continue
             message_event = message.get("event")
