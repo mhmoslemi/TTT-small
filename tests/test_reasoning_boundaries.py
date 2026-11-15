@@ -57,6 +57,20 @@ class NativeBoundaryTests(unittest.TestCase):
     def final(self, tokenizer, ids, required=True):
         return self.scope["native_final_answer_scope"](tokenizer, ids, require_final_marker=required)
 
+    def test_completed_evaluation_updates_only_its_provisional_metadata(self):
+        scope = {}
+        load_functions("train_multy_CVaR.py", {"_evaluated_rollout_meta"}, scope)
+        pending = {"status": "evaluation_pending", "step": 2, "rollout": 7}
+        result = SimpleNamespace(
+            reward=1.25, raw_score=0.75, valid=True, parsed=True, ran=True,
+            msg="ok", failure_kind=None, stdout="answer")
+        meta = scope["_evaluated_rollout_meta"](pending, result)
+        self.assertEqual(meta["status"], "evaluated")
+        self.assertEqual(meta["reward"], 1.25)
+        self.assertEqual(meta["raw_score"], 0.75)
+        self.assertEqual(meta["rollout"], 7)
+        self.assertEqual(pending["status"], "evaluation_pending")
+
     def test_hidden_native_boundary_selects_final_program_without_changing_ids(self):
         tokenizer = Tokenizer()
         tokenizer.pieces.update({1: "```python\nold_draft()\n```", 2: "```python\nfinal_program()\n```"})
@@ -142,7 +156,7 @@ class NativeBoundaryTests(unittest.TestCase):
             entropy_directory=None, two_stage_rollouts=False, training_enabled=False,
             defer_gpu_evaluation=False, isolated_eval=isolated, exp_dir="unused", step_idx=0,
             save_rollout_artifacts=lambda *args, **kwargs: saved.append((args, kwargs)),
-            _record_evaluation_completion=lambda future: None,
+            _record_evaluation_completion=lambda future, record=None: None,
             host_admission=SimpleNamespace(reservation=lambda size: nullcontext()),
             isolated_memory_limit_bytes=1024, isolated_cpu_slots=slots)
         load_functions("train_multy_CVaR.py", {"_queue_rollout", "_submit_rollout", "_run_isolated_reward"}, scope)

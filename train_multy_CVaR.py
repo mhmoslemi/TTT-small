@@ -344,6 +344,23 @@ def _as_float_list(seq, max_len: int = 4096):
     return out
 
 
+def _evaluated_rollout_meta(pending_meta, result):
+    """Add one completed CPU evaluation to its provisional rollout metadata."""
+    return {
+        **pending_meta,
+        "status": "evaluated",
+        "reward": float(result.reward),
+        "raw_score": (
+            float(result.raw_score) if result.raw_score is not None else None),
+        "valid": bool(result.valid),
+        "parsed": bool(result.parsed),
+        "ran": bool(result.ran),
+        "msg": result.msg,
+        "failure_kind": result.failure_kind,
+        "sandbox_stdout": (result.stdout or "")[:2000],
+    }
+
+
 def _adapter_dir(exp_dir, step_idx):
     from pathlib import Path
     return str(Path(exp_dir) / f"adapter_step{step_idx:03d}")
@@ -762,8 +779,9 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
     metadata atomically as each rollout arrives. Rollout-policy logprobs may be
     added by the batched scorer after generation; exact token IDs let recovery
     reproduce them without sampling the policy again.
-    Rewards are deliberately recomputed because provisional metadata never
-    claims that an in-memory evaluation survived a process crash.
+    Individually completed rewards may already be present for observability,
+    but recovery deliberately recomputes them because advantages and the
+    step-wide training reduction were not yet sealed.
     """
     step_idx = int(step_idx)
     step_dir = Path(exp_dir) / f"step{step_idx:02d}"
@@ -781,7 +799,8 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
-        if (int(meta.get("step", -1)) != step_idx or meta.get("status") != "evaluation_pending"):
+        if (int(meta.get("step", -1)) != step_idx
+                or meta.get("status") not in {"evaluation_pending", "evaluated"}):
             return None
         required = (
             "group", "parent_group", "rollout", "n_response_tokens",
@@ -1298,7 +1317,16 @@ def _finalize_pending_spo_rs_artifacts(
         eval_bar = make_progress_bar(len(evaluation_futures), desc="recovering evaluations")
         try:
             for future in as_completed(evaluation_futures):
-                results[evaluation_futures[future]] = future.result()
+                index = evaluation_futures[future]
+                result = future.result()
+                results[index] = result
+                item = artifacts[index]
+                evaluated_meta = _evaluated_rollout_meta(item["meta"], result)
+                save_rollout(
+                    exp_dir, step_idx, int(item["meta"]["group"]),
+                    int(item["meta"]["rollout"]), "", evaluated_meta,
+                    artifacts_already_saved=True)
+                item["meta"] = evaluated_meta
                 eval_bar.update(1)
         finally:
             eval_bar.close()
@@ -2327,9 +2355,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     eval_progress_completed = 0
     eval_bar_closed = False
 
-    def _record_evaluation_completion(_future):
+    def _record_evaluation_completion(_future, record=None):
         nonlocal eval_progress_completed
         with eval_progress_condition:
+            if (record is not None and not _future.cancelled()
+                    and _future.exception() is None):
+                result = _future.result()
+                save_future = rollout_io_pool.submit(
+                    save_rollout,
+                    exp_dir, step_idx, int(record["group_id"]),
+                    int(record["rollout_index"]), record["text"],
+                    _evaluated_rollout_meta(record["_pending_meta"], result),
+                    artifacts_already_saved=True,
+                )
+                rollout_io_futures.append(save_future)
             eval_progress_completed += 1
             try:
                 eval_bar.update(1)
@@ -2397,7 +2436,9 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             )
         reward_futures[g].append(fut)
         record["_reward_future"] = fut
-        fut.add_done_callback(_record_evaluation_completion)
+        fut.add_done_callback(
+            lambda completed, rollout=record:
+            _record_evaluation_completion(completed, rollout))
         return fut
 
     def _queue_rollout(job_idx, text, token_ids, behavior_logprobs=None, *,
@@ -2465,6 +2506,23 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             record["strategy_rollout_phase"] = str(rollout_phase)
         if strategy_source_job_idx is not None:
             record["strategy_source_job_idx"] = int(strategy_source_job_idx)
+        pending_meta = {
+            **budget_meta,
+            **retry_metadata(record),
+            "status": "evaluation_pending",
+            "step": int(step_idx),
+            "group": int(group_id),
+            "parent_group": parent_group,
+            "rollout": rollout_index,
+            "n_response_tokens": len(token_ids),
+            "coder_reasoning_effort": job.get("coder_reasoning_effort"),
+            "strategy_rollout_phase": (
+                str(rollout_phase) if rollout_phase is not None else None),
+            "strategy_source_job_idx": (
+                int(strategy_source_job_idx)
+                if strategy_source_job_idx is not None else None),
+        }
+        record["_pending_meta"] = pending_meta
         save_future = rollout_io_pool.submit(
             save_rollout_artifacts,
             exp_dir, step_idx, int(group_id), rollout_index, text,
@@ -2472,21 +2530,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             strategy_text=(job.get("strategy_response") if two_stage_rollouts else None),
             response_token_ids=token_ids,
             behavior_logprobs=behavior_logprobs,
-            pending_meta={
-                **budget_meta,
-                **retry_metadata(record),
-                "status": "evaluation_pending",
-                "step": int(step_idx),
-                "group": int(group_id),
-                "parent_group": parent_group,
-                "rollout": rollout_index,
-                "n_response_tokens": len(token_ids),
-                "coder_reasoning_effort": job.get("coder_reasoning_effort"),
-                "strategy_rollout_phase": (str(rollout_phase) if rollout_phase is not None else None),
-                "strategy_source_job_idx": (
-                    int(strategy_source_job_idx)
-                    if strategy_source_job_idx is not None else None),
-            },
+            pending_meta=pending_meta,
         )
         record["_artifact_save_future"] = save_future
         rollout_io_futures.append(save_future)

@@ -177,9 +177,11 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         for group in range(2):
             for rollout in range(2):
                 base = self.step / f"step03_group{group:02d}_rollout{rollout:03d}"
+                status = "evaluated" if (group, rollout) == (0, 0) else "evaluation_pending"
                 Path(str(base) + ".meta.json").write_text(json.dumps(dict(
-                    step=3, status="evaluation_pending", group=group, parent_group=group,
-                    rollout=rollout, n_response_tokens=12, counts_toward_allocation=True, retry_attempt=0)))
+                    step=3, status=status, group=group, parent_group=group,
+                    rollout=rollout, n_response_tokens=12, counts_toward_allocation=True,
+                    retry_attempt=0, **({"reward": 1.0} if status == "evaluated" else {}))))
                 for suffix in ("txt", "prompt.txt", "tokens.zlib"):
                     Path(str(base) + "." + suffix).touch()
         cfg = SimpleNamespace(groups_per_step=2, group_size=2, hardware_profile="B200_full_ram",
