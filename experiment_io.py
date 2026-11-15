@@ -33,6 +33,8 @@ from pathlib import Path
 
 _ROLLOUT_TOKEN_MAGIC = b"TTTtok1\0"
 _ROLLOUT_LOGPROB_MAGIC = b"TTTlp1\0\0"
+_ROLLOUT_IO_RETRY_SECONDS = 5.0
+_ROLLOUT_IO_RETRY_TIMEOUT_SECONDS = 2 * 60 * 60
 
 ROLLOUT_CONFIG_KEYS = (
     "groups_per_step", "group_size", "strategies_per_parent",
@@ -45,6 +47,61 @@ ROLLOUT_CONFIG_KEYS = (
 ROLLOUT_BUDGET_KEYS = ROLLOUT_CONFIG_KEYS[:5]
 
 
+def _retry_rollout_filesystem(operation, path):
+    """Wait out transient NAS write failures instead of killing a step."""
+    path = Path(path)
+    deadline = time.monotonic() + _ROLLOUT_IO_RETRY_TIMEOUT_SECONDS
+    next_notice = 0.0
+    while True:
+        try:
+            return operation()
+        except OSError as error:
+            now = time.monotonic()
+            if now >= deadline:
+                raise OSError(
+                    error.errno,
+                    f"rollout artifact remained unwritable for 2 hours: "
+                    f"{path} ({error})",
+                    str(path),
+                ) from error
+            if now >= next_notice:
+                remaining = max(0, int((deadline - now) / 60))
+                print(
+                    f"[rollout-io] write unavailable for {path.name}: "
+                    f"{error}; retrying every 5s, {remaining} min remaining",
+                    flush=True,
+                )
+                next_notice = now + 60.0
+            time.sleep(min(_ROLLOUT_IO_RETRY_SECONDS, deadline - now))
+
+
+def _atomic_write_bytes(path, payload):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+
+    def write():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+
+    _retry_rollout_filesystem(write, path)
+
+
+def _atomic_write_text(path, value, *, errors=None):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+
+    def write():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if errors is None:
+            tmp.write_text(str(value))
+        else:
+            tmp.write_text(str(value), errors=errors)
+        tmp.replace(path)
+
+    _retry_rollout_filesystem(write, path)
+
+
 def save_rollout_token_ids(path, token_ids):
     """Atomically persist exact generated IDs in a compact portable format."""
     values = [int(token_id) for token_id in token_ids]
@@ -54,10 +111,7 @@ def save_rollout_token_ids(path, token_ids):
     if values:
         payload += struct.pack(f"<{len(values)}I", *values)
     compressed = zlib.compress(payload, level=1)
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(compressed)
-    tmp.replace(path)
+    _atomic_write_bytes(path, compressed)
 
 
 def load_rollout_token_ids(path):
@@ -85,10 +139,7 @@ def save_rollout_logprobs(path, logprobs):
     if values:
         payload += struct.pack(f"<{len(values)}f", *values)
     compressed = zlib.compress(payload, level=1)
-    path = Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(compressed)
-    tmp.replace(path)
+    _atomic_write_bytes(path, compressed)
 
 
 def load_rollout_logprobs(path):
@@ -383,7 +434,8 @@ def save_rollout(
     Anything JSON-serializable is fine.
     """
     step_dir = Path(exp_dir) / f"step{step:02d}"
-    step_dir.mkdir(exist_ok=True)
+    _retry_rollout_filesystem(
+        lambda: step_dir.mkdir(parents=True, exist_ok=True), step_dir)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
     if not artifacts_already_saved:
         save_rollout_artifacts(
@@ -408,9 +460,7 @@ def save_rollout(
 
     safe_meta = {k: _coerce(v) for k, v in meta.items()}
     meta_path = step_dir / f"{base}.meta.json"
-    meta_tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
-    meta_tmp.write_text(json.dumps(safe_meta, indent=2))
-    meta_tmp.replace(meta_path)
+    _atomic_write_text(meta_path, json.dumps(safe_meta, indent=2))
 
 
 def save_rollout_artifacts(
@@ -427,13 +477,12 @@ def save_rollout_artifacts(
 ):
     """Persist generated text immediately, before reward evaluation finishes."""
     step_dir = Path(exp_dir) / f"step{step:02d}"
-    step_dir.mkdir(exist_ok=True)
+    _retry_rollout_filesystem(
+        lambda: step_dir.mkdir(parents=True, exist_ok=True), step_dir)
     base = f"step{step:02d}_group{group:02d}_rollout{rollout:03d}"
 
     def _atomic_text(path, value):
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(str(value or ""), errors="replace")
-        tmp.replace(path)
+        _atomic_write_text(path, value or "", errors="replace")
 
     _atomic_text(step_dir / f"{base}.txt", response_text)
     if response_token_ids is not None:
@@ -453,9 +502,8 @@ def save_rollout_artifacts(
         _atomic_text(step_dir / f"{base}.prompt.txt", prompt_text)
     if pending_meta is not None:
         path = step_dir / f"{base}.meta.json"
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(pending_meta, indent=2, default=str))
-        tmp.replace(path)
+        _atomic_write_text(
+            path, json.dumps(pending_meta, indent=2, default=str))
 
 
 def save_strategy_response(exp_dir: Path, step: int, parent_group: int,

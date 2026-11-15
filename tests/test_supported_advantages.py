@@ -27,6 +27,27 @@ from training.spo_rs import SPORSTracker, SPORSV2Tracker
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_step_zero_recovery_recreates_only_missing_initial_adapter(tmp_path):
+    class Model:
+        def __init__(self):
+            self.saves = 0
+
+        def save_pretrained(self, path):
+            self.saves += 1
+            Path(path).mkdir()
+
+    model = Model()
+    path, recreated = training._ensure_initial_adapter_for_recovery(
+        model, tmp_path, "Qwen/Qwen3.8-27B")
+    assert path == tmp_path / "adapter_initial"
+    assert recreated and model.saves == 1
+
+    same_path, recreated = training._ensure_initial_adapter_for_recovery(
+        model, tmp_path, "Qwen/Qwen3.8-27B")
+    assert same_path == path
+    assert not recreated and model.saves == 1
+
+
 @pytest.mark.parametrize(("model_name", "expected"), [
     ("openai/gpt-oss-120b", "unsloth"),
     ("Qwen/Qwen3-8B", "hf"),

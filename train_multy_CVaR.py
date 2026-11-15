@@ -395,6 +395,16 @@ def _save_adapter(model, exp_dir, step_idx, generation_model_name=None, director
     return out_dir
 
 
+def _ensure_initial_adapter_for_recovery(model, exp_dir, generation_model_name):
+    """Save the fresh zero-output LoRA when a copied step 0 lacks its snapshot."""
+    path = Path(exp_dir) / "adapter_initial"
+    if path.is_dir():
+        return path, False
+    return Path(_save_adapter(
+        model, exp_dir, -1, generation_model_name,
+        directory_name="adapter_initial")), True
+
+
 def _prune_adapter_snapshots(exp_dir, keep_paths):
     """Delete completed adapter snapshots not required by the live state.
 
@@ -5347,7 +5357,12 @@ def main():
             if _is_spo_rs_mode(configured_advantage_mode):
                 interrupted_spo_rs_artifacts = (_recoverable_spo_rs_artifacts(exp_dir, 0, cfg))
             initial_adapter = Path(exp_dir) / "adapter_initial"
-            if (interrupted_spo_rs_artifacts is not None and initial_adapter.is_dir()):
+            recreated_initial_adapter = False
+            if interrupted_spo_rs_artifacts is not None:
+                initial_adapter, recreated_initial_adapter = (
+                    _ensure_initial_adapter_for_recovery(
+                        model, exp_dir, cfg.model_name))
+            if interrupted_spo_rs_artifacts is not None:
                 start_step = 0
                 adapter_path = initial_adapter
                 _load_adapter(model, adapter_path)
@@ -5355,7 +5370,8 @@ def main():
                 current_policy_adapter_path = adapter_path
                 print(
                     "[resume] found a fully evaluated interrupted SPO-RS "
-                    "step 0; restored adapter_initial and will skip rollout "
+                    f"step 0; {'recreated' if recreated_initial_adapter else 'restored'} "
+                    "adapter_initial and will skip rollout "
                     "generation/evaluation",
                     flush=True,
                 )

@@ -12,7 +12,8 @@ import unittest
 from unittest.mock import patch
 
 from experiment_io import (
-    restart_changed_rollout_step, save_parent_selections,
+    _retry_rollout_filesystem, restart_changed_rollout_step,
+    save_parent_selections,
 )
 
 
@@ -41,6 +42,20 @@ class ResumeRolloutConfigTests(unittest.TestCase):
     def resume(self, cfg):
         with redirect_stdout(io.StringIO()):
             return restart_changed_rollout_step(cfg, self.run, 3)
+
+    def test_rollout_writes_retry_transient_nas_errors(self):
+        calls = []
+
+        def write():
+            calls.append(None)
+            if len(calls) < 3:
+                raise OSError(5, "synthetic NAS error")
+            return "saved"
+
+        with patch("experiment_io.time.sleep"), redirect_stdout(io.StringIO()):
+            result = _retry_rollout_filesystem(write, self.run / "rollout.zlib")
+        self.assertEqual(result, "saved")
+        self.assertEqual(len(calls), 3)
 
     def test_fresh_and_completed_steps_use_new_counts(self):
         cfg = SimpleNamespace(**self.current)
