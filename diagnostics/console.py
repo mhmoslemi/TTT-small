@@ -292,11 +292,11 @@ _ROUTED_DEPENDENCY_NOTICES = (
     "Skipping import of cpp extensions due to incompatible torch version.",
     "No prebuilt binary for CUDA",
     "You are sending unauthenticated requests to the HF Hub.",
-    "is an Enum subclass and is now natively supported by torch.compile",
     "`torch_dtype` is deprecated! Use `dtype` instead!",
 )
 _SETTING_LOG_ONLY_NOTICES = (
     "Unrecognized keys in `rope_parameters`",
+    "is an Enum subclass and is now natively supported by torch.compile",
 )
 
 

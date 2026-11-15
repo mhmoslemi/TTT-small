@@ -241,6 +241,31 @@ def test_extracted_terminal_routing_preserves_visible_and_hidden_logs(monkeypatc
         sink.log_file.close()
 
 
+def test_torch_enum_deprecations_go_only_to_setting_log(monkeypatch):
+    from diagnostics import console
+
+    visible = io.StringIO()
+    setting = io.StringIO()
+    monkeypatch.setattr(
+        console, "setting_log_only",
+        lambda *values, sep=" ", end="\n", **_: setting.write(
+            sep.join(str(value) for value in values) + end))
+    stream = console._NoticeRoutingStream(
+        visible, io.StringIO(), "dependency")
+    stream.write(
+        "W1116 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an "
+        "Enum subclass and is now natively supported by torch.compile as an "
+        "opaque value type.\n")
+    stream.write(
+        "W1116 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an "
+        "Enum subclass and is now natively supported by torch.compile as an "
+        "opaque value type.\n")
+
+    assert visible.getvalue() == ""
+    assert "KernelPreference" in setting.getvalue()
+    assert "ScaleCalculationMode" in setting.getvalue()
+
+
 def test_vllm_compat_hook_uses_project_root_after_move(monkeypatch):
     monkeypatch.setattr(gen_workers.importlib.metadata, "version", lambda _: "0.6.16")
     monkeypatch.setattr(gen_workers, "_flashinfer_comm_guard_required", lambda _: True)
