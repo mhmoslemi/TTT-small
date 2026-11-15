@@ -1457,6 +1457,46 @@ def _finalize_pending_spo_rs_artifacts(
     return [{**cached[item["meta_path"]], **item} for item in completed]
 
 
+def _rebind_saved_step_zero_parents(sampler, by_group, count):
+    """Bind fresh seed UUIDs to the evaluated step-zero groups when possible."""
+    seeds = [state for state in sampler._states
+             if state.id in sampler._seed_ids]
+    remaining = list(seeds)
+    matches = []
+    for group in range(int(count)):
+        records = by_group.get(group, ())
+        if not records:
+            return None
+        meta = records[0]["meta"]
+        construction = meta.get("parent_construction")
+        if isinstance(construction, str):
+            try:
+                construction = json.loads(construction)
+            except json.JSONDecodeError:
+                return None
+        if construction is None:
+            return None
+        candidates = [
+            state for state in remaining
+            if int(state.timestep) == int(meta.get("parent_timestep", -1))
+            and state.construction is not None
+            and np.array_equal(
+                np.asarray(state.construction), np.asarray(construction))
+        ]
+        if len(candidates) != 1:
+            return None
+        state = candidates[0]
+        matches.append((state, str(meta["parent_id"])))
+        remaining = [candidate for candidate in remaining if candidate is not state]
+    saved_ids = [saved_id for _state, saved_id in matches]
+    if len(set(saved_ids)) != len(saved_ids):
+        return None
+    for state, saved_id in matches:
+        if state.id != saved_id:
+            sampler.reassign_seed_id(state, saved_id)
+    return [state for state, _saved_id in matches]
+
+
 def _resume_spo_rs_step_from_artifacts(
         backend, model, tokenizer, sampler, optimizer, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
@@ -1480,14 +1520,24 @@ def _resume_spo_rs_step_from_artifacts(
     if sampling_adapter_path is None or not Path(sampling_adapter_path).is_dir():
         raise FileNotFoundError(f'evaluated-step recovery cannot find the sampling adapter: {sampling_adapter_path}')
 
-    parents = sampler.sample_states(int(cfg.groups_per_step), selection_step=step_idx)
+    by_group = {}
+    for item in artifacts:
+        by_group.setdefault(int(item["meta"]["group"]), []).append(item)
+    parents = _rebind_saved_step_zero_parents(
+        sampler, by_group, int(cfg.groups_per_step)) if step_idx == 0 else None
+    if parents is None:
+        parents = sampler.sample_states(
+            int(cfg.groups_per_step), selection_step=step_idx)
+    else:
+        print(
+            f"[resume] restored {len(parents)} saved step-zero seed parents; "
+            "current parent-selection settings begin at step 1",
+            flush=True,
+        )
     if len(parents) != int(cfg.groups_per_step):
         raise RuntimeError(
             "evaluated-step recovery could not reconstruct every selected "
             f"parent ({len(parents)}/{int(cfg.groups_per_step)})")
-    by_group = {}
-    for item in artifacts:
-        by_group.setdefault(int(item["meta"]["group"]), []).append(item)
     for group, parent in enumerate(parents):
         records = by_group.get(group, ())
         if not records:

@@ -48,6 +48,30 @@ def test_step_zero_recovery_recreates_only_missing_initial_adapter(tmp_path):
     assert not recreated and model.saves == 1
 
 
+def test_step_zero_recovery_uses_saved_seed_groups_before_current_jev(tmp_path):
+    problem = SimpleNamespace(build_prompt=lambda _parent: [])
+    sampler = make_sampler(
+        parent_selection="puct-jev", num_seeds=2, exp_dir=tmp_path,
+        problem=problem, jev_candidate_multiplier=5,
+        jev_same_core_threshold=.4,
+        seed_states=[
+            SeedState(code="current A", value=.5, raw_score=2., construction=[1., 1.]),
+            SeedState(code="current B", value=.5, raw_score=2., construction=[2., 2.]),
+        ])
+    by_group = {
+        0: [{"meta": {"parent_id": "saved-b", "parent_timestep": 0,
+                       "parent_construction": "[2.0, 2.0]"}}],
+        1: [{"meta": {"parent_id": "saved-a", "parent_timestep": 0,
+                       "parent_construction": "[1.0, 1.0]"}}],
+    }
+
+    parents = training._rebind_saved_step_zero_parents(sampler, by_group, 2)
+
+    assert [parent.id for parent in parents] == ["saved-b", "saved-a"]
+    assert [parent.code for parent in parents] == ["current B", "current A"]
+    assert sampler.same_core_threshold == .4
+
+
 @pytest.mark.parametrize(("model_name", "expected"), [
     ("openai/gpt-oss-120b", "unsloth"),
     ("Qwen/Qwen3-8B", "hf"),
