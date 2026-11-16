@@ -270,6 +270,16 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
     out = {"ok": False, "msg": "unknown", "logs": "", "score_us": None}
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # The benchmark and vLLM use different Triton versions; never share artifacts.
+    evaluator_cache = os.path.join(
+        os.environ.get(
+            "TTT_FAST_RUNTIME_DIR", os.path.join(os.getcwd(), ".runtime", "fast")),
+        "kernel-eval", f"triton-{expected_triton or 'default'}")
+    os.makedirs(evaluator_cache, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = evaluator_cache
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+        os.path.dirname(evaluator_cache), "torchinductor")
+    os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
     py3 = None
     try:
         py3 = ensure_python3_on_path(kernel_python)

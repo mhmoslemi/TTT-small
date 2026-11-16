@@ -6,20 +6,26 @@ set -eu
 ttt_project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ttt_project_dir"
 
-# Keep every runtime cache and temporary file on the permitted NAS mount.
+# Persistent files stay on NAS; compilation and IPC use RAM, never the 49 GB disk.
 ttt_runtime_dir="$ttt_project_dir/.runtime"
-export TMPDIR="$ttt_runtime_dir/tmp"
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    ttt_fast_runtime_dir="/dev/shm/ttt-small-runtime"
+else
+    ttt_fast_runtime_dir="$ttt_runtime_dir/fast"
+fi
+export TTT_FAST_RUNTIME_DIR="$ttt_fast_runtime_dir"
+export TMPDIR="$ttt_fast_runtime_dir/tmp"
 export XDG_CACHE_HOME="$ttt_runtime_dir/cache"
 export XDG_CONFIG_HOME="$ttt_runtime_dir/config"
 export XDG_DATA_HOME="$ttt_runtime_dir/data"
 export XDG_STATE_HOME="$ttt_runtime_dir/state"
 export HF_HOME="$ttt_runtime_dir/cache/huggingface"
-export VLLM_CACHE_ROOT="$ttt_runtime_dir/cache/vllm"
-export TORCHINDUCTOR_CACHE_DIR="$ttt_runtime_dir/cache/torchinductor"
-export TRITON_CACHE_DIR="$ttt_runtime_dir/cache/triton"
-export TORCH_EXTENSIONS_DIR="$ttt_runtime_dir/cache/torch_extensions"
-export CUDA_CACHE_PATH="$ttt_runtime_dir/cache/cuda"
-export FLASHINFER_WORKSPACE_BASE="$ttt_runtime_dir/cache/flashinfer"
+export VLLM_CACHE_ROOT="$ttt_fast_runtime_dir/vllm"
+export TORCHINDUCTOR_CACHE_DIR="$ttt_fast_runtime_dir/torchinductor-vllm"
+export TRITON_CACHE_DIR="$ttt_fast_runtime_dir/triton-vllm"
+export TORCH_EXTENSIONS_DIR="$ttt_fast_runtime_dir/torch_extensions"
+export CUDA_CACHE_PATH="$ttt_fast_runtime_dir/cuda"
+export FLASHINFER_WORKSPACE_BASE="$ttt_fast_runtime_dir/flashinfer"
 export MPLCONFIGDIR="$ttt_runtime_dir/cache/matplotlib"
 mkdir -p "$TMPDIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
     "$HF_HOME" "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" \
