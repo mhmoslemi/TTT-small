@@ -52,7 +52,7 @@ def test_trimul_config_is_512_max_effort_gpt_oss_rollouts():
     from types import SimpleNamespace
 
     config = yaml.safe_load((ROOT / "configs/gpu_mode_trimul.yaml").read_text())
-    assert config["kernel_python"] == "../kernel_env/bin/python3"
+    assert config["kernel_python"] == "kernel_env/bin/python3"
     assert config["model_name"] == config["coder_model_name"] == "openai/gpt-oss-120b"
     assert config["coder_reasoning_effort"] == "high"
     assert config["groups_per_step"] * config["group_size"] == 512
