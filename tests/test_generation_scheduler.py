@@ -31,6 +31,71 @@ def load_nested(path, name, scope):
 
 
 class GenerationSchedulerTests(unittest.TestCase):
+    def test_trimul_releases_and_restores_only_one_tp1_engine(self):
+        pool = workers.GenerationPool.__new__(workers.GenerationPool)
+        pool.num_workers = 2
+        pool._gpu_groups = [[6], [7]]
+        pool._persistent_worker_ids = (0, 1)
+        pool._transient_worker_ids = ()
+        pool.persistent_workers = 2
+        pool.procs = [SimpleNamespace(is_alive=lambda: True),
+                      SimpleNamespace(is_alive=lambda: True)]
+        stopped, started = [], []
+
+        def stop(ranks):
+            stopped.extend(ranks)
+            for rank in ranks:
+                pool.procs[rank] = None
+
+        def start(ranks):
+            started.extend(ranks)
+
+        pool._stop_workers = stop
+        pool._start_workers = start
+        released = pool.release_idle_gpu(7)
+        self.assertEqual(released, (1,))
+        self.assertEqual((pool._persistent_worker_ids,
+                          pool._transient_worker_ids), ((0,), (1,)))
+        self.assertEqual(stopped, [1])
+        pool.restore_released_workers(released)
+        self.assertEqual(started, [1])
+
+        pool._gpu_groups = [[6, 7]]
+        with self.assertRaisesRegex(RuntimeError, "independent TP=1"):
+            pool.release_idle_gpu(7)
+
+    def test_trimul_evaluation_wave_handoffs_before_submit_and_restore(self):
+        events = []
+
+        class Pool:
+            def release_gpu_for_evaluation(self, gpu_id):
+                events.append(("release", gpu_id))
+                return (1,)
+
+            def restore_gpu_after_evaluation(self, worker_ids):
+                events.append(("restore", worker_ids))
+
+        records = [dict(name="a"), dict(name="b")]
+        untouched = dict(name="later")
+        deferred = records + [untouched]
+
+        def submit(record):
+            events.append(("submit", record["name"]))
+            future = Future()
+            future.set_result(record["name"])
+            return future
+
+        evaluate = load_nested(
+            ROOT / "train_multy_CVaR.py",
+            "_evaluate_trimul_batch_on_released_gpu", {})
+        evaluate(Pool(), 7, records, deferred, submit,
+                 resume_generation=True)
+        self.assertEqual(deferred, [untouched])
+        self.assertEqual(events, [
+            ("release", 7), ("submit", "a"), ("submit", "b"),
+            ("restore", (1,)),
+        ])
+
     def test_coder_batches_use_shared_queue_on_all_hardware_profiles(self):
         pool = workers.GenerationPool.__new__(workers.GenerationPool)
         pool.num_workers, pool.gen_micro_batch = 2, 2

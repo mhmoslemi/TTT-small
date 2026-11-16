@@ -73,20 +73,28 @@ class GPURoles:
     evaluation_shares_generation: bool
 
 
-def allocate_gpu_roles(available: Iterable[int], problem: str) -> GPURoles:
+def allocate_gpu_roles(available: Iterable[int], problem: str,
+                       problem_type: Optional[str] = None) -> GPURoles:
     """Apply the phase-sharing role table defined by the launcher contract.
 
     The first card owns the differentiable trainer, but it is not a
-    training-only card: it rejoins every rollout phase.  GPU-mode keeps only
-    the last card out of generation when a distinct evaluator is available.
+    training-only card: it rejoins every rollout phase. TriMul uses every card
+    for pilot/phase-2 generation, then releases the last independent TP=1
+    engine for serialized benchmarking. Other GPU-mode tasks keep their
+    evaluator reserved throughout the step.
     """
     ids = parse_gpu_ids(list(available))
     gpu_problem = str(problem or "").strip().lower() in GPU_PROBLEM_NAMES
     training = ids[0]
 
+    trimul = bool(gpu_problem and str(problem_type or "").strip().lower()
+                  == "trimul")
     if not gpu_problem:
         generation = list(ids)
         evaluation = None
+    elif trimul:
+        generation = list(ids)
+        evaluation = ids[-1]
     elif len(ids) == 1:
         generation = [training]
         evaluation = training

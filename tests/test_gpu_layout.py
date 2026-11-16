@@ -12,6 +12,64 @@ import runtime.gpu_runtime as gpu_runtime
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_trimul_alone_shares_its_evaluator_with_generation():
+    trimul = gpu_runtime.allocate_gpu_roles([6, 7], "gpu_mode", "trimul")
+    assert trimul.generation == [6, 7]
+    assert trimul.evaluation == 7
+    assert trimul.evaluation_shares_generation
+
+    mla = gpu_runtime.allocate_gpu_roles(
+        [6, 7], "gpu_mode", "mla_decode_nvidia")
+    assert mla.generation == [6]
+    assert mla.evaluation == 7
+    assert not mla.evaluation_shares_generation
+
+
+def test_trimul_b200_benchmark_identity_is_exact():
+    from problems.gpu_mode import benchmark_environment_issue
+
+    assert benchmark_environment_issue(
+        "NVIDIA B200", (10, 0), "3.3.1", "B200", "3.3.1") is None
+    assert "expected NVIDIA B200" in benchmark_environment_issue(
+        "NVIDIA H100", (9, 0), "3.3.1", "B200", "3.3.1")
+    assert "expected Triton 3.3.1" in benchmark_environment_issue(
+        "NVIDIA B200", (10, 0), "3.4.0", "B200", "3.3.1")
+
+
+def test_trimul_config_is_512_max_effort_gpt_oss_rollouts():
+    import yaml
+    from models.coder_profiles import (_coder_effort_entries,
+                                       _coder_model_profile)
+    from types import SimpleNamespace
+
+    config = yaml.safe_load((ROOT / "configs/gpu_mode_trimul.yaml").read_text())
+    assert config["model_name"] == config["coder_model_name"] == "openai/gpt-oss-120b"
+    assert config["coder_reasoning_effort"] == "high"
+    assert config["groups_per_step"] * config["group_size"] == 512
+    assert (config["strategies_per_parent"]
+            * config["programs_per_strategy"] == config["group_size"])
+    assert _coder_model_profile(config["coder_model_name"])["reasoning_effort"] == "high"
+
+    cfg = SimpleNamespace(
+        coder_template_kind="gpt-oss", coder_reasoning_effort="high",
+        coder_thinking_budget=0)
+    sources = range(config["groups_per_step"]
+                    * config["strategies_per_parent"])
+    entries = _coder_effort_entries(
+        [], sources,
+        [config["pilot_programs_per_strategy"]] * len(sources),
+        cfg, 0, "pilot")
+    assert sum(count for _, count, _ in entries) == 384
+    assert {effort for _, _, effort in entries} == {"high"}
+    phase2 = _coder_effort_entries(
+        [], sources,
+        [config["programs_per_strategy"]
+         - config["pilot_programs_per_strategy"]] * len(sources),
+        cfg, 0, "adaptive")
+    assert sum(count for _, count, _ in phase2) == 128
+    assert {effort for _, _, effort in phase2} == {"high"}
+
+
 def blackwell_cards(total_gib=94.97):
     return {
         gpu: gpu_runtime.GPUMemory(

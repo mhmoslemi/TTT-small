@@ -2386,6 +2386,44 @@ class GenerationPool:
         self.persistent_workers = len(self._persistent_worker_ids)
         self._start_workers(reload_ids)
 
+    def release_idle_gpu(self, gpu_id):
+        """Stop the independent engine on one idle GPU for benchmarking."""
+        gpu_id = int(gpu_id)
+        worker_ids = [
+            rank for rank, group in enumerate(self._gpu_groups)
+            if list(group) == [gpu_id]
+        ]
+        if len(worker_ids) != 1:
+            raise RuntimeError(
+                f"cannot release GPU {gpu_id}: TriMul benchmarking requires "
+                "one independent TP=1, PP=1 engine on that device")
+        rank = worker_ids[0]
+        process = self.procs[rank]
+        if process is None or not process.is_alive():
+            raise RuntimeError(
+                f"cannot release GPU {gpu_id}: generation worker {rank} is "
+                "not active")
+
+        # A worker stopped between phases must not be included in the next
+        # sleep control wave. It reloads transiently for phase two and returns
+        # to the configured persistent set on the next ordinary wake-up.
+        self._persistent_worker_ids = tuple(
+            worker for worker in self._persistent_worker_ids
+            if worker != rank)
+        self._transient_worker_ids = tuple(sorted(
+            set(self._transient_worker_ids).union({rank})))
+        self.persistent_workers = len(self._persistent_worker_ids)
+        self._stop_workers((rank,))
+        return (rank,)
+
+    def restore_released_workers(self, worker_ids):
+        worker_ids = tuple(int(rank) for rank in worker_ids)
+        if any(rank < 0 or rank >= self.num_workers for rank in worker_ids):
+            raise ValueError("released generation worker id is out of range")
+        if any(self.procs[rank] is not None for rank in worker_ids):
+            raise RuntimeError("released generation worker is already active")
+        self._start_workers(worker_ids)
+
     def run_sequential_chains(
             self, *, num_chains, num_stages, prompt_builder, result_handler,
             adapter_path, max_new_tokens, temperature, top_p, step_idx=0,
@@ -3468,6 +3506,16 @@ class PhasedVLLMGenerationPool:
 
     def score_token_logprobs(self, *args, **kwargs):
         return self._ensure_started().score_token_logprobs(*args, **kwargs)
+
+    def release_gpu_for_evaluation(self, gpu_id):
+        if not self._awake or self._pool is None:
+            raise RuntimeError("generation pool is not active at GPU handoff")
+        return self._pool.release_idle_gpu(gpu_id)
+
+    def restore_gpu_after_evaluation(self, worker_ids):
+        if not self._awake or self._pool is None:
+            raise RuntimeError("generation pool is not active at GPU restore")
+        self._pool.restore_released_workers(worker_ids)
 
     def release_for_training(self, trainer):
         """Restore each trainer group as its coder engines release the GPUs."""

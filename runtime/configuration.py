@@ -803,6 +803,12 @@ def load_config():
                         local_checkpoint("fastino/GLiDE-9B", merged["hardware_profile"]))
         merged["jev_model_path"] = str(Path(jev_path).expanduser())
     _apply_coder_model_profile(merged, profile_explicit_keys)
+    if (merged.get("coder_model_profile") == "gpt-oss-120b"
+            and str(merged.get("coder_reasoning_effort", "")).lower()
+            not in {"low", "medium", "high"}):
+        raise ValueError(
+            "GPT-OSS coder reasoning supports low, medium, or high; high is "
+            "its maximum native effort")
     _resolve_coder_token_limits(merged)
 
     exact_sharded_recovery = _read_exact_sharded_recovery(resume_dir)
@@ -1126,12 +1132,20 @@ def load_config():
               "ordered physical inventory is authoritative")
 
     available_gpu_ids = parse_gpu_ids(inventory_value, field=inventory_source)
-    roles = allocate_gpu_roles(available_gpu_ids, merged["problem"])
-    if merged["isolate_eval"]:
-        if roles.gpu_problem:
+    roles = allocate_gpu_roles(
+        available_gpu_ids, merged["problem"], merged.get("problem_type"))
+    if merged["isolate_eval"] and roles.gpu_problem:
+        if str(merged.get("problem_type") or "").lower() == "trimul":
+            # run.sh enables CPU isolation for ordinary problems. TriMul has
+            # its own serialized GPU evaluator, so ignore only that default.
+            merged["isolate_eval"] = False
+            print("[config] TriMul uses its serialized GPU evaluator; "
+                  "ignoring run.sh --isolate-eval")
+        else:
             raise ValueError(
                 "--isolate-eval is for CPU sandbox problems; gpu_mode uses "
                 "its dedicated serialized GPU benchmark evaluator")
+    if merged["isolate_eval"]:
         if int(merged.get('reward_workers', 0) or 0) < 1:
             raise ValueError(
                 "--isolate-eval requires reward_workers >= 1; in this mode "
@@ -1176,7 +1190,9 @@ def load_config():
     merged["evaluation_gpu_id"] = evaluation_gpu_id
     merged["sequential_generation"] = roles.sequential_generation
     merged["evaluation_shares_generation"] = roles.evaluation_shares_generation
-    merged["reserve_last_gpu_for_evaluation"] = bool(roles.gpu_problem and evaluation_gpu_id != training_gpu_id)
+    merged["reserve_last_gpu_for_evaluation"] = bool(
+        roles.gpu_problem and not roles.evaluation_shares_generation
+        and evaluation_gpu_id != training_gpu_id)
 
     if roles.gpu_problem:
         if not str(merged.get('gpu_type') or '').strip():
@@ -1186,6 +1202,13 @@ def load_config():
         if int(merged.get('reward_workers') or 0) != 1:
             print('[config] gpu_mode forces reward_workers=1 for serialized, stable benchmark measurements')
         merged["reward_workers"] = 1
+
+        if (str(merged.get("problem_type") or "").lower() == "trimul"
+                and len(roles.available) < 2):
+            raise ValueError(
+                "TriMul pilot-barrier scheduling requires at least two GPUs: "
+                "both generate rollouts, then the last GPU is released for "
+                "serialized benchmarking")
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
@@ -1296,6 +1319,15 @@ def load_config():
                     "at the configured context")
         merged["vllm_tensor_parallel_size"] = layout.tensor_parallel_size
         merged["vllm_pipeline_parallel_size"] = layout.pipeline_parallel_size
+        if (roles.gpu_problem
+                and str(merged.get("problem_type") or "").lower() == "trimul"
+                and (layout.tensor_parallel_size != 1
+                     or layout.pipeline_parallel_size != 1)):
+            raise ValueError(
+                "TriMul pilot-barrier scheduling requires independent TP=1, "
+                "PP=1 coder engines so exactly one B200 can be released for "
+                "benchmarking; the selected model/context does not fit that "
+                "layout")
         validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], merged.get("model_name", ""))
         if merged["dual_resident_qwen3_8b_strategy_coder_pools"]:
             print(f"[config] Qwen3-8B strategist/coder ablation: two "

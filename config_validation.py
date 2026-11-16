@@ -42,6 +42,7 @@ sandbox_timeout_s reward_workers print_responses max_saved_construction
 
 COMMON_OPTIONAL_KEYS = frozenset({
     "hardware_profile",
+    "coder_reasoning_effort",
     "coder_thinking_budget",
     "max_seq_length", "max_new_tokens",  # Otherwise derived from the coder.
     "advantage_mode", "fast", "isolate_eval",
@@ -367,6 +368,12 @@ def validate_problem_config(
         raise ValueError(
             f"{_label(source)}: strategy_reasoning_effort must be auto, none, low, "
             "medium, high, xhigh, or max")
+    if ("coder_reasoning_effort" in data
+            and str(data["coder_reasoning_effort"]).lower()
+            not in {"low", "medium", "high", "xhigh"}):
+        raise ValueError(
+            f"{_label(source)}: coder_reasoning_effort must be low, medium, "
+            "high, or xhigh")
     if "api_strategy" in data:
         if not isinstance(data["api_strategy"], str):
             raise ValueError(f"{_label(source)}: api_strategy must be a model name or ''")

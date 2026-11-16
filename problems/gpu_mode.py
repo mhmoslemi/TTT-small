@@ -171,6 +171,25 @@ def collect_logs(result, limit: int = 4000) -> str:
     return "\n\n".join(p for p in parts if p.strip())[: limit * 2]
 
 
+def benchmark_environment_issue(actual_gpu: str, capability,
+                                actual_triton: str,
+                                expected_gpu: str,
+                                expected_triton: str) -> Optional[str]:
+    """Return a precise benchmark identity mismatch, if any."""
+    expected_gpu = str(expected_gpu or "").strip().lower()
+    actual_gpu_lower = str(actual_gpu or "").strip().lower()
+    if expected_gpu == "b200":
+        if "b200" not in actual_gpu_lower or tuple(capability) != (10, 0):
+            return (f"expected NVIDIA B200 sm_100, got {actual_gpu!r} "
+                    f"sm_{int(capability[0])}{int(capability[1])}")
+    elif expected_gpu and expected_gpu not in actual_gpu_lower.replace(" ", ""):
+        return f"expected {expected_gpu!r}, got {actual_gpu!r}"
+    if str(actual_triton) != str(expected_triton):
+        return (f"expected Triton {expected_triton}, got Triton "
+                f"{actual_triton}")
+    return None
+
+
 def ensure_python3_on_path() -> Optional[str]:
     """
     libkernelbot runs the submission with subprocess.run(["python3", ...]).
@@ -210,7 +229,8 @@ def ensure_python3_on_path() -> Optional[str]:
 
 def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 problem_type: str, log_chars: int,
-                gpu_id: Optional[int] = None) -> None:
+                gpu_id: Optional[int] = None, expected_gpu: str = "",
+                expected_triton: str = "") -> None:
     """
     Runs in a spawned process. Does the whole evaluation and sends back a plain
     dict: no dataclasses, no datetimes, nothing that has to pickle.
@@ -228,6 +248,16 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
     try:
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
+        if problem_type == "trimul":
+            import torch
+            import triton
+            environment_issue = benchmark_environment_issue(
+                torch.cuda.get_device_name(0),
+                torch.cuda.get_device_capability(0),
+                triton.__version__, expected_gpu, expected_triton)
+            if environment_issue is not None:
+                raise RuntimeError(
+                    f"benchmark environment mismatch: {environment_issue}")
         from libkernelbot.task import make_task_definition, build_task_config
         from libkernelbot.run_eval import run_config
         from libkernelbot.submission import compute_score
@@ -274,7 +304,9 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
 
 def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
                           problem_type: str, log_chars: int,
-                          timeout_s: float, gpu_id: Optional[int] = None) -> Dict:
+                          timeout_s: float, gpu_id: Optional[int] = None,
+                          expected_gpu: str = "",
+                          expected_triton: str = "") -> Dict:
     """
     Spawn, wait, and kill on timeout.
 
@@ -286,7 +318,8 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     proc = ctx.Process(target=_eval_child,
                        args=(child_conn, code, lib_dir, task_yaml,
-                             problem_type, log_chars, gpu_id), daemon=True)
+                             problem_type, log_chars, gpu_id,
+                             expected_gpu, expected_triton), daemon=True)
     proc.start()
     child_conn.close()
 
@@ -489,7 +522,8 @@ Rules:
                     out = run_eval_with_timeout(
                         code, self.lib_dir, self.task_yaml,
                         self.problem_type, self.log_chars,
-                        timeout, self.kernel_gpu_id)
+                        timeout, self.kernel_gpu_id,
+                        self.gpu_type, self.triton_version)
                 else:
                     # timeout disabled: run inline, the original behaviour
                     class _Sink:
@@ -498,7 +532,8 @@ Rules:
                     sink = _Sink()
                     _eval_child(sink, code, self.lib_dir, self.task_yaml,
                                 self.problem_type, self.log_chars,
-                                self.kernel_gpu_id)
+                                self.kernel_gpu_id, self.gpu_type,
+                                self.triton_version)
                     out = getattr(sink, "v", {
                         "ok": False, "msg": "no result", "logs": "",
                         "score_us": None,
@@ -515,7 +550,8 @@ Rules:
                   or "no passing leaderboard run" in msg_lower):
                 kind = "constraint"
             elif ("could not find" in msg_lower
-                  or "task files missing" in msg_lower):
+                  or "task files missing" in msg_lower
+                  or "benchmark environment mismatch" in msg_lower):
                 kind = "infrastructure"
             else:
                 kind = "code"

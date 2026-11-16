@@ -1963,6 +1963,35 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     return max(512 * 1024**2, min(1024**3, per_process))
 
 
+def _evaluate_trimul_batch_on_released_gpu(
+        gen_pool, gpu_id, records, deferred_rollouts, submit_rollout, *,
+        resume_generation):
+    """Serialize one TriMul evaluation wave after releasing its TP=1 engine."""
+    from concurrent.futures import wait
+
+    records = list(records)
+    if not records:
+        return
+    record_ids = {id(record) for record in records}
+    if len(record_ids) != len(records):
+        raise RuntimeError("TriMul evaluation wave contains duplicate rollouts")
+    deferred_ids = {id(record) for record in deferred_rollouts}
+    if not record_ids.issubset(deferred_ids):
+        raise RuntimeError(
+            "TriMul evaluation wave contains a rollout that was already "
+            "submitted or was not deferred")
+
+    worker_ids = gen_pool.release_gpu_for_evaluation(gpu_id)
+    deferred_rollouts[:] = [
+        record for record in deferred_rollouts if id(record) not in record_ids]
+    futures = [submit_rollout(record) for record in records]
+    wait(futures)
+    for future in futures:
+        future.result()
+    if resume_generation:
+        gen_pool.restore_gpu_after_evaluation(worker_ids)
+
+
 def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                cfg, exp_dir, problem, gen_pool=None,
                strategy_pool=None, strategy_tokenizer=None,
@@ -2454,7 +2483,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     # sampling, token limits, rewards, and training membership stay identical.
     deferred_coder_retry_batches = []
     defer_gpu_evaluation = bool(getattr(cfg, "evaluation_shares_generation", False))
-    if adaptive_strategy_pilots and defer_gpu_evaluation:
+    trimul_pilot_barrier = bool(
+        adaptive_strategy_pilots
+        and defer_gpu_evaluation
+        and getattr(problem, "name", "") == "gpu_mode"
+        and getattr(problem, "problem_type", "") == "trimul")
+    if adaptive_strategy_pilots and defer_gpu_evaluation and not trimul_pilot_barrier:
         raise ValueError(
             "adaptive strategy pilots require CPU evaluation concurrent with "
             "rollout generation; set pilot_programs_per_strategy=-1 for the "
@@ -3495,13 +3529,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             _run_coder_format_retries(phase_records, seed_offset=seed_offset)
                         return phase_records
 
+                    pilot_evaluation_timing = (
+                        "GPU evaluation starts after the complete pilot wave"
+                        if trimul_pilot_barrier else
+                        "CPU evaluation starts as each program arrives")
                     setting_log_only(
                         f"[step {step_idx}] rollout pilot: "
                         f"{pilot_programs_per_strategy} programs x "
-                        f"{len(source_job_indices)} strategies; CPU evaluation "
-                        "starts as each program arrives",
-                        flush=True,
-                    )
+                        f"{len(source_job_indices)} strategies; "
+                        f"{pilot_evaluation_timing}", flush=True)
                     def _run_ready_vllm_followups(
                             counts, dispatch_index, _batch_total,
                             dispatched_after, expected_total):
@@ -3566,7 +3602,41 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                         _defer_coder_format_retries(
                             phase_records, seed_offset=0 if expected_pilots else 4_000_000)
 
-                    if cfg.generation_backend == "vllm" and hasattr(gen_pool, "iter_ready_jobs"):
+                    if trimul_pilot_barrier:
+                        pilot_records = _run_vllm_code_phase(
+                            [pilot_programs_per_strategy]
+                            * len(source_job_indices),
+                            phase="pilot", seed_offset=0,
+                            progress_desc="pilot rollouts",
+                            defer_format_retries=True)
+                        print(
+                            f"[step {step_idx}] TriMul pilot barrier: "
+                            f"releasing GPU {int(cfg.evaluation_gpu_id)} and "
+                            f"evaluating {len(pilot_records)} pilots "
+                            "sequentially",
+                            flush=True,
+                        )
+                        _evaluate_trimul_batch_on_released_gpu(
+                            gen_pool, int(cfg.evaluation_gpu_id),
+                            pilot_records, deferred_rollouts,
+                            _submit_rollout, resume_generation=True)
+                        followup_counts = _finish_strategy_pilots(
+                            pilot_records, source_job_indices,
+                            rewards_already_ready=True)
+                        phase2_total = sum(followup_counts)
+                        print(
+                            f"[step {step_idx}] TriMul phase 2: reloaded both "
+                            f"coder GPUs; generating {phase2_total} allocated "
+                            "rollouts",
+                            flush=True,
+                        )
+                        _run_vllm_code_phase(
+                            followup_counts, phase="adaptive",
+                            seed_offset=4_000_000,
+                            progress_desc="adaptive rollouts",
+                            defer_format_retries=True)
+                    elif (cfg.generation_backend == "vllm"
+                          and hasattr(gen_pool, "iter_ready_jobs")):
                         pilot_records = []
                         print(f"[step {step_idx}] continuous coder queue: pilot and ready "
                               "phase-2 work share engines; no generation-batch barriers", flush=True)
@@ -3913,6 +3983,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       f"{reference_hf_fallbacks}; "
                       f"CPU evaluations completed during scoring: "
                       f"{eval_done_before}->{eval_done_after})", flush=True)
+
+            if trimul_pilot_barrier and deferred_rollouts:
+                print(
+                    f"[step {step_idx}] TriMul final evaluation barrier: "
+                    f"releasing GPU {int(cfg.evaluation_gpu_id)} and "
+                    f"evaluating {len(deferred_rollouts)} phase-2/retry "
+                    "rollouts sequentially",
+                    flush=True,
+                )
+                _evaluate_trimul_batch_on_released_gpu(
+                    gen_pool, int(cfg.evaluation_gpu_id),
+                    list(deferred_rollouts), deferred_rollouts,
+                    _submit_rollout, resume_generation=False)
 
             coder_phase_complete = True
         finally:
