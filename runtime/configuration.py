@@ -681,7 +681,7 @@ def load_config():
             if key in ydict:
                 merged[key] = ydict[key]
         # Evaluation resources follow the current launch, including on resume.
-        for key in ("budget_s", "sandbox_timeout_s", "eval_cpus"):
+        for key in ("budget_s", "sandbox_timeout_s", "eval_cpus", "kernel_python"):
             if key in ydict:
                 merged[key] = ydict[key]
         # Current YAML sets the JEV gate; unfinished selections retain only their saved window.

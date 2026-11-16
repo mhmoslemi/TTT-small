@@ -45,6 +45,48 @@ def test_gpu_mode_can_select_a_dedicated_kernel_interpreter():
     assert Path(selected).resolve() == Path(sys.executable).resolve()
 
 
+def test_kernel_python_is_checkout_relative_and_missing_path_fails_early(monkeypatch, tmp_path):
+    import os
+    from problems.gpu_mode import GpuMode, resolve_kernel_python
+
+    configured = os.path.relpath(sys.executable, ROOT)
+    monkeypatch.chdir(tmp_path)
+    assert resolve_kernel_python(configured) == os.path.abspath(sys.executable)
+    with pytest.raises(FileNotFoundError, match="correct kernel_python"):
+        GpuMode({"kernel_python": str(tmp_path / "missing-env/bin/python3")})
+
+
+def test_saved_kernel_recheck_uses_original_responses_and_separate_results(tmp_path):
+    from types import SimpleNamespace
+    from eval_saved_kernels import evaluate_saved
+    from problems.base import RewardResult
+
+    step = tmp_path / "step00"
+    step.mkdir()
+    source = step / "step00_group00_rollout000.txt"
+    response = "Some reasoning.\n```python\nimport triton\n# final kernel\n```"
+    source.write_text(response)
+    meta = source.with_suffix(".meta.json")
+    meta.write_text('{"reward": 0, "msg": "old infrastructure failure"}')
+    source.with_suffix(".prompt.txt").write_text("must not be evaluated")
+    source.with_suffix(".strategy.txt").write_text("must not be evaluated")
+    calls = []
+
+    def reward(text, parent, timeout_s):
+        calls.append((text, timeout_s))
+        return RewardResult(valid=True, parsed=True, ran=True,
+                            raw_score=123., reward=1500 / 123., msg="runtime_us=123")
+
+    output = tmp_path / "check"
+    rows = evaluate_saved(SimpleNamespace(compute_reward=reward), step, output, 900)
+    assert calls == [(response, 900)]
+    assert rows[0]["raw_score"] == 123.
+    assert json.loads((output / "results.json").read_text()) == rows
+    assert (output / "step00_group00_rollout000.py").read_text() == "import triton\n# final kernel"
+    assert source.read_text() == response
+    assert json.loads(meta.read_text())["reward"] == 0
+
+
 def test_trimul_config_is_512_max_effort_gpt_oss_rollouts():
     import yaml
     from models.coder_profiles import (_coder_effort_entries,
@@ -52,7 +94,7 @@ def test_trimul_config_is_512_max_effort_gpt_oss_rollouts():
     from types import SimpleNamespace
 
     config = yaml.safe_load((ROOT / "configs/gpu_mode_trimul.yaml").read_text())
-    assert config["kernel_python"] == "kernel_env/bin/python3"
+    assert config["kernel_python"] == "../kenrel_env/bin/python3"
     assert config["model_name"] == config["coder_model_name"] == "openai/gpt-oss-120b"
     assert config["coder_reasoning_effort"] == "high"
     assert config["groups_per_step"] * config["group_size"] == 512

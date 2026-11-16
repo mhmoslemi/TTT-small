@@ -284,6 +284,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         namespace = dict(
             saved=dict(self.saved, problem="erdos", num_seed_states=10,
                        budget_s=1800, sandbox_timeout_s=1900, eval_cpus=1,
+                       kernel_python="kernel_env/bin/python3",
                        jev_candidate_multiplier=5, jev_same_core_threshold=.90,
                        strategy_vllm_persistent_workers=2,
                        learning_rate=0.01, strategy_max_seq_length=131072,
@@ -291,6 +292,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
                        strategy_top_k=50, strategy_min_p=.1),
             ydict=dict(self.current, num_seed_states=50, seed_min_points=40,
                        budget_s=2400, sandbox_timeout_s=2500, eval_cpus=100,
+                       kernel_python="../kenrel_env/bin/python3",
                        jev_candidate_multiplier=3, jev_same_core_threshold=.68,
                        seed_max_points=500, learning_rate=0.02, strategy_max_seq_length="auto",
                        strategy_max_new_tokens="auto", strategy_temperature=1., strategy_top_p=1.,
@@ -310,6 +312,7 @@ class ResumeRolloutConfigTests(unittest.TestCase):
             self.assertEqual(namespace["merged"]["pilot_programs_per_strategy"], 6)
             self.assertEqual(tuple(namespace["merged"][key] for key in (
                 "budget_s", "sandbox_timeout_s", "eval_cpus")), (2400, 2500, 100))
+            self.assertEqual(namespace["merged"]["kernel_python"], "../kenrel_env/bin/python3")
             self.assertEqual(namespace["merged"]["jev_candidate_multiplier"], 3)
             self.assertEqual(namespace["merged"]["jev_same_core_threshold"], .68)
             self.assertEqual(namespace["merged"]["learning_rate"], 0.01)

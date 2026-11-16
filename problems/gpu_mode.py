@@ -26,6 +26,7 @@ Evaluation diagnostics and isolation:
 from __future__ import annotations
 import multiprocessing as mp
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
 from problems.base import (Problem, ParentContext, RewardResult, SeedState,
@@ -190,6 +191,17 @@ def benchmark_environment_issue(actual_gpu: str, capability,
     return None
 
 
+def resolve_kernel_python(python_executable: str = "") -> str:
+    """Resolve evaluator paths against the checkout, retaining venv symlinks."""
+    target = os.path.expandvars(os.path.expanduser(python_executable or sys.executable))
+    target = os.path.abspath(os.path.join(Path(__file__).resolve().parents[1], target))
+    if not os.path.isfile(target) or not os.access(target, os.X_OK):
+        raise FileNotFoundError(
+            2, "Evaluator Python is missing or not executable; correct kernel_python in the YAML",
+            target)
+    return target
+
+
 def ensure_python3_on_path(python_executable: str = "") -> Optional[str]:
     """
     libkernelbot runs the submission with subprocess.run(["python3", ...]).
@@ -201,17 +213,14 @@ def ensure_python3_on_path(python_executable: str = "") -> Optional[str]:
     Worse, if some other python3 resolves first, the submission runs against a
     different torch than the one you installed.
 
-    So: put the directory of sys.executable first on PATH, and if that still
+    So: put the configured interpreter's directory first on PATH, and if that still
     does not give a `python3`, symlink one into a temp dir and prepend that.
     Returns the resolved path, or None if it could not be arranged.
     """
     import shutil
     import tempfile
 
-    target = os.path.abspath(os.path.expandvars(os.path.expanduser(
-        python_executable or sys.executable)))
-    if not os.path.isfile(target) or not os.access(target, os.X_OK):
-        raise FileNotFoundError(2, "Evaluator Python is missing or not executable", target)
+    target = resolve_kernel_python(python_executable)
 
     exe_dir = os.path.dirname(target)
     os.environ["PATH"] = exe_dir + os.pathsep + os.environ.get("PATH", "")
@@ -401,7 +410,8 @@ class GpuMode(Problem):
         d = _DEFAULTS[self.problem_type]
         self.gpu_type = str(cfg.get("gpu_type", d["gpu_type"]))
         self.triton_version = str(cfg.get("triton_version", "3.3.1"))
-        self.kernel_python = str(cfg.get("kernel_python", "")).strip()
+        # Catch a broken evaluator path before loading models or generating rollouts.
+        self.kernel_python = resolve_kernel_python(str(cfg.get("kernel_python") or "").strip())
 
         # target and score_scale default to the H100 numbers scaled to this
         # device, so setting gpu_type is enough. An explicit value in the YAML
