@@ -6,6 +6,26 @@ set -eu
 ttt_project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ttt_project_dir"
 
+# Keep every runtime cache and temporary file on the permitted NAS mount.
+ttt_runtime_dir="$ttt_project_dir/.runtime"
+export TMPDIR="$ttt_runtime_dir/tmp"
+export XDG_CACHE_HOME="$ttt_runtime_dir/cache"
+export XDG_CONFIG_HOME="$ttt_runtime_dir/config"
+export XDG_DATA_HOME="$ttt_runtime_dir/data"
+export XDG_STATE_HOME="$ttt_runtime_dir/state"
+export HF_HOME="$ttt_runtime_dir/cache/huggingface"
+export VLLM_CACHE_ROOT="$ttt_runtime_dir/cache/vllm"
+export TORCHINDUCTOR_CACHE_DIR="$ttt_runtime_dir/cache/torchinductor"
+export TRITON_CACHE_DIR="$ttt_runtime_dir/cache/triton"
+export TORCH_EXTENSIONS_DIR="$ttt_runtime_dir/cache/torch_extensions"
+export CUDA_CACHE_PATH="$ttt_runtime_dir/cache/cuda"
+export FLASHINFER_WORKSPACE_BASE="$ttt_runtime_dir/cache/flashinfer"
+export MPLCONFIGDIR="$ttt_runtime_dir/cache/matplotlib"
+mkdir -p "$TMPDIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
+    "$HF_HOME" "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" \
+    "$TRITON_CACHE_DIR" "$TORCH_EXTENSIONS_DIR" "$CUDA_CACHE_PATH" \
+    "$FLASHINFER_WORKSPACE_BASE" "$MPLCONFIGDIR"
+
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export AVAILABLE_GPUS="${AVAILABLE_GPUS:-6,7}"
 # config_path="${TTT_CONFIG:-configs/circle_packing.yaml}"
