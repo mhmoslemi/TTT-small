@@ -155,6 +155,47 @@ class StrategistModelsTests(unittest.TestCase):
                 self.assertIs(kwargs["enable_flashinfer_autotune"], False)
                 self.assertEqual(kwargs["engram_config"], {"cpu_offload": True})
 
+    def test_b200_attention_avoids_runtime_kernel_downloads(self):
+        names = ("Qwen/Qwen3.8-27B", "Qwen/Qwen3-8B", "openai/gpt-oss-120b",
+                 "/root/nas/Mohammad/models/DeepSeek-R1-0528-Qwen3-8B")
+        for name in names:
+            original = gen_workers._vllm_engine_kwargs(
+                name, 262144, False, 32, .9)
+            for profile in ("B200", "B200_full_ram"):
+                with self.subTest(model=name, profile=profile):
+                    kwargs = gen_workers._vllm_engine_kwargs(
+                        name, 262144, False, 32, .9, hardware_profile=profile)
+                    self.assertEqual(kwargs, dict(
+                        original, attention_config={"backend": "FLASH_ATTN"}))
+                    self.assertFalse(kwargs["enforce_eager"])
+        for alias in models.STRATEGIST_ALIASES:
+            options = models.strategist_engine_options(alias)
+            kwargs = gen_workers._vllm_engine_kwargs(
+                models.resolve_strategy_model(alias), 262144, False, 32, .9,
+                engine_options=options, hardware_profile="B200_full_ram")
+            self.assertEqual(kwargs.get("attention_config"), options.get("attention_config"))
+        explicit = {"attention_config": {"backend": "FLASHINFER", "use_trtllm_attention": False}}
+        kwargs = gen_workers._vllm_engine_kwargs(
+            names[0], 262144, False, 32, .9,
+            engine_options=explicit, hardware_profile="B200")
+        self.assertEqual(kwargs["attention_config"], explicit["attention_config"])
+
+    def test_startup_failure_includes_engine_cause(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "strategy_vllm.log"
+            cause = "Failed to get checksums.txt from fmha/trtllm-gen/checksums.txt"
+            path.write_text("old output\n" * 3000 + cause)
+            pool = gen_workers.GenerationPool.__new__(gen_workers.GenerationPool)
+            pool.vllm_log_path = str(path)
+            pool.backend, pool._startup_timeout = "vllm", 900.
+            pool._ready_queue = Queue()
+            pool._ready_queue.put(("error", 0, f"details: {path}"))
+            pool.shutdown = Mock()
+            with self.assertRaisesRegex(RuntimeError, cause) as failure:
+                pool._wait_workers((0,))
+            self.assertLess(len(str(failure.exception)), 17000)
+            pool.shutdown.assert_called_once_with()
+
     def test_startup_watchdog_allows_active_loading_but_rejects_stalls_and_errors(self):
         for scenario in ("log_activity", "ready_activity", "stalled", "missing_log", "dead", "error"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as folder:

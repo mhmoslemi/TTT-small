@@ -731,7 +731,7 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
                         enable_expert_parallel=False,
                         enable_sleep_mode=False,
                         disable_custom_all_reduce=False, engine_options=None,
-                        enable_log_stats=False):
+                        enable_log_stats=False, hardware_profile="RTX6000"):
     """Build vLLM constructor arguments without importing vLLM.
 
     Kept separate both for unit testing and so the parent process never imports
@@ -819,6 +819,16 @@ def _vllm_engine_kwargs(model_name, max_seq_length, load_in_4bit,
             for key in ("max_lora_rank", "max_loras", "max_cpu_loras",
                         "fully_sharded_loras"):
                 kwargs.pop(key, None)
+    if hardware_profile in {"B200", "B200_full_ram"}:
+        basename = str(model_name).rstrip("/").rsplit("/", 1)[-1].lower()
+        if basename in {"qwen3.8-27b", "qwen3-8b", "qwen3-30b-a3b",
+                        "qwen3-30b-a3b-thinking-2507", "gpt-oss-120b",
+                        "deepseek-r1-0528-qwen3-8b"}:
+            # B200's automatic FlashInfer/TRTLLM path downloads kernels at
+            # startup; bundled FlashAttention (FA4 on SM100) works offline.
+            attention = dict(kwargs.get("attention_config") or {})
+            attention.setdefault("backend", "FLASH_ATTN")
+            kwargs["attention_config"] = attention
     return kwargs
 
 
@@ -1025,7 +1035,8 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
                       enable_expert_parallel=False, enable_sleep_mode=False,
                       sleep_level=1, control_queue=None, vllm_log_path=None,
                       disable_custom_all_reduce=False, engine_options=None,
-                      enable_log_stats=False, thinking_budget=0):
+                      enable_log_stats=False, thinking_budget=0,
+                      hardware_profile="RTX6000"):
     """Persistent vLLM engine spanning one physical GPU group."""
     # vLLM creates EngineCore grandchildren. If a wrapper exits after an
     # engine failure, killing only the multiprocessing.Process can leave those
@@ -1120,6 +1131,7 @@ def _vllm_worker_loop(rank, gpu_id, model_name, max_seq_length, load_in_4bit,
             disable_custom_all_reduce=disable_custom_all_reduce,
             engine_options=engine_options,
             enable_log_stats=enable_log_stats,
+            hardware_profile=hardware_profile,
         )
         if thinking_budget:
             from vllm import envs
@@ -2007,6 +2019,8 @@ class GenerationPool:
             if self.backend != "vllm":
                 raise ValueError("thinking budgets require vLLM")
             self._worker_options["thinking_budget"] = int(thinking_budget)
+        if self.backend == "vllm":
+            self._worker_options["hardware_profile"] = hardware_profile
         if self.backend == "vllm" and hardware_profile in {"B200", "B200_full_ram"}:
             # Evaluation avoids reserved cores; inference can use the full allowed cpuset.
             self._worker_options["enable_log_stats"] = True
@@ -2133,6 +2147,15 @@ class GenerationPool:
                     f"unexpected startup acknowledgement from worker {rank}")
             if status == "error":
                 self.shutdown()
+                if self.vllm_log_path:
+                    try:
+                        with open(self.vllm_log_path, "rb") as log:
+                            log.seek(0, os.SEEK_END)
+                            log.seek(max(0, log.tell() - 16_384))
+                            detail += "\nLast vLLM output:\n" + log.read().decode(
+                                "utf-8", errors="replace")
+                    except OSError:
+                        pass
                 raise RuntimeError(
                     f"{self.backend} generation worker {rank} failed to "
                     f"start:\n{detail}")
