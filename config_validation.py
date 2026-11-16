@@ -106,7 +106,9 @@ PROBLEM_OPTIONAL_KEYS = {
     "ac1": frozenset({"target_print"}),
     "ac2": frozenset({"target_print"}),
     "denoising": frozenset(),
-    "gpu_mode": frozenset({"kernel_lib_dir", "mla_seed_runtime_us"}),
+    "gpu_mode": frozenset({
+        "kernel_lib_dir", "kernel_python", "mla_seed_runtime_us",
+    }),
 }
 
 # A present field from this table is invalid outside its owner set, even for a
@@ -130,6 +132,7 @@ EXCLUSIVE_KEY_OWNERS = {
     "task_yaml": frozenset({"gpu_mode"}),
     "lib_dir": frozenset({"gpu_mode"}),
     "kernel_lib_dir": frozenset({"gpu_mode"}),
+    "kernel_python": frozenset({"gpu_mode"}),
     "kernel_log_chars": frozenset({"gpu_mode"}),
     "kernel_timeout_s": frozenset({"gpu_mode"}),
     "show_launch_note": frozenset({"gpu_mode"}),

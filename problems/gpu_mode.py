@@ -190,13 +190,13 @@ def benchmark_environment_issue(actual_gpu: str, capability,
     return None
 
 
-def ensure_python3_on_path() -> Optional[str]:
+def ensure_python3_on_path(python_executable: str = "") -> Optional[str]:
     """
     libkernelbot runs the submission with subprocess.run(["python3", ...]).
 
-    That name is hardcoded, so it must resolve to the SAME interpreter the run
-    is using: a venv whose bin is not on PATH, a conda env exposing only
-    `python`, or a container without /usr/bin/python3 all produce a bare
+    That name is hardcoded, so it must resolve to the configured evaluator
+    interpreter. A venv whose bin is not on PATH, a conda env exposing only
+    `python`, or a container without /usr/bin/python3 otherwise produces a bare
     FileNotFoundError from subprocess with no indication of what was missing.
     Worse, if some other python3 resolves first, the submission runs against a
     different torch than the one you installed.
@@ -208,29 +208,55 @@ def ensure_python3_on_path() -> Optional[str]:
     import shutil
     import tempfile
 
-    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    target = os.path.abspath(os.path.expandvars(os.path.expanduser(
+        python_executable or sys.executable)))
+    if not os.path.isfile(target) or not os.access(target, os.X_OK):
+        raise FileNotFoundError(2, "Evaluator Python is missing or not executable", target)
+
+    exe_dir = os.path.dirname(target)
     os.environ["PATH"] = exe_dir + os.pathsep + os.environ.get("PATH", "")
 
     found = shutil.which("python3")
-    if found and os.path.realpath(found) == os.path.realpath(sys.executable):
+    if found and os.path.realpath(found) == os.path.realpath(target):
         return found
-    if os.path.exists(os.path.join(exe_dir, "python3")):
-        return os.path.join(exe_dir, "python3")
 
     try:
         shim = tempfile.mkdtemp(prefix="ttt-py3-")
         link = os.path.join(shim, "python3")
-        os.symlink(os.path.abspath(sys.executable), link)
+        os.symlink(target, link)
         os.environ["PATH"] = shim + os.pathsep + os.environ["PATH"]
         return link
     except Exception:
-        return found        # whatever was there, possibly the wrong interpreter
+        return None
+
+
+def benchmark_environment_from_python(python_executable: str):
+    """Read GPU/Triton identity from the interpreter that runs the kernel."""
+    import json
+    import subprocess
+
+    probe = subprocess.run([
+        python_executable, "-c",
+        "import json,torch,triton; print(json.dumps({"
+        "'gpu':torch.cuda.get_device_name(0),"
+        "'capability':torch.cuda.get_device_capability(0),"
+        "'triton':triton.__version__}))",
+    ], text=True, capture_output=True, timeout=60)
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout).strip()
+        raise RuntimeError(
+            f"evaluator Python {python_executable!r} cannot load torch/triton: {detail}")
+    lines = [line for line in probe.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError(
+            f"evaluator Python {python_executable!r} returned no environment identity")
+    return json.loads(lines[-1])
 
 
 def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 problem_type: str, log_chars: int,
                 gpu_id: Optional[int] = None, expected_gpu: str = "",
-                expected_triton: str = "") -> None:
+                expected_triton: str = "", kernel_python: str = "") -> None:
     """
     Runs in a spawned process. Does the whole evaluation and sends back a plain
     dict: no dataclasses, no datetimes, nothing that has to pickle.
@@ -244,17 +270,18 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
     out = {"ok": False, "msg": "unknown", "logs": "", "score_us": None}
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    py3 = ensure_python3_on_path()
+    py3 = None
     try:
+        py3 = ensure_python3_on_path(kernel_python)
+        if py3 is None:
+            raise RuntimeError("could not expose the evaluator interpreter as python3")
         if lib_dir not in sys.path:
             sys.path.insert(0, lib_dir)
         if problem_type == "trimul":
-            import torch
-            import triton
+            identity = benchmark_environment_from_python(py3)
             environment_issue = benchmark_environment_issue(
-                torch.cuda.get_device_name(0),
-                torch.cuda.get_device_capability(0),
-                triton.__version__, expected_gpu, expected_triton)
+                identity["gpu"], identity["capability"], identity["triton"],
+                expected_gpu, expected_triton)
             if environment_issue is not None:
                 raise RuntimeError(
                     f"benchmark environment mismatch: {environment_issue}")
@@ -306,7 +333,8 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
                           problem_type: str, log_chars: int,
                           timeout_s: float, gpu_id: Optional[int] = None,
                           expected_gpu: str = "",
-                          expected_triton: str = "") -> Dict:
+                          expected_triton: str = "",
+                          kernel_python: str = "") -> Dict:
     """
     Spawn, wait, and kill on timeout.
 
@@ -319,7 +347,8 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
     proc = ctx.Process(target=_eval_child,
                        args=(child_conn, code, lib_dir, task_yaml,
                              problem_type, log_chars, gpu_id,
-                             expected_gpu, expected_triton), daemon=True)
+                             expected_gpu, expected_triton, kernel_python),
+                       daemon=True)
     proc.start()
     child_conn.close()
 
@@ -362,6 +391,7 @@ class GpuMode(Problem):
         d = _DEFAULTS[self.problem_type]
         self.gpu_type = str(cfg.get("gpu_type", d["gpu_type"]))
         self.triton_version = str(cfg.get("triton_version", "3.3.1"))
+        self.kernel_python = str(cfg.get("kernel_python", "")).strip()
 
         # target and score_scale default to the H100 numbers scaled to this
         # device, so setting gpu_type is enough. An explicit value in the YAML
@@ -523,7 +553,8 @@ Rules:
                         code, self.lib_dir, self.task_yaml,
                         self.problem_type, self.log_chars,
                         timeout, self.kernel_gpu_id,
-                        self.gpu_type, self.triton_version)
+                        self.gpu_type, self.triton_version,
+                        self.kernel_python)
                 else:
                     # timeout disabled: run inline, the original behaviour
                     class _Sink:
@@ -533,7 +564,7 @@ Rules:
                     _eval_child(sink, code, self.lib_dir, self.task_yaml,
                                 self.problem_type, self.log_chars,
                                 self.kernel_gpu_id, self.gpu_type,
-                                self.triton_version)
+                                self.triton_version, self.kernel_python)
                     out = getattr(sink, "v", {
                         "ok": False, "msg": "no result", "logs": "",
                         "score_us": None,
