@@ -279,9 +279,13 @@ def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: l
     @return: An integer representing the exit status: 0 if all benchmarks pass, otherwise 112.
     """
     # warm up
-    run_single_benchmark(pool, tests[0], False, 100, 10e7)
+    warmup = run_single_benchmark(pool, tests[0], False, 100, 10e7)
+    if not isinstance(warmup, Stats):
+        logger.log("benchmark.warmup.status", "fail")
+        logger.log("benchmark.warmup.error", warmup)
+        logger.log("check", "fail")
+        return 112
 
-    passed = True
     logger.log("benchmark-count", len(tests))
     for idx, test in enumerate(tests):
         logger.log(f"benchmark.{idx}.spec", test.spec)
@@ -290,16 +294,13 @@ def run_benchmarking(logger: PopcornOutput, pool: multiprocessing.Pool, tests: l
             for field in dataclasses.fields(Stats):
                 logger.log(f"benchmark.{idx}.{field.name}", getattr(result, field.name))
         else:
-            passed = False
             logger.log(f"benchmark.{idx}.status", "fail")
             logger.log(f"benchmark.{idx}.error", result)
+            logger.log("check", "fail")
+            return 112
 
-    if passed:
-        logger.log("check", "pass")
-        return 0
-    else:
-        logger.log("check", "fail")
-        return 112
+    logger.log("check", "pass")
+    return 0
 
 
 def run_single_profile(test: TestCase) -> str:
@@ -353,9 +354,13 @@ def main():
 
             if mode == "leaderboard":
                 # warmup
-                run_single_benchmark(pool, tests[0], False, 100, 1e7)
+                warmup = run_single_benchmark(pool, tests[0], False, 100, 1e7)
+                if not isinstance(warmup, Stats):
+                    logger.log("benchmark.warmup.status", "fail")
+                    logger.log("benchmark.warmup.error", warmup)
+                    logger.log("check", "fail")
+                    return 112
                 logger.log("benchmark-count", len(tests))
-                passed = True
                 for i in range(len(tests)):
                     result = run_single_benchmark(pool, tests[i], True, 100, 30e9)
                     logger.log(f"benchmark.{i}.spec", tests[i].spec)
@@ -363,12 +368,13 @@ def main():
                         for field in dataclasses.fields(Stats):
                             logger.log(f"benchmark.{i}.{field.name}", getattr(result, field.name))
                     else:
-                        passed = False
                         logger.log(f"benchmark.{i}.status", "fail")
                         logger.log(f"benchmark.{i}.error", str(result))  # TODO: Make sure result implements __str__?
-                        break
+                        logger.log("check", "fail")
+                        return 112
 
-                logger.log("check", "pass" if passed else "fail")
+                logger.log("check", "pass")
+                return 0
             elif mode == "profile":
                 run_profiling(logger, tests)
             else:

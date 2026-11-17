@@ -12,20 +12,22 @@ class TriMul(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
+        device="cuda",
+        dtype=""
     ):
         super().__init__()
 
         self.norm = nn.LayerNorm(dim)
 
-        self.left_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.right_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.left_proj = nn.Linear(dim, hidden_dim, bias=False, device=device)
+        self.right_proj = nn.Linear(dim, hidden_dim, bias=False, device=device)
 
-        self.left_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.right_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.out_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.left_gate = nn.Linear(dim, hidden_dim, bias=False, device=device)
+        self.right_gate = nn.Linear(dim, hidden_dim, bias=False, device=device)
+        self.out_gate = nn.Linear(dim, hidden_dim, bias=False, device=device)
 
-        self.to_out_norm = nn.LayerNorm(hidden_dim)
-        self.to_out = nn.Linear(hidden_dim, dim, bias=False)
+        self.to_out_norm = nn.LayerNorm(hidden_dim, device=device)
+        self.to_out = nn.Linear(hidden_dim, dim, bias=False, device=device)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -85,7 +87,7 @@ def ref_kernel(data: input_t) -> output_t:
     # Use deterministic kernels and disable TF32 for accuracy
     with DisableCuDNNTF32():
         input_tensor, mask, weights, config = data
-        trimul = TriMul(dim=config["dim"], hidden_dim=config["hidden_dim"]).to(input_tensor.device)
+        trimul = TriMul(dim=config["dim"], hidden_dim=config["hidden_dim"], device=input_tensor.device)
 
         # Fill in the given weights of the model
         trimul.norm.weight = nn.Parameter(weights['norm.weight'])
@@ -133,10 +135,14 @@ def generate_input(
 
     # Generate input tensor based on distribution
     if distribution == "cauchy":
-        # Heavier tail distribution
-        input_tensor = torch.distributions.Cauchy(0, 2).sample(
-            (batch_size, seq_len, seq_len, dim)
-        ).to(device='cuda', dtype=torch.float32)
+        # FAST: sample Cauchy(0, 2) directly on GPU via inverse CDF
+        u = torch.empty(
+            (batch_size, seq_len, seq_len, dim),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        u.uniform_(0.0, 1.0, generator=gen)
+        input_tensor = 2.0 * torch.tan(math.pi * (u - 0.5))
     else:  # normal distribution
         input_tensor = torch.randn(
             (batch_size, seq_len, seq_len, dim),
