@@ -105,13 +105,14 @@ def test_trimul_requires_contributing_triton_work(trimul_evaluator, monkeypatch,
         assert "probe failed" in message
 
 
-def test_trimul_contribution_on_real_cuda(trimul_evaluator):
+def test_trimul_contribution_on_real_cuda(trimul_evaluator, monkeypatch):
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA and Triton in the evaluator environment")
     import triton
     import triton.language as tl
+    monkeypatch.setitem(globals(), "tl", tl)
 
     @triton.jit
     def twice(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
