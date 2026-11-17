@@ -434,7 +434,8 @@ def validate_problem_config(
         raise ValueError(f"{_label(source)}: uct must be true or false")
     if "reward_workers" in data and int(data["reward_workers"]) < 0:
         raise ValueError(f"{_label(source)}: reward_workers must be >= 0")
-    if problem == "gpu_mode" and data.get("reward_workers") != 1:
+    if (problem == "gpu_mode" and data.get("problem_type") != "trimul"
+            and data.get("reward_workers") != 1):
         raise ValueError(
             f"{_label(source)}: gpu_mode requires reward_workers=1"
         )

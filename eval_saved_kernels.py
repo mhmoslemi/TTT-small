@@ -89,6 +89,7 @@ def main(argv=None):
     current = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     cfg["kernel_python"] = current["kernel_python"]
     cfg["kernel_gpu_id"] = args.gpu
+    cfg["evaluation_shares_generation"] = False
     problem = GpuMode(cfg)
     python = ensure_python3_on_path(problem.kernel_python)
     identity = benchmark_environment_from_python(python)

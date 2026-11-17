@@ -1142,7 +1142,8 @@ def _prepare_recoverable_response_tokens(model, tokenizer, artifacts):
 
 def _finalize_pending_spo_rs_artifacts(
         tokenizer, sampler, step_idx, cfg, exp_dir, problem, gen_pool,
-        spo_rs_tracker, sampling_adapter_path, artifacts):
+        spo_rs_tracker, sampling_adapter_path, artifacts, *,
+        prepare_gpu_evaluation=None):
     """Evaluate and score a generated interrupted step, then seal its metadata.
 
     No policy sampling occurs here. Exact generated token IDs come from the
@@ -1259,7 +1260,12 @@ def _finalize_pending_spo_rs_artifacts(
                 isolated_slots.put(cpu_id)
 
     evaluation_pool = ThreadPoolExecutor(max_workers=workers)
-    evaluation_futures = {evaluation_pool.submit(evaluate, item): index for index, item in enumerate(artifacts)}
+    defer_gpu_evaluation = bool(
+        getattr(cfg, "evaluation_shares_generation", False)
+        and getattr(problem, "problem_type", "") == "trimul")
+    evaluation_futures = ({} if defer_gpu_evaluation else {
+        evaluation_pool.submit(evaluate, item): index
+        for index, item in enumerate(artifacts)})
     results = [None] * len(artifacts)
     try:
         prompt_cache = {}
@@ -1323,6 +1329,17 @@ def _finalize_pending_spo_rs_artifacts(
                 required_context_ids=range(int(cfg.groups_per_step))))
         if missing_scores or not math.isfinite(divergence):
             raise RuntimeError('generated-step recovery did not obtain every exact consecutive-policy score')
+
+        if defer_gpu_evaluation:
+            # Both benchmark GPUs must be idle, including teacher-forced scoring.
+            gen_pool.release()
+            if prepare_gpu_evaluation is None:
+                raise RuntimeError("TriMul recovery requires the trainer GPU handoff")
+            prepare_gpu_evaluation()
+            problem.begin_evaluation_batch()
+            evaluation_futures = {
+                evaluation_pool.submit(evaluate, item): index
+                for index, item in enumerate(artifacts)}
 
         eval_bar = make_progress_bar(len(evaluation_futures), desc="recovering evaluations")
         try:
@@ -1963,10 +1980,10 @@ def _automatic_sandbox_memory_limit_bytes(concurrent_sandboxes: int) -> int:
     return max(512 * 1024**2, min(1024**3, per_process))
 
 
-def _evaluate_trimul_batch_on_released_gpu(
-        gen_pool, gpu_id, records, deferred_rollouts, submit_rollout, *,
+def _evaluate_trimul_batch_on_released_gpus(
+        gen_pool, gpu_ids, records, deferred_rollouts, submit_rollout, *,
         resume_generation):
-    """Serialize one TriMul evaluation wave after releasing its TP=1 engine."""
+    """Evaluate one TriMul wave with one benchmark per released TP=1 GPU."""
     from concurrent.futures import wait
 
     records = list(records)
@@ -1981,7 +1998,8 @@ def _evaluate_trimul_batch_on_released_gpu(
             "TriMul evaluation wave contains a rollout that was already "
             "submitted or was not deferred")
 
-    worker_ids = gen_pool.release_gpu_for_evaluation(gpu_id)
+    worker_ids = tuple(worker_id for gpu_id in gpu_ids
+                       for worker_id in gen_pool.release_gpu_for_evaluation(gpu_id))
     deferred_rollouts[:] = [
         record for record in deferred_rollouts if id(record) not in record_ids]
     futures = [submit_rollout(record) for record in records]
@@ -3609,15 +3627,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             phase="pilot", seed_offset=0,
                             progress_desc="pilot rollouts",
                             defer_format_retries=True)
+                        problem.begin_evaluation_batch()
                         print(
                             f"[step {step_idx}] TriMul pilot barrier: "
-                            f"releasing GPU {int(cfg.evaluation_gpu_id)} and "
+                            f"releasing GPUs {problem.kernel_gpu_ids} and "
                             f"evaluating {len(pilot_records)} pilots "
-                            "sequentially",
+                            "with one benchmark per GPU",
                             flush=True,
                         )
-                        _evaluate_trimul_batch_on_released_gpu(
-                            gen_pool, int(cfg.evaluation_gpu_id),
+                        _evaluate_trimul_batch_on_released_gpus(
+                            gen_pool, problem.kernel_gpu_ids,
                             pilot_records, deferred_rollouts,
                             _submit_rollout, resume_generation=True)
                         followup_counts = _finish_strategy_pilots(
@@ -3625,7 +3644,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                             rewards_already_ready=True)
                         phase2_total = sum(followup_counts)
                         print(
-                            f"[step {step_idx}] TriMul phase 2: reloaded both "
+                            f"[step {step_idx}] TriMul phase 2: reloaded all "
                             f"coder GPUs; generating {phase2_total} allocated "
                             "rollouts",
                             flush=True,
@@ -3985,15 +4004,16 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                       f"{eval_done_before}->{eval_done_after})", flush=True)
 
             if trimul_pilot_barrier and deferred_rollouts:
+                problem.begin_evaluation_batch()
                 print(
                     f"[step {step_idx}] TriMul final evaluation barrier: "
-                    f"releasing GPU {int(cfg.evaluation_gpu_id)} and "
+                    f"releasing GPUs {problem.kernel_gpu_ids} and "
                     f"evaluating {len(deferred_rollouts)} phase-2/retry "
-                    "rollouts sequentially",
+                    "rollouts with one benchmark per GPU",
                     flush=True,
                 )
-                _evaluate_trimul_batch_on_released_gpu(
-                    gen_pool, int(cfg.evaluation_gpu_id),
+                _evaluate_trimul_batch_on_released_gpus(
+                    gen_pool, problem.kernel_gpu_ids,
                     list(deferred_rollouts), deferred_rollouts,
                     _submit_rollout, resume_generation=False)
 
@@ -4017,9 +4037,11 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 strategy_pool.release()
 
         if deferred_rollouts:
-            print(f"[step {step_idx}] releasing trainer memory on the shared "
-                  f"evaluation GPU before {len(deferred_rollouts)} serialized "
-                  "benchmark(s)")
+            if getattr(problem, "problem_type", "") == "trimul":
+                problem.begin_evaluation_batch()
+            print(f"[step {step_idx}] releasing trainer memory before "
+                  f"{len(deferred_rollouts)} benchmark(s); "
+                  "one benchmark at a time per evaluation GPU")
             try:
                 torch.cuda.synchronize()
                 _move_optimizer_state(optimizer, "cpu", hardware_profile=getattr(cfg, "hardware_profile", "RTX6000"))
@@ -5257,7 +5279,9 @@ def main():
     print(f"Training layout:    {training_layout}")
     print(f"Training scheduler: {training_scheduler}")
     print(f"Generation GPUs:    {cfg.gpu_ids or 'in-process'}")
-    print(f"Evaluation GPU:     {(cfg.evaluation_gpu_id if cfg.evaluation_gpu_id is not None else 'none')}")
+    evaluation_gpus = (cfg.gpu_ids if getattr(problem, "problem_type", "") == "trimul"
+                       else cfg.evaluation_gpu_id)
+    print(f"Evaluation GPU:     {evaluation_gpus if evaluation_gpus is not None else 'none'}")
     evaluation_mode = (
         f"isolated, {cfg.reward_workers} processes/CPU (--isolate-eval)"
         if cfg.isolate_eval else "default")
@@ -6268,7 +6292,11 @@ def main():
                         tokenizer, sampler, step, step_cfg, exp_dir, problem,
                         gen_pool, spo_rs_tracker,
                         current_policy_adapter_path,
-                        pending_spo_rs_artifacts))
+                        pending_spo_rs_artifacts,
+                        prepare_gpu_evaluation=(
+                            _offload_trainer_for_generation
+                            if getattr(problem, "problem_type", "") == "trimul"
+                            else None)))
                 stats = _resume_spo_rs_step_from_artifacts(
                     backend, model, tokenizer, sampler, optimizer, step,
                     step_cfg, exp_dir, problem, parallel_trainer,

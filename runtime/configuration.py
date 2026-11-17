@@ -1137,9 +1137,9 @@ def load_config():
     if merged["isolate_eval"] and roles.gpu_problem:
         if str(merged.get("problem_type") or "").lower() == "trimul":
             # run.sh enables CPU isolation for ordinary problems. TriMul has
-            # its own serialized GPU evaluator, so ignore only that default.
+            # its own per-GPU benchmark evaluator, so ignore only that default.
             merged["isolate_eval"] = False
-            print("[config] TriMul uses its serialized GPU evaluator; "
+            print("[config] TriMul uses its per-GPU benchmark evaluator; "
                   "ignoring run.sh --isolate-eval")
         else:
             raise ValueError(
@@ -1199,16 +1199,16 @@ def load_config():
             merged["gpu_type"] = "H100"
             print("[config] gpu_mode gpu_type not set; defaulting explicitly to H100")
         merged["kernel_gpu_id"] = evaluation_gpu_id
-        if int(merged.get('reward_workers') or 0) != 1:
-            print('[config] gpu_mode forces reward_workers=1 for serialized, stable benchmark measurements')
-        merged["reward_workers"] = 1
+        trimul = str(merged.get("problem_type") or "").lower() == "trimul"
+        merged["reward_workers"] = len(gpu_ids) if trimul else 1
+        print(f'[config] gpu_mode uses {merged["reward_workers"]} evaluation '
+              'worker(s), one benchmark at a time per GPU')
 
-        if (str(merged.get("problem_type") or "").lower() == "trimul"
-                and len(roles.available) < 2):
+        if trimul and len(roles.available) < 2:
             raise ValueError(
                 "TriMul pilot-barrier scheduling requires at least two GPUs: "
-                "both generate rollouts, then the last GPU is released for "
-                "serialized benchmarking")
+                "all generate rollouts, then all are released for "
+                "one benchmark at a time per GPU")
 
     memory = query_gpu_memory()
     validate_selected_gpus(roles, memory)
@@ -1325,7 +1325,7 @@ def load_config():
                      or layout.pipeline_parallel_size != 1)):
             raise ValueError(
                 "TriMul pilot-barrier scheduling requires independent TP=1, "
-                "PP=1 coder engines so exactly one B200 can be released for "
+                "PP=1 coder engines so each GPU can be released for "
                 "benchmarking; the selected model/context does not fit that "
                 "layout")
         validate_attention_heads(known_heads, merged["vllm_tensor_parallel_size"], merged.get("model_name", ""))
@@ -1428,7 +1428,7 @@ def load_config():
 
     print(f"[config] AVAILABLE_GPUS={roles.available} ({inventory_source})")
     print(f"[config] GPU roles: train={training_gpu_ids}, "
-          f"generation={gpu_ids}, evaluation={evaluation_gpu_id}; "
+          f"generation={gpu_ids}, evaluation={gpu_ids if roles.evaluation_shares_generation and roles.gpu_problem else evaluation_gpu_id}; "
           f"sharing={'sequential' if roles.sequential_generation else 'isolated'}")
 
     # 4) Provide attribute access after the YAML's shared and problem-specific

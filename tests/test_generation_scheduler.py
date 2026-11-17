@@ -70,7 +70,7 @@ class GenerationSchedulerTests(unittest.TestCase):
         class Pool:
             def release_gpu_for_evaluation(self, gpu_id):
                 events.append(("release", gpu_id))
-                return (1,)
+                return (gpu_id - 6,)
 
             def restore_gpu_after_evaluation(self, worker_ids):
                 events.append(("restore", worker_ids))
@@ -87,13 +87,21 @@ class GenerationSchedulerTests(unittest.TestCase):
 
         evaluate = load_nested(
             ROOT / "train_multy_CVaR.py",
-            "_evaluate_trimul_batch_on_released_gpu", {})
-        evaluate(Pool(), 7, records, deferred, submit,
+            "_evaluate_trimul_batch_on_released_gpus", {})
+        evaluate(Pool(), [6, 7], records, deferred, submit,
                  resume_generation=True)
         self.assertEqual(deferred, [untouched])
         self.assertEqual(events, [
-            ("release", 7), ("submit", "a"), ("submit", "b"),
-            ("restore", (1,)),
+            ("release", 6), ("release", 7),
+            ("submit", "a"), ("submit", "b"), ("restore", (0, 1)),
+        ])
+
+        events.clear()
+        evaluate(Pool(), [6, 7], records, list(records), submit,
+                 resume_generation=False)
+        self.assertEqual(events, [
+            ("release", 6), ("release", 7),
+            ("submit", "a"), ("submit", "b"),
         ])
 
     def test_coder_batches_use_shared_queue_on_all_hardware_profiles(self):

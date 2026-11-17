@@ -25,6 +25,28 @@ def test_trimul_alone_shares_its_evaluator_with_generation():
     assert not mla.evaluation_shares_generation
 
 
+@pytest.mark.parametrize("resume", [False, True])
+def test_trimul_live_config_uses_one_evaluator_per_available_gpu(monkeypatch, tmp_path, resume):
+    from runtime.configuration import load_config
+
+    monkeypatch.setenv("AVAILABLE_GPUS", "6,7")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(gpu_runtime, "query_gpu_memory", lambda: {
+        gpu: gpu_runtime.GPUMemory(physical_id=gpu, name="NVIDIA B200",
+                                  total_gib=179., free_gib=179.) for gpu in (6, 7)})
+    argv = ["train_multy_CVaR.py", "--config", str(ROOT / "configs/gpu_mode_trimul.yaml"),
+            "--strategies", "--advantage-mode", "spo-rs", "--fast"]
+    if resume:
+        (tmp_path / "config.json").write_text(json.dumps({"reward_workers": 1}))
+        argv += ["--resume", str(tmp_path)]
+    monkeypatch.setattr(sys, "argv", argv)
+    cfg, _ = load_config()
+    assert cfg.reward_workers == 2
+    assert cfg.gpu_ids == "6,7"
+    assert cfg.evaluation_shares_generation
+    assert cfg.vllm_tensor_parallel_size == cfg.vllm_pipeline_parallel_size == 1
+
+
 def test_trimul_b200_benchmark_identity_is_exact():
     from problems.gpu_mode import benchmark_environment_issue
 
@@ -34,6 +56,175 @@ def test_trimul_b200_benchmark_identity_is_exact():
         "NVIDIA H100", (9, 0), "3.3.1", "B200", "3.3.1")
     assert "expected Triton 3.3.1" in benchmark_environment_issue(
         "NVIDIA B200", (10, 0), "3.4.0", "B200", "3.3.1")
+
+
+def test_trimul_evaluations_use_both_gpus_without_overlapping_on_one(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    import threading
+    import problems.gpu_mode as gpu_mode
+
+    config = dict(kernel_python=sys.executable, problem_type="trimul",
+                  kernel_gpu_id=7, gpu_ids="6,7", evaluation_shares_generation=True)
+    problem = gpu_mode.GpuMode(config)
+    assert problem.kernel_gpu_ids == [6, 7]
+    active = set()
+    calls = []
+    verified_per_gpu = {6: [], 7: []}
+    lock = threading.Lock()
+    both_running = threading.Barrier(2)
+
+    @contextmanager
+    def lease(gpu_id, *args, **kwargs):
+        with lock:
+            assert gpu_id not in active
+            active.add(gpu_id)
+        try:
+            yield
+        finally:
+            with lock:
+                active.remove(gpu_id)
+
+    def evaluate(code, lib_dir, task_yaml, problem_type, log_chars, timeout, gpu_id, *args):
+        with lock:
+            calls.append(gpu_id)
+            verified_per_gpu[gpu_id].append(args[-1])
+            call_number = len(calls)
+        both_running.wait(timeout=5)
+        # A failed benchmark must also return its GPU slot for the next wave.
+        if call_number <= 2:
+            return dict(ok=False, msg="Failed to pass test cases.", environment_verified=True)
+        return dict(ok=True, score_us=123., environment_verified=True)
+
+    monkeypatch.setattr("runtime.gpu_lease.gpu_lease", lease)
+    monkeypatch.setattr(gpu_mode, "run_eval_with_timeout", evaluate)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: problem.compute_reward(
+            "```python\n@triton.jit\ndef kernel(): pass\n```", None, 900), range(4)))
+    assert calls[:2] == [6, 7] or calls[:2] == [7, 6]
+    assert sorted(calls) == [6, 6, 7, 7]
+    assert verified_per_gpu == {6: [False, True], 7: [False, True]}
+    assert not active
+    assert [result.valid for result in results] == [False, False, True, True]
+    assert sorted(problem._kernel_gpu_slots.queue) == [6, 7]
+
+    # An explicitly selected standalone device still stays single-GPU.
+    config["evaluation_shares_generation"] = False
+    assert gpu_mode.GpuMode(config).kernel_gpu_ids == [7]
+
+
+def test_trimul_evaluator_has_a_private_work_directory(monkeypatch, tmp_path):
+    from types import ModuleType, SimpleNamespace
+    import problems.gpu_mode as gpu_mode
+
+    modules = {name: ModuleType(name) for name in (
+        "libkernelbot", "libkernelbot.task", "libkernelbot.run_eval",
+        "libkernelbot.submission", "libkernelbot.consts")}
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    task_path = ROOT / "examples/gpu_mode/lib/bioml/trimul/task.yml"
+    modules["libkernelbot.task"].make_task_definition = lambda path: (
+        SimpleNamespace(task=path) if Path(path).is_file() else None)
+    modules["libkernelbot.task"].build_task_config = lambda **options: options
+    modules["libkernelbot.consts"].SubmissionMode = SimpleNamespace(LEADERBOARD="leaderboard")
+    modules["libkernelbot.submission"].compute_score = lambda *args, **kwargs: .000123
+    monkeypatch.setattr(gpu_mode, "ensure_python3_on_path", lambda _: sys.executable)
+    probes = []
+
+    def probe(python):
+        probes.append(python)
+        return dict(gpu="NVIDIA B200", capability=(10, 0), triton="3.3.1")
+
+    monkeypatch.setattr(gpu_mode, "benchmark_environment_from_python", probe)
+    monkeypatch.setattr(gpu_mode, "collect_logs", lambda *_: "")
+    monkeypatch.setenv("TTT_FAST_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.chdir(ROOT)
+    workdirs = []
+
+    def run(config):
+        workdir = Path.cwd()
+        assert workdir != ROOT
+        assert not (workdir / "submission.py").exists()
+        (workdir / "submission.py").write_text(config["submission_content"])
+        workdirs.append(workdir)
+        return SimpleNamespace(success=True, runs={
+            key: SimpleNamespace(run=SimpleNamespace(passed=True))
+            for key in ("test", "leaderboard")})
+
+    modules["libkernelbot.run_eval"].run_config = run
+    sink = SimpleNamespace(send=lambda result: results.append(result), close=lambda: None)
+    results = []
+    for code in ("first", "second"):
+        gpu_mode._eval_child(sink, code, "examples/gpu_mode/lib", str(task_path),
+                             "trimul", 4000, expected_gpu="B200", expected_triton="3.3.1",
+                             environment_verified=(code == "second"))
+        assert Path.cwd() == ROOT
+    assert len(set(workdirs)) == 2
+    assert all(not path.exists() for path in workdirs)
+    assert all(result["ok"] and result["score_us"] == pytest.approx(123.) for result in results)
+    assert len(probes) == 1
+    assert all(result["environment_verified"] for result in results)
+
+
+@pytest.mark.parametrize("outcomes,expected_calls,exit_code", [
+    ([False, True, True], 1, 112), ([True, True, True], 3, 0)])
+def test_trimul_correctness_stops_at_first_failure(outcomes, expected_calls, exit_code):
+    import ast
+    from types import SimpleNamespace
+
+    path = ROOT / "examples/gpu_mode/lib/bioml/trimul/eval.py"
+    node = next(node for node in ast.parse(path.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name == "run_testing")
+    calls, logs = [], []
+
+    def check(pool, test):
+        calls.append(test.index)
+        return outcomes[test.index], "correctness diagnostic"
+
+    scope = dict(multiprocessing=SimpleNamespace(Pool=object), TestCase=object,
+                 PopcornOutput=object, run_single_test=check)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    result = scope["run_testing"](
+        SimpleNamespace(log=lambda *values: logs.append(values)), None,
+        [SimpleNamespace(index=i, spec=str(i)) for i in range(len(outcomes))])
+    assert result == exit_code
+    assert calls == list(range(expected_calls))
+    assert logs[-1] == ("check", "pass" if exit_code == 0 else "fail")
+    if exit_code:
+        assert ("test.0.error", "correctness diagnostic") in logs
+
+
+def test_trimul_preflight_cache_resets_at_batch_change_and_worker_failure(monkeypatch):
+    import problems.gpu_mode as gpu_mode
+
+    problem = gpu_mode.GpuMode(dict(kernel_python=sys.executable, kernel_gpu_id=7,
+                                    gpu_type="B200", problem_type="trimul"))
+    verified_args = []
+    result = dict(ok=True, score_us=123., environment_verified=True)
+
+    def evaluate(*args):
+        verified_args.append(args[-1])
+        return dict(result)
+
+    monkeypatch.setattr(gpu_mode, "run_eval_with_timeout", evaluate)
+    response = "```python\n@triton.jit\ndef kernel(): pass\n```"
+    reward = lambda: problem.compute_reward(response, None, 900)
+    assert reward().valid
+    assert reward().valid
+    result.clear()
+    result.update(ok=False, msg="kernel_eval_timeout after 900s (process killed)")
+    assert not reward().valid
+    result.update(ok=True, score_us=123., environment_verified=True)
+    assert reward().valid
+    problem.begin_evaluation_batch()
+    assert reward().valid
+    problem.triton_version = "changed-version"
+    result.clear()
+    result.update(ok=False, msg="benchmark environment mismatch: wrong Triton")
+    assert not reward().valid
+    assert not reward().valid
+    assert verified_args == [False, True, True, False, False, False, False]
+    assert not problem._verified_kernel_environments
 
 
 def test_gpu_mode_can_select_a_dedicated_kernel_interpreter():
