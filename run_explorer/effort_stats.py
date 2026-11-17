@@ -106,6 +106,7 @@ def scan_run(run_dir):
         return None
     fam = family(cfg, name)
     toks = {}          # effort -> [ntok]
+    qual = {}          # effort -> [valid, beat parent, total] over scored first-attempt rollouts
     pilot = {}         # step -> {effort: tokens} of pilot-phase rollouts (first attempt)
     files = {}         # effort -> [text path] for the thinking-share sample
     for mf in sorted(glob.glob(os.path.join(run_dir, "step*", "step*_group*_rollout*.meta.json"))):
@@ -118,6 +119,13 @@ def scan_run(run_dir):
         if not n or not eff or "valid" not in m:
             continue
         toks.setdefault(eff, []).append(n)
+        if not m.get("retry_attempt"):
+            q = qual.setdefault(eff, [0, 0, 0]); q[2] += 1
+            if m.get("valid"):
+                q[0] += 1
+                pv, rw = m.get("parent_value"), m.get("reward")
+                if pv is not None and rw is not None and rw > pv + 1e-12:
+                    q[1] += 1
         if (m.get("strategy_rollout_phase") or "pilot") == "pilot" and not m.get("retry_attempt"):
             d = pilot.setdefault(int(m.get("step", -1)), {})
             d[eff] = d.get(eff, 0) + n
@@ -133,6 +141,8 @@ def scan_run(run_dir):
         d["think_share"] = round(st.mean(shares), 3) if shares else None
         d["think_sampled"] = len(shares)
         d["think_est"] = round(d["mean"] * d["think_share"]) if shares else None
+        qv = qual.get(eff, [0, 0, 0])
+        d["valid"], d["beat"], d["attempts"] = qv
         modes[eff] = d
     gpus = [g for g in str(cfg.get("gpu_ids") or cfg.get("available_gpu_ids") or "").split(",") if g.strip()]
     hw = cfg.get("hardware_profile") or cfg.get("gpu_type") or ""
@@ -171,6 +181,7 @@ def collect(run_dirs, log=print):
         mean = wmean("mean")
         groups.append({"model": model, "effort": eff, "problem": prob, "n": n, "mean": round(mean), "median": round(wmean("median")), "p90": round(wmean("p90")), "max": max(m["max"] for _, m in items),
                        "think_share": round(share, 3) if share is not None else None, "think_est": round(mean * share) if share is not None else None,
+                       "valid": sum(m.get("valid", 0) for _, m in items), "beat": sum(m.get("beat", 0) for _, m in items), "attempts": sum(m.get("attempts", 0) for _, m in items),
                        "runs": sorted({r["run"] for r, _ in items})})
     # measured speed per model, B200 runs only (the same hardware for both models)
     speed = {}

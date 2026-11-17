@@ -35,7 +35,7 @@ function jevTreeSection(root, step) {
   const slider = paramSlider("same-core threshold", 0.3, 1, 0.01, v => v.toFixed(2), () => thrNow(step), (v, row) => setParam({ thr: v }, row));
   const ctl = h("div", { class: "row-flex", style: { margin: "2px 0 6px" } }, sweepBtn,
     h("button", { class: "btn sm", onclick: () => { stopSweep(); setParam({ thr: null }); } }, "use recorded " + thr0),
-    h("span", { class: "sub" }, "move the slider (or click a sweep chart below) - every node flips live; the same threshold drives the matrix further down and the Pipeline tab"));
+    h("span", { class: "sub" }, "move the slider - every node flips live; the same threshold drives the matrix further down and the Pipeline tab"));
   const keyLegend = h("div", { class: "legend", style: { marginTop: "6px" } },
     h("span", { class: "it" }, h("span", { class: "sw", style: { background: "var(--good)", borderRadius: "50%" } }), "accepted → becomes a parent (P1…)"),
     h("span", { class: "it" }, h("span", { class: "sw", style: { background: "var(--crit)", borderRadius: "50%" } }), "rejected - too similar to an accepted parent"),
@@ -49,12 +49,7 @@ function jevTreeSection(root, step) {
 
   root.append(card(`JEV on the search tree — step ${step}`, HASWIN ? `the top ${K} PUCT candidates (the run scanned ${decs.length} of them) · recorded threshold ${thr0} · ${REQ} become parents` : `the ${K} candidates the gate scanned (top of the PUCT ranking) · recorded threshold ${thr0} · up to ${REQ} become parents`,
     h("div", null, slider, ctl, chips, h("div", { class: "row-flex", style: { margin: "4px 0" } }, gensSel, h("span", { class: "sub" }, "left → right = step in which the program was created · circle = a candidate of the PUCT window (#rank in PUCT order; the matrix further down numbers the scan order instead), small dot = an ancestor")), treeHost, keyLegend,
-      h("h3", { style: { margin: "14px 0 2px" } }, "The same candidates on the upper-bound axis"),
-      h("div", { class: "sub" }, "dot colour = verdict at the current threshold · orange ring = the verdict differs from the recorded run · triangles = mean upper bound of the parent set (hollow: recorded, filled: replay) · equal values are stacked vertically"), stripHost, ctxChk, diffBox, noteBox,
-      h("h3", { style: { margin: "16px 0 4px" } }, "How the decision changes with the threshold"),
-      h("div", { class: "grid g2" },
-        h("div", null, sweepA, legend([{ color: S_COL(7), label: "candidates rejected", line: true }, { color: S_COL(0), label: "recorded parents that get replaced", line: true }, { color: S_COL(3), label: "substitutes in the parent set (never judged)", line: true }])),
-        h("div", null, sweepB, legend([{ color: S_COL(1), label: "mean upper bound of the accepted parents", line: true }, { color: S_COL(6), label: "worst parent", line: true }]))))));
+      diffBox, noteBox)));
   root.lastChild.style.marginBottom = "14px";
 
   /* ------------------------------------------------------------ the tree: candidates + their ancestors (built by buildTree, restyled by update()) */
@@ -222,7 +217,7 @@ function jevTreeSection(root, step) {
         N.lab.textContent = (pnum[id] ? "P" + pnum[id] + (byId[id] && byId[id].unjudged ? "*" : "") + " · " : "") + rawLab(rawOf(id));
         N.lab.setAttribute("class", "jt-lab " + st);
       }
-      const dEl = stripState.dots[id]; if (dEl) dEl.setAttribute("class", "jt-n " + st);
+      const dEl = stripState.dots && stripState.dots[id]; if (dEl) dEl.setAttribute("class", "jt-n " + st);
       const rEl = stripState.rings && stripState.rings[id]; if (rEl) { rEl.setAttribute("opacity", changed(id) ? 1 : 0); rEl.setAttribute("class", "jt-ring"); }
       if (e && e.verdict === "reject" && e.match) { const a = arcEls[id + "|" + e.match]; if (a) { a.path.setAttribute("opacity", 1); a.lab.setAttribute("opacity", 1); a.lab.textContent = `≈ ${pnum[e.match] ? "P" + pnum[e.match] : "#" + rankOf[e.match]} · ${Math.round(100 * (simOf(id, e.match) || 0))} %`; } }
     });
@@ -261,7 +256,6 @@ function jevTreeSection(root, step) {
     } else if (nAcc < REQ) notes.push(`At this threshold only ${nAcc} of ${REQ} slots can be filled from the ${K} candidates the run scanned (the candidate window could not be rebuilt for this run, so the substitutes are unknown).`);
     if (unk) notes.push(`${unk} acceptance${unk > 1 ? "s rely" : " relies"} on pairs the original run never computed (it had already stopped at an earlier match); they are counted as 'no match'.`);
     notes.forEach(t => noteBox.append(h("div", { class: "warnbox", style: { marginTop: "6px" } }, t)));
-    drawSweeps();
   }
 
   /* ------------------------------------------------------------ animated sweep */
@@ -278,6 +272,6 @@ function jevTreeSection(root, step) {
     }, 260);
   }
 
-  buildTree(); drawStrip(); update();
+  buildTree(); update();
   onParam(patch => { if ("thr" in patch) update(); });
 }

@@ -283,7 +283,7 @@ function tableCard(title, sub, rows) {
 const EFFORT = (() => { const el = document.getElementById("effort-data"); try { return el ? JSON.parse(el.textContent) : null; } catch (e) { return null; } })();
 const PROB_NAME = { ac1: "AC1", erdos: "Erdős C₅", gpu_mode: "GPU kernel (TriMul)" };
 let effProb = null;
-const k1 = v => (v >= 1000 ? (v / 1000).toFixed(v >= 100000 ? 0 : 1) + "k" : String(Math.round(v)));
+const k1 = v => (v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1000 ? (v / 1000).toFixed(v >= 100000 ? 0 : 1) + "k" : String(Math.round(v)));
 const modeName = g => g.model + " · " + g.effort;
 
 /* horizontal bars: rows = [{label, color, segs:[{v, op}], marks:[{v, kind}], end, tip}] */
@@ -404,6 +404,117 @@ function renderEffort() {
 
 }
 
+/* ---------------------------------------------------------------- what's next: scout with Qwen xhigh, refine with gpt-oss high */
+const NX = { P: 8, S: 4, a: 1, b: 10, gpus: 2, swap: 3, cur: 384 };
+function nextDiagram() {
+  const W = 1440, H = 728, s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "two-model round pipeline", style: "width:100%;max-width:1560px;display:block" });
+  const defs = svg("defs", null);
+  defs.append(svg("marker", { id: "nxa", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 11, markerHeight: 11, markerUnits: "userSpaceOnUse", orient: "auto-start-reverse" }, svg("path", { d: "M0,0L10,5L0,10z", fill: "var(--ink-2)" })));
+  s.append(defs);
+  const g = svg("g", { transform: "translate(0,56)" }); s.append(g);
+  const col = { search: "var(--s4)", strat: "var(--s2)", scout: EFF_COL.xhigh, refine: EFF_COL.high, cpu: "var(--s3)" };
+  const LOGO = { qwen: { d: "M19.713 2.825h-5.907c0-.251-.066-.503-.196-.728L12.819.728A1.46 1.46 0 0 0 11.559 0h-1.58c-.52 0-1 .275-1.26.728l-2.42 4.19a1.45 1.45 0 0 0 0 1.453l.791 1.37c.26.448.74.727 1.26.727h11.36c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451l-.79-1.37a1.46 1.46 0 0 0-1.26-.728zM.195 9.905l2.951 5.115a1.46 1.46 0 0 0-.531.531l-.791 1.37a1.45 1.45 0 0 0 0 1.452l.79 1.37c.26.448.74.727 1.26.727h4.84c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451L5.086 7.083a1.46 1.46 0 0 0-1.26-.728h-1.58c-.52 0-1 .276-1.26.728l-.79 1.37a1.45 1.45 0 0 0 0 1.452m15.888 13.367 2.951-5.115c.217.125.469.196.728.196h1.582c.52 0 1-.275 1.26-.728l.79-1.37a1.45 1.45 0 0 0 0-1.451l-2.42-4.191a1.46 1.46 0 0 0-1.259-.728h-1.582c-.52 0-1 .276-1.259.728l-5.678 9.838a1.45 1.45 0 0 0 0 1.452l.79 1.37c.26.448.74.727 1.26.727h1.582c.52 0 1-.275 1.26-.728z", fill: "#082dff" }, oss: { d: "M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z", fill: "var(--ink)" } };
+  const logo = (x, y, z, kind) => {
+    if (kind === "glide") {        // Fastino (GLiDE-9B): black rounded square with a white sparkle
+      g.append(svg("rect", { x, y, width: z, height: z, rx: z * 0.22, fill: "#0b0b0b", stroke: "rgba(255,255,255,.35)", "stroke-width": 1 }));
+      g.append(svg("path", { d: "M12,3.2L13.5,10.5L20.8,12L13.5,13.5L12,20.8L10.5,13.5L3.2,12L10.5,10.5Z", fill: "#fff", transform: `translate(${x},${y}) scale(${z / 24})` }));
+      g.append(svg("path", { d: "M6.2,6.2L9.6,9.6M17.8,6.2L14.4,9.6M6.2,17.8L9.6,14.4M17.8,17.8L14.4,14.4", stroke: "#fff", "stroke-width": 1.4, "stroke-linecap": "round", fill: "none", transform: `translate(${x},${y}) scale(${z / 24})` }));
+      return;
+    }
+    g.append(svg("path", { d: LOGO[kind].d, fill: LOGO[kind].fill, transform: `translate(${x},${y}) scale(${z / 24})` }));
+  };
+  const lora = (x, y) => { g.append(svg("rect", { x: x - 54, y: y - 11, width: 62, height: 22, rx: 11, fill: "var(--s7)", stroke: "var(--surface)", "stroke-width": 2 })); g.append(svg("text", { x: x - 23, y: y + 4.5, "text-anchor": "middle", style: "font-size:12px;font-weight:800;fill:#fff;letter-spacing:.4px" }, "+ LoRA")); };
+  const mctx = document.createElement("canvas").getContext("2d"), FAM = getComputedStyle(document.body).fontFamily;
+  const textW = (t, fs, wt) => { mctx.font = `${wt || 700} ${fs}px ${FAM}`; return mctx.measureText(t).width; };
+  const box = (x, y, w, hh, title, sub, c, mark) => {
+    g.append(svg("rect", { x, y, width: w, height: hh, rx: 8, fill: c, "fill-opacity": 0.2, stroke: c, "stroke-width": 2.2 }));
+    const lines = String(sub || "").split("\n").filter(Boolean), Z = 22, GAP = 9, pad = 18;
+    let fs = 15;                                                   // real font metrics: shrink the font (never stretch it) until logo + title fit
+    while (fs > 11 && textW(title, fs) + (mark ? Z + GAP : 0) > w - 2 * pad) fs -= 0.5;
+    const tw = textW(title, fs), grp = tw + (mark ? Z + GAP : 0), x0 = x + (w - grp) / 2;
+    const titleH = 18, gap = lines.length ? 9 : 0, blockH = titleH + gap + lines.length * 17, top = y + (hh - blockH) / 2;
+    const base = top + 14;
+    if (mark) logo(x0, base - 16, Z, mark);
+    g.append(svg("text", { x: x0 + (mark ? Z + GAP : 0), y: base, "text-anchor": "start", style: `font-weight:700;font-size:${fs}px;fill:var(--ink)` }, title));
+    lines.forEach((ln, i) => g.append(svg("text", { x: x + w / 2, y: top + titleH + gap + 13 + i * 17, "text-anchor": "middle", style: "font-size:13px;fill:var(--ink)" }, ln)));
+    if (mark === "oss") lora(x + w - 4, y);
+  };
+  const arrow = (d, c, w) => g.append(svg("path", { d, fill: "none", stroke: c || "var(--ink-2)", "stroke-width": w || 2, "stroke-linecap": "round", "stroke-linejoin": "round", "marker-end": "url(#nxa)" }));
+  const xs = [290, 580, 870, 1160], cw = 250, cx = i => xs[i] + cw / 2;
+  s.append(svg("text", { x: 850, y: 20, "text-anchor": "middle", style: "font-size:15px;fill:var(--ink)" }, "Each strategy sees ALL earlier strategies of the parent, gets one slow Qwen attempt, and gpt-oss then writes the real batch"));
+  box(20, 44, 210, 92, "Parent p", "one of the " + NX.P + " parents", col.search);
+  box(20, 210, 210, 80, "JEV gate", "", "var(--s7)", "glide");
+  box(20, 350, 210, 74, "UCT ranking", "", col.search);
+  box(20, 470, 210, 70, "Archive", "", col.search);
+  arrow("M125,468V426"); arrow("M125,348V292"); arrow("M125,208V138"); arrow("M232,90H286");
+  /* every strategy sees ALL earlier ones: rounded brackets above the row (neighbours use the straight arrow) */
+  [[0, 2, 18 + 18, 18, 24], [1, 3, 18, 36, 42], [0, 3, 18, 18, 60]].forEach(([i, j, so, eo, lift]) => {
+    const x0 = cx(i) + (i === 0 && j === 2 ? 36 : 18), x1 = cx(j) - (j === 3 && i === 1 ? 36 : 18), top = 42 - lift, r = 12;
+    arrow(`M${x0},42V${top + r}Q${x0},${top} ${x0 + r},${top}H${x1 - r}Q${x1},${top} ${x1},${top + r}V40`, "var(--s2)", 1.8);
+  });
+  for (let i = 0; i < 4; i++) {
+    box(xs[i], 44, cw, 92, "Strategy " + (i + 1), "plan for parent p\nfrozen strategist", col.strat);
+    if (i < 3) arrow(`M${xs[i] + cw + 4},90H${xs[i + 1] - 5}`);
+    arrow(`M${cx(i)},138V164`);
+    box(xs[i], 166, cw, 64, "Round 1: Qwen3.8 xhigh", "", col.scout, "qwen");
+    arrow(`M${cx(i)},232V260`);
+  }
+  box(290, 262, 1120, 56, "Evaluate", "", col.cpu);
+  arrow("M850,321V351");
+  box(290, 354, 1120, 72, "Result card per strategy", "Task + strategy + Qwen proposed plan + reward or full error message", col.search);
+  for (let i = 0; i < 4; i++) {
+    arrow(`M${cx(i)},428V454`);
+    box(xs[i], 456, cw, 104, "Round 2: gpt-oss high", "reasons, fixes issues, improves", col.refine, "oss");
+    arrow(`M${cx(i)},562V590`);
+  }
+  box(290, 592, 1120, 56, "Evaluate", "", col.cpu);
+  arrow("M288,620H147Q125,620 125,598V542");
+  const wrap = h("div", { class: "hub-chart" }); wrap.append(s); return wrap;
+}
+function nextCalc(v, G, SP) {
+  const q = G.find(g => g.model === "Qwen3.8-27B" && g.effort === "xhigh" && g.problem === "ac1") || G.find(g => g.model === "Qwen3.8-27B" && g.effort === "xhigh");
+  const o = G.find(g => g.model === "gpt-oss-120b" && g.problem === "ac1") || G.find(g => g.model === "gpt-oss-120b");
+  const ql = G.find(g => g.model === "Qwen3.8-27B" && g.effort === "low" && g.problem === "ac1") || G.find(g => g.model === "Qwen3.8-27B" && g.effort === "low");
+  if (!q || !o || !ql || !SP["Qwen3.8-27B"] || !SP["gpt-oss-120b"]) return null;
+  const sq = SP["Qwen3.8-27B"].tps_gpu_median, so = SP["gpt-oss-120b"].tps_gpu_median, n = v.P * v.S;
+  const r1 = n * v.a, r2 = n * v.b;
+  const t1 = r1 * q.mean / sq / v.gpus, t2 = r2 * o.mean / so / v.gpus, sw = 2 * v.swap * 60, cur = v.cur * ql.mean / sq / v.gpus;
+  return { q, o, ql, sq, so, n, r1, r2, t1, t2, sw, total: t1 + t2 + sw, cur, tok1: r1 * q.mean, tok2: r2 * o.mean };
+}
+function renderNext() {
+  const root = $("#nextPage"); root.innerHTML = "";
+  const G = (EFFORT && EFFORT.groups) || [], SP = (EFFORT && EFFORT.speed) || {};
+  root.append(h("h1", { class: "hub-h1" }, "What's next: scout with Qwen xhigh, refine with gpt-oss high"),
+    h("p", { class: "hub-lede" }, "Qwen at xhigh effort is strong but slow; gpt-oss-120b at high effort is about 2× faster per token and reasons well. Instead of asking one model for 64 programs per parent, give every strategy ONE slow, careful Qwen attempt, evaluate all of them, and hand each attempt - with its score and errors - to gpt-oss, which reasons about what went wrong and writes the batch of improved programs."));
+  root.append(h("div", { class: "card", style: { marginTop: "6px" } }, h("div", { class: "card-head" }, h("h2", null, "The proposed round structure"), h("span", { class: "sub" }, "numbers follow the calculator below")), nextDiagram()));
+
+  /* calculator */
+  const out = h("div"), inputs = h("div", { class: "row-flex", style: { display: "flex", gap: "14px", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "12px" } });
+  const fields = [["P", "parents per step"], ["S", "strategies per parent"], ["a", "Qwen xhigh programs per strategy"], ["b", "gpt-oss programs per strategy"], ["gpus", "generation GPUs"], ["swap", "model swap (minutes, each way)"], ["cur", "programs per step (one stage)"]];
+  fields.forEach(([k, lab]) => { const inp = h("input", { type: "number", value: NX[k], min: 0, step: k === "swap" ? 0.5 : 1, style: { width: "84px" } }); inp.addEventListener("input", () => { const v = parseFloat(inp.value); if (isFinite(v) && v >= 0) { NX[k] = v; draw(); } }); inputs.append(h("label", { class: "ctl", style: { flexDirection: "column", alignItems: "flex-start", gap: "3px" } }, h("span", { class: "sub" }, lab), inp)); });
+  const mm = x => (x / 60 >= 100 ? int(x / 60) : (x / 60).toFixed(1)) + " min";
+  function draw() {
+    out.innerHTML = "";
+    const c = nextCalc(NX, G, SP);
+    if (!c) { out.append(h("div", { class: "hint" }, "Needs the measured speeds and token counts of both models (effort_runs.txt).")); return; }
+    const mx = Math.max(c.total, c.cur) * 1.05, st = niceStep(mx), mxx = Math.ceil(mx / st) * st;
+    out.append(hbars({ label: "generation time per step", max: mxx, ticks: ticksTo(mxx, st), tickFmt: v => Math.round(v / 60) + " min", left: 250, right: 170,
+      rows: [
+        { label: "proposed: scout + refine", color: EFF_COL.xhigh, segs: [{ v: c.t1, op: 0.95 }, { v: c.sw, op: 0.35 }, { v: c.t2, op: 0.95 }], end: mm(c.total), tip: `<b>proposed</b><br>round 1 (Qwen xhigh) ${mm(c.t1)} + swaps ${mm(c.sw)} + round 2 (gpt-oss) ${mm(c.t2)}` },
+        { label: "Qwen low, one stage", color: EFF_COL.low, segs: [{ v: c.cur, op: 0.9 }], end: mm(c.cur), tip: `<b>Qwen low, one stage</b><br>${int(NX.cur)} programs × ${k1(c.ql.mean)} tokens` }] }));
+    out.append(h("div", { class: "kpis", style: { marginTop: "10px" } },
+      kpiTile("Round 1 · Qwen xhigh", mm(c.t1), `${int(c.r1)} programs × ${k1(c.q.mean)} tokens ÷ ${int(c.sq)} tok/s per GPU ÷ ${NX.gpus} GPUs`),
+      kpiTile("Round 2 · gpt-oss high", mm(c.t2), `${int(c.r2)} programs × ${k1(c.o.mean)} tokens ÷ ${int(c.so)} tok/s per GPU ÷ ${NX.gpus} GPUs`),
+      kpiTile("Model swaps", mm(c.sw), "two swaps per step (sleep one engine, wake the other)"),
+      kpiTile("Programs evaluated", int(c.r1 + c.r2), `${int(c.r1)} scouts + ${int(c.r2)} refined · vs ${int(NX.cur)}`),
+      kpiTile("Tokens generated", k1(c.tok1 + c.tok2), `${k1(c.tok1)} Qwen + ${k1(c.tok2)} gpt-oss`)));
+  }
+  root.append(h("div", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "card-head" }, h("h2", null, "How long would a step take?"), h("span", { class: "sub" }, "generation only · measured speeds and token counts of our B200 runs")), inputs, out,
+    h("div", { class: "sub", style: { marginTop: "8px" } }, "Time = programs × mean tokens ÷ measured tokens per second per GPU ÷ GPUs. It assumes both models keep their GPUs saturated; the real round 1 is longer because the last xhigh sequences (up to ≈ 165k tokens) finish alone. Evaluation is not included: round-1 programs can be evaluated while Qwen is still generating, but round 2 of a strategy can only start after its scout is scored. Prefill of the longer round-2 prompt is small next to the generation.")));
+  draw();
+
+}
+
 function renderLanding() {
   const root = $("#landing"); root.innerHTML = "";
   const totalS = RUNS.reduce((a, r) => a + (r.elapsed_s || 0), 0), gh = RUNS.reduce((a, r) => a + (r.gpu_hours || 0), 0), prog = RUNS.reduce((a, r) => a + r.rollouts, 0);
@@ -460,23 +571,26 @@ async function openRun(r) {
 }
 function openOverview(page) {
   $("#hubMain").hidden = false; $("#frames").hidden = true; $("#btnNewTab").hidden = true;
-  const eff = page === "effort";
-  $("#landing").hidden = eff; $("#effortPage").hidden = !eff;
+  const eff = page === "effort", nxt = page === "next";
+  $("#landing").hidden = eff || nxt; $("#effortPage").hidden = !eff; $("#nextPage").hidden = !nxt;
   if (eff) renderEffort();
-  document.title = eff ? "Run Explorer - reasoning effort & speed" : "Run Explorer - all problems"; $("#hubSub").textContent = eff ? "reasoning effort & speed" : "all problems";
+  if (nxt) renderNext();
+  const label = eff ? "reasoning effort & speed" : nxt ? "what's next" : "all problems";
+  document.title = "Run Explorer - " + label; $("#hubSub").textContent = label;
 }
-const currentView = () => { const v = (location.hash || "#overview").slice(1); return v === "effort" || RUNS.some(r => r.id === v) ? v : "overview"; };
+const currentView = () => { const v = (location.hash || "#overview").slice(1); return v === "effort" || v === "next" || RUNS.some(r => r.id === v) ? v : "overview"; };
 function buildNav() {
   const nav = $("#hubNav"); nav.innerHTML = "";
   nav.append(h("button", { class: "hub-pill", "data-view": "overview", onclick: () => { location.hash = "#overview"; } }, "◧ All problems"));
   if (EFFORT && EFFORT.groups && EFFORT.groups.length) nav.append(h("button", { class: "hub-pill", "data-view": "effort", title: "tokens per rollout and generation speed at each reasoning effort", onclick: () => { location.hash = "#effort"; } }, "⚡ Effort & speed"));
   RUNS.forEach(r => nav.append(h("button", { class: "hub-pill", "data-view": r.id, title: r.title + " - " + r.run_name, onclick: () => { location.hash = "#" + r.id; } },
     h("span", { class: "sw", style: { background: r.color } }), nameOf(r), h("small", null, r.best != null ? fx(r.best, r.dec) : ""))));
+  if (EFFORT && EFFORT.groups && EFFORT.groups.length) nav.append(h("button", { class: "hub-pill", "data-view": "next", title: "proposal: Qwen xhigh scouts, gpt-oss high refines", onclick: () => { location.hash = "#next"; } }, "→ What's next"));
 }
 function route() {
   const v = currentView();
   document.querySelectorAll(".hub-pill").forEach(p => p.classList.toggle("active", p.dataset.view === v));
-  if (v === "overview" || v === "effort") openOverview(v); else openRun(RUNS.find(r => r.id === v));
+  if (v === "overview" || v === "effort" || v === "next") openOverview(v); else openRun(RUNS.find(r => r.id === v));
   window.scrollTo(0, 0);
 }
 
