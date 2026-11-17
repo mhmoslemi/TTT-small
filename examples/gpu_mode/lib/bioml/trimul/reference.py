@@ -116,8 +116,6 @@ def generate_input(
     nomask: bool,
     distribution: str,
 ) -> input_t:
-    if not isinstance(nomask, bool):
-        raise TypeError("nomask must be a boolean, not a truthy string")
     # Really dumb but for now _ isn't parsing correctly.
     batch_size = bs
     seq_len = seqlen

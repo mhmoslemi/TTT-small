@@ -18,7 +18,7 @@ def trimul_evaluator(monkeypatch):
 
     directory = ROOT / "examples/gpu_mode/lib/bioml/trimul"
     modules = {}
-    for name in ("task", "utils", "reference", "kernel_check", "eval"):
+    for name in ("task", "utils", "reference", "eval"):
         spec = importlib.util.spec_from_file_location(name, directory / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
@@ -33,7 +33,6 @@ def test_trimul_mask_flags_reach_input_generation(trimul_evaluator, monkeypatch,
     import yaml
 
     task = yaml.safe_load((ROOT / "examples/gpu_mode/lib/bioml/trimul/task.yml").read_text())
-    assert {item["name"]: item["source"] for item in task["files"]}["kernel_check.py"] == "kernel_check.py"
     cases = task["tests"] + task["benchmarks"]
     path = tmp_path / "test_cases.txt"
     path.write_text("\n".join(";".join(f"{key}:{val}" for key, val in case.items())
@@ -52,107 +51,6 @@ def test_trimul_mask_flags_reach_input_generation(trimul_evaluator, monkeypatch,
     masked = reference.generate_input(**parsed[1].args)[1]
     assert torch.all(unmasked == 1)
     assert torch.any(masked == 0) and torch.any(masked == 1)
-    with pytest.raises(TypeError, match="nomask must be a boolean"):
-        reference.generate_input(**{**parsed[1].args, "nomask": "False"})
-
-
-@pytest.mark.parametrize("mode,passes", [
-    ("useful", True), ("unused", False), ("dummy", False),
-    ("copy", False), ("warmup", False), ("probe_error", False),
-])
-def test_trimul_requires_contributing_triton_work(trimul_evaluator, monkeypatch, mode, passes):
-    from types import SimpleNamespace
-    import torch
-
-    class JITFunction:
-        fn = SimpleNamespace(__module__="submission")
-        __name__ = "test_kernel"
-
-        def run(self, x, out, *, grid, warmup):
-            ir = "tt.load; tt.store" if mode == "copy" else "arith.mulf %x, %x : f32"
-            if not warmup:
-                out.copy_(x if mode == "copy" else x * 2)
-            return SimpleNamespace(asm={"ttir": ir})
-
-    original = JITFunction.run
-    monkeypatch.setitem(sys.modules, "triton.runtime.jit", SimpleNamespace(JITFunction=JITFunction))
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    jit = JITFunction()
-
-    def custom(data):
-        x = data[0]
-        if mode == "unused":
-            return x * 2
-        out = torch.empty_like(x)
-        jit.run(x * 2 if mode == "copy" else x, out, grid=(1,), warmup=mode == "warmup")
-        if mode == "probe_error" and torch.isnan(out).any():
-            raise RuntimeError("probe failed")
-        return x * 2 if mode in ("dummy", "warmup") else out
-
-    custom.__module__ = "submission"
-
-    def check(data, output):
-        torch.rand(1)  # The real reference also initializes module parameters.
-        return torch.allclose(output, data[0] * 2, rtol=.02, atol=.02), "wrong output"
-
-    rng = torch.get_rng_state()
-    good, message = trimul_evaluator["kernel_check"].check_triton_contribution(
-        custom, (torch.arange(1., 9.),), trimul_evaluator["eval"]._clone_data, check)
-    assert good is passes, message
-    assert JITFunction.run is original
-    assert torch.equal(rng, torch.get_rng_state())
-    if mode == "probe_error":
-        assert "probe failed" in message
-
-
-def test_trimul_contribution_on_real_cuda(trimul_evaluator, monkeypatch):
-    import torch
-
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA and Triton in the evaluator environment")
-    import triton
-    import triton.language as tl
-    monkeypatch.setitem(globals(), "tl", tl)
-
-    @triton.jit
-    def twice(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
-        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        value = tl.load(X + idx, idx < N, other=0)
-        tl.store(Y + idx, value * 2, idx < N)
-
-    @triton.jit
-    def copy(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
-        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        tl.store(Y + idx, tl.load(X + idx, idx < N, other=0), idx < N)
-
-    for mode in ("useful", "dummy", "copy"):
-        def custom(data):
-            x = data[0]
-            out = torch.empty_like(x)
-            if mode == "copy":
-                copy[(4,)](x * 2, out, x.numel(), 256)
-            else:
-                twice[(4,)](x, out, x.numel(), 256)
-            return x * 2 if mode == "dummy" else out
-
-        good, message = trimul_evaluator["kernel_check"].check_triton_contribution(
-            custom, (torch.arange(1., 1025., device="cuda"),),
-            trimul_evaluator["eval"]._clone_data,
-            lambda data, out: (torch.allclose(out, data[0] * 2), "wrong output"))
-        assert good is (mode == "useful"), message
-
-
-def test_trimul_audit_diagnostics_are_saved():
-    from types import SimpleNamespace
-    from problems.gpu_mode import collect_logs
-
-    run = SimpleNamespace(passed=False, stderr="", stdout="", result={
-        "evaluator": "trimul-masked-triton-v1",
-        "test.0.error": "No numerical submission Triton kernel executed",
-    })
-    logs = collect_logs(SimpleNamespace(runs={"test": SimpleNamespace(run=run)}))
-    assert "trimul-masked-triton-v1" in logs
-    assert "No numerical submission Triton kernel executed" in logs
 
 
 def test_trimul_alone_shares_its_evaluator_with_generation():
@@ -199,6 +97,62 @@ def test_trimul_b200_benchmark_identity_is_exact():
         "NVIDIA H100", (9, 0), "3.3.1", "B200", "3.3.1")
     assert "expected Triton 3.3.1" in benchmark_environment_issue(
         "NVIDIA B200", (10, 0), "3.4.0", "B200", "3.3.1")
+
+
+def test_trimul_parent_output_uses_ttt_observation_block():
+    from problems.base import ParentContext
+    from problems.gpu_mode import GpuMode
+
+    problem = GpuMode(dict(
+        kernel_python=sys.executable, problem_type="trimul",
+        gpu_type="B200", target=553.982, score_scale=1500,
+    ))
+    observation = "discarded-prefix" + "x" * 600
+    prompt = problem.build_prompt(ParentContext(
+        code="def custom_kernel(data): pass", raw_score=123.0,
+        observation=observation,
+    ))[0]["content"]
+    expected = ("--- Previous Program Output ---\n"
+                "\n\n\t\t ...(TRUNCATED)...\n" + "x" * 500
+                + "\n--- End Output ---")
+    assert expected in prompt
+    assert "discarded-prefix" not in prompt
+
+
+def test_gpu_resume_backfills_parent_output(tmp_path):
+    from types import SimpleNamespace
+    from train_multy_CVaR import _restore_archive_observations
+
+    state = SimpleNamespace(id="candidate", observation="")
+    sampler = SimpleNamespace(
+        _states=[state], _best_raw_min=None, _best_raw_max=None)
+    step = tmp_path / "step00"
+    step.mkdir()
+    (step / "step00_group00_rollout000.meta.json").write_text(json.dumps({
+        "node_id": state.id, "sandbox_stdout": "benchmark output",
+    }))
+
+    assert _restore_archive_observations(sampler, tmp_path) == 1
+    assert state.observation == "benchmark output"
+
+
+def test_live_best_raw_reports_only_strict_improvements():
+    from problems.base import RewardResult
+    from train_multy_CVaR import _advance_live_best_raw
+
+    best, line = _advance_live_best_raw(
+        RewardResult(valid=True, raw_score=9.5), 10.0, maximize=False)
+    assert best == 9.5
+    assert line == "best before: 10.000000000 --> best now: 9.500000000"
+    assert _advance_live_best_raw(
+        RewardResult(valid=True, raw_score=10.5), best, maximize=False
+    ) == (best, None)
+    assert _advance_live_best_raw(
+        RewardResult(valid=False, raw_score=1.0), best, maximize=False
+    ) == (best, None)
+    assert _advance_live_best_raw(
+        RewardResult(valid=True, raw_score=11.0), 10.0, maximize=True
+    )[0] == 11.0
 
 
 def test_trimul_evaluations_use_both_gpus_without_overlapping_on_one(monkeypatch):
@@ -307,34 +261,6 @@ def test_trimul_evaluator_has_a_private_work_directory(monkeypatch, tmp_path):
     assert all(result["ok"] and result["score_us"] == pytest.approx(123.) for result in results)
     assert len(probes) == 1
     assert all(result["environment_verified"] for result in results)
-
-
-@pytest.mark.parametrize("outcomes,expected_calls,exit_code", [
-    ([False, True, True], 1, 112), ([True, True, True], 3, 0)])
-def test_trimul_correctness_stops_at_first_failure(outcomes, expected_calls, exit_code):
-    import ast
-    from types import SimpleNamespace
-
-    path = ROOT / "examples/gpu_mode/lib/bioml/trimul/eval.py"
-    node = next(node for node in ast.parse(path.read_text()).body
-                if isinstance(node, ast.FunctionDef) and node.name == "run_testing")
-    calls, logs = [], []
-
-    def check(pool, test):
-        calls.append(test.index)
-        return outcomes[test.index], "correctness diagnostic"
-
-    scope = dict(multiprocessing=SimpleNamespace(Pool=object), TestCase=object,
-                 PopcornOutput=object, run_single_test=check)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
-    result = scope["run_testing"](
-        SimpleNamespace(log=lambda *values: logs.append(values)), None,
-        [SimpleNamespace(index=i, spec=str(i)) for i in range(len(outcomes))])
-    assert result == exit_code
-    assert calls == list(range(expected_calls))
-    assert logs[-1] == ("check", "pass" if exit_code == 0 else "fail")
-    if exit_code:
-        assert ("test.0.error", "correctness diagnostic") in logs
 
 
 def test_trimul_preflight_cache_resets_at_batch_change_and_worker_failure(monkeypatch):

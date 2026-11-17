@@ -52,6 +52,7 @@ class ParentContext:
     value: float = 0.0
     raw_score: Optional[float] = None
     construction: Optional[list] = None
+    observation: str = ""
 
 
 @dataclass

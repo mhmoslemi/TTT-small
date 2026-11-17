@@ -208,6 +208,27 @@ def test_saved_selection_and_partial_comparisons_replay_without_model(tmp_path, 
     assert actual.sample_states(3, selection_step=1) == picked
 
 
+def test_parent_observation_does_not_invalidate_saved_selection(tmp_path, monkeypatch):
+    actual = sampler(tmp_path)
+    payload = copy.deepcopy(actual.state_dict())
+    fake_judge(monkeypatch, lambda req: response())
+    picked = actual.sample_states(3, selection_step=1)
+
+    # Checkpoints and JEV selections created before observations existed remain valid.
+    for state in payload["states"]:
+        state.pop("observation", None)
+    for key in ("best_raw_min", "best_raw_max"):
+        if payload.get(key) is not None:
+            payload[key].pop("observation", None)
+    resumed = sampler(tmp_path)
+    resumed.load_state_dict(payload)
+    for state in resumed._states:
+        state.observation = "compiler output"
+    monkeypatch.setattr(jev, "GlideWorker", lambda *a, **kw: pytest.fail("replayed GLiDE"))
+    assert [state.id for state in resumed.sample_states(3, selection_step=1)] == [
+        state.id for state in picked]
+
+
 def test_failure_unloads_worker_and_reuses_completed_comparisons(tmp_path, monkeypatch):
     actual = sampler(tmp_path)
     seen = []

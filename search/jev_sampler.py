@@ -110,7 +110,8 @@ class PUCTJevSampler(PUCTSampler):
 
     def _seed_manifest(self):
         return [{"id": s.id, "digest": _digest({
-            key: value for key, value in asdict(s).items() if key != "id"})}
+            key: value for key, value in asdict(s).items()
+            if key not in {"id", "observation"}})}
                 for s in self._states if s.id in self._seed_ids]
 
     def _description(self):
@@ -146,7 +147,13 @@ class PUCTJevSampler(PUCTSampler):
         description = self._description() if step > 0 else ""
         # Validate the old snapshot before applying the current config's gate.
         threshold = saved["threshold"] if saved is not None else self.same_core_threshold
-        signature_data = {"archive": self.state_dict(), "step": step,
+        archive = self.state_dict()
+        for state in archive["states"]:
+            state.pop("observation", None)
+        for key in ("best_raw_min", "best_raw_max"):
+            if archive.get(key) is not None:
+                archive[key].pop("observation", None)
+        signature_data = {"archive": archive, "step": step,
                           "count": count, "puct_c": self.puct_c, "description": description,
                           "model": str(self.model_path), "question": QUESTION,
                           "threshold": threshold}

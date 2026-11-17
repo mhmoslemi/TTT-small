@@ -82,10 +82,11 @@ class State:
     is_seed: bool = False  # True for initial seed states
     raw_score: float = None      # true metric for prompt display (may equal value)
     construction: list = None    # injected global threaded parent -> child
+    observation: str = ""        # evaluator output shown when this state is a parent
 
     @staticmethod
     def make(timestep, value, code, parents=None, is_seed=False,
-             raw_score=None, construction=None):
+             raw_score=None, construction=None, observation=""):
         return State(
             id=str(uuid.uuid4()),
             timestep=timestep,
@@ -95,6 +96,7 @@ class State:
             is_seed=is_seed,
             raw_score=raw_score,
             construction=construction,
+            observation=str(observation or ""),
         )
 
 

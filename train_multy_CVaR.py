@@ -361,6 +361,22 @@ def _evaluated_rollout_meta(pending_meta, result):
     }
 
 
+def _advance_live_best_raw(result, current, maximize):
+    if not bool(getattr(result, "valid", False)):
+        return current, None
+    try:
+        value = float(result.raw_score)
+    except (TypeError, ValueError):
+        return current, None
+    if not math.isfinite(value):
+        return current, None
+    if current is not None and not (
+            value > current if maximize else value < current):
+        return current, None
+    before = "unavailable" if current is None else f"{current:.9f}"
+    return value, f"best before: {before} --> best now: {value:.9f}"
+
+
 def _adapter_dir(exp_dir, step_idx):
     from pathlib import Path
     return str(Path(exp_dir) / f"adapter_step{step_idx:03d}")
@@ -684,9 +700,44 @@ def _restore_legacy_archive(sampler, exp_dir, before_step):
             construction = meta.get("construction")
         except (TypeError, ValueError):
             continue
-        states.append(State.make(timestep=step, value=reward, code=code, raw_score=raw, construction=construction,))
+        states.append(State.make(
+            timestep=step, value=reward, code=code, raw_score=raw,
+            construction=construction,
+            observation=str(meta.get("sandbox_stdout") or ""),
+        ))
     sampler.import_legacy_states(states, total_expansions=total_rollouts)
     return len(states), total_rollouts
+
+
+def _restore_archive_observations(sampler, exp_dir):
+    """Backfill evaluator output for checkpoints created before State carried it."""
+    targets = {}
+    for state in sampler._states:
+        if not getattr(state, "observation", ""):
+            targets.setdefault(str(state.id), []).append(state)
+    for state in (sampler._best_raw_min, sampler._best_raw_max):
+        if state is not None and not getattr(state, "observation", ""):
+            targets.setdefault(str(state.id), []).append(state)
+    if not targets:
+        return 0
+
+    restored = set()
+    for meta_path in sorted(Path(exp_dir).glob(
+            "step*/step*_group*_rollout*.meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        node_id = str(meta.get("node_id") or "")
+        observation = meta.get("sandbox_stdout")
+        if node_id not in targets or not isinstance(observation, str) or not observation:
+            continue
+        for state in targets.pop(node_id):
+            state.observation = observation
+        restored.add(node_id)
+        if not targets:
+            break
+    return len(restored)
 
 
 def _logged_step_rewards(exp_dir, step_idx):
@@ -1208,6 +1259,7 @@ def _finalize_pending_spo_rs_artifacts(
             value=(parent.value if parent.value is not None else 0.0),
             raw_score=parent.raw_score,
             construction=parent.construction,
+            observation=getattr(parent, "observation", ""),
         )
         for parent in parents
     ]
@@ -1267,6 +1319,9 @@ def _finalize_pending_spo_rs_artifacts(
         evaluation_pool.submit(evaluate, item): index
         for index, item in enumerate(artifacts)})
     results = [None] * len(artifacts)
+    live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
+    live_best_raw = (
+        float(live_best_state.raw_score) if live_best_state is not None else None)
     try:
         prompt_cache = {}
         score_pairs = []
@@ -1347,6 +1402,8 @@ def _finalize_pending_spo_rs_artifacts(
                 index = evaluation_futures[future]
                 result = future.result()
                 results[index] = result
+                live_best_raw, best_line = _advance_live_best_raw(
+                    result, live_best_raw, bool(problem.maximize))
                 item = artifacts[index]
                 evaluated_meta = _evaluated_rollout_meta(item["meta"], result)
                 save_rollout(
@@ -1355,6 +1412,12 @@ def _finalize_pending_spo_rs_artifacts(
                     artifacts_already_saved=True)
                 item["meta"] = evaluated_meta
                 eval_bar.update(1)
+                if best_line:
+                    writer = getattr(eval_bar, "write", None)
+                    if callable(writer):
+                        writer(f"[step {step_idx}] {best_line}")
+                    else:
+                        print(f"[step {step_idx}] {best_line}", flush=True)
         finally:
             eval_bar.close()
     finally:
@@ -1403,7 +1466,7 @@ def _finalize_pending_spo_rs_artifacts(
         child = State.make(
             timestep=step_idx, value=float(result.reward),
             code=result.code or "", raw_score=result.raw_score,
-            construction=result.construction)
+            construction=result.construction, observation=result.stdout)
         archive_eligible = bool(result.valid and result.code)
         strategy_source = pending.get("strategy_source_job_idx")
         strategy_index = (
@@ -1771,6 +1834,7 @@ def _resume_spo_rs_step_from_artifacts(
                 timestep=step_idx, value=float(meta["reward"]), code=code,
                 raw_score=(float(meta["raw_score"]) if meta.get("raw_score") is not None else None),
                 construction=_literal_float_list(meta.get("construction")),
+                observation=str(meta.get("sandbox_stdout") or ""),
             )
             if meta.get("node_id"):
                 child.id = str(meta["node_id"])
@@ -2131,6 +2195,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             value=parent.value if parent.value is not None else 0.0,
             raw_score=parent.raw_score,
             construction=parent.construction,
+            observation=getattr(parent, "observation", ""),
         )
         parent_ctxs.append(pc)
         base_messages.append(problem.build_prompt(pc))
@@ -2512,13 +2577,19 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     eval_progress_condition = threading.Condition()
     eval_progress_completed = 0
     eval_bar_closed = False
+    live_best_state = sampler.best_raw_state(maximize=bool(problem.maximize))
+    live_best_raw = (
+        float(live_best_state.raw_score) if live_best_state is not None else None)
 
     def _record_evaluation_completion(_future, record=None):
-        nonlocal eval_progress_completed
+        nonlocal eval_progress_completed, live_best_raw
         with eval_progress_condition:
+            best_line = None
             if (record is not None and not _future.cancelled()
                     and _future.exception() is None):
                 result = _future.result()
+                live_best_raw, best_line = _advance_live_best_raw(
+                    result, live_best_raw, bool(problem.maximize))
                 save_future = rollout_io_pool.submit(
                     save_rollout,
                     exp_dir, step_idx, int(record["group_id"]),
@@ -2532,6 +2603,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 eval_bar.update(1)
             finally:
                 eval_progress_condition.notify_all()
+            if best_line:
+                writer = getattr(eval_bar, "write", None)
+                if callable(writer):
+                    writer(f"[step {step_idx}] {best_line}")
+                else:
+                    print(f"[step {step_idx}] {best_line}", flush=True)
 
     # Mutable records preserve streamed arrival order while vLLM reference
     # scoring fills its result concurrently with the CPU reward futures.
@@ -4582,6 +4659,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 code=res.code or "",
                 raw_score=res.raw_score,
                 construction=res.construction,
+                observation=res.stdout,
             )
             archive_eligible = bool(valids[r_idx] and codes[r_idx])
             if archive_eligible:
@@ -5656,6 +5734,11 @@ def main():
     elif legacy_resume is not None:
         n_states, n_rollouts = _restore_legacy_archive(sampler, exp_dir, before_step=start_step)
         print(f'[resume] reconstructed {n_states} valid archived candidates from {n_rollouts} earlier rollouts')
+    if resume_dir and getattr(problem, "name", "") == "gpu_mode":
+        restored_observations = _restore_archive_observations(sampler, exp_dir)
+        if restored_observations:
+            print(f"[resume] restored evaluator output for "
+                  f"{restored_observations} archived GPU candidate(s)")
     setting_log_only(f"[init] sampler archive size = {sampler.archive_size()}", flush=True)
 
     spo_rs_tracker = None

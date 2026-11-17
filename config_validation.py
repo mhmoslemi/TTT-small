@@ -95,7 +95,7 @@ PROBLEM_REQUIRED_KEYS = {
     "gpu_mode": frozenset({
         "problem_type", "score_scale", "gpu_type", "gpu_lease_timeout_s",
         "triton_version", "task_yaml", "lib_dir", "kernel_log_chars",
-        "kernel_timeout_s", "show_launch_note", "seed_from_reference",
+        "kernel_timeout_s", "seed_from_reference",
     }),
 }
 
@@ -135,7 +135,6 @@ EXCLUSIVE_KEY_OWNERS = {
     "kernel_python": frozenset({"gpu_mode"}),
     "kernel_log_chars": frozenset({"gpu_mode"}),
     "kernel_timeout_s": frozenset({"gpu_mode"}),
-    "show_launch_note": frozenset({"gpu_mode"}),
     "seed_from_reference": frozenset({"gpu_mode"}),
     "mla_seed_runtime_us": frozenset({"gpu_mode"}),
 }

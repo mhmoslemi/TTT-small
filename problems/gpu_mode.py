@@ -103,41 +103,6 @@ def arch_notes(gpu_type: str) -> str:
     return _ARCH_NOTES.get((gpu_type or "").strip().lower(), "")
 
 
-_LAUNCH_NOTE = """## Triton launch convention
-
-Every failure mode below has appeared in this search. Read this before writing.
-
-A `@triton.jit` function is NOT a Python function. It is launched with a grid
-subscript, and its `tl.constexpr` parameters exist only inside it:
-
-```python
-@triton.jit
-def my_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    m = offs < n
-    tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=m, other=0.0), mask=m)
-
-def custom_kernel(data):
-    ...
-    BLOCK = 128                                   # a host variable YOU define
-    grid = (triton.cdiv(n, BLOCK),)               # host-side, use triton.cdiv
-    my_kernel[grid](x, y, n, BLOCK=BLOCK)         # note the [grid] subscript
-```
-
-- `my_kernel(...)` without `[grid]` raises "Cannot call @triton.jit'd outside
-  the scope of a kernel".
-- `BLOCK`, `BLOCK_M`, `BLOCK_N` are not defined on the host unless you define
-  them there. Referencing one you only declared as a `tl.constexpr` parameter
-  raises NameError.
-- `tl.cdiv` is device-side. On the host use `triton.cdiv`.
-- Define the kernel at module top level, never nested inside `custom_kernel`.
-
-You do not have to move everything into Triton. A correct submission that keeps
-most of the computation in PyTorch and moves one hot region into a kernel scores;
-one that fails to launch scores zero."""
-
-
 def _clip(s: str, n: int) -> str:
     s = s or ""
     return s if len(s) <= n else s[:n // 3] + "\n...[truncated]...\n" + s[-(2 * n // 3):]
@@ -164,12 +129,6 @@ def collect_logs(result, limit: int = 4000) -> str:
         run = getattr(ev, "run", None)
         if run is None:
             continue
-        details = getattr(run, "result", {}) or {}
-        if str(details.get("evaluator", "")).startswith("trimul-"):
-            diagnostics = [f"evaluator: {details['evaluator']}"]
-            diagnostics.extend(f"{key}: {value}" for key, value in details.items()
-                               if key.endswith(".error"))
-            parts.append(f"[{name}] " + _clip("\n".join(diagnostics), limit))
         if not getattr(run, "passed", False):
             body = (getattr(run, "stderr", "") or "") + "\n" + (getattr(run, "stdout", "") or "")
             parts.append(f"[{name}] RUN FAILED\n" + _clip(body.strip(), limit))
@@ -468,7 +427,6 @@ class GpuMode(Problem):
 
         self.log_chars = int(cfg.get("kernel_log_chars", 4000))
         # 0 falls back to sandbox_timeout_s; set explicitly to override it.
-        self.show_launch_note = bool(cfg.get("show_launch_note", True))
         # Seed the tree with the task's reference submission instead of empty
         # code. With code="" the model writes a kernel from nothing at step 0,
         # and the whole batch fails on launch syntax rather than on anything
@@ -500,14 +458,20 @@ class GpuMode(Problem):
     def build_prompt(self, parent: ParentContext) -> List[dict]:
         state_ctx = render_state_context(self.metric_name, self.target, parent,
                                          maximize=self.maximize)
+        if parent.observation and parent.observation.strip():
+            stdout = parent.observation.strip()
+            if len(stdout) > 500:
+                stdout = "\n\n\t\t ...(TRUNCATED)...\n" + stdout[-500:]
+            state_ctx = (state_ctx.rstrip()
+                         + f"\n\n--- Previous Program Output ---\n{stdout}\n"
+                           "--- End Output ---")
 
         notes = arch_notes(self.gpu_type)
         arch_section = f"\n{notes}\n" if notes else ""
-        launch_section = f"\n{_LAUNCH_NOTE}\n" if self.show_launch_note else ""
 
         if self.problem_type == "trimul":
             user = f"""{TRIMUL_PROMPT}
-{arch_section}{launch_section}
+{arch_section}
 {state_ctx}
 Rules:
 - The tensors arguments passed in will be already on your cuda device.
@@ -517,13 +481,10 @@ Rules:
 - You must use triton {self.triton_version} and these kernels will be run on an {self.gpu_type}.
 - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
-- Do not wrap the kernel in a try/except that falls back to a slow reference path.
-  A fallback that silently produces correct-but-slow output hides the failure and
-  scores worse than letting the kernel fail loudly.
 """
         else:
             user = f"""{MLA_DECODE_PROMPT}
-{arch_section}{launch_section}
+{arch_section}
 {state_ctx}
 {MLA_DECODE_PROMPT_END}
 """
@@ -582,9 +543,11 @@ Rules:
             return RewardResult(reward=self.fail_score, parsed=False,
                                 msg="no_code_block", failure_kind="code")
 
-        # TriMul verifies executed kernels and their contribution in its evaluator.
-        if self.problem_type != "trimul" and "@triton.jit" not in code:
+        if "@triton.jit" not in code:
             return self._fail("Code must contain @triton.jit.")
+        if self.problem_type == "trimul" and "identity" in code:
+            return self._fail("Identity kernel is not allowed.",
+                              failure_kind="constraint")
 
         missing = self.missing_task_files()
         if missing:
