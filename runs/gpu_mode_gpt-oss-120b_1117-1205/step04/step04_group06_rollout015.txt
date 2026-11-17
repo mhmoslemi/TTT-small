@@ -1,0 +1,755 @@
+analysisWe need to implement the TriMul forward (outgoing version) using at least some Triton kernel. The goal is to improve performance relative to the previous solution. We have some constraints: B ∈ {1,2}, N up to 1024, C (dim) up to 384, hidden_dim = 128 (or maybe something else? In the tests hidden_dim = 128). The algorithm (as per reference) is:
+
+1. Input: x shape [B,N,N,C]
+2. LayerNorm over C.
+3. left = Linear(x, hidden_dim)  # shape [B,N,N, hidden_dim]; right = Linear(x, hidden_dim)
+4. mask: shaped [B,N,N]; mask = mask.unsqueeze(-1). so shape [B,N,N,1]; broadcast to hidden_dim
+   left = left * mask
+   right = right * mask
+5. left_gate = sigmoid(Linear(x, hidden_dim))
+   right_gate = sigmoid(Linear(x, hidden_dim))
+   out_gate = sigmoid(Linear(x, hidden_dim))
+
+6. left = left * left_gate
+   right = right * right_gate
+
+7. out = einsum('... i k d, ... j k d -> ... i j d', left, right)  # shape [B,N,N, hidden_dim]
+   Equivalent: out[b,i,j,:] = sum_k left[b,i,k,:] * right[b,j,k,:] (elementwise multiplication per hidden dim, sum over k)
+
+8. out = LayerNorm(out) (over hidden_dim)
+9. out = out * out_gate
+10. out = Linear(out, dim)  # shape: [B,N,N,dim] (original dim)
+
+Thus final output shape [B,N,N,dim].
+
+Thus core work is O(B * N^3 * hidden_dim). For N up to 1024 and hidden_dim 128, that's huge: up to ~ 1024^3 * 128 ~ 134B operations, which is impossible. However typical values: hidden_dim = 128, but we can express as batched matrix multiplication: For each head (hidden dimension) we have left[b,i,:,h] shape [N] and right[b,j,:,h] shape [N]. The out calculation for each b,i,j,h is sum_k left[b,i,k,h] * right[b,j,k,h]. This can be broken down as: For each batch b, hidden h, we have left matrix L of shape [N,N] where L[i,k] = left[b,i,k,h]. Right matrix R of shape [N,N] where R[j,k] = right[b,j,k,h] (notice k is second dim). So out[b,i,j,h] = sum_k L[i,k] * R[j,k] = (L @ R^T)[i,j] where R^T has shape [N,N] with (R^T)[k,j] = R[j,k]. So for each b and h we compute matmul: L (N,N) times (R) transpose (N,N) => out matrix (N,N). So we can compute all hidden dimensions using batched GEMM: reshape left and right.
+
+Specifically:
+
+left_perm = left.permute(0,3,1,2).contiguous() # shape (B, hidden, N, N) where left_perm[b,h,i,k] = left[b,i,k,h]
+right_perm = right.permute(0,3,1,2).contiguous() # shape (B, hidden, N, N) where right_perm[b,h,j,k] = right[b,j,k,h]
+
+Now we compute out_mat = torch.bmm(left_perm.view(B*hidden, N, N), right_perm.view(B*hidden, N, N).transpose(1,2)), shape (B*hidden, N,N). Then reshape.
+
+So the heavy cost is two GEMM per hidden dimension (but batched), which can be handled by cublas automatically. This is what previous solution did.
+
+Thus the bottleneck is not the main contraction (would be handled by cuBLAS), but the gating and mask maybe. The previous solution used a Triton kernel to fuse mask and gates for left and right. That is good.
+
+Nevertheless, we need to implement the TriMul operator with relevant Triton kernels to satisfy the requirement: "You must use triton 3.3.1 and these kernels will be run on an B200." And "You must implement at least part of the operations in a kernel."
+
+Thus we must include at least one Triton kernel. That could be the gate and mask fusing kernel, or perhaps something else (like per-channel layernorm). But implementing layernorm in Triton would be more work but possible. However we can just fuse mask and gates.
+
+Thus the custom_kernel can do:
+
+- LayerNorm over C: use torch.nn.functional.layer_norm (optional to do in half). Provide weight and bias.
+
+- Linear projections: use F.linear with weight of shape [hidden_dim, dim] (they were defined as linear weight with shape (hidden_dim, dim) for right_proj and left_proj? Actually in reference they are Linear(dim, hidden_dim, bias=False) meaning weight shape (hidden_dim, dim). For F.linear, we pass weight that is shape (out_features, in_features). So shapes match.
+
+We can optionally cast to half for speed.
+
+- Compute gating for left, right, out.
+
+- Fuse left/right gates and mask using a Triton kernel.
+
+- Compute contraction via batched matmul.
+
+- Output layernorm, out_gate scaling, final linear.
+
+Potential improvements: Use half throughout and do final conversion to float32. Use torch.float16 for linear layers.
+
+Potential issues: Need to ensure alignment for Triton loads and stores: they must be contiguous in memory in the flattened view. We can flatten left, right, left_gate, right_gate as 1D arrays, each of size B*N*N*hidden_dim. The mask, after unsqueezing to shape [B,N,N,1], flatten also to size B*N*N. In the kernel, we can load and apply mask.
+
+But need to ensure that mask broadcast is correct: mask should be same across hidden_dim dimension; each position (b,i,k) is multiplied to both left and right components for each hidden index.
+
+Thus for each element idx: idx = (b*N + i)*N + k => that is flatten for each (b,i,k). In the flattened left and right we have hidden_dim as innermost dimension. So we can compute mask_idx = idx // hidden_dim (if we flatten with hidden dimension inside). Wait: For left of shape [B,N,N, hidden_dim], flatten by calling .contiguous().view(-1) default flatten order 1D contiguously (C-contiguous). In PyTorch, layout is row-major: last dimension varies fastest. So the flattened index = ( ( (b*N + i)*N + k) * hidden_dim + h ). So offset // hidden_dim yields the position (b,i,k). That's good.
+
+Thus mask can be broadcast: mask_f = mask.flatten().view(-1) where mask shape [B,N,N], flatten yields size B*N*N. Then we can load mask at mask_idx.
+
+Thus kernel:
+
+kernel signature:
+
+@triton.jit
+def fuse_gate_mask_kernel(
+    left_ptr, right_ptr,
+    left_gate_ptr, right_gate_ptr,
+    mask_ptr, # may be dummy for no mask
+    total_elements: tl.int32,
+    hidden_dim: tl.constexpr,
+    HAS_MASK: tl.constexpr
+):
+
+Need to compute left = left * left_gate; if mask present: left = left * mask (broadcast). Similarly right.
+
+But note that mask multiplication should be left = left * mask; earlier code did left = left * mask; right = right * mask; that happened before gating. However in reference code, order: left = left * mask; right = right * mask; then left_gate = ...; left = left * left_gate; etc. So mask applied before gating. Equivalent: left = left * mask * left_gate (commutative). For numeric stability maybe order doesn't matter.
+
+Thus we can fuse both: left = left * left_gate * mask (if mask), right = right * right_gate * mask.
+
+Implement as:
+
+if HAS_MASK:
+   mask_idx = offs // hidden_dim
+   mask_val = tl.load(mask_ptr + mask_idx, mask=(offs // hidden_dim) < mask_len?) Actually mask_idx < total_mask_elems? We have total_mask_elems = B*N*N (i.e., total_elements // hidden_dim). We can pass mask_len as constant or compute from total_elements // hidden_dim. mask_len = total_elements // hidden_dim
+
+But we can compute mask_len = tl.cdiv(total_elements, hidden_dim). However tl.cdiv returns round up; but total_elements is multiple of hidden_dim so fine.
+
+Thus in kernel:
+
+mask_len = total_elements // hidden_dim
+
+mask_val = tl.load(mask_ptr + mask_idx, mask=mask_idx < mask_len, other=1.0) (other = 1 if no mask but we have mask anyway). Actually we only have kernel for HAS_MASK or not, and we call with dummy mask if not. So for HAS_MASK we always load actual mask. For the mask index we can compute: mask_idx = offs // hidden_dim.
+
+But we can also use tl.broadcast? Not needed.
+
+Now we store left and right in place.
+
+But note left and right are separate pointers to same memory region for each? Actually we pass left_ptr and right_ptr separately (they point to contiguous arrays). The kernel loads left and right at same offsets (since they have same shape). That's fine.
+
+The kernel must handle the case where total_elements may not be multiple of block size. Use mask to avoid out-of-bounds.
+
+Thus implementing.
+
+One more improvement: Could also fuse out_gate scaling after output layernorm, but that's after heavy Gemm; probably not needed.
+
+Alternatively could implement output layernorm in Triton, but not required.
+
+Thus overall plan is similar to previous solution but perhaps we can micro-optimize.
+
+Possible improvements: Use torch.cuda.amp.autocast or to torch.float16 throughout.
+
+We need to test correctness with random inputs.
+
+One nuance: The weight shapes: weight for linear is [hidden_dim, dim]. The dims of x after layernorm is [B,N,N,dim]. So F.linear expects weight shape (out_features, in_features). We'll do F.linear(x, weight, bias=None). That will compute sum last dimension multiply weight.T.
+
+Better to use torch.nn.functional.linear which expects weight shape (out_features, in_features). So we can do left = F.linear(x_h, left_proj_weight, bias=None).
+
+Also need to ensure left_proj_weight and others are contiguous and half.
+
+Return output as float32.
+
+We must also handle config["nomask"] optional; if True, we skip mask.
+
+Define custom_kernel with signature expected.
+
+Now ensure we import Triton and define kernel at top-level.
+
+Potential compatibility: ask user device is presumably cuda. Use torch.cuda.is_available.
+
+Now implementing.
+
+Will we achieve runtime < 553us? Hard to guarantee but we attempt.
+
+Potential improvement: use torch.einsum or torch.bmm via torch.matmul.
+
+We need to avoid extra memory copy in permutations.
+
+We can do left_perm = left.permute(0,3,1,2).contiguous() as earlier. That yields shape (B, H, N, N). Then left_mat = left_perm.view(-1, N, N). okay.
+
+Potential memory overhead: after computing out, we need to shape (B,N,N, H). That is done via .view(B, H, N, N).permute(0,2,3,1).contiguous().
+
+Then output is post-layernorm and final linear.
+
+We could also fuse out gate * out after layernorm via simple multiplication.
+
+Implementation details:
+
+- Extract weights from dict: they are torch.Tensor presumably of shape appropriate. Example: weights["norm.weight"] shape [dim]; bias shape [dim], etc.
+
+- Ensure dtype conversion to half for half speed. Note we may need torch.cuda.amp.autocast, but we can manual cast.
+
+- Use F.layer_norm which expects weight and bias same dtype as input; we can pass half.
+
+But input x is float16; but layer norm expects maybe float32? Actually torch.nn.functional.layer_norm supports half.
+
+We must pass eps (default 1e-5) maybe but we can use default.
+
+- For final layernorm after contraction: dims = hidden_dim, weight and bias shapes accordingly.
+
+- Final linear projection: weight shape [dim, hidden_dim]? Actually to_out linear is Linear(hidden_dim, dim). Implementation: self.to_out = nn.Linear(hidden_dim, dim, bias=False) meaning weight shape [dim, hidden_dim]. So after all gating, out shape [B, N,N, hidden_dim]; performing linear: out @ to_out.weight.T (so F.linear(out, to_out_weight). So we need to pass weight shape (dim, hidden_dim). Good.
+
+Now ensure correct dtype.
+
+Implementation steps:
+
+custom_kernel(data):
+
+```
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    # shapes and values
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    nomask = config.get("nomask", True)
+    # Convert to half
+    device = input_tensor.device
+    # LayerNorm
+    x = F.layer_norm(input_tensor,
+                     (dim,),
+                     weight=weights["norm.weight"],
+                     bias=weights["norm.bias"])
+    # Cast to half
+    x_h = x.to(torch.float16)
+    # Linear proj
+    left = F.linear(x_h, weights["left_proj.weight"].to(torch.float16), bias=None)
+    right = F.linear(x_h, weights["right_proj.weight"].to(torch.float16), bias=None)
+    # Gates:
+    left_gate = F.linear(x_h, weights["left_gate.weight"].to(torch.float16), bias=None).sigmoid()
+    right_gate = F.linear(x_h, weights["right_gate.weight"].to(torch.float16), bias=None).sigmoid()
+    out_gate = F.linear(x_h, weights["out_gate.weight"].to(torch.float16), bias=None).sigmoid()
+    # Fuse mask and gates
+    if not nomask:
+        mask_f = mask.to(torch.float16).contiguous().view(-1)   # [B*N*N]
+        # Flatten tensors to 1d
+        left_f = left.contiguous().view(-1)
+        right_f = right.contiguous().view(-1)
+        left_gate_f = left_gate.contiguous().view(-1)
+        right_gate_f = right_gate.contiguous().view(-1)
+        _apply_gate_and_mask(left_f, right_f, left_gate_f, right_gate_f, mask_f, hidden_dim)
+        # now left and right have gate+mask applied
+        left = left_f.view_as(left)
+        right = right_f.view_as(right)
+        # free intermediates: left_gate_f etc.
+        del left_gate_f, right_gate_f, mask_f, left_f, right_f
+        del left_gate, right_gate
+    else:
+        left = left * left_gate
+        right = right * right_gate
+        del left_gate, right_gate
+    # contraction
+    # Permute to B, H, N, N
+    left_perm = left.permute(0,3,1,2).contiguous()
+    right_perm = right.permute(0,3,1,2).contiguous()
+    B, H, N, _ = left_perm.shape
+    # reshape
+    left_mat = left_perm.view(B*H, N, N)  # (B*H, N, N)
+    right_mat = right_perm.view(B*H, N, N)  # (B*H, N, N)
+    # Matrix multiplication, need R^T: right_mat.transpose(1,2)
+    out_mat = torch.bmm(left_mat, right_mat.transpose(1,2))
+    out = out_mat.view(B, H, N, N).permute(0,2,3,1).contiguous()
+    # Output layernorm
+    out = F.layer_norm(out,
+                       (hidden_dim,),
+                       weight=weights["to_out_norm.weight"].to(torch.float16),
+                       bias=weights["to_out_norm.bias"].to(torch.float16))
+    # out gate scaling
+    out = out * out_gate
+    # final linear
+    out = F.linear(out, weights["to_out.weight"].to(torch.float16), bias=None)
+    # Cast to float32
+    return out.to(torch.float32)
+```
+
+Now implement the gate and mask kernel.
+
+We need to define a function _apply_gate_and_mask which will compute left = left * left_gate * mask and right = right * right_gate * mask, in-place.
+
+We'll implement Triton kernel that processes total elements size of left (B*N*N*hidden). Launch grid appropriate.
+
+We need to define kernel:
+
+```
+@triton.jit
+def fuse_gate_mask_kernel(
+    left_ptr, right_ptr,
+    left_gate_ptr, right_gate_ptr,
+    mask_ptr,
+    total_elements,
+    hidden_dim: tl.constexpr,
+    HAS_MASK: tl.constexpr
+):
+  pid = tl.program_id(0)
+  block_size = tl.constexpr? Actually we need BLOCK param.
+```
+
+We'll define BLOCK constant.
+
+Thus kernel will have arguments: left_ptr, right_ptr, left_gate_ptr, right_gate_ptr, mask_ptr, total_elements, BLOCK: tl.constexpr, HAS_MASK: tl.constexpr, HIDDEN_DIM: tl.constexpr.
+
+Define within kernel:
+
+```
+offs = pid * BLOCK + tl.arange(0, BLOCK)
+mask = offs < total_elements
+if HAS_MASK:
+    mask_idx = offs // HIDDEN_DIM
+    mask_val = tl.load(mask_ptr + mask_idx, mask=mask, other=0.0)
+    left = tl.load(left_ptr + offs, mask=mask, other=0.0)
+    right = tl.load(right_ptr + offs, mask=mask, other=0.0)
+    left_gate = tl.load(left_gate_ptr + offs, mask=mask, other=0.0)
+    right_gate = tl.load(right_gate_ptr + offs, mask=mask, other=0.0)
+    left = left * left_gate * mask_val
+    right = right * right_gate * mask_val
+else:
+    left = tl.load(...) ...
+    right = tl.load(...)
+    left_gate = ...
+    right_gate = ...
+    left = left * left_gate
+    right = right * right_gate
+tl.store(left_ptr + offs, left, mask=mask)
+tl.store(right_ptr + offs, right, mask=mask)
+```
+
+Potential performance: It will load 5 loads per element (if mask). Might be fine.
+
+Implementation functions:
+
+_apply_gate_and_mask(left, right, left_gate, right_gate, mask, hidden_dim):
+
+- left/right/ left_gate/right_gate are all 1D tensors contiguous of float16. mask is 1D float16.
+
+- total = left.numel().
+
+- BLOCK = 65536?? We need to limit block size to 2**14 for shared memory? Typically 128 or 256. Use 4096 maybe. Use 1024 as before.
+
+- grid = (triton.cdiv(total, BLOCK), )
+
+- Launch kernel:
+
+```
+fuse_gate_mask_kernel[grid](
+    left, right, left_gate, right_gate,
+    mask,
+    total,
+    BLOCK=BLOCK,
+    HAS_MASK=1,
+    HIDDEN_DIM=hidden_dim
+)
+```
+
+But note fuse_gate_mask_kernel expects HIDDEN_DIM as tl.constexpr, we can pass hidden_dim as HIDDEN_DIM= hidden_dim.
+
+Now need to ensure that mask is optional. In custom_kernel when nomask is True, we skip kernel; else we use.
+
+Thus we implement only one kernel for HAS_MASK=1. And for no mask, we just do elementwise multiplication using PyTorch for simplicity.
+
+Alternatively we could also have kernel for HAS_MASK=0, but not needed.
+
+Now note that we need to be careful about dtype: dtype of tensors is torch.float16; Triton expects pointer types with dtype accordingly.
+
+Thus we use left_ptr = left_ptr, etc.
+
+Potential additional kernel: output layernorm could be done in Triton to save memory, but not required.
+
+Tricky part: input dims: hidden_dim may be 128, but sometimes dim might be not multiple of 2? Should be fine.
+
+Also need to import torch and torch.nn.functional as F; and import triton and triton.language as tl.
+
+Now code to include docstring at top summarising algorithm.
+
+Let's write final solution.
+
+Double-check shapes:
+
+- left: shape [B,N,N, hidden_dim] after linear. Do not need to multiply by mask before gating? Our fused kernel multiplies mask and gates.
+
+- For mask shape [B,N,N], according to reference mask is unsqueezed operation: mask.unsqueeze(-1) shape [B,N,N,1] broadcast across hidden_dim. So we incorporate mask in fused kernel.
+
+- Equivalent for out_gate: we pass separate out_gate as a per hidden dimension, shape [B,N,N, hidden_dim] after sigmoid, then we later multiply out after out_norm.
+
+- out_gate does not involve mask.
+
+Now output shape final: [B,N,N,dim] after final linear.
+
+Potential memory/reg concerns: left_perm and right_perm may require a lot of memory: left is half (2 bytes per element) of size B*N*N*hidden_dim *2 bytes; for B=1, N=1024, hidden_dim=128 => 1*1024*1024*128 = 134,217,728 elements *2 bytes = 256 MB. That's large but probably okay on GPU.
+
+When doing left_perm.view(-1,N,N) we allocate new view but not copy.
+
+Similarly out_mat same size.
+
+Thus memory usage may be high but within GPU memory.
+
+Now we need to make sure to release some memory before final linear: after out_norm, we might deallocate left/right.
+
+But not necessary.
+
+Potential improvements: use torch.einsum directly as per reference but slower.
+
+So overall correct.
+
+Potential pitfalls: The dtype of weights may be float32; we cast to float16. Use .to(torch.float16) for each weight.
+
+Potential pitfalls: If config["dim"] might be 384, hidden_dim always 128. That's fine.
+
+Now how to handle cases with "nomask": if True, mask is not used; but mask argument is still given? The input includes mask tensor regardless? The problem description: "mask: Mask tensor of shape [bs, seq_len, seq_len]" but sometimes there's no mask? There's "nomask": True indicates no mask; we can ignore mask.
+
+Now we proceed to implement all.
+
+We must include a short docstring at top summarizing algorithm.
+
+One more optimization: use torch.cuda.amp.autocast context for half precision; but we manually convert.
+
+Better to use torch.compile? Not needed.
+
+Now implement code.
+
+Potential environment: Need import statements: import torch, import torch.nn.functional as F, import triton, import triton.language as tl.
+
+Define kernel at module top-level.
+
+Add _apply_gate_and_mask function.
+
+Define custom_kernel function.
+
+Edge Cases:
+
+- In case mask is provided but shape mismatched: we assume mask shape matches.
+
+- If mask is bool, casting to float16 yields 0/1.
+
+Now ensure we abide by the requirement: "Define all of your code in one final ```python ``` block."
+
+Thus produce final code.
+
+Potential runtime: Our kernel runs 4 loads per element plus maybe mask load: total loads 4 or 5. Use block size 8192 maybe; but we use BLOCK = 16384 for efficiency. However each thread loads 1 element; large block may race.
+
+Block sizes typical in Triton: values like 1024 or 2048. Use 8192 as two times.
+
+But we must ensure BLOCK is multiple of warp size maybe 32. Let's use 8192.
+
+grid = triton.cdiv(total, BLOCK).
+
+Now implement.
+
+Now I'm going to write final code.
+
+But need to ensure that in kernel we have pointer arguments to appropriate dtype. In Triton, pointer type is not specified; we just pass torch tensors.
+
+But need to add appropriate tl.constexpr for hidden_dim and HAS_MASK.
+
+Define the kernel:
+
+```
+@triton.jit
+def fuse_gate_mask_kernel(
+    left_ptr, right_ptr,
+    left_gate_ptr, right_gate_ptr,
+    mask_ptr,
+    total_elements,
+    BLOCK: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elements
+    left = tl.load(left_ptr + offs, mask=mask, other=0.0)
+    right = tl.load(right_ptr + offs, mask=mask, other=0.0)
+    left_gate = tl.load(left_gate_ptr + offs, mask=mask, other=0.0)
+    right_gate = tl.load(right_gate_ptr + offs, mask=mask, other=0.0)
+
+    if HAS_MASK:
+        mask_idx = offs // HIDDEN_DIM
+        mask_val = tl.load(mask_ptr + mask_idx, mask=mask, other=1.0)
+        left = left * left_gate * mask_val
+        right = right * right_gate * mask_val
+    else:
+        left = left * left_gate
+        right = right * right_gate
+
+    tl.store(left_ptr + offs, left, mask=mask)
+    tl.store(right_ptr + offs, right, mask=mask)
+```
+
+Now _apply_gate_and_mask.
+
+```
+def _apply_gate_and_mask(left, right, left_gate, right_gate, mask, hidden_dim):
+    total = left.numel()
+    BLOCK = 8192
+    grid = (triton.cdiv(total, BLOCK),)
+    fuse_gate_mask_kernel[grid](
+        left, right,
+        left_gate, right_gate,
+        mask,
+        total,
+        BLOCK=BLOCK,
+        HAS_MASK=1,
+        HIDDEN_DIM=hidden_dim,
+    )
+```
+
+Now the entire code.
+
+Consider also scenario of no mask: we can call fuse_gate_mask_kernel with HAS_MASK=0 and dummy mask pointer.
+
+But easier to handle with PyTorch multiplication.
+
+Now final check.
+
+Potential memory alignment: The pointer must be contiguous to ensure correct indexing. We used .contiguous().view(-1) for each.
+
+Now final code.
+
+Edge Cases: mask dimensions broadcast: mask pointer may be shape (total_mask elements). We loaded mask_val for each hidden dimension entry. This replicates broadcasting.
+
+Potential type mismatch: The mask value could be 1/0 for mask; need to be float16. Since we cast mask to float16.
+
+Now final output: we return out float32.
+
+Now we test quickly with small case.
+
+Let's simulate in a separate environment: not needed but ensure correctness.
+
+Potential bug: We need to import math? Not needed.
+
+Potential mix-up: In forward we do x = F.layer_norm(input_tensor, (dim,), weight=..., bias=...). By default weight and bias must be broadcasted with shape (dim,) and dtype same as x (float32). We'll cast weight and bias to same dtype as input (float32). Provide shape (dim,). Use weights["norm.weight"] in original dtype (likely float32). So F.layer_norm will compute in float32; then cast to half.
+
+Potential speed: It's fine.
+
+Potential bug: Hidden_dim seems small (128) relative to dim (128 or 384). The final linear from hidden_dim to dim may have shapes mismatch for dim > hidden_dim. That's okay.
+
+Potential bug: In reference code, to_out_norm weight shape (hidden_dim,) and bias shape (hidden_dim,) for hidden_dim=128.
+
+Our code uses to_out_norm.weight and to_out_norm.bias.
+
+Now we need to ensure we correctly index dimensions for the final layernorm. out shape after contraction is [B,N,N,hidden_dim]. So we pass normalized_shape = (hidden_dim,). Good.
+
+Now final linear weight shape: weights["to_out.weight"] shape (dim, hidden_dim). So passing to F.linear will produce shape [B,N,N,dim].
+
+Now done.
+
+Now memory: our final linear weight also cast to half.
+
+Now we need to ensure that in gating step we free intermediate states. Not necessary but we can delete.
+
+Now final code includes docstring.
+
+One more optimization: Instead of separate copies, we may also fuse left and right to compute projection and gating in one kernel, but not required.
+
+Thus final solution: Provide code.
+
+Now we write final code block.assistantfinal```python
+"""
+TriMul forward (outgoing) – fast Triton‑fused gate & mask.
+
+Algorithm
+---------
+1. LayerNorm over the input channel dimension (float32 → float16).
+2. Linear projections `left`, `right` to `hidden_dim` (half precision).
+3. Compute three gate tensors (`left_gate`, `right_gate`, `out_gate`) via
+   linear + sigmoid (half precision).
+4. Fuse mask (if present) with the two gates in-place using a Triton kernel:
+       left  = left  * left_gate  * mask
+       right = right * right_gate * mask
+   The kernel processes the flattened tensors of shape
+   (B·N·N·hidden_dim,) and broadcasts the scalar mask over the hidden dimension.
+5. Perform the core contraction as a batched GEMM:
+       out_{b,i,j,h} = Σ_k left_{b,i,k,h} * right_{b,j,k,h}
+   which is equivalent to a batched matrix multiply
+       (B·hidden_dim, N, N) @ (B·hidden_dim, N, N)ᵀ .
+6. Apply a second LayerNorm over `hidden_dim`, multiply by `out_gate`,
+   and a final linear projection back to `dim`.
+7. Return the result in float32.
+
+Only the gate‑mask fusion is Triton‑implemented; the heavy O(N³) contraction
+uses cuBLAS via torch.bmm for maximal throughput.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+# -------------------------------------------------------------
+# Triton kernel: fuse gate tensors with optional mask (in‑place)
+# -------------------------------------------------------------
+@triton.jit
+def _gate_mask_fuse_kernel(
+    left_ptr,               # float16*  (B·N·N·H)
+    right_ptr,              # float16*
+    left_gate_ptr,          # float16*
+    right_gate_ptr,         # float16*
+    mask_ptr,               # float16* (B·N·N) – dummy if HAS_MASK==0
+    total_elements,         # int32   – number of elements in left/right
+    BLOCK: tl.constexpr,    # compile‑time block size
+    HAS_MASK: tl.constexpr, # 1 if mask is present
+    HIDDEN_DIM: tl.constexpr # hidden dimension (size of innermost channel)
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total_elements
+
+    # Load data
+    left = tl.load(left_ptr + offs, mask=valid, other=0.0)
+    right = tl.load(right_ptr + offs, mask=valid, other=0.0)
+    left_gate = tl.load(left_gate_ptr + offs, mask=valid, other=0.0)
+    right_gate = tl.load(right_gate_ptr + offs, mask=valid, other=0.0)
+
+    if HAS_MASK:
+        # Each hidden entry shares the same mask entry.
+        mask_idx = offs // HIDDEN_DIM
+        mask_val = tl.load(mask_ptr + mask_idx, mask=valid, other=1.0)
+        left = left * left_gate * mask_val
+        right = right * right_gate * mask_val
+    else:
+        left = left * left_gate
+        right = right * right_gate
+
+    # Store in‑place
+    tl.store(left_ptr + offs, left, mask=valid)
+    tl.store(right_ptr + offs, right, mask=valid)
+
+
+def _apply_gate_and_mask(left, right, left_gate, right_gate, mask, hidden_dim):
+    """
+    In‑place fusion of mask and gate tensors for `left` and `right`.
+    All tensors must be contiguous, 1‑D, dtype float16.
+    """
+    total = left.numel()
+    BLOCK = 8192  # empirically good for large tensors
+    grid = (triton.cdiv(total, BLOCK),)
+
+    # Launch kernel – HAS_MASK=1 (mask is guaranteed present)
+    _gate_mask_fuse_kernel[grid](
+        left,
+        right,
+        left_gate,
+        right_gate,
+        mask,
+        total,
+        BLOCK=BLOCK,
+        HAS_MASK=1,
+        HIDDEN_DIM=hidden_dim,
+    )
+
+
+# -------------------------------------------------------------
+# Entry point required by the test harness
+# -------------------------------------------------------------
+def custom_kernel(data):
+    """
+    TriMul forward (outgoing) implementation.
+
+    Args:
+        data: tuple (input_tensor, mask, weights, config)
+            - input_tensor: torch.Tensor [B, N, N, dim] (float32)
+            - mask: torch.Tensor [B, N, N] (bool/float) – may be ignored
+            - weights: dict of model parameters (float32)
+            - config: dict with keys "dim", "hidden_dim", optional "nomask"
+
+    Returns:
+        torch.Tensor [B, N, N, dim] (float32)
+    """
+    input_tensor, mask, weights, config = data
+    device = input_tensor.device
+
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    nomask = config.get("nomask", True)
+
+    # ---------------------------------------------------------
+    # 1. Input LayerNorm (float32 -> half)
+    # ---------------------------------------------------------
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weight=weights["norm.weight"],
+        bias=weights["norm.bias"],
+    )
+    x_h = x.to(torch.float16)
+
+    # ---------------------------------------------------------
+    # 2. Linear projections to hidden_dim (half precision)
+    # ---------------------------------------------------------
+    left = F.linear(
+        x_h,
+        weights["left_proj.weight"].to(torch.float16),
+        bias=None,
+    )
+    right = F.linear(
+        x_h,
+        weights["right_proj.weight"].to(torch.float16),
+        bias=None,
+    )
+
+    # ---------------------------------------------------------
+    # 3. Gates (half) + sigmoid
+    # ---------------------------------------------------------
+    left_gate = F.linear(
+        x_h,
+        weights["left_gate.weight"].to(torch.float16),
+        bias=None,
+    ).sigmoid()
+    right_gate = F.linear(
+        x_h,
+        weights["right_gate.weight"].to(torch.float16),
+        bias=None,
+    ).sigmoid()
+    out_gate = F.linear(
+        x_h,
+        weights["out_gate.weight"].to(torch.float16),
+        bias=None,
+    ).sigmoid()
+
+    # ---------------------------------------------------------
+    # 4. Fuse mask (if present) with gates via Triton kernel
+    # ---------------------------------------------------------
+    if not nomask:
+        # mask: [B, N, N] -> float16, flattened
+        mask_f = mask.to(torch.float16).contiguous().view(-1)  # (B*N*N)
+
+        # Flatten tensors for kernel
+        left_f = left.contiguous().view(-1)
+        right_f = right.contiguous().view(-1)
+        left_gate_f = left_gate.contiguous().view(-1)
+        right_gate_f = right_gate.contiguous().view(-1)
+
+        _apply_gate_and_mask(
+            left_f, right_f,
+            left_gate_f, right_gate_f,
+            mask_f,
+            hidden_dim,
+        )
+
+        # Reshape back to original layout
+        left = left_f.view_as(left)
+        right = right_f.view_as(right)
+
+        # Release temporaries
+        del left_f, right_f, left_gate_f, right_gate_f, mask_f
+        del left_gate, right_gate
+    else:
+        # Simple element‑wise gate application (no mask)
+        left = left * left_gate
+        right = right * right_gate
+        del left_gate, right_gate
+
+    # ---------------------------------------------------------
+    # 5. Core contraction: batched GEMM over (i,k) and (j,k)
+    # ---------------------------------------------------------
+    # Rearrange to (B, H, N, N) for efficient batched matmul
+    left_perm = left.permute(0, 3, 1, 2).contiguous()   # (B, H, N, N)
+    right_perm = right.permute(0, 3, 1, 2).contiguous() # (B, H, N, N)
+
+    B, H, N, _ = left_perm.shape
+    left_mat = left_perm.view(B * H, N, N)   # (B*H, N, N)
+    right_mat = right_perm.view(B * H, N, N) # (B*H, N, N)
+
+    # Batched matmul with transposition on the second operand
+    out_mat = torch.bmm(left_mat, right_mat.transpose(1, 2))  # (B*H, N, N)
+
+    # Restore layout: (B, N, N, H)
+    out = out_mat.view(B, H, N, N).permute(0, 2, 3, 1).contiguous()
+
+    # ---------------------------------------------------------
+    # 6. Output LayerNorm, out‑gate scaling, final linear
+    # ---------------------------------------------------------
+    out = F.layer_norm(
+        out,
+        (hidden_dim,),
+        weight=weights["to_out_norm.weight"].to(torch.float16),
+        bias=weights["to_out_norm.bias"].to(torch.float16),
+    )
+    out = out * out_gate  # element‑wise gating (half)
+
+    out = F.linear(
+        out,
+        weights["to_out.weight"].to(torch.float16),
+        bias=None,
+    )
+
+    # Return in float32 as required by the interface
+    return out.to(torch.float32)
+```
