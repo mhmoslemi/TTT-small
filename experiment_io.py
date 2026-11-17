@@ -532,6 +532,35 @@ def save_strategy_response(exp_dir: Path, step: int, parent_group: int,
     return path
 
 
+def load_completed_strategy_responses(exp_dir: Path, step: int, parents: list,
+                                      strategies_per_parent: int):
+    """Return a complete interrupted planning result for the same parents."""
+    step_dir = Path(exp_dir) / f"step{step:02d}"
+    parent_path = step_dir / f"step{step:02d}.parents.json"
+    summary_path = step_dir / f"step{step:02d}.summary.json"
+    if strategies_per_parent < 1 or summary_path.exists() or not parent_path.exists():
+        return None
+
+    rows = json.loads(parent_path.read_text(encoding="utf-8")).get("parents", [])
+    rows = sorted(rows, key=lambda row: int(row["group"]))
+    if [int(row["group"]) for row in rows] != list(range(len(parents))):
+        raise RuntimeError("interrupted step has an invalid saved parent manifest")
+    if [str(row["parent_id"]) for row in rows] != [str(parent.id) for parent in parents]:
+        raise RuntimeError(
+            "interrupted step selected different parents; refusing to attach "
+            "saved strategies to the wrong coder prompts")
+
+    paths = [[
+        step_dir / (f"step{step:02d}_group{group:02d}_fold00_"
+                    f"strategy{strategy:02d}.txt")
+        for strategy in range(strategies_per_parent)
+    ] for group in range(len(parents))]
+    flat = [path for group in paths for path in group]
+    if not flat or not all(path.exists() for path in flat):
+        return None
+    return [[path.read_text(errors="replace") for path in group] for group in paths]
+
+
 def save_parent_selections(exp_dir: Path, step: int, sampler_type: str,
                            parents: list, picks_info: list, *, rollout_config=None):
     """Persist the exact parents selected for a step before generation/training.

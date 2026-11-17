@@ -1514,6 +1514,35 @@ def _rebind_saved_step_zero_parents(sampler, by_group, count):
     return [state for state, _saved_id in matches]
 
 
+def _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents):
+    """Restore seed UUIDs saved after planning but before any coder rollout."""
+    path = Path(exp_dir) / "step00" / "step00.parents.json"
+    if not path.exists():
+        return
+    rows = sorted(json.loads(path.read_text())["parents"],
+                  key=lambda row: int(row["group"]))
+    if len(rows) != len(parents):
+        return
+    if [str(row["parent_id"]) for row in rows] == [str(parent.id) for parent in parents]:
+        return
+
+    def same_number(saved, current):
+        return saved is None and current is None or (
+            saved is not None and current is not None
+            and float(saved) == float(current))
+
+    if (len({str(row["parent_id"]) for row in rows}) != len(rows)
+            or any(int(row["group"]) != group
+                   or not bool(row["parent_is_seed"]) or not parent.is_seed
+                   or int(row["parent_timestep"]) != int(parent.timestep)
+                   or not same_number(row.get("parent_reward"), parent.value)
+                   or not same_number(row.get("parent_raw_score"), parent.raw_score)
+                   for group, (row, parent) in enumerate(zip(rows, parents)))):
+        return
+    for row, parent in zip(rows, parents):
+        sampler.reassign_seed_id(parent, str(row["parent_id"]))
+
+
 def _resume_spo_rs_step_from_artifacts(
         backend, model, tokenizer, sampler, optimizer, step_idx, cfg, exp_dir,
         problem, parallel_trainer, spo_rs_tracker, sampling_adapter_path,
@@ -2022,7 +2051,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     from queue import Queue
 
     from search.sampler import State
-    from experiment_io import (save_best_state_snapshot, save_parent_selections, save_rollout,
+    from experiment_io import (load_completed_strategy_responses,
+                               save_best_state_snapshot, save_parent_selections, save_rollout,
                                save_rollout_logprobs,
                                save_rollout_artifacts,
                                save_strategy_response)
@@ -2048,6 +2078,12 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     clipped_policy_mode = _uses_clipped_policy_loss(active_advantage_mode)
     requested_parent_contexts = (int(cfg.groups_per_step))
     parents = sampler.sample_states(requested_parent_contexts, selection_step=step_idx)
+    if step_idx == 0:
+        _rebind_interrupted_step_zero_selection(sampler, exp_dir, parents)
+    two_stage_rollouts = bool(getattr(problem, "two_stage_rollouts", False))
+    strategies_per_parent = (int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
+    saved_strategy_responses = load_completed_strategy_responses(
+        exp_dir, step_idx, parents, strategies_per_parent)
     print(f"\n[step {step_idx}] parents picked: {len(parents)}")
     for i, info in enumerate(sampler.last_picks_info):
         tag = "seed" if info["is_seed"] else "expanded"
@@ -2206,8 +2242,6 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "count": count,
         })
 
-    two_stage_rollouts = bool(getattr(problem, "two_stage_rollouts", False))
-    strategies_per_parent = (int(cfg.strategies_per_parent) if two_stage_rollouts else 0)
     programs_per_strategy = (int(cfg.programs_per_strategy) if two_stage_rollouts else 0)
     pilot_programs_per_strategy = (int(getattr(cfg, "pilot_programs_per_strategy", -1)) if two_stage_rollouts else -1)
     phase2_allocation_method = str(getattr(cfg, "phase2_allocation_method", "rule_based")).strip().lower()
@@ -2257,7 +2291,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 "source_indices": list(schedule),
                 "strategies": [],
             })
-    def _record_strategy_response(chain, strategy_index, response_text):
+    def _record_strategy_response(chain, strategy_index, response_text, *, persist=True):
         """Save and register a strategy at stream-arrival time."""
         if len(chain["strategies"]) != int(strategy_index):
             raise RuntimeError(
@@ -2266,7 +2300,10 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
         raw_response = str(response_text or '')
         normalize_response = getattr(problem, "normalize_strategy_response", None)
         accepted_response = (str(normalize_response(raw_response)) if callable(normalize_response) else raw_response)
-        save_strategy_response(exp_dir, step_idx, int(chain["parent_group"]), int(strategy_index), accepted_response)
+        if persist:
+            save_strategy_response(
+                exp_dir, step_idx, int(chain["parent_group"]),
+                int(strategy_index), accepted_response)
         strategy, extraction_issue = _extract_final_strategy(accepted_response, strict=strict_strategy_validation)
         if extraction_issue is None and strict_strategy_validation:
             validate_strategy = getattr(problem, "strategy_output_issue", None)
@@ -2281,6 +2318,20 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "strategy": strategy,
             "extraction_issue": extraction_issue,
         })
+
+    restored_strategy_planning = saved_strategy_responses is not None
+    if restored_strategy_planning:
+        for strategy_index in range(strategies_per_parent):
+            for chain in strategy_chains:
+                _record_strategy_response(
+                    chain, strategy_index,
+                    saved_strategy_responses[int(chain["parent_group"])][strategy_index],
+                    persist=False)
+        print(
+            f"[resume] step {step_idx}: reused {len(strategy_chains) * strategies_per_parent} "
+            "saved strategies; continuing directly with coder rollouts",
+            flush=True,
+        )
 
     def _strategy_prompt(source_jobs, chain, strategy_index, *, retry=0):
         from copy import deepcopy
@@ -3355,7 +3406,15 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
     try:
         try:
             api_planned = bool(two_stage_rollouts and getattr(cfg, "strategy_backend", "local") == "api")
-            if api_planned:
+            if restored_strategy_planning:
+                source_prompt_jobs = prompt_jobs
+                prompt_jobs = _code_prompt_jobs(source_prompt_jobs, strategy_chains)
+                setting_log_only(
+                    f"[step {step_idx}] resumed two-stage coding: generating "
+                    f"{sum(job['count'] for job in prompt_jobs)} LoRA-policy "
+                    f"programs from {len(prompt_jobs)} saved strategy-conditioned prompts",
+                    flush=True)
+            if api_planned and not restored_strategy_planning:
                 from generation.strategy_api import run_strategy_rounds
                 if strategy_pool is None:
                     raise RuntimeError("API strategy mode requires its remote generation pool")
@@ -3386,7 +3445,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                 # above). CPU rewards and rewards on a distinct evaluation GPU
                 # start immediately. A one-card GPU problem defers evaluation
                 # until generation releases that same physical card.
-                if two_stage_rollouts and not api_planned:
+                if two_stage_rollouts and not api_planned and not restored_strategy_planning:
                     source_prompt_jobs = prompt_jobs
                     planning_pool = strategy_pool or gen_pool
                     setting_log_only(f"[step {step_idx}] hierarchical planning: "
@@ -3706,7 +3765,7 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
                     if cfg.deterministic:
                         torch.manual_seed((int(cfg.seed) * 1_000_003 + int(seed_step) * 1009 + 13) % (2**31 - 1))
 
-                if two_stage_rollouts and not api_planned:
+                if two_stage_rollouts and not api_planned and not restored_strategy_planning:
                     source_prompt_jobs = prompt_jobs
                     setting_log_only(f"[step {step_idx}] hierarchical planning: "
                           f"{len(strategy_chains)} chain(s) x "
