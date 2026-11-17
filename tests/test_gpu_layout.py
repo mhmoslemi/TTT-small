@@ -12,6 +12,148 @@ import runtime.gpu_runtime as gpu_runtime
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def trimul_evaluator(monkeypatch):
+    import importlib.util
+
+    directory = ROOT / "examples/gpu_mode/lib/bioml/trimul"
+    modules = {}
+    for name in ("task", "utils", "reference", "kernel_check", "eval"):
+        spec = importlib.util.spec_from_file_location(name, directory / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        modules[name] = module
+    return modules
+
+
+def test_trimul_mask_flags_reach_input_generation(trimul_evaluator, monkeypatch, tmp_path):
+    import torch
+    from types import SimpleNamespace
+    import yaml
+
+    task = yaml.safe_load((ROOT / "examples/gpu_mode/lib/bioml/trimul/task.yml").read_text())
+    assert {item["name"]: item["source"] for item in task["files"]}["kernel_check.py"] == "kernel_check.py"
+    cases = task["tests"] + task["benchmarks"]
+    path = tmp_path / "test_cases.txt"
+    path.write_text("\n".join(";".join(f"{key}:{val}" for key, val in case.items())
+                              for case in cases))
+    parsed = trimul_evaluator["eval"].get_test_cases(str(path), None)
+    assert [test.args for test in parsed] == cases
+    assert all(isinstance(test.args["nomask"], bool) for test in parsed)
+
+    # Use the real generator on CPU; only redirect its CUDA allocations.
+    reference = trimul_evaluator["reference"]
+    proxy = SimpleNamespace(**vars(torch))
+    proxy.Generator = lambda **kwargs: torch.Generator()
+    proxy.randn = lambda *args, **kwargs: torch.randn(*args, **{**kwargs, "device": "cpu"})
+    monkeypatch.setattr(reference, "torch", proxy)
+    unmasked = reference.generate_input(**parsed[0].args)[1]
+    masked = reference.generate_input(**parsed[1].args)[1]
+    assert torch.all(unmasked == 1)
+    assert torch.any(masked == 0) and torch.any(masked == 1)
+    with pytest.raises(TypeError, match="nomask must be a boolean"):
+        reference.generate_input(**{**parsed[1].args, "nomask": "False"})
+
+
+@pytest.mark.parametrize("mode,passes", [
+    ("useful", True), ("unused", False), ("dummy", False),
+    ("copy", False), ("warmup", False), ("probe_error", False),
+])
+def test_trimul_requires_contributing_triton_work(trimul_evaluator, monkeypatch, mode, passes):
+    from types import SimpleNamespace
+    import torch
+
+    class JITFunction:
+        fn = SimpleNamespace(__module__="submission")
+        __name__ = "test_kernel"
+
+        def run(self, x, out, *, grid, warmup):
+            ir = "tt.load; tt.store" if mode == "copy" else "arith.mulf %x, %x : f32"
+            if not warmup:
+                out.copy_(x if mode == "copy" else x * 2)
+            return SimpleNamespace(asm={"ttir": ir})
+
+    original = JITFunction.run
+    monkeypatch.setitem(sys.modules, "triton.runtime.jit", SimpleNamespace(JITFunction=JITFunction))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    jit = JITFunction()
+
+    def custom(data):
+        x = data[0]
+        if mode == "unused":
+            return x * 2
+        out = torch.empty_like(x)
+        jit.run(x * 2 if mode == "copy" else x, out, grid=(1,), warmup=mode == "warmup")
+        if mode == "probe_error" and torch.isnan(out).any():
+            raise RuntimeError("probe failed")
+        return x * 2 if mode in ("dummy", "warmup") else out
+
+    custom.__module__ = "submission"
+
+    def check(data, output):
+        torch.rand(1)  # The real reference also initializes module parameters.
+        return torch.allclose(output, data[0] * 2, rtol=.02, atol=.02), "wrong output"
+
+    rng = torch.get_rng_state()
+    good, message = trimul_evaluator["kernel_check"].check_triton_contribution(
+        custom, (torch.arange(1., 9.),), trimul_evaluator["eval"]._clone_data, check)
+    assert good is passes, message
+    assert JITFunction.run is original
+    assert torch.equal(rng, torch.get_rng_state())
+    if mode == "probe_error":
+        assert "probe failed" in message
+
+
+def test_trimul_contribution_on_real_cuda(trimul_evaluator):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA and Triton in the evaluator environment")
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def twice(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(X + idx, idx < N, other=0)
+        tl.store(Y + idx, value * 2, idx < N)
+
+    @triton.jit
+    def copy(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(Y + idx, tl.load(X + idx, idx < N, other=0), idx < N)
+
+    for mode in ("useful", "dummy", "copy"):
+        def custom(data):
+            x = data[0]
+            out = torch.empty_like(x)
+            if mode == "copy":
+                copy[(4,)](x * 2, out, x.numel(), 256)
+            else:
+                twice[(4,)](x, out, x.numel(), 256)
+            return x * 2 if mode == "dummy" else out
+
+        good, message = trimul_evaluator["kernel_check"].check_triton_contribution(
+            custom, (torch.arange(1., 1025., device="cuda"),),
+            trimul_evaluator["eval"]._clone_data,
+            lambda data, out: (torch.allclose(out, data[0] * 2), "wrong output"))
+        assert good is (mode == "useful"), message
+
+
+def test_trimul_audit_diagnostics_are_saved():
+    from types import SimpleNamespace
+    from problems.gpu_mode import collect_logs
+
+    run = SimpleNamespace(passed=False, stderr="", stdout="", result={
+        "evaluator": "trimul-masked-triton-v1",
+        "test.0.error": "No numerical submission Triton kernel executed",
+    })
+    logs = collect_logs(SimpleNamespace(runs={"test": SimpleNamespace(run=run)}))
+    assert "trimul-masked-triton-v1" in logs
+    assert "No numerical submission Triton kernel executed" in logs
+
+
 def test_trimul_alone_shares_its_evaluator_with_generation():
     trimul = gpu_runtime.allocate_gpu_roles([6, 7], "gpu_mode", "trimul")
     assert trimul.generation == [6, 7]

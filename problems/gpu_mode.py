@@ -164,6 +164,12 @@ def collect_logs(result, limit: int = 4000) -> str:
         run = getattr(ev, "run", None)
         if run is None:
             continue
+        details = getattr(run, "result", {}) or {}
+        if str(details.get("evaluator", "")).startswith("trimul-"):
+            diagnostics = [f"evaluator: {details['evaluator']}"]
+            diagnostics.extend(f"{key}: {value}" for key, value in details.items()
+                               if key.endswith(".error"))
+            parts.append(f"[{name}] " + _clip("\n".join(diagnostics), limit))
         if not getattr(run, "passed", False):
             body = (getattr(run, "stderr", "") or "") + "\n" + (getattr(run, "stdout", "") or "")
             parts.append(f"[{name}] RUN FAILED\n" + _clip(body.strip(), limit))
@@ -576,11 +582,9 @@ Rules:
             return RewardResult(reward=self.fail_score, parsed=False,
                                 msg="no_code_block", failure_kind="code")
 
-        if "@triton.jit" not in code:
+        # TriMul verifies executed kernels and their contribution in its evaluator.
+        if self.problem_type != "trimul" and "@triton.jit" not in code:
             return self._fail("Code must contain @triton.jit.")
-        if self.problem_type == "trimul" and "identity" in code:
-            return self._fail("Identity kernel is not allowed.",
-                              failure_kind="constraint")
 
         missing = self.missing_task_files()
         if missing:

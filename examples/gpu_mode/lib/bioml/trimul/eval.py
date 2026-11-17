@@ -18,6 +18,7 @@ except ImportError:
     TestSpec = dict
 
 from reference import check_implementation, generate_input
+from kernel_check import check_triton_contribution
 
 
 class PopcornOutput:
@@ -78,7 +79,8 @@ def get_test_cases(file_name: str, seed: Optional[int]) -> list[TestCase]:
             try:
                 val = int(val)
             except ValueError:
-                pass
+                if val.lower() in ("true", "false"):
+                    val = val.lower() == "true"
 
             case[key] = val
         tests.append(TestCase(spec=line, args=case))
@@ -155,10 +157,8 @@ def _run_single_test(test: TestCase):
     """
     from submission import custom_kernel
     data = generate_input(**test.args)
-    torch.cuda.synchronize()
-    submission_output = custom_kernel(_clone_data(data))
-    torch.cuda.synchronize()
-    return wrap_check_implementation(data, submission_output)
+    return check_triton_contribution(
+        custom_kernel, data, _clone_data, wrap_check_implementation)
 
 
 def run_single_test(pool: multiprocessing.Pool, test: TestCase):
@@ -203,12 +203,19 @@ def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_t
     durations = []
     # generate input data once
     data = generate_input(**test.args)
+    # Audit outside the timed loop, including every benchmark shape.
+    good, message = check_triton_contribution(
+        custom_kernel, data, _clone_data, wrap_check_implementation)
+    if not good:
+        return message
+
+    # Restore/verify ordinary execution after the counterfactual before timing.
     check_copy = _clone_data(data)
-    #  first, one obligatory correctness check
     output = custom_kernel(data)
     good, message = wrap_check_implementation(check_copy, output)
     if not good:
         return message
+    del output
 
     # now, do multiple timing runs without further correctness testing
     # there is an upper bound of 100 runs, and a lower bound of 3 runs;
@@ -344,6 +351,7 @@ def main():
     tests = get_test_cases(sys.argv[2], seed)
 
     with PopcornOutput(int(fd)) as logger:
+        logger.log("evaluator", "trimul-masked-triton-v1")
         import multiprocessing
         mp_context = multiprocessing.get_context('spawn')
         with mp_context.Pool(1) as pool:

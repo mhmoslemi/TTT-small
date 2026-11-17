@@ -111,7 +111,8 @@ def get_test_cases(file_name: str, seed: Optional[int]) -> list[TestCase]:
             try:
                 val = int(val)
             except ValueError:
-                pass
+                if val.lower() in ("true", "false"):
+                    val = val.lower() == "true"
             case[key] = val
         tests.append(TestCase(spec=line, args=case))
 
