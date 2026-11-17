@@ -521,7 +521,7 @@ def test_ram_timeout_during_sleep_is_not_swallowed_as_engine_failure():
     pool._pool = SimpleNamespace(sleep=sleep)
     with pytest.raises(host_memory.HostMemoryTimeout, match="test timeout"):
         pool.release()
-    assert not pool.active
+    assert pool.active  # The engines still own their GPUs until terminal cleanup.
 
 
 @pytest.mark.parametrize("hardware_profile", ["RTX6000", "B200_full_ram"])
@@ -684,6 +684,87 @@ def test_partial_trainer_restore_respects_physical_gpu_mapping(monkeypatch):
     assert not trainer.is_offloaded
     trainer.restore_after_generation()  # idempotent after the last wave
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("exits_after", [12, None])
+def test_vllm_shutdown_waits_for_confirmed_exit(monkeypatch, exits_after):
+    import psutil
+    from unittest.mock import Mock
+    from generation import gen_workers as workers
+
+    elapsed = [0.]
+    child = SimpleNamespace(
+        pid=123, terminate=Mock(), kill=Mock(),
+        is_running=lambda: exits_after is None or elapsed[0] < exits_after,
+        status=lambda: psutil.STATUS_DISK_SLEEP)
+    zombies = [SimpleNamespace(pid=pid, is_running=lambda: True,
+                              status=lambda state=state: state,
+                              terminate=Mock(), kill=Mock())
+               for pid, state in ((124, psutil.STATUS_ZOMBIE), (125, psutil.STATUS_DEAD))]
+
+    def wait(processes, timeout):
+        assert processes == [child]
+        elapsed[0] += timeout
+        return [], processes
+
+    monkeypatch.setattr(psutil, "wait_procs", wait)
+    monkeypatch.setattr(workers.time, "monotonic", lambda: elapsed[0])
+    if exits_after is None:
+        with pytest.raises(RuntimeError, match=r"123\(disk-sleep\).*refusing GPU handoff"):
+            workers._stop_vllm_processes([child, *zombies], timeout=15)
+    else:
+        workers._stop_vllm_processes([child, *zombies], timeout=15)
+        assert elapsed[0] >= exits_after
+    child.terminate.assert_called_once()
+    child.kill.assert_called_once()
+    for process in zombies:
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+
+def test_vllm_shutdown_preserves_orphan_identities_for_retry(monkeypatch):
+    import psutil
+    from unittest.mock import Mock
+    from generation import gen_workers as workers
+
+    child = SimpleNamespace(pid=321)
+    wrapper = SimpleNamespace(pid=123, is_alive=lambda: False, join=lambda **kw: None)
+    pool = object.__new__(workers.GenerationPool)
+    pool.backend, pool.procs, pool.task_queues = "vllm", [wrapper], [None]
+    pool._ready_worker_ids, pool._sleep_capable_workers, pool._async_worker_ids = {0}, {0}, {0}
+    process = Mock(side_effect=[SimpleNamespace(children=lambda **kw: [child]),
+                                psutil.NoSuchProcess(123), psutil.NoSuchProcess(123)])
+    cleanup = Mock(side_effect=[RuntimeError("cleanup incomplete"), None])
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(workers, "_stop_vllm_processes", cleanup)
+    monkeypatch.setattr(workers, "_terminate_vllm_process_group", lambda _: None)
+    pool._remember_worker_children(0)
+    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+        pool._stop_workers([0])
+    assert pool.procs == [wrapper]
+    assert pool._worker_descendants == {0: [child]}
+    pool._stop_workers([0])
+    assert cleanup.call_args.args == ([child],)
+    assert pool.procs == [None] and not pool._worker_descendants
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_vllm_release_retains_failed_pool_and_does_not_handoff(persistent):
+    from unittest.mock import Mock
+
+    after_stop = Mock()
+    pool = PhasedVLLMGenerationPool(lambda: None, after_stop)
+    engine = SimpleNamespace(
+        shutdown=Mock(side_effect=[RuntimeError("cleanup incomplete"), None]),
+        sleep=Mock(side_effect=RuntimeError("engine failed")))
+    pool._pool, pool._awake, pool._persistent = engine, True, persistent
+    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+        pool.release()
+    assert pool._pool is engine and pool.active
+    after_stop.assert_not_called()
+    pool.shutdown()
+    assert pool._pool is None and not pool.active
+    assert engine.shutdown.call_count == 2
 
 
 def test_vllm_shutdown_reaps_children_outside_wrapper_process_group():

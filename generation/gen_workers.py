@@ -230,6 +230,57 @@ def _terminate_vllm_process_group(process_group_id, grace_seconds=3.0):
     return True
 
 
+def _stop_vllm_processes(processes, timeout=120.0):
+    """Stop owned processes and confirm exit before reusing their GPUs."""
+    import psutil
+
+    def live(items):
+        remaining = []
+        for process in items:
+            try:
+                if not process.is_running():
+                    continue
+                status = process.status()
+                if status not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                    remaining.append((process, status))
+            except psutil.NoSuchProcess:
+                pass
+        return remaining
+
+    pending = [process for process, _ in live(processes)]
+    if not pending:
+        return
+    for process in pending:
+        try:
+            process.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, pending = psutil.wait_procs(pending, timeout=5)
+    pending = [process for process, _ in live(pending)]
+    for process in pending:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+    deadline = time.monotonic() + float(timeout)
+    next_report = time.monotonic()
+    while pending:
+        remaining = live(pending)
+        if not remaining:
+            return
+        now = time.monotonic()
+        detail = ", ".join(f"{process.pid}({status})" for process, status in remaining)
+        if now >= deadline:
+            raise RuntimeError(
+                f"vLLM processes still alive after SIGKILL: {detail}; "
+                "refusing GPU handoff")
+        if now >= next_report:
+            print(f"[pool] waiting for vLLM process cleanup: {detail}", flush=True)
+            next_report = now + 10
+        _, pending = psutil.wait_procs(
+            [process for process, _ in remaining], timeout=min(1.0, deadline - now))
+
+
 class _PrintBar:
     """Minimal stand-in for tqdm: prints progress at ~10% increments."""
 
@@ -2165,6 +2216,8 @@ class GenerationPool:
                 self._async_worker_ids.add(rank)
             self._ready_worker_ids.add(rank)
             pending.remove(rank)
+            if self.backend == "vllm":
+                self._remember_worker_children(rank)
             deadline = time.monotonic() + self._startup_timeout
             print(f"[pool] {len(self._ready_worker_ids)}/"
                   f"{self.num_workers} workers ready", flush=True)
@@ -2194,18 +2247,32 @@ class GenerationPool:
             raise HostMemoryTimeout("a shared RAM wait exceeded 2 hours; stopping generation")
         return worker_queue.get(timeout=timeout)
 
+    def _remember_worker_children(self, rank):
+        """Retain engine identities even if their wrapper exits before cleanup."""
+        import psutil
+
+        process = self.procs[rank]
+        if process is None or getattr(process, "pid", None) is None:
+            return
+        if not hasattr(self, "_worker_descendants"):
+            self._worker_descendants = {}
+        try:
+            known = {child.pid: child for child in self._worker_descendants.get(rank, ())}
+            known.update((child.pid, child) for child in
+                         psutil.Process(process.pid).children(recursive=True))
+            self._worker_descendants[rank] = list(known.values())
+        except psutil.NoSuchProcess:
+            pass
+
     def _stop_workers(self, worker_ids):
         worker_ids = tuple(int(rank) for rank in worker_ids)
-        descendants = {}
+        # Do not lose orphan identities when a failed cleanup is retried.
+        descendants = getattr(self, "_worker_descendants", {})
+        self._worker_descendants = descendants
         if self.backend == "vllm":
             import psutil
             for rank in worker_ids:
-                process = self.procs[rank]
-                if process is not None and process.pid is not None:
-                    try:
-                        descendants[rank] = psutil.Process(process.pid).children(recursive=True)
-                    except psutil.NoSuchProcess:
-                        pass
+                self._remember_worker_children(rank)
         for rank in worker_ids:
             process = self.procs[rank]
             task_queue = self.task_queues[rank]
@@ -2220,6 +2287,9 @@ class GenerationPool:
             if process is not None:
                 process.join(timeout=10)
                 if self.backend == "vllm" and process.pid is not None:
+                    # Let the wrapper reap its engines before terminating the
+                    # wrapper itself; CUDA teardown can outlast a short join.
+                    _stop_vllm_processes(descendants.get(rank, ()))
                     # The wrapper may already be gone while a vLLM EngineCore
                     # grandchild remains alive. Always reap its private group.
                     _terminate_vllm_process_group(process.pid)
@@ -2230,25 +2300,16 @@ class GenerationPool:
                 if process.is_alive():
                     process.kill()
                     process.join(timeout=5)
-            if descendants.get(rank):
-                for child in descendants[rank]:
+                if self.backend == "vllm" and process.is_alive():
                     try:
-                        child.terminate()
+                        _stop_vllm_processes((psutil.Process(process.pid),))
                     except psutil.NoSuchProcess:
                         pass
-                _, alive = psutil.wait_procs(descendants[rank], timeout=5)
-                for child in alive:
-                    try:
-                        child.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                _, alive = psutil.wait_procs(alive, timeout=5)
-                for child in alive:
-                    try:
-                        if child.status() != psutil.STATUS_ZOMBIE:
-                            raise RuntimeError(f"vLLM child {child.pid} did not exit; refusing GPU handoff")
-                    except psutil.NoSuchProcess:
-                        pass
+                    process.join(timeout=5)
+                    if process.is_alive():
+                        raise RuntimeError(
+                            f"vLLM wrapper {process.pid} did not exit; refusing GPU handoff")
+            descendants.pop(rank, None)
             self.procs[rank] = None
             self._ready_worker_ids.discard(rank)
             self._sleep_capable_workers.discard(rank)
@@ -3551,6 +3612,7 @@ class PhasedVLLMGenerationPool:
             return
         if host_admission is None:
             host_admission = self.host_memory_admission
+        handoff_ready = False
         try:
             if self._persistent:
                 try:
@@ -3563,23 +3625,12 @@ class PhasedVLLMGenerationPool:
                     from runtime.host_memory import HostMemoryTimeout
                     if isinstance(exc, HostMemoryTimeout):
                         raise
-                    # A vLLM EngineCore can die after an inference OOM.  It
-                    # cannot acknowledge sleep, but shutting down the complete
-                    # pool still releases its remaining processes and makes a
-                    # clean pool reload on the next phase safe.  Cleanup must
-                    # not turn an already handled optional-score failure into
-                    # a fatal training-step failure.
-                    failed_pool, self._pool = self._pool, None
+                    # A failed engine cannot acknowledge sleep. Retain its
+                    # pool until shutdown confirms the GPUs can be reused.
+                    self._pool.shutdown()
+                    self._pool = None
                     self._persistent = False
-                    try:
-                        failed_pool.shutdown()
-                    except Exception as shutdown_error:
-                        print(
-                            "[pool] failed vLLM engine also raised during "
-                            f"forced shutdown ({type(shutdown_error).__name__}); "
-                            "continuing after process cleanup request",
-                            flush=True,
-                        )
+                    handoff_ready = True
                     if after_sleep is not None:
                         raise
                     print(
@@ -3589,13 +3640,16 @@ class PhasedVLLMGenerationPool:
                         flush=True,
                     )
             else:
-                pool, self._pool = self._pool, None
-                pool.shutdown()
+                self._pool.shutdown()
+                self._pool = None
+                handoff_ready = True
                 if after_sleep:
                     after_sleep(self._pool_kwargs["gpu_ids"])
+            handoff_ready = True
         finally:
-            self._awake = False
-            self._after_stop()
+            if handoff_ready:
+                self._awake = False
+                self._after_stop()
 
     def shutdown(self):
         # Terminal cleanup has no next wake-up: copying every model to host
