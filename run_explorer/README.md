@@ -39,6 +39,8 @@ the HTML is a snapshot of the directory at build time. (`python3 build_explorer.
   a normalised **"progress toward the published reference"** chart (0 % = best of the first step, 100 % = the reference) that puts different problems on one axis; a side-by-side table and a **Hardware used** table (card, memory, compute capability, vLLM engines / tensor-parallel, evaluation CPUs).
 * A pill per problem in the top bar that opens that run's complete explorer (all tabs, what-ifs, constructions ...). Every explorer lives in its own frame, is inflated only when first opened, and keeps its state while you switch between problems.
   The theme button is shared; `↗ new tab` opens the current explorer on its own.
+* **⚡ Effort & speed** (separate page, second pill): tokens per rollout at every reasoning effort (Qwen3.8-27B low / medium / xhigh, gpt-oss-120b high), the estimated share that is thinking, the measured generation speed per GPU of both models on the B200 setup, and the generation time one rollout costs. Numbers come from `effort_stats.py` over the runs listed in `effort_runs.txt` (meta files for tokens, the pilot-phase progress bar of `temirnal.log` for speed). Per-effort speed cannot be read from the logs - the efforts run together in one batch - so that bar is derived (mean tokens ÷ the model's measured speed) and labelled as such.
+* Every run card, the side-by-side table and the explorer's top bar carry a coloured **reasoning-effort chip** (low = orange, medium = teal, high = violet, xhigh = crimson) with the effort mix of the scored rollouts on hover.
 * Add a problem by adding its run directory to `unified_runs.txt` (or on the command line) - problems without a profile still get the landing card and the pipeline tabs.
 
 ## Tabs
@@ -98,6 +100,10 @@ Re-run `python3 data/build_published.py [ac1|erdos]` (needs internet) to refresh
 2. Optionally create `data/published_<problem>.json` (same layout as the existing files) for the SOTA tab and the reference lines.
 Without a profile the explorer still works (pipeline, search, strategist, training, rollouts) and just skips the construction plots.
 
+### GPU Mode kernels (problem `gpu_mode`)
+A run whose `config.json` says `problem: gpu_mode` is a kernel task (TriMul, B200 in the current run): the solution is a program, not an array, so the *Solution* tab becomes **Kernel (TriMul)** (`template/js/tab_kernel.js`): best runtime per step against the published references, every valid kernel, a table of what the best kernel contains after each step (Triton / `tl.dot` / cuBLAS / fp16 ... by text search) and the source with a diff against the previous best. Nothing is recomputed in the browser - a runtime only exists on the GPU it was timed on. Strategist text saved as raw byte-level tokens (`ĊĠApproachĠand…`) is decoded for display.
+Reference data: `data/published_gpu_mode.json`, written by `data/build_published_gpu_mode.py` (live leaderboard 496 from `https://www.gpumode.com/api/leaderboard/496` + Table 4 of arXiv:2601.16175 quoted from the PDF: TTT-Discover 914.2 µs on B200, best human 1038.9 µs; the paper trained on H100 and could not submit B200 to the board). Re-run the script to refresh the leaderboard.
+
 ## Caveats worth knowing
 * For runs with a JEV gate, `config.json` is stale for the threshold: the real value is stored per step (the AC1 run used 0.9 for steps 0-3 and 0.68 from step 4).
 * Wall-clock phases are reconstructed from the HH:MM:SS timestamps of `temirnal.log` (no dates; resumed steps include restart time).
@@ -113,6 +119,7 @@ Without a profile the explorer still works (pipeline, search, strategist, traini
 make_explorer.sh    shell launcher (run directory in, html out)
 build_explorer.py   CLI: collect -> pack -> inline into the template
 collect.py          read-only reader of the run directory (parallel per step)
+effort_stats.py     tokens per rollout and generation speed per reasoning effort (hub page "Effort & speed"); runs listed in effort_runs.txt
 archive_sim.py      rebuilds the PUCT candidate window of every JEV step (for the substitutes) by replaying search/sampler.py's rules
 data/               published_<problem>.json (reference constructions, tables, history) and the script that rebuilds them
 unified_runs.txt    runs used by --unified when none are given

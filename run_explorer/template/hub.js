@@ -156,7 +156,7 @@ function sparkline(r) {
   let lo = Math.min(...vals), hi = Math.max(...vals); const pad = (hi - lo) * 0.1 || Math.abs(hi) * 1e-4;
   const labelBelow = ref != null && pts[pts.length - 1][1] > ref;      // the reference label goes on the side the curve is not on - leave room for it
   lo -= pad * (labelBelow ? 2.6 : 1); hi += pad * (labelBelow ? 1 : 1);
-  const d = Math.min(10, Math.max(2, Math.ceil(-Math.log10(hi - lo)) + 1));
+  const d = hi - lo > 50 ? 0 : Math.min(10, Math.max(2, Math.ceil(-Math.log10(hi - lo)) + 1));
   const xmax = Math.max(pts[pts.length - 1][0], 1);
   const wrap = h("div", { class: "hub-spark" });
   wrap.append(lineChart({
@@ -167,6 +167,19 @@ function sparkline(r) {
     tip: x => { const p = pts.find(q => q[0] === x); return `<b>step ${x}</b><br>best so far <b>${fx(p[1], r.dec)}</b>` + (ref != null ? `<br><span class="mut">${sgn(p[1] - ref, r.dec)} vs reference</span>` : ""); },
   }));
   return wrap;
+}
+
+const EFF_COL = { low: "#d9480f", medium: "#0b7285", high: "#7048e8", xhigh: "#c2255c" };
+const EFF_ORDER = ["low", "medium", "high", "xhigh"];
+function effText(mix) {
+  const n = Object.values(mix || {}).reduce((a, b) => a + b, 0);
+  return n ? Object.keys(mix).sort((a, b) => EFF_ORDER.indexOf(a) - EFF_ORDER.indexOf(b)).map(e => `${e} ${(100 * mix[e] / n).toFixed(mix[e] / n < 0.1 ? 1 : 0)} %`).join(" · ") : "";
+}
+function effChip(model, effort, title) { return h("span", { class: "effort-chip eff-" + effort, title: title || "" }, model, h("small", null, "· " + effort + " effort")); }
+function effortChipOf(r) {
+  const e = r.effort || {}; if (!e.base) return null;
+  const mix = effText(e.mix);
+  return effChip(r.coder, e.base, `The coder (${r.coder}) ran at reasoning effort "${e.base}".` + (mix ? ` Effort of its scored rollouts: ${mix}.` : "") + (Object.keys(e.mix || {}).length > 1 ? " The other efforts are a few pilot programs per strategy." : ""));
 }
 
 function runCard(r) {
@@ -184,6 +197,7 @@ function runCard(r) {
   return h("div", { class: "card pcard" },
     h("div", { class: "ptitle" }, h("span", { class: "sw", style: { background: r.color } }), r.title, h("span", { class: "pill " + st.cls, title: st.tip, style: { marginLeft: "auto" } }, st.t)),
     h("div", { class: "rname" }, r.run_name),
+    h("div", { class: "chiprow" }, effortChipOf(r), r.effort && Object.keys(r.effort.mix || {}).length > 1 ? h("span", { class: "sub" }, effText(r.effort.mix)) : null),
     h("div", { class: "big" }, h("span", { class: "v" }, fx(r.best, r.dec)), h("span", { class: "u" }, (r.metric || "best") + " · best so far")),
     h("div", { class: "gaprow" },
       gi ? [h("span", { class: "pill " + (gi.ok ? "good" : "") }, gi.ok ? "beats the reference" : "above the reference"), h("span", null, `${gi.txt} vs ${r.reference.label}`)] : h("span", { class: "sub" }, "no published reference for this problem"),
@@ -229,6 +243,7 @@ function compareCard() {
     ["Steps finished", r => `${r.steps_done} / ${r.steps_total || "?"}`],
     ["Programs · valid", r => `${int(r.rollouts)} · ${fx(r.valid_fraction * 100, 1)} %`],
     ["Coder / strategist", r => h("span", null, r.coder, h("span", { class: "sub" }, r.strategist))],
+    ["Coder reasoning effort", r => h("span", null, effortChipOf(r) || "–", r.effort && Object.keys(r.effort.mix || {}).length ? h("span", { class: "sub" }, effText(r.effort.mix)) : null)],
     ["Selection", r => r.selection || "PUCT"],
     ["Best so far", r => h("b", null, fx(r.best, r.dec), h("span", { class: "sub" }, r.metric))],
     ["Reference", r => r.reference ? h("span", null, fx(r.reference.value, r.dec), h("span", { class: "sub" }, r.reference.label)) : "–"],
@@ -251,7 +266,7 @@ function hardwareCardHub() {
     ["Coder generation", r => H(r).coder_engines ? `${H(r).coder_engines} vLLM engines, TP ${H(r).coder_tp}` : "vLLM"],
     ["Strategist generation", r => H(r).strategist_engines ? `${H(r).strategist_engines} vLLM engines, TP ${H(r).strategist_tp}` : "–"],
     ["Training layout", r => H(r).training_layout || "–"],
-    ["Evaluation (CPU)", r => H(r).eval_processes ? `${H(r).eval_processes} sandbox processes on ${H(r).eval_cpus_used || "?"} CPUs` : "–"],
+    ["Evaluation", r => H(r).kernel_gpu_id != null ? `kernels timed on GPU ${H(r).kernel_gpu_id} (${H(r).kernel_gpu_type || "GPU"}), one at a time` : (H(r).eval_processes ? `${H(r).eval_processes} CPU sandbox processes on ${H(r).eval_cpus_used || "?"} CPUs` : "–")],
     ["Host RAM for offload", r => H(r).host_offload_gib ? H(r).host_offload_gib + " GiB" : "–"],
     ["Basis of the card name", r => h("span", { class: "sub", style: { display: "inline" } }, H(r).basis || "")],
   ];
@@ -262,6 +277,131 @@ function tableCard(title, sub, rows) {
   const body = rows.map(([k, f]) => h("tr", null, h("td", { class: "rowh" }, k), RUNS.map(r => { const v = f(r); const td = h("td", null); if (typeof v === "string") td.innerHTML = esc(v); else td.append(v); return td; })));
   return h("div", { class: "card", style: { marginTop: "14px" } }, h("div", { class: "card-head" }, h("h2", null, title), h("span", { class: "sub" }, sub)),
     h("div", { class: "scroll", style: { maxHeight: "none" } }, h("table", { class: "t cmp" }, h("thead", null, head), h("tbody", null, body))));
+}
+
+/* ---------------------------------------------------------------- reasoning effort & speed (separate page) */
+const EFFORT = (() => { const el = document.getElementById("effort-data"); try { return el ? JSON.parse(el.textContent) : null; } catch (e) { return null; } })();
+const PROB_NAME = { ac1: "AC1", erdos: "Erdős C₅", gpu_mode: "GPU kernel (TriMul)" };
+let effProb = null;
+const k1 = v => (v >= 1000 ? (v / 1000).toFixed(v >= 100000 ? 0 : 1) + "k" : String(Math.round(v)));
+const modeName = g => g.model + " · " + g.effort;
+
+/* horizontal bars: rows = [{label, color, segs:[{v, op}], marks:[{v, kind}], end, tip}] */
+function hbars(o) {
+  const W = 940, L = o.left || 230, R = o.right || 130, rowH = 36, top = 24, H = top + o.rows.length * rowH + 6;
+  const X = v => L + Math.min(1, v / o.max) * (W - L - R);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": o.label || "bar chart" });
+  (o.ticks || []).forEach(t => {
+    s.append(svg("line", { class: "grid-line", x1: X(t), x2: X(t), y1: top - 4, y2: H - 4 }));
+    s.append(svg("text", { x: X(t), y: top - 9, "text-anchor": "middle" }, o.tickFmt ? o.tickFmt(t) : t));
+  });
+  o.rows.forEach((r, i) => {
+    const y = top + i * rowH, bh = 20;
+    s.append(svg("rect", { x: 0, y: y + 1, width: 9, height: 18, rx: 2, fill: r.color }));
+    s.append(svg("text", { class: "lbl", x: 16, y: y + 15 }, r.label));
+    let x0 = 0;
+    (r.segs || []).forEach(sg => { const w = Math.max(0, X(x0 + sg.v) - X(x0)); s.append(svg("rect", { x: X(x0), y, width: w, height: bh, fill: r.color, opacity: sg.op == null ? 1 : sg.op, rx: 2 })); x0 += sg.v; });
+    (r.marks || []).forEach(m => {
+      if (m.kind === "line") s.append(svg("line", { x1: X(m.v), x2: X(m.v), y1: y - 2, y2: y + bh + 2, stroke: "var(--ink)", "stroke-width": 2 }));
+      else s.append(svg("path", { d: `M${X(m.v)},${y + bh + 2} l-4.5,7 h9 z`, fill: "var(--ink)" }));
+    });
+    s.append(svg("text", { class: "lbl", x: W - R + 8, y: y + 15 }, r.end || ""));
+    const hit = svg("rect", { x: 0, y: y - 4, width: W, height: rowH - 2, fill: "transparent" });
+    hit.addEventListener("mousemove", ev => tipShow(r.tip || "", ev)); hit.addEventListener("mouseleave", tipHide);
+    s.append(hit);
+  });
+  const wrap = h("div", { class: "hub-chart" }); wrap.append(s); return wrap;
+}
+const niceStep = max => { const raw = max / 5, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p; };
+const ticksTo = (max, step) => { const t = []; for (let v = 0; v <= max + 1e-9; v += step) t.push(v); return t; };
+
+function effortReading(rows) {
+  const q = e => rows.find(g => g.model === "Qwen3.8-27B" && g.effort === e);
+  const lo = q("low"), me = q("medium"), xh = q("xhigh");
+  if (!lo) return "";
+  const parts = [];
+  if (xh) parts.push(`xhigh writes ${(xh.mean / lo.mean).toFixed(1)}× as many tokens as low (${k1(xh.mean)} vs ${k1(lo.mean)})`);
+  if (me) parts.push(`medium writes ${(me.mean / lo.mean).toFixed(2)}× the tokens of low - on this problem the two efforts are hardly different`);
+  return parts.length ? "Reading: " + parts.join("; ") + ". " : "";
+}
+function renderEffort() {
+  const root = $("#effortPage"); root.innerHTML = "";
+  if (!EFFORT || !EFFORT.groups || !EFFORT.groups.length) { root.append(h("h1", { class: "hub-h1" }, "Reasoning effort & speed"), h("p", { class: "hub-lede" }, "No effort statistics were embedded (effort_runs.txt is empty or the runs are missing).")); return; }
+  const G = EFFORT.groups, SP = EFFORT.speed || {};
+  const probs = ["ac1", "erdos", "gpu_mode"].filter(p => G.some(g => g.problem === p)).concat([...new Set(G.map(g => g.problem))].filter(p => !["ac1", "erdos", "gpu_mode"].includes(p)));
+  if (!effProb || !probs.includes(effProb)) effProb = probs[0];
+  const rows = G.filter(g => g.problem === effProb).sort((a, b) => (a.model < b.model ? -1 : a.model > b.model ? 1 : EFF_ORDER.indexOf(a.effort) - EFF_ORDER.indexOf(b.effort)));
+  const spd = m => (SP[m] ? SP[m].tps_gpu_median : null);
+  const gpuSec = g => (spd(g.model) ? g.mean / spd(g.model) : null);
+
+  root.append(h("h1", { class: "hub-h1" }, "Reasoning effort & generation speed"),
+    h("p", { class: "hub-lede" }, "How much the coder writes at each reasoning effort, and how fast the GPUs turn that into tokens. Everything here is measured on the runs listed at the bottom (", h("code", null, "effort_runs.txt"),
+      "); 'thinking' is an estimate from a sample of saved responses, the token counts and speeds are logged values."));
+
+  /* ---- problem selector + tiles */
+  const sel = h("div", { class: "row-flex", style: { marginBottom: "14px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } }, h("span", { class: "sub" }, "problem"),
+    probs.map(p => h("button", { class: "hub-pill" + (p === effProb ? " active" : ""), onclick: () => { effProb = p; renderEffort(); } }, PROB_NAME[p] || p)));
+  root.append(sel);
+  const tiles = h("div", { class: "kpis" });
+  rows.forEach(g => tiles.append(h("div", { class: "kpi" }, h("div", { class: "k" }, effChip(g.model, g.effort)),
+    h("div", { class: "v" }, k1(g.mean), h("span", { style: { fontSize: "13px", color: "var(--ink-3)", fontWeight: 500 } }, " tokens / rollout")),
+    h("div", { class: "d" }, g.think_est != null ? `≈ ${k1(g.think_est)} thinking (${Math.round(100 * g.think_share)} %) · ` : "", `median ${k1(g.median)} · 90 % under ${k1(g.p90)} · longest ${k1(g.max)} · n = ${int(g.n)}`))));
+  root.append(tiles);
+
+  /* ---- tokens per rollout */
+  const max = Math.max(...rows.map(g => g.p90), ...rows.map(g => g.mean)) * 1.08, st = niceStep(max);
+  const mx = Math.ceil(max / st) * st;
+  const bars = hbars({
+    label: "tokens per rollout by reasoning effort", max: mx, ticks: ticksTo(mx, st), tickFmt: k1, right: 210,
+    rows: rows.map(g => ({
+      label: modeName(g), color: EFF_COL[g.effort] || "var(--accent)",
+      segs: g.think_est != null ? [{ v: g.think_est, op: 1 }, { v: g.mean - g.think_est, op: 0.4 }] : [{ v: g.mean, op: 0.75 }],
+      marks: [{ v: g.median, kind: "line" }, { v: g.p90, kind: "tri" }], end: k1(g.mean) + (g.think_est != null ? "  (≈ " + k1(g.think_est) + " thinking)" : ""),
+      tip: `<b>${esc(modeName(g))}</b><br>mean <b>${int(g.mean)}</b> tokens · median ${int(g.median)} · 90 % under ${int(g.p90)} · longest ${int(g.max)}<br>` + (g.think_est != null ? `≈ ${int(g.think_est)} thinking + ${int(g.mean - g.think_est)} answer (estimated from ${Math.round(100 * g.think_share)} % of the characters)<br>` : "") + `<span class="mut">${int(g.n)} scored rollouts · ${g.runs.length} run${g.runs.length > 1 ? "s" : ""}</span>`,
+    })),
+  });
+  root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+    h("div", { class: "card-head" }, h("h2", null, "Tokens a rollout needs - " + (PROB_NAME[effProb] || effProb)), h("span", { class: "sub" }, "bar = mean response (dark = estimated thinking, light = code and answer) · | = median · ▲ = 90th percentile")),
+    bars,
+    h("div", { class: "sub", style: { marginTop: "6px" } }, effortReading(rows) + "The generation limit of the Qwen coder is 262,144 tokens per rollout. The effort setting is a request in the prompt, not a hard budget: the model decides how long to think, which is why the spread inside one mode is wide.")));
+
+  /* ---- speed */
+  const models = Object.keys(SP).sort();
+  if (models.length) {
+    const smax = Math.max(...models.map(m => Math.max(...SP[m].samples.map(x => x.tps_gpu)))) * 1.1, ss = niceStep(smax), sm = Math.ceil(smax / ss) * ss;
+    const colOf = m => (/gpt-oss/i.test(m) ? EFF_COL.high : EFF_COL.low);
+    const sbars = hbars({
+      label: "generation speed per GPU", max: sm, ticks: ticksTo(sm, ss), tickFmt: v => int(v), left: 270, right: 190,
+      rows: models.map(m => ({
+        label: m + (/gpt-oss/i.test(m) ? " · high" : " · low (pure steps)"), color: colOf(m), segs: [{ v: SP[m].tps_gpu_median, op: 0.85 }], dots: SP[m].samples.map(x => x.tps_gpu),
+        end: int(SP[m].tps_gpu_median) + " tokens/s per GPU", tip: `<b>${esc(m)}</b><br>median <b>${int(SP[m].tps_gpu_median)}</b> tokens/s per GPU (range ${int(SP[m].tps_gpu_min)} - ${int(SP[m].tps_gpu_max)})<br><span class="mut">${SP[m].n_timings} pilot phases from ${SP[m].n_runs} run${SP[m].n_runs > 1 ? "s" : ""} · ${esc(SP[m].basis)}</span>`,
+      })),
+    });
+    const q = SP["Qwen3.8-27B"], o = SP["gpt-oss-120b"];
+    const trows = [];
+    models.forEach(m => SP[m].samples.forEach(x => trows.push([m, x.run, x.step, x.rollouts, x.tokens, x.elapsed_s, x.tps_gpu, effText(x.mix)])));
+    root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+      h("div", { class: "card-head" }, h("h2", null, "How fast tokens are generated (2 × B200)"), h("span", { class: "sub" }, "tokens per second per GPU during the pilot phase (median of the measured steps)")),
+      sbars,
+      q && o ? h("p", { class: "sub", style: { margin: "4px 0 8px" } }, h("b", null, "gpt-oss-120b generates ≈ " + (o.tps_gpu_median / q.tps_gpu_median).toFixed(1) + "× more tokens per second per GPU than Qwen3.8-27B"), " on the same GPUs (a mixture-of-experts model with a few billion active parameters against a dense 27B model).") : null,
+      h("details", null, h("summary", { class: "sub", style: { cursor: "pointer" } }, "show the individual measurements"),
+        h("div", { class: "scroll", style: { maxHeight: "260px", marginTop: "6px" } }, h("table", { class: "t" },
+          h("thead", null, h("tr", null, ["model", "run", "step", "rollouts", "tokens", "seconds", "tokens/s/GPU", "effort mix"].map((c, i) => h("th", { class: i > 1 && i < 7 ? "num" : "" }, c)))),
+          h("tbody", null, trows.map(r => h("tr", null, r.map((c, i) => h("td", { class: i > 1 && i < 7 ? "num" : "" }, typeof c === "number" ? int(c) : c)))))))),
+      h("div", { class: "sub", style: { marginTop: "8px" } }, "Measured from the log's pilot-phase progress bar: the tokens of all pilot rollouts of a step divided by the time the bar took. The pilot phase generates everything at once and the evaluation of finished programs does not hold it back, so this is the effective speed of the generation GPUs - including the ramp-up and the tail where only the longest sequences are still running. Only runs on the B200 setup are used so both models share the hardware.")));
+
+    /* ---- derived cost */
+    const dr = rows.filter(g => gpuSec(g) != null);
+    if (dr.length) {
+      const dm = Math.max(...dr.map(gpuSec)) * 1.1, ds = niceStep(dm), dmx = Math.ceil(dm / ds) * ds;
+      root.append(h("div", { class: "card", style: { marginTop: "14px" } },
+        h("div", { class: "card-head" }, h("h2", null, "What one rollout costs in generation time - " + (PROB_NAME[effProb] || effProb)), h("span", { class: "sub" }, "GPU-seconds per rollout = mean tokens ÷ measured speed of that model")),
+        hbars({ label: "GPU-seconds per rollout", max: dmx, ticks: ticksTo(dmx, ds), tickFmt: v => int(v) + " s", rows: dr.map(g => ({ label: modeName(g), color: EFF_COL[g.effort] || "var(--accent)", segs: [{ v: gpuSec(g), op: 0.85 }], end: gpuSec(g).toFixed(gpuSec(g) < 10 ? 1 : 0) + " GPU-s",
+          tip: `<b>${esc(modeName(g))}</b><br>${int(g.mean)} tokens ÷ ${int(spd(g.model))} tokens/s per GPU = <b>${gpuSec(g).toFixed(1)}</b> GPU-seconds` })) }),
+        h("div", { class: "sub", style: { marginTop: "6px" } }, "Derived, not measured per effort: all efforts of a batch run together, so the logs only give the speed of the model as a whole. It assumes a token costs the same at every effort; very long (xhigh) contexts decode somewhat slower, so the xhigh bar is a lower bound.")));
+    }
+  }
+
 }
 
 function renderLanding() {
@@ -318,21 +458,25 @@ async function openRun(r) {
     $("#frames").append(h("div", { class: "warnbox", style: { margin: "30px" } }, "Could not load this explorer: " + (e && e.message || e) + ". Open the standalone file for this run instead."));
   } finally { if (spin) spin.remove(); }
 }
-function openOverview() {
+function openOverview(page) {
   $("#hubMain").hidden = false; $("#frames").hidden = true; $("#btnNewTab").hidden = true;
-  document.title = "Run Explorer - all problems"; $("#hubSub").textContent = "all problems";
+  const eff = page === "effort";
+  $("#landing").hidden = eff; $("#effortPage").hidden = !eff;
+  if (eff) renderEffort();
+  document.title = eff ? "Run Explorer - reasoning effort & speed" : "Run Explorer - all problems"; $("#hubSub").textContent = eff ? "reasoning effort & speed" : "all problems";
 }
-const currentView = () => { const v = (location.hash || "#overview").slice(1); return RUNS.some(r => r.id === v) ? v : "overview"; };
+const currentView = () => { const v = (location.hash || "#overview").slice(1); return v === "effort" || RUNS.some(r => r.id === v) ? v : "overview"; };
 function buildNav() {
   const nav = $("#hubNav"); nav.innerHTML = "";
   nav.append(h("button", { class: "hub-pill", "data-view": "overview", onclick: () => { location.hash = "#overview"; } }, "◧ All problems"));
+  if (EFFORT && EFFORT.groups && EFFORT.groups.length) nav.append(h("button", { class: "hub-pill", "data-view": "effort", title: "tokens per rollout and generation speed at each reasoning effort", onclick: () => { location.hash = "#effort"; } }, "⚡ Effort & speed"));
   RUNS.forEach(r => nav.append(h("button", { class: "hub-pill", "data-view": r.id, title: r.title + " - " + r.run_name, onclick: () => { location.hash = "#" + r.id; } },
     h("span", { class: "sw", style: { background: r.color } }), nameOf(r), h("small", null, r.best != null ? fx(r.best, r.dec) : ""))));
 }
 function route() {
   const v = currentView();
   document.querySelectorAll(".hub-pill").forEach(p => p.classList.toggle("active", p.dataset.view === v));
-  if (v === "overview") openOverview(); else openRun(RUNS.find(r => r.id === v));
+  if (v === "overview" || v === "effort") openOverview(v); else openRun(RUNS.find(r => r.id === v));
   window.scrollTo(0, 0);
 }
 

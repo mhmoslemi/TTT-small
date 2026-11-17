@@ -163,8 +163,8 @@ function gotchas() {
   return f;
 }
 function glossary() {
-  return GLOSSARY.filter(g => RUN.hasJev || g[0] !== "JEV").map(g => g[0] === "Seed" ? ["Seed", "One of the 8 initial trivial programs (" + fillText("{{SEEDDESC}}") + ", reward ≈ " + (PROB.seedReward ? PROB.seedReward.toFixed(2) : "?") + ")."]
-    : g[0] === "Upper bound (raw)" ? ["Raw score (" + PROB.metric + ")", PROB.glossRaw] : g[0] === "Reward" ? ["Reward", "1 / raw (0 for failures); higher is better."] : g);
+  return GLOSSARY.filter(g => RUN.hasJev || g[0] !== "JEV").map(g => g[0] === "Seed" ? ["Seed", PROB.seedText ? "One of the 8 initial parents: " + PROB.seedText + "." : "One of the 8 initial trivial programs (" + fillText("{{SEEDDESC}}") + ", reward ≈ " + (PROB.seedReward ? PROB.seedReward.toFixed(2) : "?") + ")."]
+    : g[0] === "Upper bound (raw)" ? ["Raw score (" + PROB.metric + ")", PROB.glossRaw] : g[0] === "Reward" ? ["Reward", PROB.rewardText || "1 / raw (0 for failures); higher is better."] : g[0] === "Valid" && PROB.validText ? ["Valid", PROB.validText] : g);
 }
 /* the per-stage text depends on the problem and on whether the run used the JEV gate */
 function stageView(sg) {

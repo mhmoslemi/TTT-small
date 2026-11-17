@@ -177,7 +177,6 @@ def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[T
     @param tests: A list of TestCase objects representing the test cases to be executed.
     @return: An integer representing the exit status: 0 if all tests pass, otherwise 112.
     """
-    passed = True
     logger.log("test-count", len(tests))
     for idx, test in enumerate(tests):
         logger.log(f"test.{idx}.spec", test.spec)
@@ -185,18 +184,15 @@ def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[T
         if not good:
             logger.log(f"test.{idx}.status", "fail")
             logger.log(f"test.{idx}.error", message)
-            passed = False
+            logger.log("check", "fail")
+            return 112
         else:
             logger.log(f"test.{idx}.status", "pass")
             if message:
                 logger.log(f"test.{idx}.message", message)
 
-    if passed:
-        logger.log("check", "pass")
-        return 0
-    else:
-        logger.log("check", "fail")
-        return 112
+    logger.log("check", "pass")
+    return 0
 
 
 def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float) -> Stats | Any:

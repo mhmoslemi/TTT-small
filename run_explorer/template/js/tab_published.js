@@ -31,8 +31,8 @@ registerTab({
     /* ------------------------------------------------ timeline (symmetric-log gap to the reference) */
     const hostT = h("div", { class: "chart" });
     const dated = rows.filter(r => r.date && monthIdx(r.date) >= 0), older = rows.filter(r => r.date && monthIdx(r.date) < 0);
-    root.append(card("Record progression", `published ${PROB.short} ${PROB.metric} over time (lower is better) · y-axis = gap to the reference (symmetric log) · filled = construction available and recomputed · ring = reported only · diamond = unreviewed claim`,
-      h("div", null, hostT, legend([{ color: S_COL(0), label: "this run" }, { color: cssVar("--ink-2"), label: "verified construction" }, rows.some(r => r.kind === "reported") ? { color: cssVar("--s4"), label: "reported" } : null, rows.some(r => r.kind === "claim") ? { color: cssVar("--s2"), label: "unreviewed claim" } : null, { color: cssVar("--ink-3"), label: "record so far", line: true }].filter(Boolean)),
+    root.append(card("Record progression", `published ${PROB.short} ${PROB.metric} over time (lower is better) · y-axis = gap to the reference (symmetric log) · ` + (PROB.kernel ? "ring = reported by the source" : "filled = construction available and recomputed · ring = reported only") + ` · diamond = unreviewed claim`,
+      h("div", null, hostT, legend([{ color: S_COL(0), label: "this run" }, rows.some(r => r.kind === "construction") ? { color: cssVar("--ink-2"), label: "verified construction" } : null, rows.some(r => r.kind === "reported") ? { color: cssVar("--s4"), label: "reported" } : null, rows.some(r => r.kind === "claim") ? { color: cssVar("--s2"), label: "unreviewed claim" } : null, { color: cssVar("--ink-3"), label: "record so far", line: true }].filter(Boolean)),
         older.length ? h("div", { class: "sub", style: { marginTop: "4px" } }, "Older results not on this time axis: " + older.map(r => `${r.label} ${+r.reported.toFixed(PROB.dec + 2)} (${r.date.slice(0, 4)})`).join("; ") + ".") : null)));
     registerChart(hostT, () => {
       const F = frame(hostT, { height: 420, margin: { l: 70, b: 40, t: 18, r: 30 } }), { svg, m, iw, ih } = F;
@@ -87,15 +87,17 @@ registerTab({
     const tb = table([
       { label: "method", get: r => h("span", { style: { fontWeight: r.me ? 700 : 400, fontStyle: r.kind === "claim" ? "italic" : "normal" } }, r.label) },
       { label: "date", get: r => r.date ? (r.date_approx ? "≈" : "") + r.date : "–" },
-      { label: "steps n", get: r => r.values ? fmt.n(r.values.length) : (r.n ? fmt.n(r.n) : "–"), num: true },
+      PROB.kernel ? null : { label: "steps n", get: r => r.values ? fmt.n(r.values.length) : (r.n ? fmt.n(r.n) : "–"), num: true },
       { label: "reported", get: r => fmt.rep(r.reported), num: true },
-      { label: "recomputed here", get: r => r.calc != null && !r.me ? fmt.rawx(r.calc) : "–", num: true, title: "the problem's score evaluated from the public height sequence, in your browser" },
-      { label: "Δ recomputed − reported", get: r => r.calc != null && !r.me && r.values ? (r.calc - r.reported >= 0 ? "+" : "−") + Math.abs(r.calc - r.reported).toExponential(1) : "", num: true, title: "positive = the printed bound is slightly BELOW what the construction really gives" },
-      { label: "this run − it", get: r => r.me ? "" : fmt.gap(best - val(r)), num: true },
+      PROB.kernel ? { label: "95% CI", get: r => r.ci ? `${r.ci[0]} – ${r.ci[1]}` : "", num: true, title: "confidence interval printed by the source (10 timing trials)" } : null,
+      PROB.kernel ? null : { label: "recomputed here", get: r => r.calc != null && !r.me ? fmt.rawx(r.calc) : "–", num: true, title: "the problem's score evaluated from the public height sequence, in your browser" },
+      PROB.kernel ? null : { label: "Δ recomputed − reported", get: r => r.calc != null && !r.me && r.values ? (r.calc - r.reported >= 0 ? "+" : "−") + Math.abs(r.calc - r.reported).toExponential(1) : "", num: true, title: "positive = the printed bound is slightly BELOW what the construction really gives" },
+      { label: PROB.kernel ? "this run − it (µs)" : "this run − it", get: r => r.me ? "" : fmt.gap(best - val(r)), num: true },
       { label: "status", get: stat },
       { label: "source", get: r => r.url ? h("a", { href: r.url, target: "_blank", rel: "noopener", onclick: e => e.stopPropagation() }, "link ↗") : "" },
-    ], all, { onRow: r => { if (r.values) { _sol.b = "pub:" + r.id; setState({ tab: "solution" }); } } });
-    root.append(h("div", { style: { marginTop: "14px" } }, card(`${PROB.short} results, lowest first`, "click a row with a construction to compare it with this run in the Solution tab", h("div", null, h("div", { class: "scroll", style: { maxHeight: "none" } }, tb),
+    ].filter(Boolean), all, { onRow: r => { if (r.values) { _sol.b = "pub:" + r.id; setState({ tab: "solution" }); } } });
+    root.append(h("div", { style: { marginTop: "14px" } }, card(`${PROB.short} results, lowest first`, PROB.kernel ? "runtime in µs, lower is better" : "click a row with a construction to compare it with this run in the Solution tab", h("div", null, h("div", { class: "scroll", style: { maxHeight: "none" } }, tb),
+      PROB.kernel ? h("div", { class: "sub", style: { marginTop: "8px" } }, "'reported' is the figure as printed by the source (paper tables) or returned by the GPU Mode leaderboard. A kernel's runtime depends on the GPU, so nothing is recomputed in the browser. The paper's B200 numbers are the mean of 10 trials run by the authors; the leaderboard rows are official submissions.") :
       h("div", { class: "sub", style: { marginTop: "8px" } }, "'reported' is the figure as printed by the source; 'recomputed' is evaluated here from the public height sequence (stored to 10 significant digits). Where the community-curated list replayed the same construction with exact arithmetic, the recomputed values agree with it to ~1e-9 (see ", h("a", { href: "https://github.com/teorth/optimizationproblems/issues/348", target: "_blank", rel: "noopener" }, "teorth/optimizationproblems#348"), ").")))));
 
     /* ------------------------------------------------ source tables (paper table, curated list ...) */

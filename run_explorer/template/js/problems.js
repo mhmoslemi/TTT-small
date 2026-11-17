@@ -105,6 +105,29 @@ reward = 1 / raw          (failure ⇒ 0)     seeds: raw ≈ 0.5 ⇒ reward ≈ 
   },
 };
 
+/* GPU Mode kernel tasks (problems/gpu_mode.py). The solution is a program (a GPU kernel), not an array - there is nothing to draw,
+   so `prep` stays null and the Solution tab shows the kernel source, its runtime and the references instead (tab_kernel.js). */
+PROFILES.gpu_mode = {
+  id: "gpu_mode", kernel: true, short: "TriMul", long: "GPU kernel runtime (GPU Mode TriMul)", metric: "runtime (µs)", dec: 1, K: 25, profileYmax: null, fYmax: null,
+  arrName: "the parent kernel", entry: "custom_kernel", file: "problems/gpu_mode.py", seedRewardFixed: 0, rewardScale: 1500,
+  intro: "an LLM-guided search for a faster <b>GPU kernel</b> (GPU Mode <b>TriMul</b>, the triangular multiplicative update of AlphaFold 3) - the coder writes Triton / PyTorch code and the runtime on the real GPU is the score",
+  recipeProblem: "minimise the TriMul kernel runtime",
+  prep: null, solIntro: "A GPU Mode task asks for a program, not a number list: the coder writes <code>custom_kernel(data)</code> (Triton + PyTorch) that must match the reference module on every test input and then be as fast as possible. The score is the <b>geometric mean of the measured runtimes over a fixed set of 7 input shapes</b>, on the GPU the run is configured for.",
+  solNote: "Runtimes are measured on the real GPU by the GPU Mode evaluation harness. A kernel that fails the correctness check, or runs longer than the time limit, scores nothing - it is not 'slow', it is invalid.",
+  overlayNote: "",
+  rewardShort: "reward = 1500 / runtime(µs)", rewardText: "1500 / runtime in µs (0 for failures); higher is better - 1500 µs is worth 1.0.",
+  validText: "Program parsed, built, passed the correctness tests on every input and was timed. It does not need to beat the parent.",
+  seedText: "the starting 'parents' have no program yet (score 0, reward 0) - the first kernels are written from the task description",
+  evalEq: `runtime  = geometric mean over 7 benchmark shapes of the kernel's measured time (µs)   (after the correctness tests pass)
+reward   = 1500 / runtime          (failure ⇒ 0)         e.g. 3,217 µs ⇒ 0.466,  914 µs ⇒ 1.64,  554 µs ⇒ 2.71`,
+  evalBody: `<p>Each kernel is built and run by the GPU Mode evaluation harness on a <b>dedicated GPU</b> (kernel_gpu_id), in a child process that is killed after the time limit. It must define <code>custom_kernel(data)</code>, reproduce the PyTorch reference within the task's tolerance on every test input, and is then timed on 7 benchmark shapes (batch 1-2, sequence length 256-1024, dim 128 or 384).</p>
+    <p><b>Reward = 1500 / runtime in µs</b> (higher is better); every failure gets reward 0. Most failures are <code>constraint</code> (the kernel ran but failed the correctness tests), the rest are build / runtime errors or timeouts.</p>
+    <p>The target runtime only appears in the prompt and in this page; it does not enter the reward.</p>`,
+  evalRefs: ["problems/gpu_mode.py (compute_reward: isolated child process with timeout; reward = score_scale / runtime_us)", "examples/gpu_mode/lib/bioml/trimul/task.yml (benchmark shapes, tolerance)", "evaluation of kernels on the GPU named by kernel_gpu_id"],
+  glossRaw: "geometric-mean runtime in microseconds over the 7 benchmark shapes - the quantity to minimise.",
+  sizeHint: "lines",
+};
+
 function genericProfile(id) {
   return {
     id: id || "generic", short: (id || "problem").toUpperCase(), long: id || "this problem", metric: "score", dec: 6, K: 1e-4, profileYmax: null, fYmax: null, arrName: "the parent array", entry: "solve", file: "problems/<problem>.py",
@@ -125,8 +148,8 @@ function setupProblem() {
   // facts about the run
   const roots = (TREE.roots || []).map(i => TREE.nodes[i][1]).filter(x => x > 0);
   PROB.seedRaw = roots.length ? mean(roots) : NaN;
-  PROB.seedRewards = roots.map(x => 1 / x);
-  PROB.seedReward = roots.length ? mean(PROB.seedRewards) : 0.5;
+  PROB.seedRewards = PROB.seedRewardFixed != null ? [PROB.seedRewardFixed] : roots.map(x => 1 / x);
+  PROB.seedReward = PROB.seedRewardFixed != null ? PROB.seedRewardFixed : (roots.length ? mean(PROB.seedRewards) : 0.5);
   const rew = R.filter(r => r.valid && r.reward > 0).map(r => r.reward);
   const rmax = rew.length ? Math.max(...rew) : PROB.seedReward;
   PROB.rewardMax = niceCeil(Math.max(rmax, PROB.seedReward) * 1.08);

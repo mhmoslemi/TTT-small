@@ -25,10 +25,20 @@ const fmt = {
   id: s => s ? String(s).slice(0, 8) : "–",
   dh: s => { if (s == null || isNaN(s)) return "–"; let h = Math.round(s / 3600); const d = Math.floor(h / 24); h -= d * 24; return d ? `${d}d ${String(h).padStart(2, "0")}h` : `${h}h`; },
   tok: x => x == null ? "–" : x >= 1e6 ? (x / 1e6).toFixed(1) + "M" : x >= 1000 ? (x / 1000).toFixed(1) + "k" : String(x),
-  gap: x => x == null || isNaN(x) ? "–" : (x >= 0 ? "+" : "−") + Math.abs(x).toPrecision(3),
+  gap: x => x == null || isNaN(x) ? "–" : (x >= 0 ? "+" : "−") + (PROB && PROB.kernel ? Number(Math.abs(x).toFixed(Math.abs(x) >= 100 ? 0 : 1)).toLocaleString("en-US") : Math.abs(x).toPrecision(3)),
   pctGap: x => x == null || isNaN(x) ? "–" : (x >= 0 ? "+" : "−") + Math.abs(x * 100).toPrecision(2) + "%",
   sign: (x, d = 3) => x == null || isNaN(x) ? "–" : (x >= 0 ? "+" : "") + Number(x).toFixed(d),
 };
+/* which reasoning effort the coder ran at: the configured base effort and what the rollouts really used */
+function effortInfo() {
+  const mix = {}; let n = 0;
+  R.forEach(r => { if (r.effort) { mix[r.effort] = (mix[r.effort] || 0) + 1; n++; } });
+  const base = CFG.coder_reasoning_effort || (n ? Object.keys(mix).sort((a, b) => mix[b] - mix[a])[0] : "");
+  const model = String(CFG.coder_model_name || CFG.model_name || "coder").split("/").filter(Boolean).pop().replace(/^Qwen3\.8-27B.*/i, "Qwen3.8-27B").replace(/^gpt-oss-120b.*/i, "gpt-oss-120b");
+  const order = ["low", "medium", "high", "xhigh"];
+  const text = Object.keys(mix).sort((a, b) => order.indexOf(a) - order.indexOf(b)).map(e => `${e} ${(100 * mix[e] / n).toFixed(mix[e] / n < 0.1 ? 1 : 0)}%`).join(" · ");
+  return { base, mix, n, model, text };
+}
 const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const S_COL = i => cssVar("--s" + ((i % 8) + 1));
 const STRAT_LABEL = ["S0", "S1", "S2", "S3"];

@@ -42,6 +42,7 @@ registerTab({
   async render(root) {
     const heavy = await lazy("heavy");
     const pub = await lazy("pub");
+    if (PROB.kernel) { await kernelSolution(root, heavy, pub); return; }          // the solution is a program: tab_kernel.js
     const snaps = heavy.best.filter(b => b.construction && b.construction.length);
     const pubs = ((pub && pub.results) || []).filter(r => r.values && r.values.length && pubVisible(r));
     root.append(pageHead("The construction the search found",

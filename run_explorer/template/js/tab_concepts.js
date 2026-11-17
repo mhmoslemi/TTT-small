@@ -22,57 +22,70 @@ const FILE_MAP = [
 
 function architectureSvg(host) {
   registerChart(host, () => {
-    const W = 1130, H = 476;
+    const W = 1190, H = 700;
     host.innerHTML = "";
-    const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", style: "max-width:1130px" }, host);
+    const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", style: "max-width:1190px" }, host);
     const defs = sv("defs", null, svg);
     ["a", "b"].forEach(k => { const m = sv("marker", { id: "ar" + k, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" }, defs); sv("path", { d: "M0,0L10,5L0,10z", fill: k === "a" ? cssVar("--ink-3") : cssVar("--s4") }, m); });
     const col = { search: cssVar("--s4"), strat: cssVar("--s2"), coder: cssVar("--s1"), cpu: cssVar("--s3"), train: cssVar("--s8"), jev: cssVar("--s7") };
-    const box = (x, y, w, hh, title, sub, c, stage) => {
+    const last = ST[STEPS[STEPS.length - 1]] || {};
+    const nm = p => String(p || "").split("/").filter(Boolean).pop();
+    const P = CFG.groups_per_step || 8, S = CFG.strategies_per_parent || 4, per = CFG.group_size || 64, Hn = CFG.pilot_programs_per_strategy || 11, Bn = Math.max(0, per - S * Hn);
+    const jevThr = ((last.jev || {}).threshold), mult = CFG.jev_candidate_multiplier || 3;
+    /* centred box: soft fill in the stage colour, bold title, grey sub-lines; click = open that stage in the Pipeline tab */
+    const box = (x, y, w, hh, title, sub, c, stage, tsize) => {
       const g = sv("g", { style: stage ? "cursor:pointer" : "" }, svg);
-      sv("rect", { x, y, width: w, height: hh, rx: 10, fill: cssVar("--surface"), stroke: c, "stroke-width": 2 }, g);
-      sv("rect", { x, y, width: 6, height: hh, rx: 3, fill: c }, g);
-      const t = sv("text", { x: x + 16, y: y + 24, style: "font-weight:600;font-size:13px;fill:" + cssVar("--ink") }, g); t.textContent = title;
-      sub.split("\n").forEach((ln, i) => { const s = sv("text", { x: x + 16, y: y + 42 + i * 14, style: "font-size:11px;fill:" + cssVar("--ink-2") }, g); s.textContent = ln; });
+      sv("rect", { x, y, width: w, height: hh, rx: 7, fill: c, "fill-opacity": 0.11, stroke: c, "stroke-width": 1.6 }, g);
+      const lines = String(sub || "").split("\n").filter(Boolean), top = y + hh / 2 - (lines.length * 7.5) - 2;
+      const t = sv("text", { x: x + w / 2, y: top + 6, "text-anchor": "middle", style: `font-weight:700;font-size:${tsize || 15}px;fill:${cssVar("--ink")}` }, g); t.textContent = title;
+      lines.forEach((ln, i) => { const s2 = sv("text", { x: x + w / 2, y: top + 25 + i * 14.5, "text-anchor": "middle", style: "font-size:11.5px;fill:" + cssVar("--ink-2") }, g); s2.textContent = ln; });
       if (stage) g.addEventListener("click", () => { _stageSel = stage; setState({ tab: "pipeline" }); });
       return g;
     };
-    const arrow = (d, label, dashed, lx, ly, c) => {
-      sv("path", { d, fill: "none", stroke: c || cssVar("--ink-3"), "stroke-width": 1.6, "stroke-dasharray": dashed ? "5 4" : "", "marker-end": `url(#ar${dashed ? "b" : "a"})` }, svg);
-      if (label) { const t = sv("text", { x: lx, y: ly, "text-anchor": "middle", style: "font-size:10.5px;fill:" + cssVar("--ink-3") }, svg); t.textContent = label; }
+    const arrow = (d, label, dashed, lx, ly, c, anchor) => {
+      sv("path", { d, fill: "none", stroke: c || cssVar("--ink-3"), "stroke-width": 1.5, "stroke-dasharray": dashed ? "5 4" : "", "marker-end": `url(#ar${dashed ? "b" : "a"})` }, svg);
+      if (label) { const t = sv("text", { x: lx, y: ly, "text-anchor": anchor || "middle", style: "font-size:11px;fill:" + (c || cssVar("--ink-3")) }, svg); t.textContent = label; }
     };
-    // row A
-    box(20, 24, 200, 74, "Archive", "valid, de-duplicated programs\n8 seeds + ~63 per step · cap 2000", col.search, "archive");
-    box(285, 24, 190, 74, "PUCT ranking", "Q + c·scale·P·√(1+T)/(1+n)\nrank-based prior P", col.search, "select");
-    if (RUN.hasJev) box(540, 24, 220, 74, "JEV gate · GLiDE-9B", "reject if P(same core idea) ≥ " + (((ST[STEPS[STEPS.length - 1]] || {}).jev || {}).threshold || 0.68) + "\nlooks at top 3×8 = 24 states", col.jev, "select");
-    else box(540, 24, 220, 74, "Lineage blocking", "skip ancestors / descendants of\nevery picked parent (no JEV gate)", col.search, "select");
-    box(825, 24, 200, 74, "8 parents", "one per group\n+ their code, score, construction", col.search, "select");
-    arrow("M220,61H283", "", false); arrow("M475,61H538", "", false); arrow("M760,61H823", "", false);
-    // row B (right to left)
-    box(825, 168, 200, 82, "Strategist chains", String(CFG.strategy_model_name || "?").split("/").pop() + " (frozen)\n" + (CFG.strategies_per_parent || 4) + " sequential plans per parent\nup to " + ((CFG.strategy_format_max_retries != null ? CFG.strategy_format_max_retries : 3) + 1) + " attempts, else fallback", col.strat, "strategist");
-    box(540, 168, 220, 82, "32 strategy plans", "<strategy> blocks: approach, math,\nprocedure, search, budget, contract\n(thinking never reaches the coder)", col.strat, "strategist");
-    { const nm = p => String(p || "").split("/").filter(Boolean).pop(); const L = STEPS[STEPS.length - 1], pil = CFG.pilot_programs_per_strategy || 11;
-      box(285, 168, 190, 82, "Coder", nm(CFG.coder_model_name || CFG.model_name) + " + LoRA r=" + (CFG.lora_rank || "?") + "\nvLLM, thinking '" + (CFG.coder_reasoning_effort || "?") + "'\n" + pil + " pilot programs / strategy", col.coder, "pilot"); }
-    { const per = (CFG.groups_per_step || 8) * (CFG.group_size || 64), pilot = (CFG.groups_per_step || 8) * (CFG.strategies_per_parent || 4) * (CFG.pilot_programs_per_strategy || 11);
-      box(20, 168, 200, 82, per + " programs / step", pilot + " pilot + " + (per - pilot) + " phase 2\npython `" + PROB.entry + "`\n" + (CFG.budget_s || "?") + " s search budget each", col.coder, "pilot"); }
-    arrow("M925,98V166", "", false); arrow("M825,209H762", "plans", false, 793, 203); arrow("M540,209H477", "", false); arrow("M285,209H222", "", false);
-    // row C
-    box(20, 316, 170, 74, "CPU sandbox", "reward = 1 / raw " + PROB.metric + "\nfailure ⇒ 0" + ((ST[STEPS[STEPS.length - 1]] || {}).evaluation_workers ? " · " + ST[STEPS[STEPS.length - 1]].evaluation_workers + " parallel" : ""), col.cpu, "eval");
-    box(230, 316, 170, 74, "Hurdle allocator", "20 spare programs / parent\nto the strategy likeliest to beat it", col.search, "alloc");
-    box(440, 316, 190, 74, "SPO² advantage", "A = (exp(2r)/v − 1)/2\nrun-wide baseline v", col.train, "adv");
-    box(670, 316, 170, 74, "LoRA update", "PPO-clip, 1 AdamW step\nlr 4e-5 · 2 GPUs", col.train, "train");
-    box(880, 316, 215, 74, "Archive update", "dedupe · top-2 / (parent,strategy)\ntop-8 / parent · cap 2000", col.search, "archive");
-    arrow("M120,250V314", "evaluate", false, 148, 286);
-    arrow("M190,353H228", "", false);
-    arrow("M315,314V252", "+20 programs / parent", true, 396, 290, cssVar("--s4"));
-    // bypasses along the bottom
-    arrow("M105,392V420H535V392", "all rewards", false, 320, 436);
-    arrow("M755,314V282H400V252", "updated LoRA adapter → samples the next step", true, 640, 276, cssVar("--s8"));
-    arrow("M630,353H668", "", false);
-    arrow("M150,392V446H987V392", "valid programs with code", false, 760, 462);
-    // loop notes (adapter loop is drawn above)
-    const note = (x, y, t) => { const s = sv("text", { x, y, style: "font-size:11px;font-style:italic;fill:" + cssVar("--s4") }, svg); s.textContent = t; };
-        note(880, 409, "→ becomes next step's archive");
+    const xs = [290, 520, 750, 980], cw = 190, cx = i => xs[i] + cw / 2;
+    // headline
+    const th = sv("text", { x: 730, y: 22, "text-anchor": "middle", style: "font-size:14px;fill:" + cssVar("--ink-2") }, svg);
+    th.textContent = "Each new plan sees the earlier plans of the same parent, to encourage a different approach";
+    // left column: archive -> PUCT -> JEV -> parent
+    box(20, 44, 210, 84, "Parent p", "one of the " + P + " parents of the step\n(code, score" + (PROB.kernel ? "" : ", construction") + ")", col.search, "select");
+    if (RUN.hasJev) box(20, 178, 210, 92, "JEV gate", "GLiDE-9B compares candidates\nwith the parents already picked;\nskip if P(same core idea) ≥ " + (jevThr != null ? jevThr : "threshold"), col.jev, "select");
+    else box(20, 178, 210, 92, "Lineage blocking", "skip ancestors and descendants\nof every parent already picked\n(this run has no JEV gate)", col.search, "select");
+    box(20, 318, 210, 84, "PUCT ranking", "Q + c·scale·P·√(1+T)/(1+n)\n" + (RUN.hasJev ? "window = top " + P + "×" + mult + " states" : "rank-based prior P"), col.search, "select");
+    box(20, 448, 210, 70, "Archive", "scores + ancestry\ncap " + (CFG.max_buffer_size || 2000), col.search, "archive");
+    arrow("M125,446V404", "", false); arrow("M125,316V272", "", false); arrow("M125,176V130", "", false);
+    arrow("M232,86H286", "", false);
+    // strategies (chained), pilots
+    for (let i = 0; i < S && i < 4; i++) {
+      box(xs[i], 44, cw, 84, "Strategy " + (i + 1), "plan for parent p\nfrozen strategist", col.strat, "strategist");
+      box(xs[i], 172, cw, 70, Hn + " pilot programs", nm(CFG.coder_model_name || CFG.model_name) + " + LoRA\n" + (CFG.coder_reasoning_effort ? "reasoning " + CFG.coder_reasoning_effort : ""), col.coder, "pilot");
+      arrow(`M${cx(i)},130V170`, "", false); arrow(`M${cx(i)},244V275`, "", false);
+      if (i < S - 1 && i < 3) arrow(`M${xs[i] + cw + 2},86H${xs[i + 1] - 4}`, "", false);
+    }
+    // evaluation band, bandit band
+    box(290, 275, 880, 54, (PROB.kernel ? "GPU evaluation" : "CPU evaluation") + " streams results as programs arrive", (PROB.kernel ? "kernel correctness tests + timing on the GPU · " : "isolated sandbox per program · ") + (PROB.rewardShort || "reward from the score") + " · failure ⇒ 0", col.cpu, "eval", 15);
+    arrow("M730,331V355", "", false);
+    box(290, 357, 880, 78, "Parent-relative hurdle bandit", "pilot outcomes decide how likely each strategy is to beat the parent p\n→ allocate the B = " + Bn + " follow-up programs of p to the most promising strategies", col.search, "alloc", 15);
+    for (let i = 0; i < Math.min(S, 4); i++) {
+      arrow(`M${cx(i)},437V472`, "", false);
+      box(xs[i], 474, cw, 60, "a" + "₁₂₃₄"[i] + " new programs", "coder · follow-up", col.coder, "pilot");
+    }
+    // archive update loop (bottom)
+    for (let i = 0; i < Math.min(S, 4); i++) sv("path", { d: `M${cx(i)},536V560`, fill: "none", stroke: cssVar("--ink-3"), "stroke-width": 1.5 }, svg);
+    arrow(`M${cx(Math.min(S, 4) - 1)},560H125V520`, "", false);
+    { const t = sv("text", { x: 640, y: 578, "text-anchor": "middle", style: "font-size:11px;fill:" + cssVar("--ink-3") }, svg); t.textContent = "every valid program is scored, de-duplicated (top-" + (CFG.strategy_archive_top_r || 2) + " per parent × strategy, top-" + (CFG.topk_children_per_parent || 8) + " per parent) and enters the archive"; }
+    { const t = sv("text", { x: 138, y: 540, style: "font-size:11px;font-weight:600;fill:" + col.search }, svg); t.textContent = "update"; }
+    // learning lane
+    sv("line", { x1: 20, x2: W - 20, y1: 598, y2: 598, stroke: cssVar("--line-2"), "stroke-dasharray": "2 4" }, svg);
+    { const t = sv("text", { x: 20, y: 622, style: "font-size:12px;font-weight:700;fill:" + cssVar("--ink-2") }, svg); t.textContent = "Learning"; }
+    { const t = sv("text", { x: 20, y: 638, style: "font-size:11px;fill:" + cssVar("--ink-3") }, svg); t.textContent = "all scored programs"; }
+    box(290, 608, 250, 62, "SPO² advantage", "exp(β·r) against one run-wide\nbaseline v", col.train, "adv");
+    box(590, 608, 250, 62, "LoRA update", "PPO-clip · AdamW · lr " + (CFG.learning_rate || "?") + "\n" + (CFG.num_training_gpus || "?") + " GPUs", col.train, "train");
+    box(890, 608, 280, 62, "Updated adapter", "generates the coder programs\nof the next step", col.coder, "pilot");
+    arrow("M542,639H588", "", false); arrow("M842,639H888", "", false);
   });
 }
 
@@ -84,7 +97,7 @@ registerTab({
       `Click any box to open that stage in the <b>Pipeline</b> tab. Solid arrows happen inside one step; dashed arrows are the loops that tie steps together.`));
     const host = h("div", { class: "chart" });
     root.append(card("Architecture of one training step", "colour = which model/subsystem does the work", h("div", null, host,
-      legend([{ color: cssVar("--s4"), label: "search / bookkeeping" }, { color: cssVar("--s7"), label: "GLiDE-9B judge" }, { color: cssVar("--s2"), label: "strategist (frozen)" }, { color: cssVar("--s1"), label: "coder (trained)" }, { color: cssVar("--s3"), label: "CPU sandboxes" }, { color: cssVar("--s8"), label: "trainer" }]))));
+      legend([{ color: cssVar("--s4"), label: "search / bookkeeping" }, { color: cssVar("--s7"), label: "GLiDE-9B judge" }, { color: cssVar("--s2"), label: "strategist (frozen)" }, { color: cssVar("--s1"), label: "coder (trained)" }, { color: cssVar("--s3"), label: PROB.kernel ? "GPU kernel evaluation" : "CPU sandboxes" }, { color: cssVar("--s8"), label: "trainer" }]))));
     architectureSvg(host);
 
     // the three loops

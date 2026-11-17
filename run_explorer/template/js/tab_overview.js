@@ -43,7 +43,8 @@ registerTab({
       kpi("Best " + PROB.metric, fmt.raw(best), `vs ${esc(TARGET_LABEL())} ${fmt.rep(tgt)} · gap <b>${fmt.gap(best - tgt)}</b> (${fmt.pctGap((best - tgt) / tgt)})` + (lastSeen.provisional ? ` · found in step ${lastSeen.best_seen_step}, update pending` : "")),
       kpi("Steps completed", `${done.length} <span style="font-size:14px;color:var(--ink-3)">/ ${nSteps}</span>`, partial.length ? partial.map(p => ST[p].provisional ? `step ${p}: rollouts scored, adapter update pending` : `step ${p} in progress (${(RS[p] || []).length} programs so far)`).join(" · ") : "all steps on disk finished"),
       kpi("Programs evaluated", fmt.n(totalRoll), `${fmt.n(valids)} valid (${fmt.pct(valids / totalRoll)})`),
-      kpi("Improvement vs seed", fmt.f(PROB.seedRaw - best, 4), `seeds score ${fmt.f(PROB.seedRaw, 4)} → ${fmt.raw(best)}`),
+      PROB.kernel ? kpi("Since the first step", fmt.f(ST[seen[0]].best_seen_raw_score / best, 2) + "× faster", `${fmt.raw(ST[seen[0]].best_seen_raw_score)} µs after step ${seen[0]} → ${fmt.raw(best)} µs`)
+        : kpi("Improvement vs seed", fmt.f(PROB.seedRaw - best, 4), `seeds score ${fmt.f(PROB.seedRaw, 4)} → ${fmt.raw(best)}`),
       kpi("Archive size", fmt.n(last.archive_size), `${fmt.n(D.main.meta.n_nodes)} nodes in the search tree`),
       kpi("Hardware", HW.n_gpus ? `${HW.n_gpus} × ${esc(HW.short)}` : "–", HW.n_gpus ? `${HW.mem_gib ? HW.mem_gib.toFixed(0) + " GiB each · " : ""}${esc(HW.family || "")}` : "not recorded"),
       kpi("Training compute", fmt.dur(cum), `coder LoRA updates on ${last.training_parallel_gpus || String(CFG.training_gpu_ids || CFG.gpu_ids || CFG.available_gpu_ids || "").split(",").filter(Boolean).length || "several"} GPUs`)));
@@ -100,7 +101,7 @@ registerTab({
     const qpts = qs.map(([n, q, i]) => seen.map((s, k) => [s, gapOf(quantile(stats[k].raws, q))]));
     const qd = gapDomain(qpts.flatMap(arr => arr.slice(2).map(p => p[1])));
     lineChart($("#chQuant"), {
-      height: 280, xLabel: "step", yLabel: "gap to reference " + tgt.toFixed(6) + " (symlog)", margin: { l: 62 }, clip: true, yDomain: qd,
+      height: 280, xLabel: "step", yLabel: "gap to reference " + tgt.toFixed(PROB.kernel ? 1 : 6) + " (symlog)", margin: { l: 62 }, clip: true, yDomain: qd,
       yTicks: gapTicks(), yFmt: gapFmt,
       series: qs.map(([n, q, i], qi) => ({ name: n, color: S_COL(i), pts: qpts[qi], width: 1.8, dotR: 2.6, fmt: v => (tgt + gapInv(v)).toFixed(5) })),
       xFmt: v => String(Math.round(v)), xTicks: seen,
@@ -176,13 +177,14 @@ function recipeNode() {
     ["Problem", `${c.problem} · ${PROB.recipeProblem} · prompt target ${c.target}`],
     ["Coder (trained)", `${nm(c.coder_model_name || c.model_name)} + LoRA r=${c.lora_rank}, lr ${c.learning_rate}, reasoning "${c.coder_reasoning_effort}"`],
     ["Strategist (frozen)", `${nm(c.strategy_model_name)}${c.strategy_reasoning_effort ? ` · reasoning "${c.strategy_reasoning_effort}"` : ""}${c.strategy_format_max_retries != null ? ` · up to ${c.strategy_format_max_retries + 1} attempts` : ""}`],
-    ...(RUN.hasJev ? [["JEV judge", nm((c.jev_model_path || "").replace(/\/snapshots.*/, "")).replace(/^models--/, "").replace(/--/g, "/")]] : []),
+    ...(RUN.hasJev ? [["JEV judge", (nm((c.jev_model_path || "").replace(/\/snapshots.*/, "")) || "models--fastino--GLiDE-9B").replace(/^models--/, "").replace(/--/g, "/")]] : []),
     ["Parent selection", `${c.parent_selection || RUN.sampler} · c=${c.puct_c} · ${c.num_seed_states} seeds${RUN.hasJev ? ` · window ×${c.jev_candidate_multiplier}` : ""}`],
     ["Per step", `${c.groups_per_step} parents × (${c.strategies_per_parent} strategies × ${c.programs_per_strategy}) = ${c.groups_per_step * c.group_size} programs`],
     ["Pilot / phase 2", `${c.pilot_programs_per_strategy} pilot per strategy, then ${c.strategies_per_parent * (c.programs_per_strategy - c.pilot_programs_per_strategy)} per parent by "${c.phase2_allocation_method}"`],
     ["Advantage", `${c.advantage_mode} · β=${c.spo_rs_beta} · clip [${c.spo_rs_clip_epsilon_low}, ${c.spo_rs_clip_epsilon_high}]`],
     ["Archive", `top-${c.strategy_archive_top_r}/strategy · top-${c.topk_children_per_parent}/parent · cap ${c.max_buffer_size}`],
-    ["Program budget", `${c.budget_s}s search${c.sandbox_timeout_s ? `, sandbox kill at ${c.sandbox_timeout_s}s` : ""}${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`],
+    PROB.kernel ? ["Kernel evaluation", `on ${c.gpu_type || "the GPU"} (GPU ${c.kernel_gpu_id != null ? c.kernel_gpu_id : "?"}), killed after ${c.kernel_timeout_s || c.sandbox_timeout_s}s${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`]
+      : ["Program budget", `${c.budget_s}s search${c.sandbox_timeout_s ? `, sandbox kill at ${c.sandbox_timeout_s}s` : ""}${c.max_new_tokens ? `, up to ${fmt.n(c.max_new_tokens)} tokens` : ""}`],
     ["Hardware", ((D.main.hardware || {}).label || [c.hardware_profile, c.gpu_ids ? "GPUs " + c.gpu_ids : ""].filter(Boolean).join(" · ")) + (c.generation_backend ? " · vLLM " + c.generation_backend : "")],
   ];
   return h("div", { class: "kv", html: rows.map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>`).join("") });
@@ -191,9 +193,9 @@ function recipeNode() {
 
 /* hlines for the reference value(s) */
 function refLines(all) {
-  const main = REF(), out = [{ y: main.val, label: `${main.label} ${main.val.toFixed(6)}`, color: cssVar("--good-ink") }];
+  const main = REF(), out = [{ y: main.val, label: `${main.label} ${main.val.toFixed(PROB.kernel ? 1 : 6)}`, color: cssVar("--good-ink") }];
   const others = all ? refList().filter(r => r.id !== main.id && r.id !== "prompt") : refList().filter(r => r.id === "ttt" && main.id !== "ttt");
-  others.forEach((r, i) => out.push({ y: r.val, label: `${r.label} ${r.val.toFixed(6)}`, color: cssVar("--ink-3"), dash: "2 4", anchor: "start", dy: (i % 2 ? 14 : 0) }));
+  others.forEach((r, i) => out.push({ y: r.val, label: `${r.label} ${r.val.toFixed(PROB.kernel ? 1 : 6)}`, color: cssVar("--ink-3"), dash: "2 4", anchor: "start", dy: (i % 2 ? 14 : 0) }));
   return out;
 }
 
@@ -259,6 +261,7 @@ function hardwareCard(root, HW, done) {
     ["GPU ids used", `${(HW.gpu_ids || []).join(", ")} <span class="sub">- all ${HW.n_gpus} train the coder (replicated LoRA) and generate (sequential sharing)</span>`],
     ["Coder generation", HW.coder_engines ? `${HW.coder_engines} vLLM engine${HW.coder_engines > 1 ? "s" : ""}, tensor-parallel ${HW.coder_tp} (${HW.coder_engines * HW.coder_tp} GPUs)` : "vLLM"],
     ["Strategist generation", HW.strategist_engines ? `${HW.strategist_engines} vLLM engine${HW.strategist_engines > 1 ? "s" : ""}, tensor-parallel ${HW.strategist_tp}` : "–"],
+    PROB.kernel ? ["Kernel evaluation", `${CFG.gpu_type || "GPU"} · GPU ${CFG.kernel_gpu_id != null ? CFG.kernel_gpu_id : "?"} runs the correctness tests and the timing, one kernel at a time (kernel_timeout_s = ${CFG.kernel_timeout_s || "?"})`] :
     ["Evaluation (CPU)", HW.eval_processes ? `${HW.eval_processes} sandbox processes on ${HW.eval_cpus_used || "?"} CPUs (config eval_cpus = ${CFG.eval_cpus || "?"})` : `${CFG.eval_cpus || "?"} CPUs configured`],
     HW.host_offload_gib ? ["Host RAM for offload", `${HW.host_offload_gib} GiB budget for activation / weight offload`] : null,
     E.total != null ? ["GPU-hours so far", `<b>≈ ${Math.round(spentH * HW.n_gpus).toLocaleString("en-US")} GPU-h</b> <span class="sub">(${HW.n_gpus} GPUs × ${spentH.toFixed(1)} h wall clock incl. restarts)</span>`] : null,

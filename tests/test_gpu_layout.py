@@ -263,6 +263,29 @@ def test_trimul_evaluator_has_a_private_work_directory(monkeypatch, tmp_path):
     assert all(result["environment_verified"] for result in results)
 
 
+@pytest.mark.parametrize("outcomes,expected_calls,exit_code", [
+    ([False, True, True], 1, 112),
+    ([True, True, True], 3, 0),
+])
+def test_trimul_correctness_stops_at_first_failure(
+        trimul_evaluator, monkeypatch, outcomes, expected_calls, exit_code):
+    from types import SimpleNamespace
+
+    evaluator = trimul_evaluator["eval"]
+    calls = []
+    monkeypatch.setattr(evaluator, "run_single_test", lambda _pool, test: (
+        calls.append(test.index) or (outcomes[test.index], "diagnostic")))
+    logs = []
+    tests = [SimpleNamespace(index=i, spec=str(i)) for i in range(len(outcomes))]
+
+    result = evaluator.run_testing(
+        SimpleNamespace(log=lambda *values: logs.append(values)), None, tests)
+
+    assert result == exit_code
+    assert calls == list(range(expected_calls))
+    assert logs[-1] == ("check", "fail" if exit_code else "pass")
+
+
 def test_trimul_preflight_cache_resets_at_batch_change_and_worker_failure(monkeypatch):
     import problems.gpu_mode as gpu_mode
 

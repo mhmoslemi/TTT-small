@@ -29,10 +29,37 @@ JS_ORDER = [
     "core.js", "charts.js", "problems.js", "knowledge.js",
     "tab_overview.js", "tab_pipeline.js", "tab_search.js", "tab_strategist.js",
     "tab_rollouts.js", "tab_alloc.js", "tab_train.js", "jev_tree.js",
-    "tab_solution.js", "tab_published.js", "tab_concepts.js", "tab_logs.js", "main.js",
+    "tab_kernel.js", "tab_solution.js", "tab_published.js", "tab_concepts.js", "tab_logs.js", "main.js",
 ]
 PROBLEM_TITLES = {"ac1": "First autocorrelation inequality (AC1)", "erdos": "Erdős minimum-overlap problem (C₅)"}
 PROBLEM_SHORT = {"ac1": "AC1", "erdos": "Erdős C₅"}
+GPU_TASKS = {"trimul": ("TriMul", "triangular multiplicative update"), "mla_decode_nvidia": ("MLA decode", "multi-head latent attention decode")}
+KERNEL_PROBLEMS = {"gpu_mode"}
+
+
+def problem_labels(pid, cfg):
+    """(title, short) of a run. GPU Mode runs are named after the kernel task and the GPU the runtime is measured on."""
+    if pid == "gpu_mode":
+        task = GPU_TASKS.get(str(cfg.get("problem_type") or "").lower(), (str(cfg.get("problem_type") or "kernel"), "GPU kernel"))
+        gpu = str(cfg.get("gpu_type") or "").upper()
+        return "GPU Mode · %s kernel%s" % (task[0], " (%s)" % gpu if gpu else ""), ("%s %s" % (task[0], gpu)).strip()
+    return PROBLEM_TITLES.get(pid, pid.upper() or "problem"), PROBLEM_SHORT.get(pid, pid.upper() or "problem")
+
+
+def effort_summary(main):
+    """Which reasoning effort the coder ran at: the configured base effort and what the rollouts actually used."""
+    cfg = main.get("config") or {}
+    cols = main["rcols"]
+    if "effort" not in cols:
+        return {"base": cfg.get("coder_reasoning_effort"), "mix": {}}
+    i = cols.index("effort")
+    mix = {}
+    for r in main["rows"]:
+        e = r[i]
+        if e:
+            mix[e] = mix.get(e, 0) + 1
+    base = cfg.get("coder_reasoning_effort") or (max(mix, key=mix.get) if mix else None)
+    return {"base": base, "mix": mix}
 
 
 def pack(obj) -> str:
@@ -79,9 +106,10 @@ def summarize(main, pub):
     hw = main.get("hardware") or {}
     metric = next((s.get("result_metric_name") for s in steps if s.get("result_metric_name")), "score")
     nm = lambda p: str(p or "").rstrip("/").split("/")[-1]
+    title, short = problem_labels(pid, cfg)
     return {
-        "problem": pid, "title": PROBLEM_TITLES.get(pid, pid.upper() or "problem"), "short": PROBLEM_SHORT.get(pid, pid.upper() or "problem"),
-        "metric": metric, "lower_is_better": True,
+        "problem": pid, "title": title, "short": short, "kind": "kernel" if pid in KERNEL_PROBLEMS else "construction",
+        "metric": metric, "lower_is_better": True, "effort": effort_summary(main), "gpu_type": cfg.get("gpu_type"),
         "run_name": main["meta"]["run_name"], "generated_at": main["meta"]["generated_at"],
         "coder": nm(cfg.get("coder_model_name") or cfg.get("model_name")), "strategist": nm(cfg.get("strategy_model_name")),
         "steps_done": len(done), "steps_total": cfg.get("num_steps"), "rollouts": len(rows), "valid_fraction": (n_valid / len(rows)) if rows else None,
@@ -89,7 +117,7 @@ def summarize(main, pub):
         "stopped": bool(el.get("stopped")), "elapsed_s": el.get("total"), "hardware": hw,
         "gpu_hours": (el.get("total") / 3600 * hw.get("n_gpus", 0)) if el.get("total") is not None and hw.get("n_gpus") else None,
         "selection": "PUCT + JEV" if any(s.get("jev") for s in steps) else "PUCT",
-        "dec": {"ac1": 6, "erdos": 8}.get(pid, 6),
+        "dec": {"ac1": 6, "erdos": 8, "gpu_mode": 1}.get(pid, 6),
     }
 
 
@@ -136,11 +164,24 @@ def build_unified(run_dirs, out_path, code_per_step=25, all_code=False):
         runs.append(summ)
         tags.append('<script type="application/octet-stream" id="html-%s">%s</script>' % (rid, pack_text(html)))
         print("  embedded %s (%s, %.1f MB html)" % (summ["run_name"], summ["title"], len(html) / 1e6))
+    effort = {}
+    try:
+        import effort_stats
+        eruns = effort_stats.default_runs()
+        if eruns:
+            print("  measuring reasoning effort and generation speed on %d runs (effort_runs.txt) ..." % len(eruns))
+            effort = effort_stats.collect(eruns)
+            effort["generated"] = __import__("datetime").date.today().isoformat()
+            effort["speed"] = {m: dict(v, samples=[{k: x[k] for k in ("run", "step", "rollouts", "tokens", "elapsed_s", "tps_gpu", "mix")} for x in v["samples"]]) for m, v in effort["speed"].items()}
+    except Exception as e:      # the landing page must still build
+        print("warning: effort statistics skipped: %r" % (e,))
+        effort = {}
     page = read(os.path.join(tdir, "hub.html"))
     css = read(os.path.join(tdir, "style.css")) + "\n" + read(os.path.join(tdir, "hub.css"))
     js = read(os.path.join(tdir, "hub.js"))
     page = (page.replace("/*__CSS__*/", css).replace("/*__JS__*/", js.replace("</script>", "<\\/script>"))
                 .replace("<!--__HUBDATA__-->", '<script type="application/json" id="hub-data">%s</script>' % json.dumps(runs, ensure_ascii=False, allow_nan=False).replace("</", "<\\/"))
+                .replace("<!--__EFFORTDATA__-->", ('<script type="application/json" id="effort-data">%s</script>' % json.dumps(effort, ensure_ascii=False, allow_nan=False).replace("</", "<\\/")) if effort else "")
                 .replace("<!--__RUNS__-->", "\n".join(tags)))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:

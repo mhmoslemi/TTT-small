@@ -42,6 +42,34 @@ def _read(path, default=""):
         return default
 
 
+def _byte_level_map():
+    """Inverse of the GPT-2 byte -> printable-character table (what 'Ġ' and 'Ċ' come from)."""
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs, n = bs[:], 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b); cs.append(256 + n); n += 1
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+_BYTE_LEVEL = _byte_level_map()
+
+
+def debyte(text):
+    """Some strategist outputs were saved as raw byte-level tokens ('ĊĠApproachĠandĠRationale'); turn them back into text.
+    Only touches text that clearly has that form (several 'Ġ'/'Ċ' markers and almost no real spaces)."""
+    if not text or text.count("\u0120") + text.count("\u010a") < 4 or text.count(" ") > text.count("\u0120"):
+        return text
+    raw = bytearray()
+    for ch in text:
+        b = _BYTE_LEVEL.get(ch)
+        if b is None:
+            raw.extend(ch.encode("utf-8"))
+        else:
+            raw.append(b)
+    return raw.decode("utf-8", errors="replace")
+
+
 def _sig(x, digits=6):
     """Shorten floats so the embedded JSON stays small."""
     if x is None:
@@ -120,6 +148,7 @@ def _scan_step(args):
             "msg": (meta.get("msg") or "")[:160],
             "adv": _sig(meta.get("advantage"), 6),
             "ntok": meta.get("n_response_tokens"),
+            "effort": meta.get("coder_reasoning_effort"),
             "n": n_len,
             "retry": meta.get("retry_attempt") or 0,
             "counts": bool(meta.get("counts_toward_allocation", True)),
@@ -163,7 +192,7 @@ def _scan_step(args):
         if not m:
             continue
         g, fo, s = (int(x) for x in m.groups()[1:])
-        txt = _read(os.path.join(sd, name))
+        txt = debyte(_read(os.path.join(sd, name)))
         think, ans = split_think(txt)
         sm = STRAT_RE.search(txt)
         block = sm.group(1).strip() if sm else ""
@@ -412,6 +441,12 @@ def parse_hardware(run_dir, config, steps):
     hw["capability"] = caps.most_common(1)[0][0] if caps else None
     setting = _read_head(os.path.join(run_dir, "setting.log"), 400000)
     tlog = _read_head(os.path.join(run_dir, "temirnal.log"), 3_000_000)
+    if hw["mem_gib"] is None:      # runs whose vLLM log has no memory line: CUDA out-of-memory warnings print the device total
+        caps_seen = Counter(float(x) for x in re.findall(r"GPU \d+ has a total capacity of ([\d.]+) GiB", tlog))
+        if caps_seen:
+            hw["mem_gib"] = caps_seen.most_common(1)[0][0]
+    if c.get("kernel_gpu_id") is not None:     # GPU Mode kernel tasks are timed on a GPU, not in CPU sandboxes
+        hw["kernel_gpu_id"], hw["kernel_gpu_type"] = c.get("kernel_gpu_id"), c.get("gpu_type")
     m = re.search(r"vLLM engines: (\d+) replica\(s\), TP=(\d+), PP=(\d+), (\d+) GPU\(s\)/engine", setting)
     if m:
         hw["coder_engines"], hw["coder_tp"] = int(m.group(1)), int(m.group(2))
@@ -772,7 +807,7 @@ def collect(run_dir, code_per_step=25, all_code=False, think_full=False, progres
     # slim rollouts into columnar form
     cols = ["id", "step", "group", "pgroup", "rollout", "sidx", "phase", "node", "parent", "raw", "reward",
             "valid", "parsed", "ran", "fail", "msg", "adv", "ntok", "n", "retry", "counts", "pval", "praw",
-            "fallback", "arch", "think_chars"]
+            "fallback", "arch", "think_chars", "effort"]
     rows = []
     for r in rollouts:
         rows.append([r.get(c) for c in cols])
