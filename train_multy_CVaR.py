@@ -906,6 +906,45 @@ def _recoverable_pending_spo_rs_artifacts(exp_dir, step_idx, cfg):
     return artifacts
 
 
+def _saved_rollout_strategy_index(item, cfg):
+    """Recover a rollout's strategy slot, including pre-fix artifacts."""
+    meta = item["meta"]
+    if not bool(getattr(cfg, "strategies", False)
+                or meta.get("two_stage_rollout", False)):
+        return None
+    count = int(cfg.strategies_per_parent)
+    value = meta.get("strategy_index")
+    if value is None and meta.get("strategy_source_job_idx") is not None:
+        value = int(meta["strategy_source_job_idx"]) % count
+    if value is None:
+        base = item["meta_path"].name.removesuffix(".meta.json")
+        rollout_path = item["meta_path"].with_name(base + ".strategy.txt")
+        if not rollout_path.is_file():
+            raise RuntimeError(
+                f"rollout strategy identity is missing for {item['meta_path'].name}")
+        rollout_response = rollout_path.read_text(
+            encoding="utf-8", errors="replace")
+        parent_group = int(meta["parent_group"])
+        matches = []
+        for index in range(count):
+            canonical = item["meta_path"].parent / (
+                f"step{int(meta['step']):02d}_group{parent_group:02d}_"
+                f"fold00_strategy{index:02d}.txt")
+            if (canonical.is_file()
+                    and canonical.read_text(encoding="utf-8", errors="replace")
+                    == rollout_response):
+                matches.append(index)
+        if not matches:
+            raise RuntimeError(
+                f"cannot match {rollout_path.name} to its saved strategy slot")
+        value = matches[0]
+    value = int(value)
+    if not 0 <= value < count:
+        raise RuntimeError(
+            f"invalid strategy index {value} in {item['meta_path'].name}")
+    return value
+
+
 def _literal_metadata_mapping(value):
     """Recover mappings stringified by the rollout JSON compatibility layer."""
     if isinstance(value, dict):
@@ -1468,10 +1507,7 @@ def _finalize_pending_spo_rs_artifacts(
             code=result.code or "", raw_score=result.raw_score,
             construction=result.construction, observation=result.stdout)
         archive_eligible = bool(result.valid and result.code)
-        strategy_source = pending.get("strategy_source_job_idx")
-        strategy_index = (
-            int(strategy_source) % int(cfg.strategies_per_parent)
-            if bool(cfg.strategies) and strategy_source is not None else None)
+        strategy_index = _saved_rollout_strategy_index(item, cfg)
         base = item["meta_path"].name.removesuffix(".meta.json")
         strategy_path = step_dir / f"{base}.strategy.txt"
         strategy = None
@@ -1840,7 +1876,7 @@ def _resume_spo_rs_step_from_artifacts(
                 child.id = str(meta["node_id"])
             parent_group = int(meta.get("parent_group", group))
             all_children.append((child, parents[parent_group]))
-            strategy_keys.append(int(meta["strategy_index"]) if meta.get("strategy_index") is not None else None)
+            strategy_keys.append(_saved_rollout_strategy_index(item, cfg))
 
     if not all_examples:
         raise RuntimeError("evaluated-step recovery found no nonempty responses to train")
@@ -2756,6 +2792,8 @@ def train_step(backend, model, tokenizer, sampler, optimizer, step_idx: int,
             "rollout": rollout_index,
             "n_response_tokens": len(token_ids),
             "coder_reasoning_effort": job.get("coder_reasoning_effort"),
+            "strategy_index": (
+                int(job["strategy_index"]) if two_stage_rollouts else None),
             "strategy_rollout_phase": (
                 str(rollout_phase) if rollout_phase is not None else None),
             "strategy_source_job_idx": (

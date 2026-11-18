@@ -239,6 +239,30 @@ class ResumeRolloutConfigTests(unittest.TestCase):
         self.assertEqual(saved[0][0].name,
                          "step03_group00_rollout000.behavior_logprobs.zlib")
 
+    def test_completed_recovery_recovers_pre_fix_strategy_slot(self):
+        root = Path(__file__).resolve().parents[1]
+        source = ast.parse((root / "train_multy_CVaR.py").read_text())
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_saved_rollout_strategy_index")
+        scope = {"Path": Path}
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     "strategy-recovery", "exec"), scope)
+        meta_path = self.step / "step03_group00_rollout000.meta.json"
+        rollout_strategy = self.step / "step03_group00_rollout000.strategy.txt"
+        (self.step / "step03_group00_fold00_strategy00.txt").write_text("first")
+        (self.step / "step03_group00_fold00_strategy01.txt").write_text("second")
+        rollout_strategy.write_text("second")
+        item = {
+            "meta_path": meta_path,
+            "meta": {
+                "step": 3, "parent_group": 0, "two_stage_rollout": True,
+                "strategy_index": None,
+            },
+        }
+        cfg = SimpleNamespace(strategies=True, strategies_per_parent=2)
+
+        self.assertEqual(scope["_saved_rollout_strategy_index"](item, cfg), 1)
+
     def test_full_ram_resume_launcher_is_portable_and_checks_sidecars(self):
         import os
         import subprocess

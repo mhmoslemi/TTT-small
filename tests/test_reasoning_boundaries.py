@@ -177,6 +177,19 @@ class NativeBoundaryTests(unittest.TestCase):
                 scope["_queue_rollout"](0, raw, [1, 2])
                 self.assertEqual(len(evaluated), 1)  # Reasoning drafts never reach the sandbox.
 
+    def test_pending_two_stage_rollout_persists_its_strategy_slot(self):
+        scope, _evaluated, saved = self.pipeline_scope(False)
+        scope["two_stage_rollouts"] = True
+        scope["prompt_jobs"][0].update(
+            strategy_index=3, strategy_response="saved strategy response")
+
+        scope["_queue_rollout"](0, "response", [1, 2])
+
+        pending = saved[0][1]["pending_meta"]
+        self.assertEqual(pending["strategy_index"], 3)
+        self.assertEqual(saved[0][1]["strategy_text"],
+                         "saved strategy response")
+
     def test_pending_recovery_rechecks_saved_format_issue_using_exact_ids(self):
         scope, evaluated, _ = self.pipeline_scope(False)
         scope.update(parent_contexts=[object()], isolated_eval=False)
