@@ -684,6 +684,12 @@ def _offline_mode() -> bool:
                for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"))
 
 
+def _local_model_files_only(model_name: str) -> bool:
+    """A local checkpoint must never trigger auxiliary Hub downloads."""
+    path = os.path.expandvars(os.path.expanduser(str(model_name)))
+    return _offline_mode() or os.path.isdir(path)
+
+
 def _expert_count(model_config) -> int:
     for _ in range(2):
         if model_config is None:
@@ -1206,7 +1212,7 @@ class UnslothBackend(_ModelPlacementBackend):
         device_map = _training_device_map(self.cfg)
         print(f"[backend=unsloth] loading {training_name} across "
               f"{int(getattr(self.cfg, 'num_training_gpus', 1))} GPU(s) ...")
-        offline = _offline_mode()
+        local_files_only = _local_model_files_only(training_name)
         model, tokenizer = retry_host_allocation(lambda: FastLanguageModel.from_pretrained(
             model_name=training_name,
             max_seq_length=self.cfg.max_seq_length,
@@ -1214,8 +1220,8 @@ class UnslothBackend(_ModelPlacementBackend):
             dtype=torch.bfloat16,
             # Keep GPT-OSS on the exact checkpoint used by vLLM. Modern
             # Unsloth leaves its published MXFP4 experts packed for backward.
-            use_exact_model_name=offline or packed_mxfp4,
-            local_files_only=offline,
+            use_exact_model_name=local_files_only or packed_mxfp4,
+            local_files_only=local_files_only,
             device_map=device_map,
             **({"max_memory": _training_max_memory(self.cfg)}
                if _training_max_memory(self.cfg) else {}),

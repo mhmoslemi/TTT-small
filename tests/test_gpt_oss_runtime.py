@@ -13,7 +13,8 @@ from torch.utils.checkpoint import checkpoint
 
 from models.gpt_oss_training import install_attention_layout_guards
 from models.model_backend import (
-    _is_packed_mxfp4, _require_packed_mxfp4_training_runtime)
+    _is_packed_mxfp4, _local_model_files_only,
+    _require_packed_mxfp4_training_runtime)
 from train_multy_CVaR import _coder_vllm_persistent_workers
 
 
@@ -64,6 +65,13 @@ def test_packed_mxfp4_runtime_does_not_modify_qwen(monkeypatch):
             SimpleNamespace(coder_model_profile=name))
     assert os.environ["UNSLOTH_MXFP4_KEEP_PACKED"] == "0"
     assert "UNSLOTH_MXFP4_NO_DEQUANTIZE" not in os.environ
+
+
+def test_local_model_checkpoint_never_uses_the_hub(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+    assert _local_model_files_only(str(tmp_path))
+    assert not _local_model_files_only("organization/model-not-on-this-machine")
 
 
 def test_only_gpt_oss_training_uses_transient_coder_engines():
