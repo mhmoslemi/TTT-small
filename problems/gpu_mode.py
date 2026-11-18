@@ -28,7 +28,10 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 from queue import Queue
+import signal
 import sys
+import threading
+import time
 from typing import Any, Dict, List, Optional
 from problems.base import (Problem, ParentContext, RewardResult, SeedState,
                            render_state_context)
@@ -231,11 +234,96 @@ def benchmark_environment_from_python(python_executable: str, *, gpu_id=None):
     return json.loads(lines[-1])
 
 
+def _eval_process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_eval_process_tree(proc, grace_seconds: float = 3.0) -> None:
+    """Stop the evaluator wrapper and every subprocess it launched."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if proc.is_alive():
+            proc.terminate()
+    proc.join(grace_seconds)
+    if _eval_process_group_exists(proc.pid):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.join(5)
+
+
+def _watch_eval_owner(owner_pid: int) -> None:
+    while os.getppid() == owner_pid:
+        time.sleep(1)
+    # The trainer vanished without cleanup; no benchmark may outlive it.
+    os.killpg(os.getpid(), signal.SIGKILL)
+
+
+def _isolate_eval_process_tree(owner_pid: Optional[int]) -> None:
+    if owner_pid is None:
+        return
+    os.setsid()
+    threading.Thread(target=_watch_eval_owner, args=(owner_pid,), daemon=True).start()
+
+
+def _reap_orphaned_kernel_evaluators(gpu_ids) -> int:
+    """Remove detached TriMul evaluator trees left by a killed trainer."""
+    import psutil
+
+    target_gpus = {str(gpu_id) for gpu_id in gpu_ids}
+    current_uid = os.getuid()
+    roots = []
+    for root in psutil.process_iter(["pid", "ppid", "uids"]):
+        try:
+            if (root.info["ppid"] != 1
+                    or root.info["uids"].real != current_uid):
+                continue
+            tree = [root, *root.children(recursive=True)]
+            if not any(
+                    Path(proc.cwd()).name.startswith("ttt-kernel-eval-")
+                    and any(Path(arg).name == "eval.py" for arg in proc.cmdline())
+                    for proc in tree):
+                continue
+            visible_gpus = {
+                proc.environ().get("CUDA_VISIBLE_DEVICES", "") for proc in tree
+            }
+            if target_gpus.isdisjoint(visible_gpus):
+                continue
+            roots.append((root, tree))
+        except (psutil.AccessDenied, psutil.NoSuchProcess, ProcessLookupError):
+            continue
+
+    for root, tree in roots:
+        processes = list(reversed(tree))
+        for proc in processes:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=3)
+        for proc in alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                pass
+        psutil.wait_procs(alive, timeout=3)
+    return len(roots)
+
+
 def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
                 problem_type: str, log_chars: int,
                 gpu_id: Optional[int] = None, expected_gpu: str = "",
                 expected_triton: str = "", kernel_python: str = "",
-                environment_verified: bool = False) -> None:
+                environment_verified: bool = False,
+                owner_pid: Optional[int] = None) -> None:
     """
     Runs in a spawned process. Does the whole evaluation and sends back a plain
     dict: no dataclasses, no datetimes, nothing that has to pickle.
@@ -246,6 +334,7 @@ def _eval_child(conn, code: str, lib_dir: str, task_yaml: str,
     generation or a training backward pass produces a number that reflects the
     contention rather than the kernel. Reserve a device that nothing else uses.
     """
+    _isolate_eval_process_tree(owner_pid)
     out = {"ok": False, "msg": "unknown", "logs": "", "score_us": None}
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -352,28 +441,24 @@ def run_eval_with_timeout(code: str, lib_dir: str, task_yaml: str,
                        args=(child_conn, code, lib_dir, task_yaml,
                              problem_type, log_chars, gpu_id,
                              expected_gpu, expected_triton, kernel_python,
-                             environment_verified),
+                             environment_verified, os.getpid()),
                        daemon=True)
     proc.start()
     child_conn.close()
 
     out = None
     try:
-        if parent_conn.poll(timeout_s):
-            out = parent_conn.recv()
-    except Exception:
-        out = None
+        try:
+            if parent_conn.poll(timeout_s):
+                out = parent_conn.recv()
+        except Exception:
+            out = None
     finally:
         parent_conn.close()
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(10)
-        if proc.is_alive():
-            proc.kill()
+        if proc.is_alive() or _eval_process_group_exists(proc.pid):
+            _terminate_eval_process_tree(proc)
+        else:
             proc.join(5)
-    else:
-        proc.join(5)
 
     if out is None:
         return {"ok": False, "score_us": None, "logs": "",
@@ -453,6 +538,11 @@ class GpuMode(Problem):
     def begin_evaluation_batch(self):
         """Invalidate preflight checks when entering a new GPU evaluation wave."""
         self._verified_kernel_environments.clear()
+        if self.problem_type == "trimul":
+            removed = _reap_orphaned_kernel_evaluators(self.kernel_gpu_ids)
+            if removed:
+                print(f"[gpu-eval] removed {removed} orphaned evaluator tree(s)",
+                      flush=True)
 
     # ------------------------------------------------------------------
     def build_prompt(self, parent: ParentContext) -> List[dict]:

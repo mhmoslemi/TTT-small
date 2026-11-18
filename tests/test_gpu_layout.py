@@ -12,6 +12,19 @@ import runtime.gpu_runtime as gpu_runtime
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _private_eval_tree(send_conn):
+    """Spawn the shape used by the evaluator: private group plus subprocess."""
+    import os
+    import subprocess
+    import time
+
+    os.setsid()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    send_conn.send((child.pid, os.getpgrp()))
+    send_conn.close()
+    time.sleep(120)
+
+
 @pytest.fixture
 def trimul_evaluator(monkeypatch):
     import importlib.util
@@ -317,6 +330,105 @@ def test_trimul_preflight_cache_resets_at_batch_change_and_worker_failure(monkey
     assert not reward().valid
     assert verified_args == [False, True, True, False, False, False, False]
     assert not problem._verified_kernel_environments
+
+
+def test_eval_timeout_reaps_the_full_process_group():
+    import multiprocessing as mp
+    import os
+    import psutil
+    import time
+    import problems.gpu_mode as gpu_mode
+
+    ctx = mp.get_context("spawn")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_private_eval_tree, args=(send_conn,))
+    proc.start()
+    send_conn.close()
+    try:
+        assert recv_conn.poll(10)
+        child_pid, pgid = recv_conn.recv()
+        assert pgid == proc.pid
+        gpu_mode._terminate_eval_process_tree(proc, grace_seconds=.1)
+        deadline = time.monotonic() + 5
+        while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
+            if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                break
+            time.sleep(.05)
+        assert not psutil.pid_exists(child_pid) or (
+            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE)
+        assert not proc.is_alive()
+    finally:
+        recv_conn.close()
+        if proc.is_alive():
+            os.killpg(proc.pid, 9)
+            proc.join(5)
+
+
+def test_eval_watchdog_kills_its_group_when_the_trainer_disappears(monkeypatch):
+    import signal
+    import problems.gpu_mode as gpu_mode
+
+    parents = iter((77, 1))
+    killed = []
+    monkeypatch.setattr(gpu_mode.os, "getppid", lambda: next(parents))
+    monkeypatch.setattr(gpu_mode.os, "getpid", lambda: 88)
+    monkeypatch.setattr(gpu_mode.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(gpu_mode.os, "killpg",
+                        lambda pgid, sig: killed.append((pgid, sig)))
+
+    gpu_mode._watch_eval_owner(77)
+    assert killed == [(88, signal.SIGKILL)]
+
+
+def test_orphan_reaper_targets_only_detached_kernel_evaluator_trees(monkeypatch):
+    import os
+    import psutil
+    from types import SimpleNamespace
+    import problems.gpu_mode as gpu_mode
+
+    class FakeProcess:
+        def __init__(self, pid, ppid, cwd, cmdline, gpu, children=()):
+            self.pid = pid
+            self.info = {"pid": pid, "ppid": ppid,
+                         "uids": SimpleNamespace(real=os.getuid())}
+            self._cwd = cwd
+            self._cmdline = cmdline
+            self._gpu = gpu
+            self._children = list(children)
+            self.terminated = False
+            self.killed = False
+
+        def children(self, recursive=False):
+            return list(self._children)
+
+        def cwd(self):
+            return self._cwd
+
+        def cmdline(self):
+            return list(self._cmdline)
+
+        def environ(self):
+            return {"CUDA_VISIBLE_DEVICES": self._gpu}
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+    evaluator = FakeProcess(
+        102, 101, "/dev/shm/ttt-kernel-eval-old",
+        ["kernel-python", "/repo/eval.py", "test"], "6")
+    orphan = FakeProcess(
+        101, 1, "/repo", ["python", "spawn_main"], "6", [evaluator])
+    unrelated = FakeProcess(
+        201, 2, "/repo", ["python", "spawn_main"], "6", [evaluator])
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: [orphan, unrelated])
+    monkeypatch.setattr(psutil, "wait_procs", lambda processes, timeout: (processes, []))
+
+    assert gpu_mode._reap_orphaned_kernel_evaluators([6, 7]) == 1
+    assert orphan.terminated and evaluator.terminated
+    assert not unrelated.terminated
 
 
 def test_gpu_mode_can_select_a_dedicated_kernel_interpreter():
