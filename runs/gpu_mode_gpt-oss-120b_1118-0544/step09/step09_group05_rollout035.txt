@@ -1,0 +1,724 @@
+analysisWe need to implement custom_kernel for TriMul outgoing version. The description: we have input tensor shape [B,N,N,C] (dim = C), mask shape [B,N,N], weights dictionary with many weights: "norm.weight","norm.bias", etc.
+
+Goal: implement forward pass as described, with some use of Triton for part of the operation. We can design a Triton kernel for applying mask, projection and gate fused, but maybe also for the core reduction (the batched matrix multiplication). However, the batched matrix multiplication can be done via torch.bmm which is already optimized; we need at least some Triton kernel for something else.
+
+So we need to produce a final code block with all imports, definitions, and custom_kernel.
+
+We need to be careful about shape handling: the hidden dimension is "hidden_dim" arg. The Linear layers are bias-free (except final to_out has bias=False as per code). No biases for left_proj, right_proj, left_gate, right_gate, out_gate, to_out, only to_out_norm has bias. Model weight shapes: left_proj.weight shape (hidden_dim, dim) typical PyTorch linear weight shape (out_features, in_features). When we call F.linear(x, weight) w/o bias, it's x @ weight.T. So we need to pass weight shape (hidden_dim, dim). Similarly for left_gate etc.
+
+Also weight dtype is float32; we should convert to float16 for compute.
+
+Algorithm:
+
+1. Input layer norm: F.layer_norm(input, (dim,), weight=norm_weight, bias=norm_bias). That's FP32 maybe.
+
+2. Cast to fp16 for compute: x_fp16 = x.to(torch.float16).
+
+3. Compute projections:
+
+   left_proj = F.linear(x_fp16, left_proj_weight)  # shape (B,N,N,hidden_dim)
+   right_proj = F.linear(x_fp16, right_proj_weight)
+   left_gate = F.linear(x_fp16, left_gate_weight).sigmoid()
+   right_gate = F.linear(x_fp16, right_gate_weight).sigmoid()
+   out_gate = F.linear(x_fp16, out_gate_weight).sigmoid()
+
+   (All weights cast to fp16.)
+
+4. If mask provided and not nomask: we need to multiply left_proj and right_proj by mask (broadcast mask across hidden_dim). However mask dtype can be bool or float. We'll treat as 0/1.
+
+   Perhaps we fuse mask multiplication and gate multiplication using a Triton kernel to reduce memory loads. The kernel will read left_proj, right_proj, left_gate, right_gate, mask, compute left_out = left_proj * left_gate * mask, and right_out similarly. mask is per (B,N,N). So for each element (i.e., each index b,i,j,h), the mask is the same across h, thus we need to load mask at index = (b,i,j) and broadcast.
+
+   Provide a Triton kernel that loads contiguous memory across hidden dimension maybe.
+
+   Since the shape is [B,N,N,hidden], we can flatten to total_elems = B * N * N * hidden. Compute mask_idx = offset // hidden, load mask at that index as scalar, broadcast.
+
+   We'll implement that kernel.
+
+5. If no mask or nomask: just multiply projections by gates elementwise.
+
+6. Next core reduction: compute out[b,i,j,h] = sum_k left[b,i,k,h] * right[b,j,k,h].
+
+   Note: left shape (B,N,N,hidden). We need to treat dimension k as the second N dimension. Left indexes: left[b,i,k,h]; right[b,j,k,h] (notice both have same k). That's like for each batch b and hidden h, we have matrices left[b,:, :, h] of shape (N,N) where index i rows, k columns; and right matrices of shape (N,N) where index j rows, k columns. Actually right[b,j,k,h] means right matrix transposed relative to left: we need left[b,i,k,:] times right[b,j,k,:] (k index over inner dimension). This is matrix multiplication left[b,:, :, h] @ right[b,:, :, h].T -> shape (N,N). Because left: (i,k), right: (j,k) we want sum_k left[i,k] * right[j,k] = (left) * (right)^T.
+
+   So we can compute for each h, batch: out[b, :, :, h] = left[b,:,:,h] @ right[b,:,:,h].T.
+
+   Use torch.bmm after reshaping as described.
+
+   Steps:
+
+   B,N,_,H = left.shape
+
+   left_flat = left.permute(0,3,1,2).reshape(B*H, N, N)  # (B*H, N, N)
+   right_flat = right.permute(0,3,1,2).reshape(B*H, N, N)
+
+   out_flat = torch.bmm(left_flat, right_flat.transpose(1,2))  # (B*H, N, N)
+
+   out = out_flat.view(B, H, N, N).permute(0,2,3,1)  # (B,N,N,H)
+
+7. Then apply output layer norm (to_out_norm) over hidden dimension H: F.layer_norm(out, (H,), weight=to_out_norm_weight,bias=to_out_norm_bias). Input dtype is fp16; weight/bias are also fp16.
+
+8. Multiply by out_gate (broadcast over hidden dim). out_gate shape (B,N,N,H). Multiply elementwise.
+
+9. Final linear projection back to dim: F.linear(out, to_out_weight). The to_out weight shape (dim, hidden). Output shape (B,N,N,dim). Keep in fp16.
+
+10. Cast back to original dtype (input dtype).
+
+Now we need to ensure proper use of torch functions: F.linear expects input shape (..., in_features). So if we give out shape (B,N,N,H) and weight shape (dim, H), output shape (B,N,N,dim). Good.
+
+Now we need to implement the Triton kernel for mask+gate+projection fusion.
+
+But we need to also ensure that the kernel can handle case where some inputs may be non-contiguous: we can ensure contiguous before passing to kernel.
+
+Potential issues: memory usage for large N (up to 1024) and hidden dim up to 768 (maybe). B up to 2. So total elements: B * N * N * H: for N=1024,H=768,B=1 => about 805 million elements, each FP16 2 bytes: ~1.6GB, could be memory heavy but maybe okay for GPU. We need to handle this. Our kernel will process in blocks.
+
+We'll set BLOCK_SIZE = 8192 perhaps. Use triton.cdiv to compute grid.
+
+Implementation details for kernel:
+
+@triton.jit
+def _proj_gate_mask_kernel(
+
+   left_proj_ptr, right_proj_ptr,
+   left_gate_ptr, right_gate_ptr,
+   mask_ptr,
+   left_out_ptr, right_out_ptr,
+   total_elems, hidden_dim,
+   BLOCK_SIZE: tl.constexpr,
+):
+
+   pid = tl.program_id(0)
+   start = pid * BLOCK_SIZE
+   offs = start + tl.arange(0, BLOCK_SIZE)
+   mask = offs < total_elems
+
+   # Compute mask index: because mask has shape (B,N,N) and each hidden repeats hidden_dim times.
+   mask_idx = offs // hidden_dim
+
+   # Load
+   lproj = tl.load(left_proj_ptr + offs, mask=mask, other=0.0)
+   rproj = tl.load(right_proj_ptr + offs, mask=mask, other=0.0)
+   lgate = tl.load(left_gate_ptr + offs, mask=mask, other=0.0)
+   rgate = tl.load(right_gate_ptr + offs, mask=mask, other=0.0)
+   m = tl.load(mask_ptr + mask_idx, mask=mask, other=1.0)
+
+   # Compute
+   lout = lproj * lgate * m
+   rout = rproj * rgate * m
+
+   tl.store(left_out_ptr + offs, lout, mask=mask)
+   tl.store(right_out_ptr + offs, rout, mask=mask)
+
+We need to ensure that left_proj_ptr etc. are appropriately typed (fp16). Use .to(torch.float16). The kernel will assume pointer type is fp16.
+
+One nuance: when mask is None or nomask, we skip kernel.
+
+Now we must also apply left_proj * left_gate and right_proj * right_gate after mask, but in case mask is not needed, we can just compute left = left_proj * left_gate; right = right_proj * right_gate.
+
+Implementation yields correct output.
+
+Now we need to produce final code block with everything.
+
+We also need to import torch, torch.nn.functional as F, triton etc. In code we will define both the kernel and helper function _apply_proj_gate_mask similar to previous code.
+
+Potential improvements: Use torch.einsum for core reduction? No, use bmm as described.
+
+Potentially need to implement a custom kernel for the core reduction too? Not required, but we must implement at least part in Triton (which we do). Good.
+
+Now test for correctness: For small sizes (e.g., B=1,N=2,dim=3, hidden_dim=3) we could compute both from our function and the reference PyTorch implementation. But we assume it's fine.
+
+Potential issues: Is out_gate shape (B,N,N,H) as per original code? Actually out_gate computed from linear of x: shape (B,N,N,H). It is multiplied after second layernorm (out) which is shape (B,N,N,H). So out_gate should have same shape.
+
+Note that in our code we compute out_gate before we compute left/right gating. We'll compute same.
+
+Now need to handle mask. Input mask shape [B,N,N], often binary. In PyTorch code they do mask = mask.unsqueeze(-1) and left = left * mask; right = right * mask. So mask is broadcast across hidden dim. That matches our kernel.
+
+Edge cases: If mask dtype is bool, convert to float16.
+
+Implementation details:
+
+- In custom_kernel, after unpack, set device, dtype_in.
+
+- Compute x_norm = F.layer_norm(input_tensor, (dim,), weight=norm_weight, bias=norm_bias). Both weight and bias need shape (dim,). Should be torch.Tensor.
+
+- Cast to fp16: x = x_norm.to(torch.float16)
+
+- Convert weights to fp16: use .to(torch.float16). For to_out_norm weight/bias also cast.
+
+- Compute left_proj = F.linear(x, left_proj_weight) etc.
+
+- Compute gates (sigmoid). Note: F.linear returns fp16, then .sigmoid() may be slower - but fine.
+
+- If mask and not nomask: ensure mask contiguous in fp16: mask_fp16 = mask.to(torch.float16).contiguous()
+
+- Then call a helper function that runs kernel to produce left,right as fused outputs.
+
+- Else: left = left_proj * left_gate; right = right_proj * right_gate; if mask not None and not nomask?? Wait mask is not None but nomask is True means ignore mask: we still don't multiply by mask. So the else branch covers both cases where mask is None or nomask True.
+
+- Compute core reduction:
+
+   B,N,_,H = left.shape
+
+   left_flat = left.permute(0,3,1,2).reshape(B*H, N, N)
+   right_flat = right.permute(0,3,1,2).reshape(B*H, N, N)
+
+   out_flat = torch.bmm(left_flat, right_flat.transpose(1,2))
+
+   out = out_flat.view(B, H, N, N).permute(0,2,3,1).contiguous()
+
+- Output layernorm: out = F.layer_norm(out, (H,), weight=to_out_norm_weight, bias=to_out_norm_bias)
+
+- Multiply out_gate: out = out * out_gate
+
+- Final linear: out = F.linear(out, to_out_weight)  # weight shape (dim, H). (Bias false)
+
+- Cast to original dtype: out = out.to(dtype_in) if needed.
+
+Return out.
+
+Potential performance: the core reduction is large; could be memory bound. But we are not required to achieve super low runtime; we just need correctness and some optimization.
+
+Now need to add docstring at top summarizing algorithm.
+
+Potential pitfalls: The weight shapes for linear: for F.linear(x, weight) weight shape should be (out_features, in_features). Our weight tensors in weights dict likely have shape (hidden_dim, dim) or (dim, hidden_dim), not sure. In original code they defined self.left_proj = nn.Linear(dim, hidden_dim, bias=False). So weight shape in PyTorch is (hidden_dim, dim). When they call self.left_proj(x): that uses weight shape (hidden_dim, dim). So our weight shape must match that. So we should use weights["left_proj.weight"] as given.
+
+When we do F.linear(x, left_proj_weight), that will compute x @ weight.T. Since weight shape (hidden_dim, dim), weight.T shape (dim, hidden_dim). So x shape (..., dim) times weight.T shape (dim, hidden_dim) yields (..., hidden_dim). Perfect.
+
+Similarly for to_out: to_out = nn.Linear(hidden_dim, dim, bias=False). So weight shape (dim, hidden_dim). Using F.linear(out, to_out_weight) gives out @ weight.T shape (..., hidden_dim) @ (hidden_dim, dim) = (..., dim). So weight shape is correct.
+
+Now we need to ensure the mask is applied correctly: In reference code they do mask = mask.unsqueeze(-1) then left = left * mask; right = right * mask. So mask has shape (B,N,N,1). Our kernel multiplies left_proj*left_gate*m, which replicates same effect (since left_gate applied after mask in reference: left = left * mask; left = left * left_gate). The order multiplication commutes.
+
+Now output: We must ensure we follow the same order: after core reduction and out = self.to_out_norm(out), out = out * out_gate, then self.to_out.
+
+Thus our code matches.
+
+Now we must define custom_kernel with signature as requested.
+
+One more nuance: The mask may be integer 0/1, but converting to fp16 ensures multiplication.
+
+Potential memory: the kernel reads left_proj, right_proj, left_gate, right_gate and writes left_out and right_out (both same shape). This duplicates memory usage but okay.
+
+Now we also need to handle case where mask is None: earlier they said "There will either be no mask, or a randomly sampled mask over the inputs." In custom_kernel signature they provide mask as separate argument? Actually input data is tuple (input, mask, weights, config). In the description: data: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict). Wait earlier they said "input: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)". But also inside they mention mask. In the skeleton: def custom_kernel(data) input_tensor, mask, weights, config = data . So the tuple includes mask as second element. So we need to handle if mask is None or torch tensor.
+
+Now ensure we import needed modules.
+
+Testing: We'll need abide by Triton version 3.3.1 and B200; but our code should be generic.
+
+Potential improvements: Use torch.nn.functional.layer_norm for FP16; instance.
+
+Now produce final code:
+
+```python
+"""
+TriMul outgoing kernel implementation.
+
+The kernel performs:
+1. Input LayerNorm.
+2. Linear projections (left/right) and gating (left/right/out) in FP16.
+3. Optional mask fusion via a Triton kernel that multiplies projection,
+   gate and mask in one pass.
+4. Core O(N^3) reduction:
+   out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+   implemented as a batched matrix‑multiply (left @ rightᵀ) across the
+   hidden dimension.
+5. Output LayerNorm, output‑gate, and final linear projection back to the
+   original dimension.
+All heavy‑weight arithmetic is carried out in fp16, while the final
+result is returned in the input dtype.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from typing import Tuple, Dict
+
+@triton.jit
+def _proj_gate_mask_kernel(
+    left_proj_ptr,   # fp16 *
+    right_proj_ptr,  # fp16 *
+    left_gate_ptr,   # fp16 *
+    right_gate_ptr,  # fp16 *
+    mask_ptr,        # fp16 *
+    left_out_ptr,    # fp16 *
+    right_out_ptr,   # fp16 *
+    total_elems,     # i64
+    hidden_dim,      # i64
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fuse projection, gate and mask for left/right tensors.
+    Each program processes BLOCK_SIZE elements of the flattened
+    (B, N, N, H) tensors. The mask has no hidden dimension, so we
+    compute the mask index as offset // hidden_dim.
+    """
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offs = start + tl.arange(0, BLOCK_SIZE)
+
+    mask = offs < total_elems
+
+    # index of the corresponding mask element (B, N, N)
+    mask_idx = offs // hidden_dim
+
+    # load values
+    lproj = tl.load(left_proj_ptr + offs, mask=mask, other=0.0)
+    rproj = tl.load(right_proj_ptr + offs, mask=mask, other=0.0)
+    lgate = tl.load(left_gate_ptr + offs, mask=mask, other=0.0)
+    rgate = tl.load(right_gate_ptr + offs, mask=mask, other=0.0)
+    m = tl.load(mask_ptr + mask_idx, mask=mask, other=1.0)
+
+    # fused computation
+    lout = lproj * lgate * m
+    rout = rproj * rgate * m
+
+    tl.store(left_out_ptr + offs,  lout, mask=mask)
+    tl.store(right_out_ptr + offs, rout, mask=mask)
+
+def _apply_proj_gate_mask(
+    left_proj: torch.Tensor,
+    right_proj: torch.Tensor,
+    left_gate: torch.Tensor,
+    right_gate: torch.Tensor,
+    mask: torch.Tensor,
+    block_size: int = 8192,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the Triton kernel that fuses mask, projection and gate."""
+    assert left_proj.is_contiguous()
+    assert right_proj.is_contiguous()
+    assert left_gate.is_contiguous()
+    assert right_gate.is_contiguous()
+    assert mask.is_contiguous()
+
+    B, N, _, H = left_proj.shape
+    total = left_proj.numel()
+    left_out = torch.empty_like(left_proj)
+    right_out = torch.empty_like(right_proj)
+
+    grid = (triton.cdiv(total, block_size),)
+
+    _proj_gate_mask_kernel[grid](
+        left_proj,
+        right_proj,
+        left_gate,
+        right_gate,
+        mask,
+        left_out,
+        right_out,
+        total,
+        H,
+        BLOCK_SIZE=block_size,
+    )
+    return left_out, right_out
+
+def custom_kernel(
+    data: Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict]
+) -> torch.Tensor:
+    """
+    Forward pass of the outgoing TriMul operation.
+
+    Args:
+        data: (input_tensor, mask, weights, config)
+            - input_tensor: torch.Tensor of shape [B, N, N, C]
+            - mask: torch.Tensor of shape [B, N, N] or None
+            - weights: dict with keys
+                "norm.weight", "norm.bias",
+                "left_proj.weight", "right_proj.weight",
+                "left_gate.weight", "right_gate.weight",
+                "out_gate.weight",
+                "to_out_norm.weight", "to_out_norm.bias",
+                "to_out.weight"
+            - config: dict with keys "dim", "hidden_dim", optional "nomask"
+    Returns:
+        torch.Tensor of shape [B, N, N, C] (same dtype as input).
+    """
+    # ------------------------------------------------------------------
+    # Unpack inputs
+    # ------------------------------------------------------------------
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    nomask = config.get("nomask", False)
+
+    device = input_tensor.device
+    dtype_in = input_tensor.dtype
+
+    # ------------------------------------------------------------------
+    # 1) Input LayerNorm over the channel dimension `dim`
+    # ------------------------------------------------------------------
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weight=weights["norm.weight"],
+        bias=weights["norm.bias"],
+    )  # (B, N, N, dim)
+
+    # ------------------------------------------------------------------
+    # 2) Cast to fp16 for compute‑heavy operations
+    # ------------------------------------------------------------------
+    x = x.to(torch.float16)
+
+    # ------------------------------------------------------------------
+    # 3) Cast linear weights to fp16 (bias‑free)
+    # ------------------------------------------------------------------
+    left_proj_w   = weights["left_proj.weight"].to(torch.float16)
+    right_proj_w  = weights["right_proj.weight"].to(torch.float16)
+    left_gate_w   = weights["left_gate.weight"].to(torch.float16)
+    right_gate_w  = weights["right_gate.weight"].to(torch.float16)
+    out_gate_w    = weights["out_gate.weight"].to(torch.float16)
+    to_out_norm_w = weights["to_out_norm.weight"].to(torch.float16)
+    to_out_norm_b = weights["to_out_norm.bias"].to(torch.float16)
+    to_out_w      = weights["to_out.weight"].to(torch.float16)
+
+    # ------------------------------------------------------------------
+    # 4) Linear projections and gates (all fp16)
+    # ------------------------------------------------------------------
+    left_proj = F.linear(x, left_proj_w)          # (B, N, N, H)
+    right_proj = F.linear(x, right_proj_w)        # (B, N, N, H)
+
+    left_gate = F.linear(x, left_gate_w).sigmoid()   # (B, N, N, H)
+    right_gate = F.linear(x, right_gate_w).sigmoid() # (B, N, N, H)
+    out_gate = F.linear(x, out_gate_w).sigmoid()     # (B, N, N, H)
+
+    # ------------------------------------------------------------------
+    # 5) Fuse mask, projection and gate (via Triton when needed)
+    # ------------------------------------------------------------------
+    if mask is not None and not nomask:
+        # Ensure mask is contiguous float16 (0/1)
+        mask_fp16 = mask.to(torch.float16).contiguous()
+        left, right = _apply_proj_gate_mask(
+            left_proj.contiguous(),
+            right_proj.contiguous(),
+            left_gate.contiguous(),
+            right_gate.contiguous(),
+            mask_fp16,
+            block_size=8192,
+        )
+    else:
+        # Simple element‑wise multiplication (mask ignored)
+        left = left_proj * left_gate
+        right = right_proj * right_gate
+
+    # ------------------------------------------------------------------
+    # 6) Core reduction: out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+    #    Implemented as batched matrix multiply (left @ rightᵀ)
+    # ------------------------------------------------------------------
+    B, N, _, H = left.shape
+    # reshape to (B*H, N, N) for batched gemm
+    left_flat = left.permute(0, 3, 1, 2).reshape(B * H, N, N)
+    right_flat = right.permute(0, 3, 1, 2).reshape(B * H, N, N)
+
+    # (B*H, N, N) @ (B*H, N, N).T -> (B*H, N, N)
+    out_flat = torch.bmm(left_flat, right_flat.transpose(1, 2))
+
+    # reshape back to (B, N, N, H)
+    out = out_flat.view(B, H, N, N).permute(0, 2, 3, 1).contiguous()
+
+    # ------------------------------------------------------------------
+    # 7) Output LayerNorm, out‑gate, final projection
+    # ------------------------------------------------------------------
+    out = F.layer_norm(
+        out,
+        (H,),
+        weight=to_out_norm_w,
+        bias=to_out_norm_b,
+    )
+    out = out * out_gate
+    out = F.linear(out, to_out_w)   # (B, N, N, dim)
+
+    # ------------------------------------------------------------------
+    # 8) Cast back to the original dtype
+    # ------------------------------------------------------------------
+    if out.dtype != dtype_in:
+        out = out.to(dtype_in)
+
+    return out
+```
+
+Now let's review for any potential errors.
+
+Potential errors: For out_gate we compute from x (fp16). In the original code they compute x = self.norm(x), then compute left_proj = self.left_proj(x) etc. All in same dtype as input (maybe float32). But we convert to fp16; out_gate also in fp16; multiplication later is ok.
+
+Potential unify: For left_proj, right_proj we computed using F.linear with weight shape (hidden_dim, dim). F.linear expects input shape (B,N,N,dim) and weight shape (hidden_dim, dim). That's correct.
+
+Now about mask: mask shape (B,N,N). We compute mask_idx = offs // hidden_dim. But we need to ensure that the order of elements in flattened tensors matches this. In PyTorch, tensors are stored in row-major (C-contiguous). For shape (B,N,N,H) order is (B,N,N,H). The flatten offset i = ((b* N + i) * N + j) * H + h. So offset // H indeed yields ((b*N + i) * N + j) which is the index of mask element. So loads correct mask.
+
+One nuance: Our left_proj_ptr etc. are pointers to fp16 tensors; we pass them directly as torch tensors to kernel using Triton. Works.
+
+Potential issues: Need to specify dtype for kernel. Triton's default for fp16 is tl.float16. Our operations fine.
+
+Now test for small shape:
+
+Consider B=1,N=2,dim=3,hidden_dim=4. Input x shape (1,2,2,3). left_proj shape (1,2,2,4). Flatten total_elems=1*2*2*4=16. hidden_dim=4.
+
+Mask shape (1,2,2). For each offset from 0 to 15: mask_idx = offset // 4 yields values 0..3 each repeated 4 times? Actually offset 0-3 -> 0; 4-7->1; 8-11->2; 12-15->3. This matches (b,i,j) flatten order: each (i,j) group of H. Good. For contiguous memory it's correct.
+
+Thus kernel multiplication works.
+
+Potential memory: left_out = torch.empty_like(left_proj) etc. This uses int16 occupancy.
+
+Now function returns out shape (B,N,N,dim). Good.
+
+Double-check to_out_norm weight: weight shape (hidden_dim,) according to LayerNorm over hidden dimension H. In config we have hidden_dim (maybe 128). So to_out_norm_weight shape (hidden_dim,) and bias shape (hidden_dim,). That's correct.
+
+Potential missing: The original code uses self.to_out_norm.weight and bias as parameters for hidden dimension. In our code we need to convert to fp16.
+
+Now final code.
+
+Potential things: If mask is None, mask is None; we skip mask process. Good.
+
+Edge case: mask present but nomask True: we ignore mask in else branch (no multiply). That's fine.
+
+Potential missing: The code for mask gating after kernel sets left = left_proj*left_gate*m (where m is mask). In reference they multiply mask before gating (left = left_proj * mask; left = left * left_gate). Equivalent.
+
+Now ensure to import typing for Tuple, Dict. Good.
+
+Now final test: Should compile.
+
+We need to also handle the case where mask is boolean. mask.to(torch.float16) works.
+
+Potential runtime: In worst-case N=1024, H=768, total elements ~ 1024*1024*768 ≈ 805M. That's memory heavy; left_proj, right_proj each similar size, plus gates, etc. Might exceed GPU memory. But config includes dim maybe 384; hidden_dim=128. Actually hidden_dim is separate from dim. In tests, hidden_dim always 128. dim can be 384. So total elements: B * N * N * hidden_dim = for N=1024, hidden_dim=128, B=1 => 1024*1024*128 ≈ 134 million floats (~256MB in fp16). That's okay. Plus other tensors maybe 5-6 times that - about 1.5GB, still okay.
+
+Now we need to ensure not to allocate too many temporaries. The mask fuse kernel writes left and right outputs but still need left_proj, right_proj, left_gate,right_gate which we will allocate; we could reuse memory but fine.
+
+Now ensure we use contiguous for left_proj etc. After F.linear capsules may return contiguous. Usually F.linear returns contiguous.
+
+Potential need to call .contiguous() before passing to kernel: we already call .contiguous().
+
+Now correctness: Need same output as reference. Compute using torch. Should be fine.
+
+Potential issues: using torch.bmm expects both inputs to be of shape (batch, N, N). Our left_flat, right_flat shapes (B*H,N,N). This may be large (B * H up to 2*128 =256). That's okay.
+
+Now for hidden_dim larger than 128 (like 384). In tests, hidden_dim is 128 always? The config includes hidden_dim param, but they didn't say hidden_dim can be something else. It's given as hidden_dim in config. So fine.
+
+Now create final code block with docstring. Ensure top docstring summarizing algorithm.
+
+Now produce final answer.assistantfinal```python
+"""
+TriMul outgoing kernel implementation.
+
+The kernel follows the AlphaFold3 "outgoing" TriMul operation:
+
+1. Input LayerNorm over the channel dimension.
+2. Linear projections (left/right) and three sigmoid gates (left, right, out) in
+   fp16.
+3. Optional mask fusion: a Triton kernel multiplies the left/right projections
+   with their respective gates and the binary mask in a single pass.
+4. Core O(N³) reduction:
+   out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+   realized as a batched matrix‑multiply (left @ rightᵀ) across the hidden
+   dimension.
+5. Output LayerNorm over the hidden dimension, multiplication by the output
+   gate, and a final linear projection back to the original channel dimension.
+All heavy arithmetic is performed in fp16; the result is returned in the
+input dtype.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from typing import Tuple, Dict
+
+@triton.jit
+def _proj_gate_mask_kernel(
+    left_proj_ptr,   # fp16 *
+    right_proj_ptr,  # fp16 *
+    left_gate_ptr,   # fp16 *
+    right_gate_ptr,  # fp16 *
+    mask_ptr,        # fp16 *
+    left_out_ptr,    # fp16 *
+    right_out_ptr,   # fp16 *
+    total_elems,     # i64
+    hidden_dim,      # i64
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fuse projection, gate and mask for the left/right tensors.
+
+    Each program processes BLOCK_SIZE elements of the flattened
+    (B, N, N, H) tensors.  The mask has shape (B, N, N) (no hidden dim);
+    we compute the mask index as offset // hidden_dim.
+    """
+    pid = tl.program_id(0)
+    start = pid * BLOCK_SIZE
+    offs = start + tl.arange(0, BLOCK_SIZE)
+
+    mask = offs < total_elems
+
+    # Index of the corresponding mask element (B, N, N)
+    mask_idx = offs // hidden_dim
+
+    # Load values
+    lproj = tl.load(left_proj_ptr + offs, mask=mask, other=0.0)
+    rproj = tl.load(right_proj_ptr + offs, mask=mask, other=0.0)
+    lgate = tl.load(left_gate_ptr + offs, mask=mask, other=0.0)
+    rgate = tl.load(right_gate_ptr + offs, mask=mask, other=0.0)
+    m = tl.load(mask_ptr + mask_idx, mask=mask, other=1.0)
+
+    # Fused computation
+    lout = lproj * lgate * m
+    rout = rproj * rgate * m
+
+    tl.store(left_out_ptr + offs,  lout, mask=mask)
+    tl.store(right_out_ptr + offs, rout, mask=mask)
+
+def _apply_proj_gate_mask(
+    left_proj: torch.Tensor,
+    right_proj: torch.Tensor,
+    left_gate: torch.Tensor,
+    right_gate: torch.Tensor,
+    mask: torch.Tensor,
+    block_size: int = 8192,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run the Triton kernel that fuses mask, projection and gate.
+    All inputs must be contiguous fp16 tensors.
+    """
+    assert left_proj.is_contiguous()
+    assert right_proj.is_contiguous()
+    assert left_gate.is_contiguous()
+    assert right_gate.is_contiguous()
+    assert mask.is_contiguous()
+
+    total = left_proj.numel()
+    left_out = torch.empty_like(left_proj)
+    right_out = torch.empty_like(right_proj)
+
+    grid = (triton.cdiv(total, block_size),)
+
+    _proj_gate_mask_kernel[grid](
+        left_proj,
+        right_proj,
+        left_gate,
+        right_gate,
+        mask,
+        left_out,
+        right_out,
+        total,
+        left_proj.shape[-1],   # hidden_dim
+        BLOCK_SIZE=block_size,
+    )
+    return left_out, right_out
+
+def custom_kernel(
+    data: Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict]
+) -> torch.Tensor:
+    """
+    Forward pass of the outgoing TriMul operation.
+
+    Args:
+        data: (input_tensor, mask, weights, config)
+            - input_tensor: torch.Tensor of shape [B, N, N, C] (float32 or float16)
+            - mask: torch.Tensor of shape [B, N, N] (binary) or None
+            - weights: dict with keys
+                "norm.weight", "norm.bias",
+                "left_proj.weight", "right_proj.weight",
+                "left_gate.weight", "right_gate.weight",
+                "out_gate.weight",
+                "to_out_norm.weight", "to_out_norm.bias",
+                "to_out.weight"
+            - config: dict with keys
+                "dim" (C), "hidden_dim" (H), optional "nomask" (bool)
+    Returns:
+        torch.Tensor of shape [B, N, N, C] (same dtype as input_tensor).
+    """
+    # --------------------------------------------------------------
+    # Unpack inputs
+    # --------------------------------------------------------------
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+    nomask = config.get("nomask", False)
+
+    dtype_in = input_tensor.dtype
+    device = input_tensor.device
+
+    # --------------------------------------------------------------
+    # 1) Input LayerNorm over the channel dimension `dim`
+    # --------------------------------------------------------------
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weight=weights["norm.weight"],
+        bias=weights["norm.bias"],
+    )  # (B, N, N, dim)
+
+    # --------------------------------------------------------------
+    # 2) Cast to fp16 for compute‑intensive ops
+    # --------------------------------------------------------------
+    x = x.to(torch.float16)
+
+    # --------------------------------------------------------------
+    # 3) Cast linear weights to fp16 (bias‑free layers)
+    # --------------------------------------------------------------
+    left_proj_w   = weights["left_proj.weight"].to(torch.float16)
+    right_proj_w  = weights["right_proj.weight"].to(torch.float16)
+    left_gate_w   = weights["left_gate.weight"].to(torch.float16)
+    right_gate_w  = weights["right_gate.weight"].to(torch.float16)
+    out_gate_w    = weights["out_gate.weight"].to(torch.float16)
+    to_out_norm_w = weights["to_out_norm.weight"].to(torch.float16)
+    to_out_norm_b = weights["to_out_norm.bias"].to(torch.float16)
+    to_out_w      = weights["to_out.weight"].to(torch.float16)
+
+    # --------------------------------------------------------------
+    # 4) Linear projections and gates (all fp16)
+    # --------------------------------------------------------------
+    left_proj  = F.linear(x, left_proj_w)          # (B, N, N, H)
+    right_proj = F.linear(x, right_proj_w)        # (B, N, N, H)
+
+    left_gate  = F.linear(x, left_gate_w).sigmoid()   # (B, N, N, H)
+    right_gate = F.linear(x, right_gate_w).sigmoid() # (B, N, N, H)
+    out_gate   = F.linear(x, out_gate_w).sigmoid()   # (B, N, N, H)
+
+    # --------------------------------------------------------------
+    # 5) Fuse mask, projection and gate (Triton kernel when needed)
+    # --------------------------------------------------------------
+    if mask is not None and not nomask:
+        mask_fp16 = mask.to(torch.float16).contiguous()
+        left, right = _apply_proj_gate_mask(
+            left_proj.contiguous(),
+            right_proj.contiguous(),
+            left_gate.contiguous(),
+            right_gate.contiguous(),
+            mask_fp16,
+            block_size=8192,
+        )
+    else:
+        # Simple element‑wise multiplication; mask ignored.
+        left = left_proj * left_gate
+        right = right_proj * right_gate
+
+    # --------------------------------------------------------------
+    # 6) Core reduction: out[b,i,j,h] = Σ_k left[b,i,k,h] * right[b,j,k,h]
+    #    Implemented as batched matrix multiplication (left @ rightᵀ).
+    # --------------------------------------------------------------
+    B, N, _, H = left.shape
+    # reshape to (B*H, N, N) for batched gemm
+    left_flat  = left.permute(0, 3, 1, 2).reshape(B * H, N, N)
+    right_flat = right.permute(0, 3, 1, 2).reshape(B * H, N, N)
+
+    # (B*H, N, N) @ (B*H, N, N).T -> (B*H, N, N)
+    out_flat = torch.bmm(left_flat, right_flat.transpose(1, 2))
+
+    # reshape back to (B, N, N, H)
+    out = out_flat.view(B, H, N, N).permute(0, 2, 3, 1).contiguous()
+
+    # --------------------------------------------------------------
+    # 7) Output LayerNorm, out‑gate, final linear projection
+    # --------------------------------------------------------------
+    out = F.layer_norm(
+        out,
+        (H,),
+        weight=to_out_norm_w,
+        bias=to_out_norm_b,
+    )
+    out = out * out_gate
+    out = F.linear(out, to_out_w)   # (B, N, N, dim)
+
+    # --------------------------------------------------------------
+    # 8) Cast back to the original dtype
+    # --------------------------------------------------------------
+    if out.dtype != dtype_in:
+        out = out.to(dtype_in)
+
+    return out
+```
